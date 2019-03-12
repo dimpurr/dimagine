@@ -6,6 +6,8 @@ A tool like pinterest for illustrator (which wouldn't ban r18 pics)
 
 * https://picturepan2.github.io/spectre/
 * https://expressjs.com/
+* https://github.com/mapbox/node-sqlite3/wiki/API
+* https://github.com/bnoguchi/everyauth
 
 ### Run
 

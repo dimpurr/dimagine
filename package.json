@@ -19,10 +19,13 @@
   "dependencies": {
     "cookie-parser": "~1.4.3",
     "debug": "~2.6.9",
+    "everyauth": "^0.4.9",
     "express": "~4.16.0",
     "http-errors": "~1.6.2",
+    "mongodb": "^3.1.13",
     "morgan": "~1.9.0",
-    "pug": "2.0.0-beta11",
-    "spectre.css": "^0.5.8"
+    "pug": "^2.0.3",
+    "spectre.css": "^0.5.8",
+    "sqlite3": "^4.0.6"
   }
 }
