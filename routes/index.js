@@ -14,4 +14,9 @@ router.get('/', function(req, res, next) {
   });
 });
 
+/* GET login. */
+router.get('/login', function(req, res, next) {
+  res.send('respond with a login 1');
+});
+
 module.exports = router;

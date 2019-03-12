@@ -3,8 +3,11 @@ var express = require('express');
 var path = require('path');
 var cookieParser = require('cookie-parser');
 var logger = require('morgan');
-var everyauth = require('everyauth');
 var session = require('express-session')
+var Passport = require( 'passport' );
+var LocalStrategy = require( 'passport-local' ).Strategy;
+// var bodyParser = require('body-parser')
+// var everyauth = require('everyauth');
 
 var indexRouter = require('./routes/index');
 var usersRouter = require('./routes/users');
@@ -31,7 +34,11 @@ app.use(session({
   resave: false,
   saveUninitialized: true
 }));
-app.use(everyauth.middleware(app));
+
+// everyauth.helpExpress(app);
+// everyauth.password
+// app.use(everyauth.middleware(app));
+// everyauth.everymodule.logoutPath('/bye');
 
 app.use('/', indexRouter);
 app.use('/users', usersRouter);
