@@ -7,9 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Skill: images with meaningless names are named from their source URL
-  (Twitter, pixiv, Bilibili, or site and last path segment) before falling
-  back to the import time.
+- Skill: images with meaningless names are named `<site>-<id>` from an
+  ID-shaped token in their source URL path (query strings and tracking
+  segments ignored) before falling back to the import time.
 - Core checks: grouped duplicate-ID findings, incomplete-read exit reporting, bounded note reads, native path tracking, and stricter link/collection checks.
 - Rust workspace with the first two read-only CLI commands, `dimagine scan` (library summary) and `dimagine check` (findings), plus CI.
 - Read-only web viewer (`dimagine-serve`): sanitized Markdown,

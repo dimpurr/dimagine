@@ -40,11 +40,14 @@ items in `inbox/` and suggest topic folders later.
    one.
 2. Avoid `[ ] # ^ |` in file names; they break links. Replace them with `-`.
 3. If the image has no meaningful name (`image.png`, `download.jpg`,
-   `IMG_1234.jpg`, a pasted image), build one from its source URL when it has
-   one: `twitter-<user>-<status id>-<photo n>`, `pixiv-<artwork id>` (or
-   `pixiv-<id>-p<n>` for a page), `bilibili-<id>`, otherwise
-   `<site>-<last path segment>`. Without a usable URL, name it after the
-   import time plus four characters: `20261004-143012-q3f7.jpg`.
+   `IMG_1234.jpg`, a pasted image) and has a source URL, name it
+   `<site>-<id>`: take the URL path only (ignore `?query` and `#fragment`),
+   skip path segments containing `=`, split the rest on non-alphanumeric
+   characters, and use the first ID-shaped token: all digits (5–20 long)
+   preferred, otherwise letters mixed with digits (6–24 long). Ignore longer
+   tokens; they are hashes. `<site>` is the host's main label (`twitter`,
+   `amazon`). Without a usable ID, name it after the import time plus four
+   characters: `20261004-143012-q3f7.jpg`. The full URL stays in the note.
 4. If a file with that name already exists in the folder, add `-2`, `-3`, ...
    before the extension.
 5. Only if there is something to record (source, author, tags, a note), write an
