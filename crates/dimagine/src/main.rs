@@ -14,6 +14,8 @@
 #[cfg(feature = "import-eagle")]
 mod import;
 mod plugins;
+#[cfg(feature = "previews")]
+mod previews;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -44,6 +46,8 @@ fn main() -> ExitCode {
         "check" => run_check(sub, &library_dir),
         #[cfg(feature = "import-eagle")]
         "import" => import::run(sub, &library_dir),
+        #[cfg(feature = "previews")]
+        "previews" => previews::run(sub, &library_dir),
         other => unreachable!("clap already rejected unknown subcommand {other}"),
     }
 }
@@ -93,6 +97,10 @@ fn cli(plugins: &CorePlugins) -> Command {
     }
     #[cfg(not(feature = "import-eagle"))]
     let _ = &plugins.import_eagle;
+    #[cfg(feature = "previews")]
+    if plugins.previews {
+        command = command.subcommand(previews::command());
+    }
     #[cfg(not(feature = "previews"))]
     let _ = &plugins.previews;
     #[cfg(not(feature = "serve"))]
