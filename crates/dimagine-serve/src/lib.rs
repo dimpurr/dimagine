@@ -8,19 +8,21 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use percent_encoding::percent_decode_str;
 use pulldown_cmark::{html, Event, Options, Parser};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Seek, SeekFrom},
     path::{Component, Path as FsPath, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Condvar, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use unicode_normalization::UnicodeNormalization;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp",
@@ -316,8 +318,30 @@ impl Catalog for FsCatalog {
                     return Err(CatalogError::Forbidden);
                 }
                 candidate.push(part);
-                let metadata =
-                    fs::symlink_metadata(&candidate).map_err(|_| CatalogError::NotFound)?;
+                let metadata = match fs::symlink_metadata(&candidate) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let parent = candidate.parent().ok_or(CatalogError::NotFound)?;
+                        let mut matched = None;
+                        if let Ok(entries) = fs::read_dir(parent) {
+                            let part_str = part.to_string_lossy();
+                            let part_nfc: String = part_str.nfc().collect();
+                            for entry in entries.flatten() {
+                                let ename = entry.file_name();
+                                let ename_str = ename.to_string_lossy();
+                                if ename_str.nfc().eq(part_nfc.chars()) {
+                                    candidate.pop();
+                                    candidate.push(&ename);
+                                    if let Ok(m) = fs::symlink_metadata(&candidate) {
+                                        matched = Some(m);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        matched.ok_or(CatalogError::NotFound)?
+                    }
+                };
                 if metadata.file_type().is_symlink() {
                     return Err(CatalogError::Forbidden);
                 }
@@ -347,6 +371,142 @@ pub struct OriginalPreview;
 impl PreviewProvider for OriginalPreview {
     fn preview_path(&self, image: &str, _kind: PreviewKind) -> Option<PathBuf> {
         Some(PathBuf::from(image))
+    }
+}
+
+/// Bounded concurrency limiter for CPU-intensive preview generation.
+struct ConcurrencyLimiter {
+    active: Mutex<usize>,
+    cvar: Condvar,
+    max: usize,
+}
+
+impl ConcurrencyLimiter {
+    fn new(max: usize) -> Self {
+        Self {
+            active: Mutex::new(0),
+            cvar: Condvar::new(),
+            max,
+        }
+    }
+
+    fn acquire(&self) -> ConcurrencyGuard<'_> {
+        let mut count = self.active.lock().unwrap();
+        while *count >= self.max {
+            count = self.cvar.wait(count).unwrap();
+        }
+        *count += 1;
+        ConcurrencyGuard { limiter: self }
+    }
+}
+
+struct ConcurrencyGuard<'a> {
+    limiter: &'a ConcurrencyLimiter,
+}
+
+impl<'a> Drop for ConcurrencyGuard<'a> {
+    fn drop(&mut self) {
+        let mut count = self.limiter.active.lock().unwrap();
+        *count -= 1;
+        self.limiter.cvar.notify_one();
+    }
+}
+
+/// Real preview provider backed by `dimagine_preview::ensure`.
+pub struct CachedPreview {
+    root: PathBuf,
+    concurrency: Arc<ConcurrencyLimiter>,
+    logged: Arc<Mutex<HashSet<String>>>,
+}
+
+impl CachedPreview {
+    /// Create a new preview provider for a library root with bounded concurrency (default 4).
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_concurrency(root, 4)
+    }
+
+    /// Create a new preview provider with a custom concurrency limit.
+    pub fn with_concurrency(root: impl Into<PathBuf>, max_concurrency: usize) -> Self {
+        let root = root.into();
+        let root = fs::canonicalize(&root).unwrap_or(root);
+        Self {
+            root,
+            concurrency: Arc::new(ConcurrencyLimiter::new(max_concurrency.max(1))),
+            logged: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+impl PreviewProvider for CachedPreview {
+    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        let relative = FsPath::new(image);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
+        {
+            return None;
+        }
+        let candidate = self.root.join(relative);
+        let source = match fs::canonicalize(&candidate) {
+            Ok(c) if c.starts_with(&self.root) && c.is_file() => c,
+            _ => {
+                // Try resolving with NFC/NFD normalization if exact byte match failed
+                let mut matched = self.root.clone();
+                for component in relative.components() {
+                    if let Component::Normal(part) = component {
+                        matched.push(part);
+                        if fs::symlink_metadata(&matched).is_err() {
+                            let parent = matched.parent()?;
+                            let mut resolved = None;
+                            if let Ok(entries) = fs::read_dir(parent) {
+                                let part_str = part.to_string_lossy();
+                                let part_nfc: String = part_str.nfc().collect();
+                                for entry in entries.flatten() {
+                                    let ename = entry.file_name();
+                                    let ename_str = ename.to_string_lossy();
+                                    if ename_str.nfc().eq(part_nfc.chars()) {
+                                        matched.pop();
+                                        matched.push(&ename);
+                                        if fs::symlink_metadata(&matched).is_ok() {
+                                            resolved = Some(());
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            resolved?;
+                        }
+                    }
+                }
+                let Ok(c) = fs::canonicalize(&matched) else {
+                    return None;
+                };
+                if c.starts_with(&self.root) && c.is_file() {
+                    c
+                } else {
+                    return None;
+                }
+            }
+        };
+        let preview_kind = match kind {
+            PreviewKind::Thumb => dimagine_preview::Kind::Thumb,
+            PreviewKind::View => dimagine_preview::Kind::View,
+        };
+        let _guard = self.concurrency.acquire();
+        match dimagine_preview::ensure(&self.root, &source, &[preview_kind]) {
+            Ok(renditions) => renditions
+                .into_iter()
+                .find(|r| r.kind == preview_kind)
+                .map(|r| r.path),
+            Err(err) => {
+                let mut logged = self.logged.lock().unwrap();
+                if logged.insert(image.to_string()) {
+                    eprintln!("preview generation failed for {image}: {err}");
+                }
+                None
+            }
+        }
     }
 }
 
@@ -433,6 +593,7 @@ pub fn router_from(
         .route("/image/*path", get(image_page))
         .route("/media/*path", get(media))
         .route("/thumb/*path", get(media))
+        .route("/raw/*path", get(media))
         .route("/api/folder", get(folder_root_json))
         .route("/api/folder/*path", get(folder_json))
         .route("/api/collection/*path", get(collection_json))
@@ -466,10 +627,10 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     };
     if authenticated {
         let mut response = next.run(request).await;
-        response.headers_mut().insert(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("private, no-cache"),
-        );
+        response
+            .headers_mut()
+            .entry(header::CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static("private, no-cache"));
         return response;
     }
     if request.uri().path().starts_with("/api/") {
@@ -564,7 +725,11 @@ async fn login(
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
-    let folder = route_tail(uri.path(), "/folder/");
+    let raw = route_tail(uri.path(), "/folder/");
+    let folder = match percent_decode_str(&raw).decode_utf8() {
+        Ok(s) => s.into_owned(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let catalog = state.catalog.clone();
     match tokio::task::spawn_blocking(move || {
         render_folder_data(&AppState { catalog, ..state }, &folder)
@@ -618,7 +783,7 @@ async fn image_page(State(state): State<AppState>, Path(path): Path<String>) -> 
                     )
                 })
                 .unwrap_or_default();
-            let content = format!("<img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre>{diagnostic}<h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), escape_html(&detail.path));
+            let content = format!("<p><a class=\"original-link\" href=\"/raw/{}\">View original</a></p><img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre>{diagnostic}<h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), encode_path(&detail.path), escape_html(&detail.path));
             Html(layout(&detail.path, &content)).into_response()
         }
         Ok(Err(e)) => error_response(e),
@@ -640,9 +805,11 @@ async fn media(
     headers: HeaderMap,
 ) -> Response {
     let kind = if uri.path().starts_with("/thumb/") {
-        PreviewKind::Thumb
+        Some(PreviewKind::Thumb)
+    } else if uri.path().starts_with("/raw/") {
+        None
     } else {
-        PreviewKind::View
+        Some(PreviewKind::View)
     };
     let catalog = state.catalog.clone();
     let previews = state.previews.clone();
@@ -655,17 +822,21 @@ async fn media(
         if !is_image(&original) {
             return Err(ServeImageError::Catalog(CatalogError::NotFound));
         }
-        let served = previews
-            .preview_path(&path, kind)
-            .and_then(|p| fs::canonicalize(p).ok())
-            .filter(|p| p.starts_with(&root) && p.is_file())
-            .unwrap_or(original);
-        open_hashed_image(&served)
+        let served = match kind {
+            Some(k) => previews
+                .preview_path(&path, k)
+                .and_then(|p| fs::canonicalize(p).ok())
+                .filter(|p| p.starts_with(&root) && p.is_file())
+                .unwrap_or_else(|| original.clone()),
+            None => original.clone(),
+        };
+        let is_preview = served != original;
+        open_hashed_image(&served).map(|r| (r, is_preview))
     })
     .await;
     match prepared {
-        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
-            stream_image(file, metadata, etag, mime, mismatch, &headers).await
+        Ok(Ok(((file, metadata, etag, mime, mismatch), is_preview))) => {
+            stream_image(file, metadata, etag, mime, mismatch, is_preview, &headers).await
         }
         Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
         Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
@@ -719,6 +890,7 @@ async fn stream_image(
     etag: String,
     mime: &'static str,
     mismatch: bool,
+    is_preview: bool,
     request_headers: &HeaderMap,
 ) -> Response {
     let file = tokio::fs::File::from_std(file);
@@ -733,9 +905,14 @@ async fn stream_image(
     let mut response = Response::new(body);
     let h = response.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    let cache_control = if is_preview {
+        "private, max-age=31536000, immutable"
+    } else {
+        "private, no-cache"
+    };
     h.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-cache"),
+        HeaderValue::from_static(cache_control),
     );
     if mismatch {
         h.insert(
@@ -903,7 +1080,7 @@ fn error_response(e: CatalogError) -> Response {
     }
 }
 fn layout(title: &str, body: &str) -> String {
-    format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>:root{{color-scheme:light dark;font:16px system-ui}}body{{max-width:1100px;margin:auto;padding:1rem}}a{{color:inherit}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}}.tile img,figure img{{width:100%;height:180px;object-fit:cover;border-radius:8px}}.detail{{max-width:100%;height:auto}}figure{{margin:0 0 1.4rem}}pre{{overflow:auto}}@media(max-width:420px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}</style><h1>{}</h1>{}</html>", escape_html(title), escape_html(title), body)
+    format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>:root{{color-scheme:light dark;font:16px system-ui}}body{{max-width:1100px;margin:auto;padding:1rem}}a{{color:inherit}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}}.tile{{display:flex;flex-direction:column;text-decoration:none}}.tile img{{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px}}.tile span{{margin-top:4px;font-size:0.85rem;overflow-wrap:break-word}}.tile.folder{{aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:rgba(128,128,128,0.15);border-radius:8px;padding:0.5rem;text-align:center;box-sizing:border-box}}.detail{{max-width:100%;height:auto}}figure{{margin:0 0 1.4rem}}figure img{{max-width:100%;height:auto;border-radius:8px}}pre{{overflow:auto}}@media(max-width:420px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}</style><h1>{}</h1>{}</html>", escape_html(title), escape_html(title), body)
 }
 fn markdown_html(markdown: &str) -> String {
     let mut out = String::new();
