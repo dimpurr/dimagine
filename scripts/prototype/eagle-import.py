@@ -15,10 +15,83 @@ B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
 GENERIC = re.compile(r'^(image|download|untitled|pasted image.*|img[_-]?\d+|screenshot.*|[0-9a-f]{16,})$', re.I)
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-ap.add_argument('src', help='Eagle library folder (Name.library)')
-ap.add_argument('dst', help='target dimagine library folder (empty or missing)')
+ap.add_argument('src', nargs='?', help='Eagle library folder (Name.library)')
+ap.add_argument('dst', nargs='?', help='target dimagine library folder (empty or missing)')
 ap.add_argument('--name', help='label for this Eagle library (default: folder name without .library)')
+ap.add_argument('--selftest', action='store_true', help='check name_from_url against the shared fixture')
 a = ap.parse_args()
+
+TWO_PART_SUFFIXES = {'co.uk', 'co.jp', 'com.cn', 'com.au'}
+
+def _strip_scheme(url):
+    low = url.lower()
+    for scheme in ('https://', 'http://'):
+        if low.startswith(scheme):
+            return url[len(scheme):]
+    return None
+
+def _site_from_host(host):
+    labels = [p for p in host.split('.') if p]
+    if not labels:
+        return None
+    if len(labels) >= 2 and '.'.join(labels[-2:]) in TWO_PART_SUFFIXES:
+        suffix = 2
+    elif len(labels) >= 2:
+        suffix = 1
+    else:
+        suffix = 0
+    idx = len(labels) - suffix - 1
+    return labels[idx] if idx >= 0 else None
+
+def name_from_url(url):
+    """Generic <site>-<id> name from a source URL, or None (K24 rule)."""
+    if not isinstance(url, str):
+        return None
+    rest = _strip_scheme(url)
+    if rest is None:
+        return None
+    cut = len(rest)
+    for sep in ('?', '#'):
+        i = rest.find(sep)
+        if i >= 0:
+            cut = min(cut, i)
+    rest = rest[:cut]
+    slash = rest.find('/')
+    authority, path = (rest[:slash], rest[slash:]) if slash >= 0 else (rest, '')
+    authority = authority.rsplit('@', 1)[-1]
+    site = _site_from_host(authority.split(':', 1)[0].lower())
+    if not site:
+        return None
+    first_digits = first_mixed = None
+    for segment in path.split('/'):
+        if not segment or '=' in segment:
+            continue
+        for token in re.split(r'[^A-Za-z0-9]+', segment):
+            if not token or len(token) > 24:
+                continue
+            if token.isdigit():
+                if 5 <= len(token) <= 20 and first_digits is None:
+                    first_digits = token
+            elif any(c.isalpha() for c in token) and any(c.isdigit() for c in token):
+                if 6 <= len(token) <= 24 and first_mixed is None:
+                    first_mixed = token
+    ident = first_digits or first_mixed
+    return f'{site}-{ident}' if ident else None
+
+if a.selftest:
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
+                           'crates', 'dimagine-eagle', 'tests', 'fixtures', 'url-names.json')
+    cases = json.load(open(fixture))
+    bad = [(c['url'], c['name'], name_from_url(c['url'])) for c in cases
+           if name_from_url(c['url']) != c['name']]
+    if bad:
+        print('FAIL', bad)
+        sys.exit(1)
+    print(f'ok {len(cases)} cases')
+    sys.exit(0)
+
+if not a.src or not a.dst:
+    ap.error('src and dst are required')
 SRC, DST = os.path.abspath(os.path.expanduser(a.src)), os.path.abspath(os.path.expanduser(a.dst))
 LIB = a.name or re.sub(r'\.library$', '', os.path.basename(SRC.rstrip('/')))
 
@@ -87,7 +160,9 @@ for d in sorted(glob.glob(os.path.join(SRC, 'images', '*.info'))):
     os.makedirs(home, exist_ok=True)
     name = clean(m.get('name'))
     if not name or GENERIC.match(name):
-        name = now.strftime('%Y%m%d-%H%M%S') + '-' + ulid()[-4:].lower(); renamed += 1
+        derived = name_from_url(m.get('url'))
+        name = clean(derived) if derived else now.strftime('%Y%m%d-%H%M%S') + '-' + ulid()[-4:].lower()
+        renamed += 1
     fname = unique(home, name, ext)
     try:
         shutil.copy2(orig, os.path.join(home, fname))

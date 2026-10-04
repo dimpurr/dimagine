@@ -561,7 +561,10 @@ fn rejects_root_or_prefix_components_in_source_item_metadata() {
     let report = import(&src, &dst, ImportOptions::default()).unwrap();
     assert_eq!(report.imported.len(), 0);
     assert_eq!(report.skipped.len(), 1);
-    assert_eq!(report.skipped[0].reason_code, SkipReasonCode::OriginalMissing);
+    assert_eq!(
+        report.skipped[0].reason_code,
+        SkipReasonCode::OriginalMissing
+    );
 }
 
 #[cfg(unix)]
@@ -592,7 +595,11 @@ fn does_not_write_through_leaf_symlinks_in_settings() {
     let external_css = temp.path().join("external.css");
     fs::write(&external_css, b"external css").unwrap();
     let victim = src.join("images/victim.txt");
-    symlink(&external_css, dst.join(".obsidian/snippets/dimagine-gallery.css")).unwrap();
+    symlink(
+        &external_css,
+        dst.join(".obsidian/snippets/dimagine-gallery.css"),
+    )
+    .unwrap();
     symlink(&victim, dst.join(".obsidian/appearance.json")).unwrap();
     let report = import(&src, &dst, ImportOptions::default()).unwrap();
     assert_eq!(report.imported.len(), 3);
@@ -604,10 +611,12 @@ fn does_not_write_through_leaf_symlinks_in_settings() {
         fs::read(temp.path().join("external.css")).unwrap(),
         b"external css"
     );
-    assert!(fs::symlink_metadata(dst.join(".obsidian/snippets/dimagine-gallery.css"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(dst.join(".obsidian/snippets/dimagine-gallery.css"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert!(fs::symlink_metadata(dst.join(".obsidian/appearance.json"))
         .unwrap()
         .file_type()
@@ -631,11 +640,22 @@ fn post_item_failure_reports_partial_io_with_retained_artifacts() {
     let _ = fs::set_permissions(dst.join(".obsidian"), fs::Permissions::from_mode(0o755));
 
     match result {
-        Err(ImportError::PartialIo { progress, retained_artifacts, .. }) => {
+        Err(ImportError::PartialIo {
+            progress,
+            retained_artifacts,
+            ..
+        }) => {
             assert_eq!(progress.imported.len(), 3);
-            assert!(!retained_artifacts.is_empty(), "retained artifacts must be reported");
+            assert!(
+                !retained_artifacts.is_empty(),
+                "retained artifacts must be reported"
+            );
             for artifact in &retained_artifacts {
-                assert!(artifact.exists(), "reported artifact {} must exist", artifact.display());
+                assert!(
+                    artifact.exists(),
+                    "reported artifact {} must exist",
+                    artifact.display()
+                );
             }
         }
         other => panic!("expected PartialIo, got {:?}", other),
@@ -751,4 +771,23 @@ fn normalize_generated_refs(text: &str) -> String {
         index += ch.len_utf8();
     }
     output
+}
+
+#[test]
+fn generic_name_uses_url_identifier() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Url.library");
+    let dst = temp.path().join("dest");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), b"{\"version\":4,\"folders\":[]}").unwrap();
+    item(
+        &src,
+        "g",
+        json!({"id":"g", "name":"image", "ext":"jpg",
+               "url":"https://i.pximg.net/img-original/img/2023/01/02/03/04/05/12345678_p0.jpg"}),
+        Some(("image.jpg", b"jpg-g")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.renamed, 1);
+    assert!(dst.join("inbox/pximg-12345678.jpg").is_file());
 }

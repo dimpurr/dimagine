@@ -402,11 +402,18 @@ pub fn import(
         let mut name = clean(original_name);
         let generated_name = name.is_empty() || is_generic(&name);
         if generated_name {
-            name = format!(
-                "{}-{}",
-                now.format("%Y%m%d-%H%M%S"),
-                &Ulid::new().to_string().to_lowercase()[22..]
-            );
+            name = metadata
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(name_from_url)
+                .map(|derived| clean(&derived))
+                .unwrap_or_else(|| {
+                    format!(
+                        "{}-{}",
+                        now.format("%Y%m%d-%H%M%S"),
+                        &Ulid::new().to_string().to_lowercase()[22..]
+                    )
+                });
             // Count generated names only after the image and raw metadata commit.
         }
         let filename = unique_name(&home, &name, &ext, &mut taken)
@@ -606,11 +613,7 @@ enum CopyItemError {
     },
 }
 
-fn copy_item_transactionally(
-    source: &Path,
-    image: &Path,
-    raw: &[u8],
-) -> Result<(), CopyItemError> {
+fn copy_item_transactionally(source: &Path, image: &Path, raw: &[u8]) -> Result<(), CopyItemError> {
     let parent = image.parent().expect("image destination has parent");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1006,6 +1009,83 @@ fn is_generic(name: &str) -> bool {
         || (lower.len() >= 16 && lower.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
+/// Derive a generic `<site>-<id>` name from a source URL.
+///
+/// Only the URL path is considered (query and fragment are dropped), path
+/// segments containing `=` are skipped, and remaining segments are split into
+/// alphanumeric tokens. The first all-digit identifier (5-20 chars) wins,
+/// otherwise the first mixed letter/digit identifier (6-24 chars). Tokens
+/// longer than 24 characters are treated as hashes and ignored. Returns `None`
+/// for non-http(s) URLs or when no identifier-shaped token is present.
+pub fn name_from_url(url: &str) -> Option<String> {
+    let rest = strip_scheme(url)?;
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let rest = &rest[..end];
+    let (authority, path) = match rest.find('/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, ""),
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = authority.split(':').next().unwrap_or(authority);
+    let site = site_label(&host.to_ascii_lowercase())?;
+    let mut first_digits: Option<&str> = None;
+    let mut first_mixed: Option<&str> = None;
+    for segment in path.split('/') {
+        if segment.is_empty() || segment.contains('=') {
+            continue;
+        }
+        for token in segment.split(|c: char| !c.is_ascii_alphanumeric()) {
+            if token.is_empty() || token.len() > 24 {
+                continue;
+            }
+            if token.bytes().all(|b| b.is_ascii_digit()) {
+                if (5..=20).contains(&token.len()) && first_digits.is_none() {
+                    first_digits = Some(token);
+                }
+            } else if token.bytes().any(|b| b.is_ascii_alphabetic())
+                && token.bytes().any(|b| b.is_ascii_digit())
+                && (6..=24).contains(&token.len())
+                && first_mixed.is_none()
+            {
+                first_mixed = Some(token);
+            }
+        }
+    }
+    let id = first_digits.or(first_mixed)?;
+    Some(format!("{site}-{id}"))
+}
+
+fn strip_scheme(url: &str) -> Option<&str> {
+    for scheme in ["https://", "http://"] {
+        if let Some(prefix) = url.get(..scheme.len()) {
+            if prefix.eq_ignore_ascii_case(scheme) {
+                return Some(&url[scheme.len()..]);
+            }
+        }
+    }
+    None
+}
+
+fn site_label(host: &str) -> Option<String> {
+    let labels: Vec<&str> = host.split('.').filter(|label| !label.is_empty()).collect();
+    let suffix = match labels.len() {
+        0 => return None,
+        1 => 0,
+        _ => {
+            if matches!(
+                format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]).as_str(),
+                "co.uk" | "co.jp" | "com.cn" | "com.au"
+            ) {
+                2
+            } else {
+                1
+            }
+        }
+    };
+    let index = labels.len().checked_sub(suffix + 1)?;
+    labels.get(index).map(|label| (*label).to_owned())
+}
+
 fn unique_name(
     home: &Path,
     name: &str,
@@ -1322,7 +1402,10 @@ mod tests {
                 panic!("expected clean rollback (Skipped), got CleanupFailed");
             }
         }
-        assert!(!image.exists(), "published image must be rolled back on companion failure");
+        assert!(
+            !image.exists(),
+            "published image must be rolled back on companion failure"
+        );
     }
 
     #[test]
