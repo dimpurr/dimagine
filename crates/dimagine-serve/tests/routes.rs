@@ -10,13 +10,17 @@ use tower::ServiceExt;
 fn library() -> (TempDir, axum::Router) {
     let temp = tempfile::tempdir().unwrap();
     fs::create_dir_all(temp.path().join("art")).unwrap();
-    fs::write(temp.path().join("art/猫.png"), b"image bytes").unwrap();
+    fs::write(
+        temp.path().join("art/猫.png"),
+        b"\x89PNG\r\n\x1a\nimage bytes",
+    )
+    .unwrap();
     fs::write(
         temp.path().join("art/猫.png.md"),
         "---\ntitle: 猫\nrating: 5\n---\nA **quiet** cat.\n<script>alert(1)</script>\n",
     )
     .unwrap();
-    fs::write(temp.path().join("art/second.jpg"), b"image two").unwrap();
+    fs::write(temp.path().join("art/second.jpg"), b"\xff\xd8\xffimage two").unwrap();
     fs::create_dir_all(temp.path().join("art/nested")).unwrap();
     fs::write(temp.path().join("set.md"), "---\nkind: collection\ntitle: Ordered set\n---\n![[art/second.jpg]]\nSecond caption\n![[art/猫.png]]\nFirst cat.\n").unwrap();
     fs::write(
@@ -221,7 +225,7 @@ async fn image_response_has_type_etag_and_last_modified() {
 fn scanner_skips_format_ignored_paths_and_unicode_is_preserved() {
     let (_temp, _app) = library();
     let temp = tempfile::tempdir().unwrap();
-    fs::create_dir_all(temp.path().join(".private")).unwrap();
+    fs::create_dir_all(temp.path().join(".hidden")).unwrap();
     fs::write(temp.path().join("Thumbs.db"), b"not image").unwrap();
     fs::write(temp.path().join("._fork.png"), b"ignore").unwrap();
     fs::write(temp.path().join("桌面.png"), b"image").unwrap();

@@ -21,9 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(passcode) = env::var("DIMAGINE_PASSCODE") {
         config.passcode = passcode;
     }
-    let app = router(catalog, OriginalPreview, config);
+    let app = router(catalog, OriginalPreview, config.clone());
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;
     println!("Listening on http://{}", listener.local_addr()?);
-    serve(listener, app).await?;
+    serve(listener, app, &config).await?;
     Ok(())
 }

@@ -9,10 +9,13 @@ use axum::{
     Json, Router,
 };
 use pulldown_cmark::{html, Event, Options, Parser};
+use saphyr::{LoadableYamlNode, Yaml};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     fs,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
@@ -59,7 +62,9 @@ pub struct ImageDetail {
     /// Image path relative to the library root.
     pub path: String,
     /// YAML front matter properties.
-    pub properties: serde_yaml::Value,
+    pub properties: serde_json::Value,
+    /// Front matter parsing error, if the note has malformed YAML.
+    pub front_matter_error: Option<String>,
     /// Markdown note body rendered to safe HTML by the page handler.
     pub body: String,
     /// Adjacent raw metadata filenames.
@@ -130,9 +135,7 @@ impl FsCatalog {
                 continue;
             }
             let ty = entry.file_type().map_err(|_| CatalogError::Unreadable)?;
-            if ty.is_dir() {
-                out.extend(self.scan_images(&path)?);
-            } else if ty.is_file() && is_image(&path) {
+            if ty.is_file() && is_image(&path) {
                 let relative = path
                     .strip_prefix(&self.root)
                     .map_err(|_| CatalogError::Forbidden)?;
@@ -158,14 +161,16 @@ impl FsCatalog {
                 continue;
             }
             let text = fs::read_to_string(entry.path()).map_err(|_| CatalogError::Unreadable)?;
-            let (props, body) = parse_note(&text);
-            if yaml_string(&props, "kind").as_deref() == Some("collection") {
+            let parsed = parse_note(&text);
+            let props = &parsed.properties;
+            let body = parsed.body.as_str();
+            if yaml_string(props, "kind").as_deref() == Some("collection") {
                 let entry_path = entry.path();
                 let rel = entry_path
                     .strip_prefix(&self.root)
                     .map_err(|_| CatalogError::Forbidden)?;
                 let path = rel.to_string_lossy().replace('\\', "/");
-                let title = yaml_string(&props, "title")
+                let title = yaml_string(props, "title")
                     .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
                 items.push(Collection {
                     path: path.clone(),
@@ -217,20 +222,22 @@ impl Catalog for FsCatalog {
             return Err(CatalogError::NotFound);
         }
         let text = fs::read_to_string(&safe).map_err(|_| CatalogError::Unreadable)?;
-        let (props, body) = parse_note(&text);
-        if yaml_string(&props, "kind").as_deref() != Some("collection") {
+        let parsed = parse_note(&text);
+        if parsed.error.is_some()
+            || yaml_string(&parsed.properties, "kind").as_deref() != Some("collection")
+        {
             return Err(CatalogError::NotFound);
         }
         Ok(Collection {
             path: path.to_owned(),
-            title: yaml_string(&props, "title").unwrap_or_else(|| {
+            title: yaml_string(&parsed.properties, "title").unwrap_or_else(|| {
                 safe.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .trim_end_matches(".md")
                     .to_string()
             }),
-            members: collect_members(&self.root, path, body),
+            members: collect_members(&self.root, path, &parsed.body),
         })
     }
 
@@ -239,15 +246,33 @@ impl Catalog for FsCatalog {
         if !image.is_file() || !is_image(&image) {
             return Err(CatalogError::NotFound);
         }
-        let note = PathBuf::from(format!("{}.md", image.to_string_lossy()));
-        let body = if note.is_file() {
-            let text = fs::read_to_string(note).map_err(|_| CatalogError::Unreadable)?;
-            let (properties, body) = parse_note(&text);
-            (properties, body.to_owned())
-        } else {
-            (serde_yaml::Value::Null, String::new())
+        let note_path = PathBuf::from(format!("{}.md", image.to_string_lossy()));
+        let note_meta = match fs::symlink_metadata(&note_path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(CatalogError::Unreadable),
         };
-        let (properties, body) = body;
+        let (properties, body, front_matter_error) = if let Some(note_meta) = note_meta {
+            if note_meta.file_type().is_symlink() {
+                return Err(CatalogError::Forbidden);
+            }
+            let canonical_note =
+                fs::canonicalize(&note_path).map_err(|_| CatalogError::Unreadable)?;
+            let note_relative = canonical_note
+                .strip_prefix(&self.root)
+                .map_err(|_| CatalogError::Forbidden)?;
+            if note_relative
+                .components()
+                .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
+            {
+                return Err(CatalogError::Forbidden);
+            }
+            let text = fs::read_to_string(canonical_note).map_err(|_| CatalogError::Unreadable)?;
+            let parsed = parse_note(&text);
+            (parsed.properties, parsed.body, parsed.error)
+        } else {
+            (serde_json::Value::Null, String::new(), None)
+        };
         let parent = image.parent().ok_or(CatalogError::NotFound)?;
         let base = image.file_name().unwrap_or_default().to_string_lossy();
         let mut raw_files = Vec::new();
@@ -269,6 +294,7 @@ impl Catalog for FsCatalog {
             path: path.to_owned(),
             properties,
             body,
+            front_matter_error,
             raw_files,
         })
     }
@@ -282,9 +308,29 @@ impl Catalog for FsCatalog {
         {
             return Err(CatalogError::Forbidden);
         }
-        let candidate = self.root.join(relative);
+        let mut candidate = self.root.clone();
+        for component in relative.components() {
+            if let Component::Normal(part) = component {
+                let name = part.to_string_lossy();
+                if ignored_name(&name) {
+                    return Err(CatalogError::Forbidden);
+                }
+                candidate.push(part);
+                let metadata =
+                    fs::symlink_metadata(&candidate).map_err(|_| CatalogError::NotFound)?;
+                if metadata.file_type().is_symlink() {
+                    return Err(CatalogError::Forbidden);
+                }
+            }
+        }
         let canonical = fs::canonicalize(&candidate).map_err(|_| CatalogError::NotFound)?;
-        if !canonical.starts_with(&self.root) {
+        let relative = canonical
+            .strip_prefix(&self.root)
+            .map_err(|_| CatalogError::Forbidden)?;
+        if relative
+            .components()
+            .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
+        {
             return Err(CatalogError::Forbidden);
         }
         Ok(canonical)
@@ -329,12 +375,15 @@ pub struct ServeConfig {
     pub passcode: String,
     /// Cookie name used for the in-memory session.
     pub cookie_name: String,
+    /// Set this when the viewer is served directly over HTTPS.
+    pub https: bool,
 }
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
             passcode: "2333".to_string(),
             cookie_name: "dimagine_session".to_string(),
+            https: false,
         }
     }
 }
@@ -345,6 +394,13 @@ struct AppState {
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
+    throttles: Arc<Mutex<ThrottleState>>,
+}
+
+#[derive(Default)]
+struct ThrottleState {
+    clients: HashMap<String, (u32, u64)>,
+    global_failures: u32,
 }
 
 /// Build the read-only viewer router.
@@ -367,6 +423,7 @@ pub fn router_from(
         previews,
         config,
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        throttles: Arc::new(Mutex::new(ThrottleState::default())),
     };
     Router::new()
         .route("/login", get(login_page).post(login))
@@ -396,13 +453,24 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     let authenticated = if let Some(token) = token {
         let now = now_seconds();
         let mut sessions = state.sessions.lock().unwrap();
-        sessions.retain(|_, expiry| *expiry > now);
-        sessions.contains_key(&token)
+        match sessions.get(&token).copied() {
+            Some(expiry) if expiry > now => true,
+            Some(_) => {
+                sessions.remove(&token);
+                false
+            }
+            None => false,
+        }
     } else {
         false
     };
     if authenticated {
-        return next.run(request).await;
+        let mut response = next.run(request).await;
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, no-cache"),
+        );
+        return response;
     }
     if request.uri().path().starts_with("/api/") {
         return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
@@ -410,14 +478,25 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     Redirect::to("/login").into_response()
 }
 
-async fn login_page() -> Html<String> {
-    Html(layout("Sign in", "<form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label><button>Sign in</button></form>"))
+async fn login_page() -> Response {
+    let mut response = Html(layout("Sign in", "<form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label><button>Sign in</button></form>")).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 #[derive(Deserialize)]
 struct LoginForm {
     passcode: String,
 }
-async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Response {
+async fn login(
+    State(state): State<AppState>,
+    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let client_key = client
+        .map(|c| c.0.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
     if form
         .passcode
         .as_bytes()
@@ -425,64 +504,133 @@ async fn login(State(state): State<AppState>, Form(form): Form<LoginForm>) -> Re
         .unwrap_u8()
         != 1
     {
-        return (StatusCode::UNAUTHORIZED, Html(layout("Sign in", "<p>Incorrect passcode.</p><form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\"></label><button>Sign in</button></form>"))).into_response();
+        let delay = {
+            let mut throttle = state.throttles.lock().unwrap();
+            throttle.global_failures = throttle.global_failures.saturating_add(1);
+            let now = now_seconds();
+            if throttle.clients.len() >= 1024 && !throttle.clients.contains_key(&client_key) {
+                if let Some(oldest) = throttle
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, (_, seen))| seen)
+                    .map(|(key, _)| key.clone())
+                {
+                    throttle.clients.remove(&oldest);
+                }
+            }
+            let client_failures = {
+                let entry = throttle.clients.entry(client_key).or_insert((0, now));
+                entry.0 = entry.0.saturating_add(1);
+                entry.1 = now;
+                entry.0
+            };
+            throttle.global_failures.max(client_failures)
+        };
+        let millis =
+            (100u64.saturating_mul(1u64.checked_shl(delay.min(6)).unwrap_or(u64::MAX))).min(5000);
+        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        let mut response = (StatusCode::UNAUTHORIZED, Html(layout("Sign in", "<p>Incorrect passcode.</p><form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\"></label><button>Sign in</button></form>"))).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+    {
+        let mut throttles = state.throttles.lock().unwrap();
+        throttles.clients.remove(&client_key);
+        throttles.global_failures = 0;
     }
     let token = uuid::Uuid::new_v4().to_string();
-    state
-        .sessions
-        .lock()
-        .unwrap()
-        .insert(token.clone(), now_seconds() + SESSION_SECONDS);
+    store_session(
+        &mut state.sessions.lock().unwrap(),
+        token.clone(),
+        now_seconds(),
+    );
     let mut response = Redirect::to("/").into_response();
     let cookie = format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={};",
-        state.config.cookie_name, token, SESSION_SECONDS
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        state.config.cookie_name,
+        token,
+        SESSION_SECONDS,
+        if state.config.https { "; Secure" } else { "" }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let folder = route_tail(uri.path(), "/folder/");
-    render_folder(&state, &folder, false)
+    let catalog = state.catalog.clone();
+    match tokio::task::spawn_blocking(move || {
+        render_folder_data(&AppState { catalog, ..state }, &folder)
+    })
+    .await
+    {
+        Ok(Ok(data)) => render_folder_data_html(data),
+        Ok(Err(error)) => error_response(error),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 async fn folder_root_json(State(state): State<AppState>) -> Response {
-    json_result(render_folder_data(&state, ""))
+    folder_data_blocking(state, String::new()).await
 }
 async fn folder_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    json_result(render_folder_data(&state, &path))
+    folder_data_blocking(state, path).await
 }
 async fn collection_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    match state.catalog.collection(&path) {
-        Ok(c) => Html(layout(&c.title, &collection_html(&c))).into_response(),
-        Err(e) => error_response(e),
+    let catalog = state.catalog.clone();
+    match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
+        Ok(Ok(c)) => Html(layout(&c.title, &collection_html(&c))).into_response(),
+        Ok(Err(e)) => error_response(e),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 async fn collection_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    json_result(state.catalog.collection(&path))
+    let catalog = state.catalog.clone();
+    match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
+        Ok(result) => json_result(result),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 async fn image_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    match state.catalog.image_detail(&path) {
-        Ok(detail) => {
-            let props = escape_html(&serde_yaml::to_string(&detail.properties).unwrap_or_default());
+    let catalog = state.catalog.clone();
+    match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
+        Ok(Ok(detail)) => {
+            let props = escape_html(&yaml_json_string(&detail.properties));
             let body = markdown_html(&detail.body);
             let raws = detail
                 .raw_files
                 .iter()
                 .map(|f| format!("<li>{}</li>", escape_html(f)))
                 .collect::<String>();
-            let content = format!("<img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre><h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), escape_html(&detail.path));
+            let diagnostic = detail
+                .front_matter_error
+                .as_ref()
+                .map(|e| {
+                    format!(
+                        "<p class=\"error\">Front matter error: {}</p>",
+                        escape_html(e)
+                    )
+                })
+                .unwrap_or_default();
+            let content = format!("<img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre>{diagnostic}<h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), escape_html(&detail.path));
             Html(layout(&detail.path, &content)).into_response()
         }
-        Err(e) => error_response(e),
+        Ok(Err(e)) => error_response(e),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 async fn image_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    match state.catalog.image_detail(&path) {
-        Ok(d) => Json(d).into_response(),
-        Err(e) => error_response(e),
+    let catalog = state.catalog.clone();
+    match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
+        Ok(Ok(d)) => Json(d).into_response(),
+        Ok(Err(e)) => error_response(e),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 async fn media(
@@ -491,54 +639,110 @@ async fn media(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let original = match state.catalog.resolve_path(&path) {
-        Ok(p) => p,
-        Err(e) => return error_response(e),
-    };
-    if !is_image(&original) {
-        return StatusCode::NOT_FOUND.into_response();
-    }
     let kind = if uri.path().starts_with("/thumb/") {
         PreviewKind::Thumb
     } else {
         PreviewKind::View
     };
-    let served = state
-        .previews
-        .preview_path(&path, kind)
-        .and_then(|p| fs::canonicalize(p).ok())
-        .filter(|p| p.starts_with(state.catalog.root()) && p.is_file())
-        .unwrap_or(original);
-    serve_image(&served, &headers)
+    let catalog = state.catalog.clone();
+    let previews = state.previews.clone();
+    let root = state.catalog.root().to_path_buf();
+    let headers = headers.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        let original = catalog
+            .resolve_path(&path)
+            .map_err(ServeImageError::Catalog)?;
+        if !is_image(&original) {
+            return Err(ServeImageError::Catalog(CatalogError::NotFound));
+        }
+        let served = previews
+            .preview_path(&path, kind)
+            .and_then(|p| fs::canonicalize(p).ok())
+            .filter(|p| p.starts_with(&root) && p.is_file())
+            .unwrap_or(original);
+        open_hashed_image(&served)
+    })
+    .await;
+    match prepared {
+        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
+            stream_image(file, metadata, etag, mime, mismatch, &headers).await
+        }
+        Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
+        Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
-fn serve_image(path: &FsPath, request_headers: &HeaderMap) -> Response {
-    let metadata = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
-    let bytes = match fs::read(path) {
-        Ok(b) => b,
-        Err(_) => return StatusCode::FORBIDDEN.into_response(),
-    };
+enum ServeImageError {
+    Catalog(CatalogError),
+    Io,
+}
+fn open_hashed_image(
+    path: &FsPath,
+) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
+    let mut file = fs::File::open(path).map_err(|_| ServeImageError::Io)?;
+    let metadata = file.metadata().map_err(|_| ServeImageError::Io)?;
+    let mut hasher = Sha256::new();
+    let mut signature = [0u8; 32];
+    let mut prefix = Vec::with_capacity(32);
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| ServeImageError::Io)?;
+        if read == 0 {
+            break;
+        }
+        if prefix.len() < 32 {
+            prefix.extend_from_slice(&buffer[..read.min(32 - prefix.len())]);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    signature.copy_from_slice(&hasher.finalize());
+    file.seek(SeekFrom::Start(0))
+        .map_err(|_| ServeImageError::Io)?;
+    let etag = format!(
+        "\"{}\"",
+        signature
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    );
+    let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
+    let extension_mime = mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+    Ok((file, metadata, etag, mime, mime != extension_mime))
+}
+
+async fn stream_image(
+    file: fs::File,
+    metadata: fs::Metadata,
+    etag: String,
+    mime: &'static str,
+    mismatch: bool,
+    request_headers: &HeaderMap,
+) -> Response {
+    let file = tokio::fs::File::from_std(file);
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = Body::from_stream(stream);
     let modified = metadata
         .modified()
         .unwrap_or(UNIX_EPOCH)
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let etag = format!("\"{:x}-{:x}\"", metadata.len(), modified);
-    let mut response = Response::new(Body::from(bytes));
-    *response.status_mut() = StatusCode::OK;
+    let mut response = Response::new(body);
     let h = response.headers_mut();
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
     h.insert(
-        header::CONTENT_TYPE,
-        mime_guess::from_path(path)
-            .first_or_octet_stream()
-            .as_ref()
-            .parse()
-            .unwrap(),
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
     );
+    if mismatch {
+        h.insert(
+            "x-dimagine-extension-mismatch",
+            HeaderValue::from_static("true"),
+        );
+    }
     h.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
     h.insert(
         header::LAST_MODIFIED,
@@ -550,12 +754,43 @@ fn serve_image(path: &FsPath, request_headers: &HeaderMap) -> Response {
     if request_headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
-        == Some(etag.as_str())
+        .is_some_and(|value| etag_header_matches(value, &etag))
     {
         *response.status_mut() = StatusCode::NOT_MODIFIED;
         *response.body_mut() = Body::empty();
     }
     response
+}
+
+fn etag_header_matches(header: &str, etag: &str) -> bool {
+    header.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
+    })
+}
+
+fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        Some("image/tiff")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        match &bytes[8..12] {
+            b"avif" | b"avis" => Some("image/avif"),
+            b"heic" | b"heix" | b"hevc" | b"hevx" => Some("image/heic"),
+            b"mif1" => Some("image/heif"),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 #[derive(Serialize)]
@@ -592,59 +827,64 @@ fn render_folder_data(state: &AppState, folder: &str) -> Result<FolderData, Cata
         collections,
     })
 }
-fn render_folder(state: &AppState, folder: &str, _json: bool) -> Response {
-    match render_folder_data(state, folder) {
-        Ok(data) => {
-            let crumbs = data
-                .breadcrumbs
-                .iter()
-                .map(|(label, path)| {
-                    if path.is_empty() {
-                        format!("<a href=\"/\">{}</a>", escape_html(label))
-                    } else {
-                        format!(
-                            "<a href=\"/folder/{}\">{}</a>",
-                            encode_path(path),
-                            escape_html(label)
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" / ");
-            let folders = data
-                .folders
-                .iter()
-                .map(|folder| {
-                    let name = folder.rsplit('/').next().unwrap_or(folder);
-                    format!(
-                        "<a class=\"tile folder\" href=\"/folder/{}\">📁 {}</a>",
-                        encode_path(folder),
-                        escape_html(name)
-                    )
-                })
-                .collect::<String>();
-            let images = data.images.iter().map(|i| format!("<a class=\"tile\" href=\"/image/{}\"><img loading=\"lazy\" src=\"/thumb/{}\" alt=\"{}\"><span>{}</span></a>", encode_path(&i.path), encode_path(&i.path), escape_html(&i.name), escape_html(&i.name))).collect::<String>();
-            let cols = data
-                .collections
-                .iter()
-                .map(|c| {
-                    format!(
-                        "<li><a href=\"/collection/{}\">{}</a></li>",
-                        encode_path(&c.path),
-                        escape_html(&c.title)
-                    )
-                })
-                .collect::<String>();
-            Html(layout(
-                if folder.is_empty() { "Library" } else { folder },
-                &format!(
-                    "<nav>{crumbs}</nav><ul>{cols}</ul><section class=\"grid\">{folders}{images}</section>"
-                ),
-            ))
-            .into_response()
-        }
-        Err(e) => error_response(e),
+async fn folder_data_blocking(state: AppState, folder: String) -> Response {
+    match tokio::task::spawn_blocking(move || render_folder_data(&state, &folder)).await {
+        Ok(result) => json_result(result),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+fn render_folder_data_html(data: FolderData) -> Response {
+    let crumbs = data
+        .breadcrumbs
+        .iter()
+        .map(|(label, path)| {
+            if path.is_empty() {
+                format!("<a href=\"/\">{}</a>", escape_html(label))
+            } else {
+                format!(
+                    "<a href=\"/folder/{}\">{}</a>",
+                    encode_path(path),
+                    escape_html(label)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let folders = data
+        .folders
+        .iter()
+        .map(|folder| {
+            let name = folder.rsplit('/').next().unwrap_or(folder);
+            format!(
+                "<a class=\"tile folder\" href=\"/folder/{}\">📁 {}</a>",
+                encode_path(folder),
+                escape_html(name)
+            )
+        })
+        .collect::<String>();
+    let images = data.images.iter().map(|i| format!("<a class=\"tile\" href=\"/image/{}\"><img loading=\"lazy\" src=\"/thumb/{}\" alt=\"{}\"><span>{}</span></a>", encode_path(&i.path), encode_path(&i.path), escape_html(&i.name), escape_html(&i.name))).collect::<String>();
+    let cols = data
+        .collections
+        .iter()
+        .map(|c| {
+            format!(
+                "<li><a href=\"/collection/{}\">{}</a></li>",
+                encode_path(&c.path),
+                escape_html(&c.title)
+            )
+        })
+        .collect::<String>();
+    Html(layout(
+        if data.folder.is_empty() {
+            "Library"
+        } else {
+            &data.folder
+        },
+        &format!(
+            "<nav>{crumbs}</nav><ul>{cols}</ul><section class=\"grid\">{folders}{images}</section>"
+        ),
+    ))
+    .into_response()
 }
 fn collection_html(c: &Collection) -> String {
     c.members.iter().map(|m| format!("<figure><a href=\"/image/{}\"><img loading=\"lazy\" src=\"/media/{}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>", encode_path(&m.path), encode_path(&m.path), escape_html(&m.path), escape_html(&m.caption))).collect::<String>()
@@ -674,7 +914,9 @@ fn markdown_html(markdown: &str) -> String {
         other => other,
     });
     html::push_html(&mut out, safe_events);
-    out
+    let mut sanitizer = ammonia::Builder::default();
+    sanitizer.url_schemes(["http", "https", "mailto"].into_iter().collect());
+    sanitizer.clean(&out).to_string()
 }
 fn escape_html(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -694,20 +936,97 @@ fn is_image(path: &FsPath) -> bool {
         .and_then(|x| x.to_str())
         .is_some_and(|x| IMAGE_EXTENSIONS.contains(&x.to_ascii_lowercase().as_str()))
 }
-fn parse_note(text: &str) -> (serde_yaml::Value, &str) {
-    if let Some(rest) = text.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---") {
-            let yaml = &rest[..end];
-            let body = rest[end + 4..].trim_start_matches(['\r', '\n']);
-            return (
-                serde_yaml::from_str(yaml).unwrap_or(serde_yaml::Value::Null),
-                body,
-            );
-        }
-    }
-    (serde_yaml::Value::Null, text)
+struct ParsedNote {
+    properties: serde_json::Value,
+    body: String,
+    error: Option<String>,
 }
-fn yaml_string(value: &serde_yaml::Value, key: &str) -> Option<String> {
+fn parse_note(text: &str) -> ParsedNote {
+    let mut lines = text.split_inclusive('\n');
+    let Some(first) = lines.next() else {
+        return ParsedNote {
+            properties: serde_json::Value::Null,
+            body: String::new(),
+            error: None,
+        };
+    };
+    if first.trim_end_matches(['\r', '\n']) != "---" {
+        return ParsedNote {
+            properties: serde_json::Value::Null,
+            body: text.to_owned(),
+            error: None,
+        };
+    }
+    let mut offset = first.len();
+    let yaml_start = offset;
+    for line in lines {
+        if line.trim_end_matches(['\r', '\n']) == "---" {
+            let yaml = &text[yaml_start..offset];
+            let body = text[offset + line.len()..].to_owned();
+            return match Yaml::load_from_str(yaml) {
+                Ok(documents) if documents.len() == 1 => ParsedNote {
+                    properties: yaml_to_json(&documents[0]),
+                    body,
+                    error: None,
+                },
+                Ok(_) => ParsedNote {
+                    properties: serde_json::Value::Null,
+                    body,
+                    error: Some("front matter must contain exactly one YAML document".to_owned()),
+                },
+                Err(error) => ParsedNote {
+                    properties: serde_json::Value::Null,
+                    body,
+                    error: Some(error.to_string()),
+                },
+            };
+        }
+        offset += line.len();
+    }
+    ParsedNote {
+        properties: serde_json::Value::Null,
+        body: text.to_owned(),
+        error: Some("front matter has no closing delimiter".to_owned()),
+    }
+}
+fn yaml_to_json(yaml: &Yaml<'_>) -> serde_json::Value {
+    if let Some(value) = yaml.as_str() {
+        return serde_json::Value::String(value.to_owned());
+    }
+    if let Some(value) = yaml.as_bool() {
+        return serde_json::Value::Bool(value);
+    }
+    if let Some(value) = yaml.as_integer() {
+        return serde_json::Value::Number(value.into());
+    }
+    if let Some(value) = yaml.as_floating_point() {
+        return serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null);
+    }
+    if yaml.is_null() {
+        return serde_json::Value::Null;
+    }
+    if let Some(sequence) = yaml.as_vec() {
+        return serde_json::Value::Array(sequence.iter().map(yaml_to_json).collect());
+    }
+    if let Some(mapping) = yaml.as_mapping() {
+        let mut object = serde_json::Map::new();
+        for (key, value) in mapping {
+            let key = key
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{key:?}"));
+            object.insert(key, yaml_to_json(value));
+        }
+        return serde_json::Value::Object(object);
+    }
+    serde_json::Value::Null
+}
+fn yaml_json_string(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned())
+}
+fn yaml_string(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(ToOwned::to_owned)
 }
 fn collect_members(root: &FsPath, note_path: &str, body: &str) -> Vec<CollectionMember> {
@@ -727,8 +1046,12 @@ fn collect_members(root: &FsPath, note_path: &str, body: &str) -> Vec<Collection
         } else {
             None
         };
+        // TODO(core-wiring): Replace this lightweight extractor with the shared core parser.
         if let Some(target) = target {
             if let Some(path) = resolve_embed(root, note_path, &target) {
+                if image_note_self_embed(root, note_path, &path) {
+                    continue;
+                }
                 let caption = match lines.peek() {
                     Some(next)
                         if !next.trim().is_empty() && !next.trim_start().starts_with("![[") =>
@@ -744,13 +1067,48 @@ fn collect_members(root: &FsPath, note_path: &str, body: &str) -> Vec<Collection
     out
 }
 fn resolve_embed(root: &FsPath, note: &str, target: &str) -> Option<String> {
+    // TODO(core-wiring): Shared core owns unique bare-name resolution and diagnostics.
     let note_parent = FsPath::new(note).parent().unwrap_or(FsPath::new(""));
     let candidates = [root.join(target), root.join(note_parent).join(target)];
     for candidate in candidates {
+        let Ok(relative) = candidate.strip_prefix(root) else {
+            continue;
+        };
+        let mut checked = root.to_path_buf();
+        let mut safe = true;
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                safe = false;
+                break;
+            };
+            if ignored_name(&part.to_string_lossy()) {
+                safe = false;
+                break;
+            }
+            checked.push(part);
+            if fs::symlink_metadata(&checked)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(true)
+            {
+                safe = false;
+                break;
+            }
+        }
+        if !safe {
+            continue;
+        }
         let Ok(canonical) = fs::canonicalize(&candidate) else {
             continue;
         };
-        if canonical.starts_with(root) && canonical.is_file() && is_image(&canonical) {
+        if canonical.starts_with(root)
+            && canonical.strip_prefix(root).ok().is_some_and(|relative| {
+                relative
+                    .components()
+                    .all(|c| !ignored_name(&c.as_os_str().to_string_lossy()))
+            })
+            && canonical.is_file()
+            && is_image(&canonical)
+        {
             return canonical
                 .strip_prefix(root)
                 .ok()
@@ -758,6 +1116,27 @@ fn resolve_embed(root: &FsPath, note: &str, target: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
+    sessions.retain(|_, expiry| *expiry > now);
+    if sessions.len() >= 10_000 {
+        if let Some(oldest) = sessions
+            .iter()
+            .min_by_key(|(_, expiry)| *expiry)
+            .map(|(token, _)| token.clone())
+        {
+            sessions.remove(&oldest);
+        }
+    }
+    sessions.insert(token, now + SESSION_SECONDS);
+}
+fn image_note_self_embed(root: &FsPath, note: &str, member: &str) -> bool {
+    let Some(image_note) = note.strip_suffix(".md") else {
+        return false;
+    };
+    let image_note = root.join(image_note);
+    is_image(&image_note) && image_note == root.join(member)
 }
 fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out = vec![("Library".to_string(), String::new())];
@@ -805,6 +1184,65 @@ fn now_seconds() -> u64 {
 }
 
 /// Run the viewer on a pre-bound TCP listener. Callers choose the bind address.
-pub async fn serve(listener: tokio::net::TcpListener, app: Router) -> std::io::Result<()> {
-    axum::serve(listener, app).await
+pub async fn serve(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    config: &ServeConfig,
+) -> std::io::Result<()> {
+    let address = listener.local_addr()?;
+    if default_passcode_warning(config, address) {
+        eprintln!("WARNING: the default passcode is active on a non-loopback address");
+    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+}
+
+fn default_passcode_warning(config: &ServeConfig, address: std::net::SocketAddr) -> bool {
+    config.passcode == "2333" && !address.ip().is_loopback()
+}
+
+#[cfg(test)]
+mod regression_unit_tests {
+    use super::*;
+
+    #[test]
+    fn session_storage_prunes_expired_tokens_and_stays_bounded() {
+        let mut sessions = (0..10_000)
+            .map(|index| (format!("session-{index}"), 100 + index))
+            .collect::<HashMap<_, _>>();
+        store_session(&mut sessions, "fresh".to_owned(), 50);
+        assert_eq!(sessions.len(), 10_000);
+        assert!(sessions.contains_key("fresh"));
+        assert!(!sessions.contains_key("session-0"));
+
+        sessions.insert("expired".to_owned(), 1);
+        store_session(&mut sessions, "after-expiry".to_owned(), 200);
+        assert!(!sessions.contains_key("expired"));
+        assert!(sessions.contains_key("after-expiry"));
+        assert!(sessions.len() <= 10_000);
+    }
+
+    #[test]
+    fn default_passcode_warning_only_applies_to_non_loopback_binds() {
+        let config = ServeConfig::default();
+        assert!(!default_passcode_warning(
+            &config,
+            "127.0.0.1:3000".parse().unwrap()
+        ));
+        assert!(default_passcode_warning(
+            &config,
+            "0.0.0.0:3000".parse().unwrap()
+        ));
+        let custom = ServeConfig {
+            passcode: "different".to_owned(),
+            ..config
+        };
+        assert!(!default_passcode_warning(
+            &custom,
+            "0.0.0.0:3000".parse().unwrap()
+        ));
+    }
 }
