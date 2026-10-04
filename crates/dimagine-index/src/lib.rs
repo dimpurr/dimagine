@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 const SCHEMA_VERSION: i64 = 2;
@@ -103,6 +104,8 @@ pub struct LinkRecord {
 #[derive(Debug)]
 pub enum IndexError {
     Busy,
+    ScanNotActive,
+    ScanAborted,
     RebuildRequired(String),
     Sqlite(rusqlite::Error),
     Io(std::io::Error),
@@ -112,6 +115,10 @@ impl fmt::Display for IndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => write!(f, "index is already open for this library"),
+            Self::ScanNotActive => write!(f, "index write requires an active scan"),
+            Self::ScanAborted => {
+                write!(f, "index scan was aborted; begin a new scan before writing")
+            }
             Self::RebuildRequired(reason) => write!(f, "index rebuild required: {reason}"),
             Self::Sqlite(error) => write!(f, "SQLite index error: {error}"),
             Self::Io(error) => write!(f, "index filesystem error: {error}"),
@@ -239,6 +246,7 @@ impl Index {
 
     /// Inserts or updates a file row and marks its path as seen in this scan.
     pub fn upsert_file(&mut self, record: &FileRecord) -> Result<(), IndexError> {
+        self.ensure_scan_active()?;
         let result = (|| {
             self.conn()?.execute(
                 "INSERT INTO files(path,size,mtime_ns,sha256,kind) VALUES(?1,?2,?3,?4,?5) \
@@ -265,6 +273,7 @@ impl Index {
 
     /// Inserts or updates parsed note metadata and marks the note path seen.
     pub fn upsert_note(&mut self, record: &NoteRecord) -> Result<(), IndexError> {
+        self.ensure_scan_active()?;
         let result = (|| {
             let title = searchable(&record.title);
             let tags = searchable(&record.tags.join(" "));
@@ -285,6 +294,7 @@ impl Index {
 
     /// Stores note body text for full-text search.
     pub fn set_note_body(&mut self, path: &str, body: &str) -> Result<(), IndexError> {
+        self.ensure_scan_active()?;
         let result = self
             .conn()?
             .execute(
@@ -303,8 +313,19 @@ impl Index {
         result
     }
 
+    fn ensure_scan_active(&self) -> Result<(), IndexError> {
+        if self.scan_aborted {
+            Err(IndexError::ScanAborted)
+        } else if self.scan_active {
+            Ok(())
+        } else {
+            Err(IndexError::ScanNotActive)
+        }
+    }
+
     /// Replaces all outgoing links for one source path.
     pub fn replace_links(&mut self, src: &str, links: &[LinkRecord]) -> Result<(), IndexError> {
+        self.ensure_scan_active()?;
         let result = (|| {
             self.conn()?
                 .execute("DELETE FROM links WHERE src=?1", [src])?;
@@ -325,7 +346,7 @@ impl Index {
     /// Commits the scan and deletes file/note/link rows whose paths vanished.
     pub fn finish_scan(&mut self, seen_paths: &[String]) -> Result<(), IndexError> {
         if self.scan_aborted {
-            return Err(IndexError::Sqlite(rusqlite::Error::InvalidQuery));
+            return Err(IndexError::ScanAborted);
         }
         if !self.scan_active {
             self.conn()?.execute_batch("BEGIN IMMEDIATE;")?;
@@ -569,6 +590,37 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
             }
         }
     }
+    for (table, expected_key) in [
+        ("files", vec!["path"]),
+        ("notes", vec!["note_id"]),
+        ("links", vec!["src", "raw"]),
+        ("scan_seen", vec!["path"]),
+        ("moved_from", vec!["path"]),
+    ] {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut key_columns = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        key_columns.retain(|(position, _)| *position > 0);
+        key_columns.sort_by_key(|(position, _)| *position);
+        if key_columns
+            .into_iter()
+            .map(|(_, column)| column)
+            .collect::<Vec<_>>()
+            != expected_key
+        {
+            return Err(IndexError::RebuildRequired(format!(
+                "{table} has an incompatible primary key"
+            )));
+        }
+    }
+    if !has_unique_index(conn, "notes", &["path"])? {
+        return Err(IndexError::RebuildRequired(
+            "notes.path must be unique".into(),
+        ));
+    }
     let fts_sql: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE name='notes_fts'",
@@ -585,11 +637,73 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
             "notes_fts has an incompatible configuration".into(),
         ));
     }
+    for (trigger, expected_sql) in [
+        (
+            "notes_ai",
+            "CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body); END",
+        ),
+        (
+            "notes_ad",
+            "CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN INSERT INTO notes_fts(notes_fts,rowid,title,tags,body) VALUES('delete',old.note_id,old.title,old.tags,old.body); END",
+        ),
+        (
+            "notes_au",
+            "CREATE TRIGGER notes_au AFTER UPDATE OF title,tags,body ON notes BEGIN INSERT INTO notes_fts(notes_fts,rowid,title,tags,body) VALUES('delete',old.note_id,old.title,old.tags,old.body); INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body); END",
+        ),
+    ] {
+        let trigger_sql: Option<String> = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name=?1 AND type='trigger' AND tbl_name='notes'",
+                [trigger],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if trigger_sql.is_none_or(|sql| normalize_sql(&sql) != normalize_sql(expected_sql)) {
+            return Err(IndexError::RebuildRequired(format!(
+                "required FTS synchronization trigger {trigger} is missing or incompatible"
+            )));
+        }
+    }
     Ok(())
 }
 
+fn has_unique_index(
+    conn: &Connection,
+    table: &str,
+    expected_columns: &[&str],
+) -> Result<bool, IndexError> {
+    let mut indexes = conn.prepare(&format!("PRAGMA index_list({table})"))?;
+    let names = indexes
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (name, unique) in names {
+        if !unique {
+            continue;
+        }
+        let mut columns = conn.prepare(&format!(
+            "PRAGMA index_info('{}')",
+            name.replace('\'', "''")
+        ))?;
+        let actual = columns
+            .query_map([], |row| row.get::<_, String>(2))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if actual.iter().map(String::as_str).collect::<Vec<_>>() == expected_columns {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn normalize_sql(sql: &str) -> String {
+    sql.chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
 fn searchable(text: &str) -> String {
-    text.to_lowercase().nfc().collect()
+    text.case_fold().nfc().collect()
 }
 
 fn valid_sha256(hash: &str) -> bool {
@@ -663,6 +777,7 @@ mod tests {
     fn full_text_cjk_and_short_query() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
         index
             .upsert_note(&note("cn.md", None, "深海少女", &["水彩"]))
             .unwrap();
@@ -670,6 +785,7 @@ mod tests {
         index
             .upsert_note(&note("jp.md", None, "星空の旅", &["夜空"]))
             .unwrap();
+        index.finish_scan(&[]).unwrap();
         assert_eq!(index.search_text("海の中").unwrap(), vec!["cn.md"]);
         assert_eq!(index.search_text("少女").unwrap(), vec!["cn.md"]);
         assert_eq!(index.search_text("星空").unwrap(), vec!["jp.md"]);
@@ -816,6 +932,10 @@ mod tests {
         assert!(index
             .replace_links("keep.jpg.md", &[duplicate, conflict])
             .is_err());
+        assert!(matches!(
+            index.upsert_file(&file("escaped.jpg", 1, 1, None)),
+            Err(IndexError::ScanAborted)
+        ));
         assert!(index.finish_scan(&[]).is_err());
         let retained_size: i64 = index
             .conn()
@@ -855,6 +975,7 @@ mod tests {
     fn repeated_identical_links_are_stored_once() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
         let link = LinkRecord {
             src: "album.md".into(),
             raw: "a.jpg".into(),
@@ -864,6 +985,7 @@ mod tests {
         index
             .replace_links("album.md", &[link.clone(), link])
             .unwrap();
+        index.finish_scan(&["album.md".into()]).unwrap();
         let count: i64 = index
             .conn()
             .unwrap()
@@ -942,6 +1064,7 @@ mod tests {
     fn short_search_treats_wildcards_literally() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
         index
             .upsert_note(&note("percent.md", None, "100% literal", &[]))
             .unwrap();
@@ -954,6 +1077,7 @@ mod tests {
         index
             .upsert_note(&note("ordinary.md", None, "abc", &[]))
             .unwrap();
+        index.finish_scan(&[]).unwrap();
         assert_eq!(index.search_text("%").unwrap(), vec!["percent.md"]);
         assert_eq!(index.search_text("_").unwrap(), vec!["under.md"]);
         assert_eq!(index.search_text("\\").unwrap(), vec!["slash.md"]);
@@ -981,16 +1105,81 @@ mod tests {
     }
 
     #[test]
+    fn missing_fts_sync_trigger_requires_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        drop(index);
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        let conn = Connection::open(db).unwrap();
+        conn.execute("DROP TRIGGER notes_ai", []).unwrap();
+        drop(conn);
+        let index = Index::open(dir.path()).unwrap();
+        assert!(index.rebuild_required());
+    }
+
+    #[test]
+    fn missing_note_path_unique_constraint_requires_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        drop(index);
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        let conn = Connection::open(db).unwrap();
+        conn.execute_batch(
+            "PRAGMA writable_schema=ON;
+             UPDATE sqlite_master SET sql=replace(sql,'path TEXT NOT NULL UNIQUE','path TEXT NOT NULL') WHERE type='table' AND name='notes';
+             PRAGMA schema_version=222;",
+        )
+        .unwrap();
+        drop(conn);
+        let index = Index::open(dir.path()).unwrap();
+        assert!(index.rebuild_required());
+    }
+
+    #[test]
     fn unicode_search_normalizes_queries_and_text_but_keeps_paths() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
         let path = "notes/cafe\u{301}.md";
         index
             .upsert_note(&note(path, None, "École Café", &[]))
             .unwrap();
         index.set_note_body(path, "Cafe\u{301} noir").unwrap();
+        index
+            .upsert_note(&note("greek.md", None, "ΟΣΟΝ", &[]))
+            .unwrap();
+        index.finish_scan(&[]).unwrap();
         assert_eq!(index.search_text("é").unwrap(), vec![path]);
         assert_eq!(index.search_text("café").unwrap(), vec![path]);
         assert_eq!(index.search_text("CAFÉ").unwrap(), vec![path]);
+        assert_eq!(index.search_text("ΟΣ").unwrap(), vec!["greek.md"]);
+    }
+
+    #[test]
+    fn writes_require_an_active_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        assert!(matches!(
+            index.upsert_file(&file("outside.jpg", 1, 1, None)),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert!(matches!(
+            index.upsert_note(&note("outside.md", None, "outside", &[])),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert!(matches!(
+            index.set_note_body("outside.md", "body"),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert!(matches!(
+            index.replace_links("outside.md", &[]),
+            Err(IndexError::ScanNotActive)
+        ));
+        let count: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
