@@ -13,6 +13,9 @@ All notable changes to this project are documented here. The format follows
   bounded login/session state, hidden-path checks, streaming media, and secure
   cache/cookie behavior.
 - Viewer front matter parsing through `saphyr`, with explicit malformed-note diagnostics.
+- Index scans reject writes outside an active transaction, validate required
+  schema keys and FTS synchronization triggers, and use Unicode case folding
+  for text search.
 - Prototype scripts: an Eagle importer and a tool that adds missing
   self-embeds (`scripts/prototype/`).
 - Format 0.1 draft revision: image notes end with an embed of their own image;
