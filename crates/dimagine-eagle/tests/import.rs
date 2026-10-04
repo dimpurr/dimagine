@@ -1,4 +1,5 @@
 use dimagine_eagle::{import, ImportOptions, SkipReasonCode};
+use saphyr::{LoadableYamlNode, Yaml};
 use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -163,6 +164,361 @@ fn refuses_visible_destination_content() {
     fs::create_dir_all(&dst).unwrap();
     fs::write(dst.join("visible"), "x").unwrap();
     assert!(import(&src, &dst, ImportOptions::default()).is_err());
+}
+
+#[test]
+fn rejects_canonical_source_destination_overlap_and_absolute_library_label() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Fixture.library");
+    fake_library(&src);
+    let inside = src.join("nested-output");
+    let error = import(&src, &inside, ImportOptions::default()).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("overlapping source and destination"));
+
+    let parent = temp.path().join("parent");
+    fs::create_dir_all(parent.join("source.library")).unwrap();
+    fake_library(&parent.join("source.library"));
+    let error = import(
+        &parent.join("source.library"),
+        &parent,
+        ImportOptions::default(),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("overlapping source and destination"));
+
+    let outside = temp.path().join("absolute-label-output");
+    let report = import(
+        &src,
+        &outside,
+        ImportOptions {
+            name: Some(src.to_string_lossy().into_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.imported.len(), 3);
+    assert!(outside.join("Eagle").exists());
+    assert!(src.join("images").exists());
+}
+
+#[test]
+fn allocates_case_insensitive_sibling_folder_names_without_overwrites() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Aliases.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(
+            &json!({"folders":[{"id":"upper","name":"A"},{"id":"lower","name":"a"}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    item(
+        &src,
+        "1",
+        json!({"name":"x","ext":"png","folders":["upper"]}),
+        Some(("x.png", b"first")),
+    );
+    item(
+        &src,
+        "2",
+        json!({"name":"x","ext":"png","folders":["lower"]}),
+        Some(("x.png", b"second")),
+    );
+    item(
+        &src,
+        "3",
+        json!({"name":"x","ext":"png","folders":["upper"]}),
+        Some(("x.png", b"third")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 3);
+    assert_eq!(
+        fs::read(dst.join("Eagle/Aliases/A/x.png")).unwrap(),
+        b"first"
+    );
+    assert_eq!(
+        fs::read(dst.join("Eagle/Aliases/a-2/x.png")).unwrap(),
+        b"second"
+    );
+    assert_eq!(
+        fs::read(dst.join("Eagle/Aliases/A/x-2.png")).unwrap(),
+        b"third"
+    );
+}
+
+#[test]
+fn accepts_only_settings_directories_and_preserves_existing_viewer_settings() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Fixture.library");
+    let dst = temp.path().join("dest");
+    fake_library(&src);
+    fs::create_dir_all(dst.join(".obsidian/snippets")).unwrap();
+    fs::create_dir_all(dst.join(".dimagine")).unwrap();
+    fs::write(
+        dst.join(".obsidian/snippets/dimagine-gallery.css"),
+        "user css",
+    )
+    .unwrap();
+    fs::write(dst.join(".dimagine/settings.json"), "user settings").unwrap();
+    assert_eq!(
+        import(&src, &dst, ImportOptions::default())
+            .unwrap()
+            .imported
+            .len(),
+        3
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join(".obsidian/snippets/dimagine-gallery.css")).unwrap(),
+        "user css"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.join(".dimagine/settings.json")).unwrap(),
+        "user settings"
+    );
+
+    let other = temp.path().join("other");
+    fs::create_dir_all(other.join(".other-hidden")).unwrap();
+    assert!(import(&src, &other, ImportOptions::default()).is_err());
+
+    let hidden_file = temp.path().join("hidden-file");
+    fs::create_dir_all(&hidden_file).unwrap();
+    fs::write(hidden_file.join(".keep"), "hidden user file").unwrap();
+    assert!(import(&src, &hidden_file, ImportOptions::default()).is_err());
+}
+
+#[test]
+fn emitted_frontmatter_round_trips_adversarial_strings_as_yaml() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Yaml.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    let title = "before\u{007f}\u{0085}\u{2028}\u{2029}: \"quoted\"";
+    let url = "https://example.test/path?q=\u{0085}line\u{2028}break";
+    let tags = vec![
+        "plain".to_owned(),
+        "tag\u{007f}end".to_owned(),
+        "line\u{0085}break".to_owned(),
+    ];
+    item(
+        &src,
+        "adversarial",
+        json!({"id":"item\u{2028}id","name":title,"ext":"png","url":url,"tags":tags}),
+        Some(("adversarial.png", b"pixels")),
+    );
+    let display = "library\u{0085}name";
+    let report = import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some(display.to_owned()),
+        },
+    )
+    .unwrap();
+    let note_path = dst.join(format!("{}.md", report.imported[0].path));
+    let note = fs::read_to_string(note_path).unwrap();
+    let frontmatter = note
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed = Yaml::load_from_str(frontmatter).unwrap();
+    let doc = &parsed[0];
+    assert_eq!(doc["title"].as_str(), Some(title));
+    assert_eq!(doc["source"].as_str(), Some(url));
+    let parsed_tags: Vec<_> = doc["tags"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        parsed_tags,
+        tags.iter().map(String::as_str).collect::<Vec<_>>()
+    );
+    assert_eq!(doc["sources"][0]["library"].as_str(), Some(display));
+    assert_eq!(doc["sources"][0]["item"].as_str(), Some("item\u{2028}id"));
+}
+
+#[test]
+fn empty_tags_are_omitted_from_image_note() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("EmptyTags.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    item(
+        &src,
+        "tagless",
+        json!({"name":"tagless","ext":"png","tags":[]}),
+        Some(("tagless.png", b"x")),
+    );
+    import(&src, &dst, ImportOptions::default()).unwrap();
+    let note = fs::read_to_string(dst.join("inbox/tagless.png.md")).unwrap();
+    let frontmatter = note
+        .strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0;
+    let parsed = Yaml::load_from_str(frontmatter).unwrap();
+    assert!(parsed[0].as_mapping_get("tags").is_none());
+}
+
+#[test]
+fn sanitizes_reserved_trailing_and_multibyte_components() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("SafeNames.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(
+            &json!({"folders":[{"id":"dots","name":format!("{}.", "a".repeat(120))}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    item(
+        &src,
+        "reserved",
+        json!({"name":"CON","ext":"png"}),
+        Some(("CON.png", b"reserved")),
+    );
+    item(
+        &src,
+        "long",
+        json!({"name":"漢".repeat(120),"ext":"png","folders":["dots"]}),
+        Some(("long.png", b"long")),
+    );
+    import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(fs::read(dst.join("inbox/_CON.png")).unwrap(), b"reserved");
+    let imported = fs::read_dir(dst.join("Eagle/SafeNames"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    let folder_name = imported.file_name().unwrap().to_string_lossy();
+    assert!(!folder_name.ends_with('.') && folder_name.len() <= 120);
+    let image = fs::read_dir(imported)
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.path().extension().is_some_and(|ext| ext == "png"))
+        .unwrap();
+    assert!(image.file_name().to_string_lossy().len() < 255);
+}
+
+#[test]
+fn rejects_duplicate_folder_ids_including_ancestor_repetition() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Duplicate.library");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(
+            &json!({"folders":[{"id":"f","name":"A","children":[{"id":"f","name":"B"}]}]}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let error = import(&src, &temp.path().join("out"), ImportOptions::default()).unwrap_err();
+    assert!(error.to_string().contains("duplicate Eagle folder ID: f"));
+}
+
+#[test]
+fn imports_deep_folder_metadata_beyond_json_default_recursion_limit() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Deep.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    let mut folders = json!([]);
+    for index in (0..80).rev() {
+        folders = json!([{"id":format!("f{index}"),"name":format!("d{index}"),"children":folders}]);
+    }
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(&json!({"folders":folders})).unwrap(),
+    )
+    .unwrap();
+    item(
+        &src,
+        "deep",
+        json!({"name":"deep","ext":"png","folders":["f79"]}),
+        Some(("deep.png", b"deep")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 1);
+    assert!(
+        report.imported[0].path.matches('/').count() >= 80,
+        "{}",
+        report.imported[0].path
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn skips_symlinked_eagle_entries_without_copying_external_files() {
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Symlinks.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images/metadata-link.info")).unwrap();
+    fs::create_dir_all(src.join("images/original-link.info")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    let external = temp.path().join("outside.json");
+    fs::write(&external, br#"{"name":"external","ext":"png"}"#).unwrap();
+    symlink(
+        &external,
+        src.join("images/metadata-link.info/metadata.json"),
+    )
+    .unwrap();
+    fs::write(
+        src.join("images/original-link.info/metadata.json"),
+        br#"{"name":"external","ext":"png"}"#,
+    )
+    .unwrap();
+    let external_image = temp.path().join("outside.png");
+    fs::write(&external_image, b"outside bytes").unwrap();
+    symlink(
+        &external_image,
+        src.join("images/original-link.info/external.png"),
+    )
+    .unwrap();
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 0);
+    assert_eq!(
+        report
+            .skipped
+            .iter()
+            .filter(|skip| skip.reason_code == SkipReasonCode::Symlink)
+            .count(),
+        2
+    );
+    assert!(!dst.join("inbox/external.png").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_symlink_traversal_in_allowed_destination_settings() {
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Fixture.library");
+    let dst = temp.path().join("dest");
+    let external = temp.path().join("external");
+    fake_library(&src);
+    fs::create_dir_all(dst.join(".obsidian")).unwrap();
+    fs::create_dir_all(&external).unwrap();
+    symlink(&external, dst.join(".obsidian/snippets")).unwrap();
+    assert!(import(&src, &dst, ImportOptions::default()).is_err());
+    assert!(!external.join("dimagine-gallery.css").exists());
 }
 
 #[test]

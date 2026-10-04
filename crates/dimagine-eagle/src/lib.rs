@@ -11,6 +11,7 @@ use std::error::Error as StdError;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 use unicode_normalization::UnicodeNormalization;
 
@@ -32,6 +33,7 @@ pub enum SkipReasonCode {
     NotImage,
     OriginalMissing,
     CopyFailed,
+    Symlink,
 }
 
 /// An item skipped during import, including stable reason code and detail.
@@ -74,8 +76,21 @@ pub struct ImportReport {
 pub enum ImportError {
     /// Source metadata is missing or malformed.
     InvalidSource(String),
-    /// Destination has visible content and is therefore not empty.
+    /// Destination contains entries outside the allowed settings directories.
     DestinationNotEmpty(PathBuf),
+    /// Source and destination overlap after resolving existing path components.
+    OverlappingPaths {
+        source: PathBuf,
+        destination: PathBuf,
+    },
+    /// The Eagle folder tree contains an ID more than once.
+    DuplicateFolderId(String),
+    /// An I/O failure after some outputs were committed, with recoverable progress.
+    PartialIo {
+        error: io::Error,
+        progress: ImportReport,
+        retained_artifacts: Vec<PathBuf>,
+    },
     /// An underlying filesystem operation failed.
     Io(io::Error),
 }
@@ -87,6 +102,25 @@ impl std::fmt::Display for ImportError {
             Self::DestinationNotEmpty(path) => {
                 write!(f, "refuse: {} exists and is not empty", path.display())
             }
+            Self::OverlappingPaths {
+                source,
+                destination,
+            } => write!(
+                f,
+                "refuse overlapping source and destination: {} and {}",
+                source.display(),
+                destination.display()
+            ),
+            Self::DuplicateFolderId(id) => write!(f, "duplicate Eagle folder ID: {id}"),
+            Self::PartialIo {
+                error,
+                retained_artifacts,
+                ..
+            } => write!(
+                f,
+                "I/O failure after partial import ({} retained artifacts): {error}",
+                retained_artifacts.len()
+            ),
             Self::Io(error) => write!(f, "{error}"),
         }
     }
@@ -102,8 +136,8 @@ impl From<io::Error> for ImportError {
 
 /// Import images from an Eagle library into an empty or missing destination.
 ///
-/// The source is read only. The destination may contain hidden entries, matching
-/// the prototype's empty-target rule. The returned report records imported paths,
+/// The source is read only. The destination may contain `.obsidian/` and/or
+/// `.dimagine/` settings directories. The returned report records imported paths,
 /// stable skip codes, generic-name changes, dangling folder references, and
 /// per-folder counts.
 pub fn import(
@@ -111,38 +145,58 @@ pub fn import(
     dst_library: &Path,
     opts: ImportOptions,
 ) -> Result<ImportReport, ImportError> {
-    let source_meta = src_library.join("metadata.json");
-    if !source_meta.exists() {
+    let source = fs::canonicalize(src_library)?;
+    let destination = canonicalize_future_path(dst_library)?;
+    if source.starts_with(&destination) || destination.starts_with(&source) {
+        return Err(ImportError::OverlappingPaths {
+            source,
+            destination,
+        });
+    }
+    let dst_library = destination.as_path();
+    let source_meta = source.join("metadata.json");
+    if !matches!(fs::symlink_metadata(&source_meta), Ok(ref m) if m.file_type().is_file()) {
         return Err(ImportError::InvalidSource(format!(
             "not an Eagle library (no metadata.json): {}",
-            src_library.display()
+            source.display()
         )));
     }
-    if dst_library.exists()
-        && fs::read_dir(dst_library)?
-            .filter_map(Result::ok)
-            .any(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
-    {
-        return Err(ImportError::DestinationNotEmpty(dst_library.to_path_buf()));
+    if dst_library.exists() {
+        for entry in fs::read_dir(dst_library)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let allowed = name == ".obsidian" || name == ".dimagine";
+            if !allowed || !entry.file_type()?.is_dir() {
+                return Err(ImportError::DestinationNotEmpty(dst_library.to_path_buf()));
+            }
+        }
     }
 
-    let root: Value = serde_json::from_slice(&fs::read(&source_meta)?).map_err(|error| {
+    let json_bytes = fs::read(&source_meta)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&json_bytes);
+    deserializer.disable_recursion_limit();
+    let stacked = serde_stacker::Deserializer::new(&mut deserializer);
+    let root = Value::deserialize(stacked).map_err(|error| {
         ImportError::InvalidSource(format!("unreadable metadata.json: {error}"))
     })?;
-    let default_name = src_library
+    let default_name = source
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
-    let library = opts.name.unwrap_or_else(|| {
+    let display_library = opts.name.unwrap_or_else(|| {
         default_name
             .strip_suffix(".library")
             .unwrap_or(&default_name)
             .to_owned()
     });
+    let mut library = safe_component(&display_library, 120);
+    if library.is_empty() {
+        library = "Eagle".to_owned();
+    }
     let mut folder_paths = HashMap::new();
     if let Some(folders) = root.get("folders").and_then(Value::as_array) {
-        walk_folders(folders, "", &mut folder_paths);
+        walk_folders(folders, "", &mut folder_paths)?;
     }
 
     let now: DateTime<Local> = Local::now();
@@ -151,9 +205,32 @@ pub fn import(
     let mut notes = Vec::new();
     let mut collection_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut taken: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    let mut item_dirs = sorted_info_dirs(&src_library.join("images"))?;
+    let images_dir = source.join("images");
+    if matches!(fs::symlink_metadata(&images_dir), Ok(ref metadata) if metadata.file_type().is_symlink())
+    {
+        report.skipped.push(skip(
+            "images".to_owned(),
+            SkipReasonCode::Symlink,
+            "images directory is a symlink",
+        ));
+    }
+    let mut item_dirs =
+        sorted_info_dirs(&images_dir).map_err(|error| partial_io(error, dst_library, &report))?;
 
     for item_dir in item_dirs.drain(..) {
+        if fs::symlink_metadata(&item_dir)
+            .map_err(|error| partial_io(error, dst_library, &report))?
+            .file_type()
+            .is_symlink()
+        {
+            let item = item_dir.file_name().unwrap_or_default().to_string_lossy();
+            report.skipped.push(skip(
+                item.strip_suffix(".info").unwrap_or(&item).to_owned(),
+                SkipReasonCode::Symlink,
+                "item directory is a symlink",
+            ));
+            continue;
+        }
         let item = item_dir.file_name().unwrap_or_default().to_string_lossy();
         let item = item.strip_suffix(".info").unwrap_or(&item).to_owned();
         let meta_path = item_dir.join("metadata.json");
@@ -162,6 +239,18 @@ pub fn import(
                 item,
                 SkipReasonCode::MissingMetadata,
                 "no metadata.json",
+            ));
+            continue;
+        }
+        if !fs::symlink_metadata(&meta_path)
+            .map_err(|error| partial_io(error, dst_library, &report))?
+            .file_type()
+            .is_file()
+        {
+            report.skipped.push(skip(
+                item,
+                SkipReasonCode::Symlink,
+                "metadata entry is not a regular file",
             ));
             continue;
         }
@@ -220,12 +309,46 @@ pub fn import(
             "{original_name}.{}",
             metadata.get("ext").and_then(Value::as_str).unwrap_or("")
         ));
-        let original = if expected.exists() {
+        let expected_metadata = fs::symlink_metadata(&expected);
+        if matches!(expected_metadata, Ok(ref metadata) if metadata.file_type().is_symlink()) {
+            report.skipped.push(skip(
+                item,
+                SkipReasonCode::Symlink,
+                "original image is a symlink",
+            ));
+            continue;
+        }
+        let expected_is_file = Path::new(original_name).components().count() == 1
+            && matches!(expected_metadata, Ok(metadata) if metadata.file_type().is_file());
+        let original = if expected_is_file {
             expected
         } else {
-            match fallback_original(&item_dir)? {
+            match fallback_original(&item_dir)
+                .map_err(|error| partial_io(error, dst_library, &report))?
+            {
                 Some(path) => path,
                 None => {
+                    let has_symlink = fs::read_dir(&item_dir)
+                        .map_err(|error| partial_io(error, dst_library, &report))?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| partial_io(error, dst_library, &report))?
+                        .iter()
+                        .any(|entry| {
+                            entry.file_type().is_ok_and(|kind| kind.is_symlink())
+                                && entry.file_name() != "metadata.json"
+                                && !entry
+                                    .file_name()
+                                    .to_string_lossy()
+                                    .ends_with("_thumbnail.png")
+                        });
+                    if has_symlink {
+                        report.skipped.push(skip(
+                            item,
+                            SkipReasonCode::Symlink,
+                            "original candidate is a symlink",
+                        ));
+                        continue;
+                    }
                     report.skipped.push(skip(
                         item,
                         SkipReasonCode::OriginalMissing,
@@ -252,19 +375,22 @@ pub fn import(
         } else {
             dst_library.join("inbox")
         };
-        fs::create_dir_all(&home)?;
+        create_confined_dirs(dst_library, &home)
+            .map_err(|error| partial_io(error, dst_library, &report))?;
         let mut name = clean(original_name);
-        if name.is_empty() || is_generic(&name) {
+        let generated_name = name.is_empty() || is_generic(&name);
+        if generated_name {
             name = format!(
                 "{}-{}",
                 now.format("%Y%m%d-%H%M%S"),
                 &Ulid::new().to_string().to_lowercase()[22..]
             );
-            report.renamed += 1;
+            // Count generated names only after the image and raw metadata commit.
         }
-        let filename = unique_name(&home, &name, &ext, &mut taken)?;
+        let filename = unique_name(&home, &name, &ext, &mut taken)
+            .map_err(|error| partial_io(error, dst_library, &report))?;
         let destination_image = home.join(&filename);
-        if let Err(error) = fs::copy(&original, &destination_image) {
+        if let Err(error) = copy_item_transactionally(&original, &destination_image, &raw) {
             report.skipped.push(skip(
                 item,
                 SkipReasonCode::CopyFailed,
@@ -273,11 +399,13 @@ pub fn import(
             continue;
         }
         let raw_filename = format!("{filename}.eagle.json");
-        fs::write(home.join(&raw_filename), &raw)?;
+        if generated_name {
+            report.renamed += 1;
+        }
         let rel = relative_string(dst_library, &destination_image);
         let note = make_note(
             &metadata,
-            &library,
+            &display_library,
             &item,
             &paths,
             &filename,
@@ -307,7 +435,8 @@ pub fn import(
         }
     }
 
-    let name_counts = image_name_counts(dst_library)?;
+    let name_counts =
+        image_name_counts(dst_library).map_err(|error| partial_io(error, dst_library, &report))?;
     for note in notes {
         let embed = if name_counts
             .get(&note.filename.to_lowercase())
@@ -319,21 +448,40 @@ pub fn import(
         } else {
             note.rel
         };
-        fs::write(
-            note.path,
-            format!("{}![[{}]]\n", note.frontmatter_and_body, embed),
-        )?;
+        let text = format!("{}![[{}]]\n", note.frontmatter_and_body, embed);
+        if let Err(error) = write_atomically(&note.path, text.as_bytes()) {
+            let retained_artifacts = retained_artifacts(dst_library, &report);
+            return Err(ImportError::PartialIo {
+                error,
+                progress: report,
+                retained_artifacts,
+            });
+        }
     }
 
-    write_collection_and_report(
+    if let Err(error) = write_collection_and_report(
         dst_library,
-        src_library,
+        &source,
         &library,
         &now,
         &report,
         &collection_members,
-    )?;
-    write_obsidian_gallery(dst_library)?;
+    ) {
+        let retained_artifacts = retained_artifacts(dst_library, &report);
+        return Err(ImportError::PartialIo {
+            error,
+            progress: report,
+            retained_artifacts,
+        });
+    }
+    if let Err(error) = write_obsidian_gallery(dst_library) {
+        let retained_artifacts = retained_artifacts(dst_library, &report);
+        return Err(ImportError::PartialIo {
+            error,
+            progress: report,
+            retained_artifacts,
+        });
+    }
     Ok(report)
 }
 
@@ -345,18 +493,194 @@ fn skip(item: String, reason_code: SkipReasonCode, reason: impl Into<String>) ->
     }
 }
 
-fn walk_folders(folders: &[Value], parent: &str, output: &mut HashMap<String, String>) {
+fn canonicalize_future_path(path: &Path) -> io::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing = Vec::new();
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        let name = ancestor.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "destination has no existing ancestor",
+            )
+        })?;
+        missing.push(name.to_os_string());
+        ancestor = ancestor.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "destination has no existing ancestor",
+            )
+        })?;
+    }
+    let mut resolved = fs::canonicalize(ancestor)?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn create_confined_dirs(root: &Path, target: &Path) -> io::Result<()> {
+    let relative = target.strip_prefix(root).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "write path escaped destination",
+        )
+    })?;
+    let mut current = root.to_path_buf();
+    if !current.exists() {
+        fs::create_dir_all(&current)?;
+    }
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unsafe destination path",
+            ));
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "destination path contains a symlink",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "destination component is not a directory",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn copy_item_transactionally(source: &Path, image: &Path, raw: &[u8]) -> io::Result<()> {
+    let parent = image.parent().expect("image destination has parent");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let image_tmp = parent.join(format!(".dimagine-tmp-{nonce}.image"));
+    let raw_path = image.with_file_name(format!(
+        "{}.eagle.json",
+        image.file_name().unwrap().to_string_lossy()
+    ));
+    let raw_tmp = parent.join(format!(".dimagine-tmp-{nonce}.raw"));
+    let result = (|| {
+        fs::copy(source, &image_tmp)?;
+        fs::write(&raw_tmp, raw)?;
+        fs::rename(&image_tmp, image)?;
+        if let Err(error) = fs::rename(&raw_tmp, &raw_path) {
+            let _ = fs::remove_file(image);
+            return Err(error);
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&image_tmp);
+    let _ = fs::remove_file(&raw_tmp);
+    result
+}
+
+fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().expect("output file has parent");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".dimagine-tmp-{nonce}.note"));
+    let result = (|| {
+        fs::write(&temporary, bytes)?;
+        fs::rename(&temporary, path)
+    })();
+    let _ = fs::remove_file(temporary);
+    result
+}
+
+fn retained_artifacts(root: &Path, report: &ImportReport) -> Vec<PathBuf> {
+    report
+        .imported
+        .iter()
+        .flat_map(|item| {
+            let image = root.join(&item.path);
+            [
+                image.clone(),
+                image.with_file_name(format!(
+                    "{}.eagle.json",
+                    image.file_name().unwrap().to_string_lossy()
+                )),
+                image.with_file_name(format!(
+                    "{}.md",
+                    image.file_name().unwrap().to_string_lossy()
+                )),
+            ]
+        })
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn partial_io(error: io::Error, root: &Path, report: &ImportReport) -> ImportError {
+    ImportError::PartialIo {
+        error,
+        progress: report.clone(),
+        retained_artifacts: retained_artifacts(root, report),
+    }
+}
+
+fn walk_folders(
+    folders: &[Value],
+    parent: &str,
+    output: &mut HashMap<String, String>,
+) -> Result<(), ImportError> {
+    walk_folders_at(folders, parent, output, &mut HashSet::new(), 0)
+}
+
+fn walk_folders_at(
+    folders: &[Value],
+    parent: &str,
+    output: &mut HashMap<String, String>,
+    ids: &mut HashSet<String>,
+    depth: usize,
+) -> Result<(), ImportError> {
+    if depth > 128 {
+        return Err(ImportError::InvalidSource(
+            "folder nesting exceeds the supported maximum of 128".to_owned(),
+        ));
+    }
+    let mut siblings = HashSet::new();
     for folder in folders {
         let Some(id) = folder.get("id").and_then(Value::as_str) else {
             continue;
         };
+        if !ids.insert(id.to_owned()) {
+            return Err(ImportError::DuplicateFolderId(id.to_owned()));
+        }
         let name = folder.get("name").and_then(Value::as_str).unwrap_or("");
-        let segment = clean(name);
-        let segment = if segment.is_empty() {
-            id.to_owned()
+        let base = safe_component(name, 120);
+        let base = if base.is_empty() {
+            let fallback = safe_component(id, 80);
+            if fallback.is_empty() {
+                "unnamed-folder".to_owned()
+            } else {
+                fallback
+            }
         } else {
-            segment
+            base
         };
+        let mut segment = base.clone();
+        let mut suffix = 2;
+        while !siblings.insert(segment.to_lowercase()) {
+            segment = suffixed_component(&base, suffix, 120);
+            suffix += 1;
+        }
         let path = if parent.is_empty() {
             segment
         } else {
@@ -364,13 +688,14 @@ fn walk_folders(folders: &[Value], parent: &str, output: &mut HashMap<String, St
         };
         output.insert(id.to_owned(), path.clone());
         if let Some(children) = folder.get("children").and_then(Value::as_array) {
-            walk_folders(children, &path, output);
+            walk_folders_at(children, &path, output, ids, depth + 1)?;
         }
     }
+    Ok(())
 }
 
 fn sorted_info_dirs(images: &Path) -> io::Result<Vec<PathBuf>> {
-    if !images.exists() {
+    if !matches!(fs::symlink_metadata(images), Ok(ref metadata) if metadata.is_dir()) {
         return Ok(Vec::new());
     }
     let mut entries = fs::read_dir(images)?.collect::<Result<Vec<_>, _>>()?;
@@ -378,18 +703,24 @@ fn sorted_info_dirs(images: &Path) -> io::Result<Vec<PathBuf>> {
     Ok(entries
         .into_iter()
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "info") && path.is_dir())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "info"))
         .collect())
 }
 
 fn fallback_original(item_dir: &Path) -> io::Result<Option<PathBuf>> {
     let mut files = fs::read_dir(item_dir)?.collect::<Result<Vec<_>, _>>()?;
     files.sort_by_key(|entry| entry.file_name());
-    Ok(files.into_iter().map(|entry| entry.path()).find(|path| {
-        path.file_name().is_some_and(|name| {
-            name != "metadata.json" && !name.to_string_lossy().ends_with("_thumbnail.png")
+    Ok(files
+        .into_iter()
+        .find(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.file_name() != "metadata.json"
+                && !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with("_thumbnail.png")
         })
-    }))
+        .map(|entry| entry.path()))
 }
 
 fn is_image(ext: &str) -> bool {
@@ -400,23 +731,47 @@ fn is_image(ext: &str) -> bool {
 }
 
 fn clean(input: &str) -> String {
+    safe_component(input, 180)
+}
+
+fn safe_component(input: &str, max_bytes: usize) -> String {
     let normalized: String = input.nfc().collect();
-    let replaced: String = normalized
-        .chars()
-        .map(|c| {
-            if matches!(
-                c,
-                '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '[' | ']' | '#' | '^'
-            ) || (c as u32) < 32
-            {
-                '-'
-            } else {
-                c
-            }
-        })
-        .collect();
-    let trimmed = replaced.trim().trim_matches('.');
-    trimmed.chars().take(120).collect()
+    let mut replaced = String::new();
+    for character in normalized.chars() {
+        let character = if matches!(
+            character,
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '[' | ']' | '#' | '^'
+        ) || character.is_control()
+        {
+            '-'
+        } else {
+            character
+        };
+        if replaced.len() + character.len_utf8() > max_bytes {
+            break;
+        }
+        replaced.push(character);
+    }
+    let mut result = replaced.trim().trim_matches(['.', ' ']).to_owned();
+    if result.is_empty() {
+        return result;
+    }
+    let stem = result.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    if reserved {
+        result.insert(0, '_');
+    }
+    result
+}
+
+fn suffixed_component(base: &str, suffix: usize, max_bytes: usize) -> String {
+    let suffix = format!("-{suffix}");
+    let shortened = safe_component(base, max_bytes.saturating_sub(suffix.len()));
+    safe_component(&format!("{shortened}{suffix}"), max_bytes)
 }
 
 fn is_generic(name: &str) -> bool {
@@ -445,9 +800,8 @@ fn unique_name(
     if !taken.contains_key(home) {
         let names = if home.is_dir() {
             fs::read_dir(home)?
-                .filter_map(Result::ok)
-                .map(|e| e.file_name().to_string_lossy().to_lowercase())
-                .collect()
+                .map(|entry| entry.map(|e| e.file_name().to_string_lossy().to_lowercase()))
+                .collect::<io::Result<HashSet<_>>>()?
         } else {
             HashSet::new()
         };
@@ -458,17 +812,21 @@ fn unique_name(
     let mut suffix = 1;
     while names.contains(&format!("{candidate}.{ext}").to_lowercase()) {
         suffix += 1;
-        candidate = format!("{name}-{suffix}");
+        candidate = suffixed_component(name, suffix, 180);
     }
     names.insert(format!("{candidate}.{ext}").to_lowercase());
     Ok(format!("{candidate}.{ext}"))
 }
 
-fn json_quote(value: &Value) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned())
+fn yaml_quote(value: &Value) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+    json.replace('\u{007f}', "\\u007F")
+        .replace('\u{0085}', "\\u0085")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
-fn json_string(value: &str) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+fn yaml_string(value: &str) -> String {
+    yaml_quote(&Value::String(value.to_owned()))
 }
 
 fn make_note(
@@ -488,10 +846,13 @@ fn make_note(
     let mut lines = vec![
         "---".to_owned(),
         format!("id: {}", Ulid::new()),
-        format!("title: {}", json_quote(&title)),
+        format!("title: {}", yaml_quote(&title)),
     ];
-    if let Some(tags) = metadata.get("tags").filter(|v| truthy(v)) {
-        lines.push(format!("tags: {}", json_quote(tags)));
+    if let Some(tags) = metadata
+        .get("tags")
+        .filter(|v| v.as_array().is_some_and(|items| !items.is_empty()))
+    {
+        lines.push(format!("tags: {}", yaml_quote(tags)));
     }
     if let Some(star) = metadata.get("star").filter(|v| truthy(v)) {
         let rating = star
@@ -502,7 +863,7 @@ fn make_note(
         lines.push(format!("rating: {rating}"));
     }
     if let Some(url) = metadata.get("url").filter(|v| truthy(v)) {
-        lines.push(format!("source: {}", json_quote(url)));
+        lines.push(format!("source: {}", yaml_quote(url)));
     }
     if let (Some(width), Some(height)) = (
         metadata.get("width").filter(|v| truthy(v)),
@@ -515,20 +876,20 @@ fn make_note(
         format!("imported: {now}"),
         "sources:".to_owned(),
         "  - type: eagle".to_owned(),
-        format!("    library: {}", json_string(library)),
+        format!("    library: {}", yaml_string(library)),
         format!(
             "    item: {}",
-            json_string(metadata.get("id").and_then(Value::as_str).unwrap_or(item))
+            yaml_string(metadata.get("id").and_then(Value::as_str).unwrap_or(item))
         ),
         format!(
             "    folders: {}",
-            json_quote(&Value::Array(
+            yaml_quote(&Value::Array(
                 paths.iter().cloned().map(Value::String).collect()
             ))
         ),
         format!("    imported: {now}"),
         "    importer: \"eagle-import prototype 0.2\"".to_owned(),
-        format!("    raw: {}", json_string(raw)),
+        format!("    raw: {}", yaml_string(raw)),
         "---".to_owned(),
         "".to_owned(),
     ]);
@@ -611,13 +972,13 @@ fn write_collection_and_report(
     members: &BTreeMap<String, Vec<String>>,
 ) -> io::Result<()> {
     let collection_dir = root.join("Eagle").join(library);
-    fs::create_dir_all(&collection_dir)?;
+    create_confined_dirs(root, &collection_dir)?;
     let mut collection = vec![
         "---".to_owned(),
         format!("kind: collection"),
         format!(
             "title: {}",
-            json_string(&format!("{library} (Eagle import)"))
+            yaml_string(&format!("{library} (Eagle import)"))
         ),
         "cssclasses: [dimagine-gallery]".to_owned(),
         "---".to_owned(),
@@ -647,7 +1008,7 @@ fn write_collection_and_report(
         "---".to_owned(),
         format!(
             "title: {}",
-            json_string(&format!("Import report {library}"))
+            yaml_string(&format!("Import report {library}"))
         ),
         format!("imported: {}", now.format("%Y-%m-%dT%H:%M:%S%:z")),
         "---".to_owned(),
@@ -680,8 +1041,11 @@ fn write_collection_and_report(
 
 fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
     let snippets = root.join(".obsidian").join("snippets");
-    fs::create_dir_all(&snippets)?;
-    fs::write(snippets.join("dimagine-gallery.css"), ".dimagine-gallery .image-embed { display:inline-block; width:24%; margin:0.4%; vertical-align:top; }\n.dimagine-gallery .image-embed img { width:100%; height:auto; border-radius:4px; }\n")?;
+    create_confined_dirs(root, &snippets)?;
+    let css = snippets.join("dimagine-gallery.css");
+    if !css.exists() {
+        fs::write(css, ".dimagine-gallery .image-embed { display:inline-block; width:24%; margin:0.4%; vertical-align:top; }\n.dimagine-gallery .image-embed img { width:100%; height:auto; border-radius:4px; }\n")?;
+    }
     let appearance = root.join(".obsidian").join("appearance.json");
     if !appearance.exists() {
         fs::write(
@@ -690,4 +1054,24 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_item_transactionally;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn failed_item_copy_leaves_no_published_or_temporary_artifacts() {
+        let temp = TempDir::new().unwrap();
+        let source_dir = temp.path().join("source-directory");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("child"), b"not a regular image").unwrap();
+        let image = temp.path().join("photo.png");
+        assert!(copy_item_transactionally(&source_dir, &image, b"raw metadata").is_err());
+        assert!(!image.exists());
+        assert!(!temp.path().join("photo.png.eagle.json").exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
 }
