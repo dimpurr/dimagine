@@ -1,0 +1,16 @@
+[package]
+name = "dimagine"
+description = "dimagine: tools for a folder-of-images image library (scan and check)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dimagine"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+dimagine-core = { path = "../dimagine-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
