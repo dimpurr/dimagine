@@ -13,6 +13,7 @@
 
 #[cfg(feature = "import-eagle")]
 mod import;
+mod plugins;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -23,11 +24,17 @@ use dimagine_core::check::{self, CheckReport, Severity};
 use dimagine_core::library::Library;
 use dimagine_core::scan::{self, ScanReport};
 
+use plugins::CorePlugins;
+
 // The clap default is a plain literal; keep it in sync with the core constant.
 const _: () = assert!(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES == 8_388_608);
 
 fn main() -> ExitCode {
-    let matches = cli().get_matches(); // clap exits with code 2 on usage errors
+    // The offered subcommands depend on the library's switch file, so the
+    // library is resolved before clap runs; a misread falls back to the
+    // current directory, which is also clap's default for the flag.
+    let plugins = CorePlugins::load(&plugins::library_hint(std::env::args_os()));
+    let matches = cli(&plugins).get_matches(); // clap exits with code 2 on usage errors
     let Some((name, sub)) = matches.subcommand() else {
         return ExitCode::from(2);
     };
@@ -41,7 +48,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn cli() -> Command {
+fn cli(plugins: &CorePlugins) -> Command {
     let mut command = Command::new("dimagine")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
@@ -78,10 +85,18 @@ fn cli() -> Command {
         )
         .subcommand_required(true)
         .arg_required_else_help(true);
+    // Built-in plugins: compiled per Cargo feature, then switched per library
+    // (ADR-013). Disabled plugins do not appear in help or usage.
     #[cfg(feature = "import-eagle")]
-    {
+    if plugins.import_eagle {
         command = command.subcommand(import::command());
     }
+    #[cfg(not(feature = "import-eagle"))]
+    let _ = &plugins.import_eagle;
+    #[cfg(not(feature = "previews"))]
+    let _ = &plugins.previews;
+    #[cfg(not(feature = "serve"))]
+    let _ = &plugins.serve;
     command
 }
 
