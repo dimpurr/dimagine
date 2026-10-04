@@ -17,4 +17,3 @@ unicode-normalization = "0.1"
 tempfile = "3"
 saphyr = "0.1"
 
-[workspace]
