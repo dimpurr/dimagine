@@ -84,7 +84,7 @@ fn external_urls_and_empty_targets_are_not_library_links() {
     for link in &links {
         let outcome = Resolver::new(&files(&[])).resolve(
             &link.target,
-            "",
+            &note_in(""),
             if link.syntax == LinkSyntax::WikiLink {
                 LinkSyntax::WikiLink
             } else {
@@ -147,6 +147,16 @@ fn library_of(entries: &[(&str, FileClass)]) -> Vec<FileEntry> {
         .collect()
 }
 
+/// A linking note whose library-relative folder is `dir` ("" at the root).
+fn note_in(dir: &str) -> FileEntry {
+    let rel = if dir.is_empty() {
+        "note.md".to_string()
+    } else {
+        format!("{dir}/note.md")
+    };
+    entry(&rel, FileClass::Note)
+}
+
 #[test]
 fn bare_names_resolve_when_unique_and_ambiguous_when_not() {
     let files = library_of(&[
@@ -157,11 +167,11 @@ fn bare_names_resolve_when_unique_and_ambiguous_when_not() {
     let resolver = Resolver::new(&files);
     // FORMAT §5.1 rule 2: exactly one file with that name.
     assert!(matches!(
-        resolver.resolve("solo.png", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("solo.png", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(2)
     ));
     // Rule 3: two files with that name -> ambiguous, never guessed.
-    match resolver.resolve("girl.jpg", "", LinkSyntax::WikiLink) {
+    match resolver.resolve("girl.jpg", &note_in(""), LinkSyntax::WikiLink) {
         Outcome::Ambiguous(hits) => {
             assert_eq!(hits.len(), 2, "both same-named files are candidates");
         }
@@ -182,11 +192,11 @@ fn bare_name_resolution_is_nfc_and_case_insensitive() {
     );
     let resolver = Resolver::new(&files);
     assert!(matches!(
-        resolver.resolve(nfc, "", LinkSyntax::MarkdownImage),
+        resolver.resolve(nfc, &note_in(""), LinkSyntax::MarkdownImage),
         Outcome::Resolved(0)
     ));
     assert!(matches!(
-        resolver.resolve("TOUCHÉ.JPG", "", LinkSyntax::MarkdownImage),
+        resolver.resolve("TOUCHÉ.JPG", &note_in(""), LinkSyntax::MarkdownImage),
         Outcome::Resolved(0)
     ));
 }
@@ -201,26 +211,26 @@ fn path_links_try_root_then_note_folder() {
     let resolver = Resolver::new(&files);
     // Root-relative hits first (FORMAT §5.1 rule 1).
     assert!(matches!(
-        resolver.resolve("refs/root.jpg", "x", LinkSyntax::WikiEmbed),
+        resolver.resolve("refs/root.jpg", &note_in("x"), LinkSyntax::WikiEmbed),
         Outcome::Resolved(0)
     ));
     assert!(matches!(
-        resolver.resolve("x/note.jpg", "x", LinkSyntax::WikiEmbed),
+        resolver.resolve("x/note.jpg", &note_in("x"), LinkSyntax::WikiEmbed),
         Outcome::Resolved(1)
     ));
     assert_eq!(
-        resolver.resolve("./x/note.jpg", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("./x/note.jpg", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(1),
         "leading ./ is accepted"
     );
     // Root miss -> note-relative fallback.
     assert!(matches!(
-        resolver.resolve("leaf/in.jpg", "x", LinkSyntax::MarkdownImage),
+        resolver.resolve("leaf/in.jpg", &note_in("x"), LinkSyntax::MarkdownImage),
         Outcome::Resolved(2)
     ));
     // Bare names never use the note folder, only the global name index.
     assert_eq!(
-        resolver.resolve("in.jpg", "refs", LinkSyntax::MarkdownImage),
+        resolver.resolve("in.jpg", &note_in("refs"), LinkSyntax::MarkdownImage),
         Outcome::Resolved(2)
     );
 }
@@ -230,16 +240,16 @@ fn parent_segments_resolve_against_the_note_folder() {
     let files = library_of(&[("a/c/x.jpg", FileClass::Image)]);
     let resolver = Resolver::new(&files);
     assert!(matches!(
-        resolver.resolve("../c/x.jpg", "a/b", LinkSyntax::WikiEmbed),
+        resolver.resolve("../c/x.jpg", &note_in("a/b"), LinkSyntax::WikiEmbed),
         Outcome::Resolved(0)
     ));
     // Escaping the library root resolves to nothing.
     assert_eq!(
-        resolver.resolve("../x.jpg", "", LinkSyntax::MarkdownImage),
+        resolver.resolve("../x.jpg", &note_in(""), LinkSyntax::MarkdownImage),
         Outcome::NotFound
     );
     assert_eq!(
-        resolver.resolve("../../escape.jpg", "a", LinkSyntax::MarkdownImage),
+        resolver.resolve("../../escape.jpg", &note_in("a"), LinkSyntax::MarkdownImage),
         Outcome::NotFound
     );
 }
@@ -249,11 +259,15 @@ fn image_extension_targets_report_missing_not_silent() {
     let files = library_of(&[("real.jpg", FileClass::Image)]);
     let resolver = Resolver::new(&files);
     assert_eq!(
-        resolver.resolve("ghost.jpg", "", LinkSyntax::WikiLink),
+        resolver.resolve("ghost.jpg", &note_in(""), LinkSyntax::WikiLink),
         Outcome::NotFound
     );
     assert_eq!(
-        resolver.resolve("refs/deep/ghost.jpg", "", LinkSyntax::MarkdownImage),
+        resolver.resolve(
+            "refs/deep/ghost.jpg",
+            &note_in(""),
+            LinkSyntax::MarkdownImage
+        ),
         Outcome::NotFound
     );
 }
@@ -267,15 +281,15 @@ fn note_like_targets_are_never_image_findings() {
     let resolver = Resolver::new(&files);
     // Missing .md links are note links, out of scope for findings.
     assert_eq!(
-        resolver.resolve("ghost.md", "", LinkSyntax::WikiLink),
+        resolver.resolve("ghost.md", &note_in(""), LinkSyntax::WikiLink),
         Outcome::NotImageTarget
     );
     assert_eq!(
-        resolver.resolve("ideas.md.missing", "", LinkSyntax::MarkdownImage),
+        resolver.resolve("ideas.md.missing", &note_in(""), LinkSyntax::MarkdownImage),
         Outcome::NotImageTarget
     );
     assert_eq!(
-        resolver.resolve("nope.json", "", LinkSyntax::WikiLink),
+        resolver.resolve("nope.json", &note_in(""), LinkSyntax::WikiLink),
         Outcome::NotImageTarget
     );
 }
@@ -286,23 +300,23 @@ fn extensionless_targets_fall_back_to_image_stems() {
     let resolver = Resolver::new(&one);
     // ![[photo]] resolves like Obsidian would.
     assert!(matches!(
-        resolver.resolve("photo", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("photo", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(0)
     ));
     // A bare wikilink that matches nothing image-like is not reported (it
     // could be a note link).
     assert_eq!(
-        resolver.resolve("ideas", "", LinkSyntax::WikiLink),
+        resolver.resolve("ideas", &note_in(""), LinkSyntax::WikiLink),
         Outcome::NotImageTarget
     );
     // An embed that matches no image could be a note embed: not reported.
     assert_eq!(
-        resolver.resolve("wip-idea", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("wip-idea", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::NotImageTarget
     );
     // But explicit Markdown image syntax can only mean an image.
     assert_eq!(
-        resolver.resolve("wip-idea", "", LinkSyntax::MarkdownImage),
+        resolver.resolve("wip-idea", &note_in(""), LinkSyntax::MarkdownImage),
         Outcome::NotFound
     );
     // Ambiguity among stems is reported.
@@ -312,16 +326,16 @@ fn extensionless_targets_fall_back_to_image_stems() {
     ]);
     let resolver = Resolver::new(&two);
     assert!(matches!(
-        resolver.resolve("photo", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("photo", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Ambiguous(_)
     ));
     // Path-like extensionless targets append image extensions.
     assert!(matches!(
-        resolver.resolve("a/photo", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("a/photo", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(0)
     ));
     assert!(matches!(
-        resolver.resolve("b/photo", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("b/photo", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(1)
     ));
     // An extless path that matches several candidate files stays ambiguous.
@@ -331,11 +345,11 @@ fn extensionless_targets_fall_back_to_image_stems() {
     ]);
     let resolver = Resolver::new(&three);
     assert!(matches!(
-        resolver.resolve("c/photo", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("c/photo", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Ambiguous(_)
     ));
     assert!(matches!(
-        resolver.resolve("d/nowhere", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("d/nowhere", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::NotImageTarget, // a note embed to a missing folder is not reported
     ));
 }
@@ -349,7 +363,7 @@ fn image_notes_do_not_satisfy_bare_image_names() {
     let resolver = Resolver::new(&files);
     // `girl.jpg.md` is a different name; `girl.jpg` matches only the image.
     assert!(matches!(
-        resolver.resolve("girl.jpg", "", LinkSyntax::WikiEmbed),
+        resolver.resolve("girl.jpg", &note_in(""), LinkSyntax::WikiEmbed),
         Outcome::Resolved(0)
     ));
 }
@@ -389,4 +403,73 @@ fn target_class_matches_expectations() {
     ] {
         assert_eq!(target_class(target), class, "{target}");
     }
+}
+
+#[test]
+fn quoted_titles_may_contain_brackets() {
+    // Regression (R7b): `(` or `<` inside a quoted title used to make the
+    // whole embed unfindable. The destination and the optional title are
+    // parsed apart now, so these are all valid images of `photo.jpg`.
+    let text = "![](photo.jpg \"opening (\")\n\
+                ![](photo.jpg \"less <\")\n\
+                ![](photo.jpg 'single (q)')\n\
+                ![](photo.jpg (paren (t) here))\n\
+                ![](photo.jpg \"say \\\"hi\\\"\")\n\
+                ![](photo.jpg \"t\" )\n";
+    let links = extract_markdown_links(text, 1);
+    assert_eq!(links.len(), 6, "{links:?}");
+    for link in &links {
+        assert_eq!(link.target, "photo.jpg", "{:?}", link.raw);
+    }
+}
+
+#[test]
+fn junk_after_the_destination_makes_no_image() {
+    // CommonMark: only a properly quoted title may sit between the
+    // destination and the closing paren.
+    assert!(extract_markdown_links("![a](photo.jpg junk)\n", 1).is_empty());
+    assert!(extract_markdown_links("![a](photo.jpg \"t\" junk)\n", 1).is_empty());
+    assert!(extract_markdown_links("![a](<a b.jpg> junk)\n", 1).is_empty());
+}
+
+#[test]
+#[cfg(unix)]
+fn note_relative_resolution_keeps_native_directory_bytes() {
+    // Regression (R7b finding 4): the resolution base used to be the lossy
+    // display path, so a note under a non-UTF-8 folder could resolve
+    // against an unrelated folder whose name happens to contain the
+    // replacement character, while the note's true folder was unreachable.
+    use std::os::unix::ffi::OsStrExt;
+    let native_folder = std::path::PathBuf::from(std::ffi::OsStr::from_bytes(b"d\xff"));
+    let under_native = FileEntry {
+        rel: "d\u{FFFD}/x.jpg".to_string(),
+        name: "x.jpg".to_string(),
+        path: native_folder.join("x.jpg"),
+        native_name: std::ffi::OsString::from("x.jpg"),
+        class: FileClass::Image,
+    };
+    // A different, valid-UTF-8 folder really named with U+FFFD.
+    let decoy = entry("d\u{FFFD}/x.jpg", FileClass::Image);
+    let note_under_native = FileEntry {
+        rel: "d\u{FFFD}/note.md".to_string(),
+        name: "note.md".to_string(),
+        path: native_folder.join("note.md"),
+        native_name: std::ffi::OsString::from("note.md"),
+        class: FileClass::Note,
+    };
+    let files = vec![decoy, under_native, note_under_native];
+    let resolver = Resolver::new(&files);
+    match resolver.resolve("./x.jpg", &files[2], LinkSyntax::MarkdownImage) {
+        Outcome::Resolved(one) => assert_eq!(one, 1, "must hit the native sibling, not the decoy"),
+        other => panic!("expected the native sibling to resolve, got {other:?}"),
+    }
+    // The same link from a note under the decoy folder hits the decoy.
+    assert!(matches!(
+        resolver.resolve(
+            "./x.jpg",
+            &entry("d\u{FFFD}/note.md", FileClass::Note),
+            LinkSyntax::MarkdownImage
+        ),
+        Outcome::Resolved(0)
+    ));
 }

@@ -73,12 +73,13 @@ pub fn open_regular(root: &Path, entry: &FileEntry) -> std::io::Result<fs::File>
 }
 
 impl FileEntry {
-    /// The library-relative path of the folder holding this file, `""` at root.
-    pub fn dir(&self) -> &str {
-        match self.rel.rfind('/') {
-            Some(i) => &self.rel[..i],
-            None => "",
-        }
+    /// Native library-relative path of the folder holding this file, `""` at
+    /// the library root. Unlike the lossy display [`FileEntry::rel`], this
+    /// keeps the on-disk bytes, so a note under a non-UTF-8 directory still
+    /// names its true folder. Link resolution bases itself on this, never on
+    /// display text.
+    pub fn dir_path(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new(""))
     }
 
     /// For an image note, the name of the image it belongs to (``x.jpg`` for
@@ -274,7 +275,7 @@ impl Library {
                 }
             };
             let rel_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
-            let rel = rel_path.to_string_lossy().replace('\\', "/");
+            let rel = display_rel(&rel_path);
             if metadata.is_dir() {
                 self.walk_dir(&path);
             } else {
@@ -302,6 +303,21 @@ impl Library {
             IgnoreReason::OsMetadata => self.ignored.os_metadata += 1,
         }
     }
+}
+
+/// Lossy display spelling of a library-relative path. Only the platform's own
+/// separators are normalized: on Windows `\` is a separator and is shown as
+/// `/`, while on every other platform `\` is an ordinary file-name character
+/// and must stay visible (FORMAT §2.1 bans no such character). Resolver keys
+/// are never built from this string.
+#[cfg(windows)]
+fn display_rel(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn display_rel(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 /// Strip `suffix` from `name` if present, ASCII-case-insensitively.

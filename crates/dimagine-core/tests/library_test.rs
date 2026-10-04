@@ -143,11 +143,13 @@ fn entry_dir_helpers() {
     write(tmp.path(), "root.md", b"note");
     let lib = open_library(tmp.path());
     let note = lib.files.iter().find(|f| f.rel == "refs/a.jpg.md").unwrap();
-    assert_eq!(note.dir(), "refs");
+    // The native folder path keeps the walk's bytes; it grounds link
+    // resolution, so it must not be derived from lossy display text.
+    assert_eq!(note.dir_path(), Path::new("refs"));
     assert_eq!(note.paired_image_name(), Some("a.jpg"));
     assert_eq!(note.paired_image_rel(), Some("refs/a.jpg"));
     let plain = lib.files.iter().find(|f| f.rel == "root.md").unwrap();
-    assert_eq!(plain.dir(), "");
+    assert_eq!(plain.dir_path(), Path::new(""));
     assert_eq!(plain.paired_image_name(), None);
 
     let _ = Path::new("/dev/null");

@@ -615,3 +615,43 @@ fn unknown_properties_do_not_break_checks() {
     );
     assert_eq!(report.exit_code(), 0);
 }
+
+#[test]
+fn quoted_title_embed_satisfies_the_self_embed() {
+    // Regression (R7b): a `(` or `<` in a quoted title used to hide the
+    // embed entirely, so a valid note image with a title was reported as
+    // missing its self-embed.
+    let tmp = tmp("title-embed");
+    write(tmp.path(), "girl.jpg", jpg());
+    write(
+        tmp.path(),
+        "girl.jpg.md",
+        "words\n\n![](girl.jpg \"opening (\")\n",
+    );
+    let lib = open_library(tmp.path());
+    let report = run(&lib);
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+}
+
+#[test]
+#[cfg(unix)]
+fn backslash_file_names_do_not_alias_slash_paths() {
+    // Regression (R7b): on Unix both the file `a\b.jpg` and the file
+    // `a/b.jpg` shared the resolver key `a/b.jpg`, so a valid link was
+    // ambiguous and the display path lied about the real name.
+    // (Filesystem fixtures for non-UTF-8 folders are built only in
+    // links_test, in memory: APFS refuses non-UTF-8 names with EILSEQ.)
+    let tmp = tmp("backslash");
+    write_os(tmp.path(), b"a\\b.jpg", jpg()); // one file named a\b.jpg
+    write(tmp.path(), "a/b.jpg", jpg()); // a different file, a/b.jpg
+    write(tmp.path(), "n.md", "![](a/b.jpg) and ![](a\\b.jpg)\n");
+    let lib = open_library(tmp.path());
+    let report = run(&lib);
+    assert!(report.findings.is_empty(), "{:?}", report.findings);
+    let entry = lib
+        .files
+        .iter()
+        .find(|f| f.path == Path::new("a\\b.jpg"))
+        .expect("native backslash-named file");
+    assert_eq!(entry.rel, "a\\b.jpg", "display keeps the backslash");
+}

@@ -47,6 +47,17 @@ pub fn write(root: &Path, rel: &str, content: impl AsRef<[u8]>) {
     std::fs::write(path, content).unwrap_or_else(|err| panic!("write {rel}: {err}"));
 }
 
+/// Write a file at a native (possibly non-UTF-8) library-relative path.
+#[cfg(unix)]
+pub fn write_os(root: &Path, rel: &[u8], content: impl AsRef<[u8]>) {
+    use std::os::unix::ffi::OsStrExt;
+    let path = root.join(std::ffi::OsStr::from_bytes(rel));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(&path, content).unwrap_or_else(|err| panic!("write: {err}"));
+}
+
 pub fn fixture_bytes(name: &str) -> Vec<u8> {
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures");
     std::fs::read(base.join(name)).unwrap_or_else(|err| panic!("read fixture {name}: {err}"))
