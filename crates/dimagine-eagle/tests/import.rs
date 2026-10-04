@@ -463,6 +463,24 @@ fn imports_deep_folder_metadata_beyond_json_default_recursion_limit() {
     );
 }
 
+#[test]
+fn rejects_trailing_malformed_data_in_root_metadata() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Trailing.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), b"{\"folders\":[]}garbage").unwrap();
+    match import(&src, &dst, ImportOptions::default()) {
+        Err(ImportError::InvalidSource(msg)) => {
+            assert!(
+                msg.contains("unreadable metadata.json"),
+                "expected unreadable metadata.json, got: {msg}"
+            );
+        }
+        other => panic!("expected InvalidSource, got {:?}", other),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn skips_symlinked_eagle_entries_without_copying_external_files() {

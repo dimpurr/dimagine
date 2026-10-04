@@ -180,6 +180,9 @@ pub fn import(
     let root = Value::deserialize(stacked).map_err(|error| {
         ImportError::InvalidSource(format!("unreadable metadata.json: {error}"))
     })?;
+    deserializer.end().map_err(|error| {
+        ImportError::InvalidSource(format!("unreadable metadata.json: {error}"))
+    })?;
     let default_name = source
         .file_name()
         .unwrap_or_default()
