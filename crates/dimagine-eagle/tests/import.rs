@@ -481,6 +481,29 @@ fn rejects_trailing_malformed_data_in_root_metadata() {
     }
 }
 
+#[test]
+fn rejects_deeply_nested_unused_fields_safely() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("DeepFields.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    let mut nested = String::from("1");
+    for _ in 0..600 {
+        nested = format!("[{nested}]");
+    }
+    let json = format!("{{\"folders\":[],\"unused\":{nested}}}");
+    fs::write(src.join("metadata.json"), json.as_bytes()).unwrap();
+    match import(&src, &dst, ImportOptions::default()) {
+        Err(ImportError::InvalidSource(msg)) => {
+            assert!(
+                msg.contains("nesting exceeds"),
+                "expected nesting error, got: {msg}"
+            );
+        }
+        other => panic!("expected InvalidSource, got {:?}", other),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn skips_symlinked_eagle_entries_without_copying_external_files() {

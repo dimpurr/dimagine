@@ -183,6 +183,8 @@ pub fn import(
     deserializer.end().map_err(|error| {
         ImportError::InvalidSource(format!("unreadable metadata.json: {error}"))
     })?;
+    let root = IterativeValue::new(root);
+    check_json_depth(&root, 512)?;
     let default_name = source
         .file_name()
         .unwrap_or_default()
@@ -779,6 +781,75 @@ fn partial_io(error: io::Error, root: &Path, report: &ImportReport) -> ImportErr
     }
 }
 
+struct IterativeValue(Option<Value>);
+
+impl IterativeValue {
+    fn new(value: Value) -> Self {
+        Self(Some(value))
+    }
+}
+
+impl std::ops::Deref for IterativeValue {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("value present")
+    }
+}
+
+impl Drop for IterativeValue {
+    fn drop(&mut self) {
+        if let Some(val) = self.0.take() {
+            drop_value_iteratively(val);
+        }
+    }
+}
+
+fn drop_value_iteratively(mut value: Value) {
+    let mut stack = Vec::new();
+    stack.push(std::mem::replace(&mut value, Value::Null));
+    while let Some(mut current) = stack.pop() {
+        match current {
+            Value::Array(ref mut vec) => {
+                for item in vec.drain(..) {
+                    stack.push(item);
+                }
+            }
+            Value::Object(ref mut map) => {
+                for (_, item) in std::mem::take(map) {
+                    stack.push(item);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn check_json_depth(root: &Value, max_depth: usize) -> Result<(), ImportError> {
+    let mut stack = vec![(root, 1)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > max_depth {
+            return Err(ImportError::InvalidSource(format!(
+                "JSON nesting exceeds maximum supported depth of {max_depth}"
+            )));
+        }
+        match node {
+            Value::Array(arr) => {
+                for item in arr {
+                    stack.push((item, depth + 1));
+                }
+            }
+            Value::Object(map) => {
+                for item in map.values() {
+                    stack.push((item, depth + 1));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn walk_folders(
     folders: &[Value],
     parent: &str,
@@ -1252,5 +1323,17 @@ mod tests {
             }
         }
         assert!(!image.exists(), "published image must be rolled back on companion failure");
+    }
+
+    #[test]
+    fn iterative_drop_handles_deep_nesting_without_stack_overflow() {
+        use super::drop_value_iteratively;
+        use serde_json::Value;
+
+        let mut val = Value::Null;
+        for _ in 0..10_000 {
+            val = Value::Array(vec![val]);
+        }
+        drop_value_iteratively(val);
     }
 }
