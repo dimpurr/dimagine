@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Rust workspace with the first two read-only CLI commands, `dimagine scan` (library summary) and `dimagine check` (findings), plus CI.
 - Prototype scripts: an Eagle importer and a tool that adds missing
   self-embeds (`scripts/prototype/`).
 - Format 0.1 draft revision: image notes end with an embed of their own image;
