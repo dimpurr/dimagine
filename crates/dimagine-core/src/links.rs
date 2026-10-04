@@ -20,6 +20,8 @@
 //! none means the link does not point at an image (and is not reported).
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path};
 
 use percent_encoding::percent_decode_str;
 use unicode_normalization::UnicodeNormalization;
@@ -166,9 +168,9 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
                 match find_byte(bytes, b']', i + 2) {
                     Some(alt_end) if alt_end + 1 < bytes.len() && bytes[alt_end + 1] == b'(' => {
-                        match markdown_destination_end(bytes, alt_end + 2) {
-                            Some(close) => {
-                                push_markdown(&mut links, &body[alt_end + 2..close], line_at(i));
+                        match markdown_link_tail(bytes, alt_end + 2) {
+                            Some((dest_start, dest_end, close)) => {
+                                push_markdown(&mut links, &body[dest_start..dest_end], line_at(i));
                                 i = close + 1;
                             }
                             None => i = alt_end + 1,
@@ -287,39 +289,137 @@ fn find_byte(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
-fn markdown_destination_end(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut angle = false;
-    let mut escaped = false;
-    for (offset, &byte) in bytes.iter().enumerate().skip(from) {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if byte == b'\\' {
-            escaped = true;
-            continue;
-        }
-        if byte == b'<' {
-            angle = true;
-            continue;
-        }
-        if byte == b'>' && angle {
-            angle = false;
-            continue;
-        }
-        if angle {
-            continue;
-        }
-        match byte {
-            b'(' => depth += 1,
-            b')' if depth == 0 => return Some(offset),
-            b')' => depth -= 1,
-            b'\n' if depth == 0 => return None,
-            _ => {}
-        }
+/// Parse the tail of an inline Markdown image, starting right after the
+/// opening `(`: optional spaces or tabs, a destination, an optional quoted
+/// title, and the closing paren. The whole tail must sit on one line and
+/// follow the CommonMark inline-info shape, so the destination and the title
+/// are handled separately. Brackets inside a quoted title are title text,
+/// not nesting. Returns `(destination start, destination end, index of the
+/// closing paren)`.
+fn markdown_link_tail(bytes: &[u8], from: usize) -> Option<(usize, usize, usize)> {
+    let mut i = from;
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
     }
-    None
+    let dest_start = i;
+    let (dest_end, closed_here) = if bytes.get(i) == Some(&b'<') {
+        // Angle-quoted destination: no line endings, no unescaped `<`/`>`.
+        let mut j = i + 1;
+        let dest_end = loop {
+            match bytes.get(j) {
+                None | Some(b'\n') | Some(b'<') => return None,
+                Some(b'\\') => j = j.checked_add(2)?,
+                Some(b'>') => break j + 1,
+                Some(_) => j += 1,
+            }
+        };
+        (dest_end, false)
+    } else {
+        // Bare destination: stops at ASCII whitespace or the unbalanced
+        // closing paren; parentheses inside must stay balanced or escaped.
+        let mut j = i;
+        let mut depth = 0usize;
+        loop {
+            match bytes.get(j) {
+                None | Some(b'\n') => return None,
+                Some(b'\\') => {
+                    j = j.checked_add(2)?;
+                }
+                Some(b' ' | b'\t') => break (j, false),
+                Some(b'(') => {
+                    depth += 1;
+                    j += 1;
+                }
+                Some(b')') => {
+                    if depth == 0 {
+                        break (j, true);
+                    }
+                    depth -= 1;
+                    j += 1;
+                }
+                Some(_) => j += 1,
+            }
+        }
+    };
+    if closed_here {
+        // The destination ended at the paren that also closes the image.
+        return Some((dest_start, dest_end, dest_end));
+    }
+    title_and_close(bytes, dest_start, dest_end)
+}
+
+/// After a destination that ended at whitespace (or after an angle-quoted
+/// destination): an optional title in double quotes, single quotes or
+/// parentheses, then the closing paren.
+fn title_and_close(
+    bytes: &[u8],
+    dest_start: usize,
+    dest_end: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut k = dest_end;
+    while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+        k += 1;
+    }
+    match bytes.get(k) {
+        Some(b'"') | Some(b'\'') => {
+            let quote = bytes[k];
+            let mut t = k + 1;
+            loop {
+                match bytes.get(t) {
+                    None | Some(b'\n') => return None,
+                    Some(b'\\') => t = t.checked_add(2)?,
+                    Some(byte) if *byte == quote => {
+                        t += 1;
+                        break;
+                    }
+                    Some(_) => t += 1,
+                }
+            }
+            title_ends_at(bytes, dest_start, dest_end, t)
+        }
+        Some(b'(') => {
+            let mut t = k + 1;
+            let mut depth = 1usize;
+            loop {
+                match bytes.get(t) {
+                    None | Some(b'\n') => return None,
+                    Some(b'\\') => t = t.checked_add(2)?,
+                    Some(b'(') => {
+                        depth += 1;
+                        t += 1;
+                    }
+                    Some(b')') => {
+                        depth -= 1; // opening paren guaranteed depth >= 1
+                        t += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    Some(_) => t += 1,
+                }
+            }
+            title_ends_at(bytes, dest_start, dest_end, t)
+        }
+        Some(b')') => Some((dest_start, dest_end, k)),
+        _ => None,
+    }
+}
+
+/// The title just ended at `from`; optional whitespace, then `)` must follow.
+fn title_ends_at(
+    bytes: &[u8],
+    dest_start: usize,
+    dest_end: usize,
+    from: usize,
+) -> Option<(usize, usize, usize)> {
+    let mut k = from;
+    while matches!(bytes.get(k), Some(b' ' | b'\t')) {
+        k += 1;
+    }
+    match bytes.get(k) {
+        Some(b')') => Some((dest_start, dest_end, k)),
+        _ => None,
+    }
 }
 
 /// Byte ranges of fenced code blocks (``` and ~~~), including their fences.
@@ -365,6 +465,51 @@ pub fn key(s: &str) -> String {
     s.nfc().collect::<String>().to_lowercase()
 }
 
+/// One component of a native library-relative path, as a resolver key.
+/// Components that are valid UTF-8 normalize like every other name
+/// (NFC + lowercase); components that are not valid UTF-8 keep their native
+/// bytes and can only be reached through a note-relative base, never by
+/// link text, so a lossy display spelling can never alias them.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum PartKey {
+    Text(String),
+    Opaque(OsString),
+}
+
+fn part_key(component: &OsStr) -> PartKey {
+    match component.to_str() {
+        Some(text) => PartKey::Text(key(text)),
+        None => PartKey::Opaque(component.to_os_string()),
+    }
+}
+
+/// The resolver keys of every path component of `path`, skipping any
+/// non-normal components (walked library paths only contain normal ones).
+fn path_parts(path: &Path) -> Vec<PartKey> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part_key(part)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Join a link target onto an optional native base and resolve `.` and `..`
+/// segments. Returns `None` when the path escapes the library root.
+fn join_parts(base: Option<&[PartKey]>, target: &str) -> Option<Vec<PartKey>> {
+    let mut parts: Vec<PartKey> = base.map(|b| b.to_vec()).unwrap_or_default();
+    for segment in target.split('/').filter(|s| !s.is_empty()) {
+        match segment {
+            "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            segment => parts.push(PartKey::Text(key(segment))),
+        }
+    }
+    Some(parts)
+}
+
 /// Resolve link targets against the files of one library walk.
 #[derive(Debug)]
 pub struct Resolver {
@@ -372,15 +517,18 @@ pub struct Resolver {
     name_index: HashMap<String, Vec<usize>>,
     /// Image file name without extension → file indexes, by [`key`].
     image_stem_index: HashMap<String, Vec<usize>>,
-    /// Library-relative path → file indexes, by [`key`].
-    path_index: HashMap<String, Vec<usize>>,
+    /// Native library-relative path components → file indexes. Keys are
+    /// built from [`std::path::Path`] components, never from lossy display
+    /// text, so different native folders (or a folder with a `\` in its
+    /// name and the same path spelled with separators) never collide.
+    path_index: HashMap<Vec<PartKey>, Vec<usize>>,
 }
 
 impl Resolver {
     pub fn new(files: &[FileEntry]) -> Resolver {
         let mut name_index: HashMap<String, Vec<usize>> = HashMap::new();
         let mut image_stem_index: HashMap<String, Vec<usize>> = HashMap::new();
-        let mut path_index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut path_index: HashMap<Vec<PartKey>, Vec<usize>> = HashMap::new();
         for (idx, entry) in files.iter().enumerate() {
             // A lossy display spelling is never a lookup key: it could alias
             // a different valid UTF-8 name. Such entries remain reportable
@@ -392,9 +540,12 @@ impl Resolver {
                     image_stem_index.entry(key(stem)).or_default().push(idx);
                 }
             }
-            if entry.path.to_str().is_some() {
-                path_index.entry(key(&entry.rel)).or_default().push(idx);
-            }
+            // Path keys come from native components; paths with non-UTF-8
+            // folders stay reachable through note-relative resolution.
+            path_index
+                .entry(path_parts(&entry.path))
+                .or_default()
+                .push(idx);
         }
         Resolver {
             name_index,
@@ -405,9 +556,11 @@ impl Resolver {
 
     /// Resolve one link target (FORMAT §5.1).
     ///
-    /// `note_dir` is the library-relative folder of the linking note (`""`
-    /// for a note at the root), used for the note-relative leg of path links.
-    pub fn resolve(&self, target: &str, note_dir: &str, syntax: LinkSyntax) -> Outcome {
+    /// `note` is the linking note; its native folder ([`FileEntry::dir_path`])
+    /// grounds the note-relative leg of path links, so a note under a
+    /// non-UTF-8 directory resolves against that directory, not against an
+    /// unrelated folder with the same lossy display spelling.
+    pub fn resolve(&self, target: &str, note: &FileEntry, syntax: LinkSyntax) -> Outcome {
         let Some(target) = prepare_target(target) else {
             return Outcome::NotImageTarget;
         };
@@ -438,10 +591,11 @@ impl Resolver {
             }
         } else {
             // Path: library root first, then the note's folder (§5.1 rule 1).
+            let note_base = path_parts(note.dir_path());
             if let Some(out) = self.lookup_path(&target, None) {
                 return out;
             }
-            if let Some(out) = self.lookup_path(&target, Some(note_dir)) {
+            if let Some(out) = self.lookup_path(&target, Some(&note_base)) {
                 return out;
             }
             match class {
@@ -452,7 +606,7 @@ impl Resolver {
                         if let Some(out) = self.lookup_path(&with_ext, None) {
                             collect(&mut hits, out);
                         }
-                        if let Some(out) = self.lookup_path(&with_ext, Some(note_dir)) {
+                        if let Some(out) = self.lookup_path(&with_ext, Some(&note_base)) {
                             collect(&mut hits, out);
                         }
                     }
@@ -483,16 +637,18 @@ impl Resolver {
 
     /// Resolve explicit local Markdown note references so missing and
     /// ambiguous note links are not hidden by image-only classification.
-    pub fn resolve_note_reference(&self, target: &str, note_dir: &str) -> Option<Outcome> {
+    /// `note` grounds the note-relative leg, like in [`Resolver::resolve`].
+    pub fn resolve_note_reference(&self, target: &str, note: &FileEntry) -> Option<Outcome> {
         let target = prepare_target(target)?;
         if !target.to_ascii_lowercase().ends_with(".md") {
             return None;
         }
         if target.contains('/') {
+            let note_base = path_parts(note.dir_path());
             if let Some(out) = self.lookup_path(&target, None) {
                 return Some(out);
             }
-            if let Some(out) = self.lookup_path(&target, Some(note_dir)) {
+            if let Some(out) = self.lookup_path(&target, Some(&note_base)) {
                 return Some(out);
             }
             Some(Outcome::NotFound)
@@ -506,9 +662,9 @@ impl Resolver {
         }
     }
 
-    fn lookup_path(&self, target: &str, base: Option<&str>) -> Option<Outcome> {
-        let normalized = normalize_rel(target, base)?;
-        let hits = self.path_index.get(&key(&normalized))?;
+    fn lookup_path(&self, target: &str, base: Option<&[PartKey]>) -> Option<Outcome> {
+        let parts = join_parts(base, target)?;
+        let hits = self.path_index.get(&parts)?;
         Some(collapse(hits.iter().copied()))
     }
 }
@@ -560,25 +716,4 @@ fn prepare_target(target: &str) -> Option<String> {
         }
     }
     Some(t.to_string())
-}
-
-/// Join `target` onto `base` and resolve `.` and `..` segments. Returns
-/// `None` when the path escapes the library root.
-fn normalize_rel(target: &str, base: Option<&str>) -> Option<String> {
-    let mut parts: Vec<&str> = Vec::new();
-    if let Some(base) = base {
-        if !base.is_empty() {
-            parts.extend(base.split('/'));
-        }
-    }
-    for segment in target.split('/').filter(|s| !s.is_empty()) {
-        match segment {
-            "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            _ => parts.push(segment),
-        }
-    }
-    Some(parts.join("/"))
 }

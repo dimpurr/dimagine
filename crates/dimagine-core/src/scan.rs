@@ -203,7 +203,7 @@ pub fn run_with_limit(library: &Library, max_note_bytes: u64) -> ScanReport {
                                         continue;
                                     }
                                     if let Outcome::Resolved(idx) =
-                                        resolver.resolve(&link.target, entry.dir(), link.syntax)
+                                        resolver.resolve(&link.target, entry, link.syntax)
                                     {
                                         if library.files[idx].class == FileClass::Image
                                             && !(entry.class == FileClass::ImageNote

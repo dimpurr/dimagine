@@ -379,7 +379,7 @@ fn check_note(
 
     let mut self_embed_seen = false;
     for link in links::extract_markdown_links(&parsed.body, parsed.body_line) {
-        let outcome = resolver.resolve(&link.target, entry.dir(), link.syntax);
+        let outcome = resolver.resolve(&link.target, entry, link.syntax);
         if entry.class == FileClass::ImageNote {
             note_self_embed(
                 library,
@@ -393,9 +393,7 @@ fn check_note(
         match outcome {
             Outcome::Resolved(_) => {}
             Outcome::NotImageTarget => {
-                if let Some(note_outcome) =
-                    resolver.resolve_note_reference(&link.target, entry.dir())
-                {
+                if let Some(note_outcome) = resolver.resolve_note_reference(&link.target, entry) {
                     match note_outcome {
                         Outcome::NotFound => findings.push(Finding {
                             severity: Severity::Warning,
