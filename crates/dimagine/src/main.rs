@@ -11,6 +11,9 @@
 //! - `3` did not finish reading the library, so every "not found" in the
 //!   output proves nothing.
 
+#[cfg(feature = "import-eagle")]
+mod import;
+
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -32,12 +35,14 @@ fn main() -> ExitCode {
     match name {
         "scan" => run_scan(sub, &library_dir),
         "check" => run_check(sub, &library_dir),
+        #[cfg(feature = "import-eagle")]
+        "import" => import::run(sub, &library_dir),
         other => unreachable!("clap already rejected unknown subcommand {other}"),
     }
 }
 
 fn cli() -> Command {
-    Command::new("dimagine")
+    let mut command = Command::new("dimagine")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
         .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. Commands only read the library; derived data lives in .dimagine/ and can always be deleted.")
@@ -72,7 +77,12 @@ fn cli() -> Command {
             Command::new("check").about("Report problems in the library; never changes files."),
         )
         .subcommand_required(true)
-        .arg_required_else_help(true)
+        .arg_required_else_help(true);
+    #[cfg(feature = "import-eagle")]
+    {
+        command = command.subcommand(import::command());
+    }
+    command
 }
 
 fn resolve_library(sub: &ArgMatches) -> PathBuf {
