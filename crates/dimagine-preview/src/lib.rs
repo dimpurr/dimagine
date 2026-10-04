@@ -1,9 +1,7 @@
 //! Content-addressed image previews for dimagine libraries.
 //!
 //! Preview files are derived cache entries; originals are opened read-only and
-//! are never changed. Colour profiles are detected, but no colour transform is
-//! applied, so each rendition reports ColourStatus::NotConverted when an
-//! embedded ICC profile is present.
+//! are never changed. Embedded colour profiles are transformed to sRGB.
 
 use std::{
     fs::{self, File},
@@ -11,16 +9,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use image::{imageops, DynamicImage, GenericImageView, ImageEncoder, ImageFormat, ImageReader};
+use image::{
+    imageops, AnimationDecoder, DynamicImage, GenericImageView, ImageDecoder, ImageEncoder,
+    ImageError, ImageFormat, ImageReader, Limits,
+};
+use lcms2::{ColorSpaceSignature, Intent, PixelFormat, Profile, Transform};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use thiserror::Error;
+use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
 
 const THUMB_EDGE: u32 = 400;
 const VIEW_EDGE: u32 = 1568;
 const VIEW_AREA: u64 = 1_150_000;
 const DEFAULT_PIXEL_LIMIT: u64 = 200_000_000;
+const MAX_ENCODED_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// A lowercase hexadecimal SHA-256 digest of the original file bytes.
 pub type Hash = String;
@@ -49,9 +54,11 @@ pub enum RenditionFormat {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ColourStatus {
-    /// No embedded ICC marker was found in the source bytes.
+    /// No embedded ICC profile was exposed by the image decoder.
     NoProfile,
-    /// ICC profile was detected but pixels were kept unchanged.
+    /// An embedded ICC profile was converted to sRGB.
+    Srgb,
+    /// Embedded ICC profile could not be interpreted by Little CMS.
     NotConverted,
 }
 
@@ -102,6 +109,9 @@ pub enum PreviewError {
     /// Source exceeds the configured pixel limit.
     #[error("image dimensions {width}x{height} exceed pixel limit {limit}")]
     PixelLimit { width: u32, height: u32, limit: u64 },
+    /// Decoder refused the image because it exceeded a resource limit.
+    #[error("image resource limit exceeded: {0}")]
+    ResourceLimit(String),
 }
 
 /// Hash a file's bytes with SHA-256.
@@ -164,6 +174,12 @@ pub fn ensure_with_options(
     options: Options,
 ) -> Result<Vec<Rendition>, PreviewError> {
     let image_path = image_path.as_ref();
+    let metadata = fs::metadata(image_path)?;
+    if metadata.len() > MAX_ENCODED_BYTES {
+        return Err(PreviewError::ResourceLimit(format!(
+            "encoded image exceeds {MAX_ENCODED_BYTES} bytes"
+        )));
+    }
     let bytes = fs::read(image_path)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let format = format_from_bytes(&bytes)
@@ -171,14 +187,55 @@ pub fn ensure_with_options(
     if !supported(format) {
         return Err(PreviewError::Unsupported(format!("{format:?}")));
     }
+    if format == ImageFormat::WebP {
+        check_webp_frame_limits(&bytes, options.pixel_limit)?;
+    }
     let reader = ImageReader::with_format(Cursor::new(&bytes), format);
     let dimensions = reader
         .into_dimensions()
         .map_err(|e| PreviewError::Decode(e.to_string()))?;
     check_limit(dimensions.0, dimensions.1, options.pixel_limit)?;
-    let mut image = ImageReader::with_format(Cursor::new(&bytes), format)
-        .decode()
-        .map_err(|e| PreviewError::Decode(e.to_string()))?;
+    let mut reader = ImageReader::with_format(Cursor::new(&bytes), format);
+    let mut decode_limits = Limits::default();
+    decode_limits.max_alloc = Some(MAX_DECODE_BYTES);
+    reader.limits(decode_limits);
+    let mut decoder = reader.into_decoder().map_err(map_image_error)?;
+    let icc = decoder.icc_profile().map_err(map_image_error)?;
+    let profiled_cmyk = format == ImageFormat::Jpeg
+        && icc.as_deref().is_some_and(|profile| {
+            Profile::new_icc(profile)
+                .is_ok_and(|p| p.color_space() == ColorSpaceSignature::CmykData)
+        });
+    let (mut image, converted) = if profiled_cmyk {
+        match decode_profiled_cmyk_jpeg(&bytes, icc.as_deref().expect("profile checked")) {
+            Ok(cmyk_srgb) => (cmyk_srgb, true),
+            Err(_) => (
+                DynamicImage::from_decoder(decoder).map_err(map_image_error)?,
+                false,
+            ),
+        }
+    } else {
+        let mut image = DynamicImage::from_decoder(decoder).map_err(map_image_error)?;
+        let converted = icc
+            .as_deref()
+            .is_some_and(|profile| convert_to_srgb(&mut image, profile).is_ok());
+        (image, converted)
+    };
+    if format == ImageFormat::Png {
+        let mut png_reader =
+            image::codecs::png::PngDecoder::new(Cursor::new(&bytes)).map_err(map_image_error)?;
+        let mut png_limits = Limits::default();
+        png_limits.max_alloc = Some(MAX_DECODE_BYTES);
+        png_reader.set_limits(png_limits).map_err(map_image_error)?;
+        if png_reader.is_apng().map_err(map_image_error)? {
+            let mut frames = png_reader.apng().map_err(map_image_error)?.into_frames();
+            let frame = frames
+                .next()
+                .ok_or_else(|| PreviewError::Decode("APNG has no animation frames".into()))?
+                .map_err(map_image_error)?;
+            image = DynamicImage::ImageRgba8(frame.into_buffer());
+        }
+    }
     apply_orientation(&mut image, &bytes);
     let (width, height) = image.dimensions();
     let transparent = has_transparency(&image);
@@ -187,7 +244,9 @@ pub fn ensure_with_options(
     } else {
         RenditionFormat::Jpeg
     };
-    let colour_status = if has_icc_marker(&bytes) {
+    let colour_status = if converted {
+        ColourStatus::Srgb
+    } else if icc.is_some() {
         ColourStatus::NotConverted
     } else {
         ColourStatus::NoProfile
@@ -196,7 +255,8 @@ pub fn ensure_with_options(
     for &kind in kinds {
         let (out_w, out_h) = plan(width, height, kind);
         let path = cache_path(library_root.as_ref(), &hash, kind, rendition_format);
-        if !path.exists() {
+        ensure_cache_dirs(library_root.as_ref(), &path)?;
+        if !valid_cache_hit(&path, (out_w, out_h), rendition_format) {
             let rendered = if (out_w, out_h) == (width, height) {
                 image.clone()
             } else {
@@ -216,6 +276,70 @@ pub fn ensure_with_options(
     Ok(output)
 }
 
+fn map_image_error(error: ImageError) -> PreviewError {
+    match error {
+        ImageError::Unsupported(e) => PreviewError::Unsupported(e.to_string()),
+        ImageError::Limits(e) => PreviewError::ResourceLimit(e.to_string()),
+        ImageError::IoError(e) => PreviewError::Io(e),
+        other => PreviewError::Decode(other.to_string()),
+    }
+}
+
+fn convert_to_srgb(image: &mut DynamicImage, icc: &[u8]) -> Result<(), String> {
+    let input = Profile::new_icc(icc).map_err(|e| e.to_string())?;
+    let output = Profile::new_srgb();
+    let rgb = image.to_rgb8();
+    let source = rgb.as_raw();
+    let mut converted = vec![0; source.len()];
+    let transform = Transform::new(
+        &input,
+        PixelFormat::RGB_8,
+        &output,
+        PixelFormat::RGB_8,
+        Intent::Perceptual,
+    )
+    .map_err(|e| e.to_string())?;
+    transform.transform_pixels(source, &mut converted);
+    let result = image::RgbImage::from_raw(rgb.width(), rgb.height(), converted)
+        .ok_or("invalid transformed pixels")?;
+    *image = DynamicImage::ImageRgb8(result);
+    Ok(())
+}
+
+fn decode_profiled_cmyk_jpeg(bytes: &[u8], icc: &[u8]) -> Result<DynamicImage, String> {
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+        ZCursor::new(bytes),
+        DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::CMYK),
+    );
+    decoder.decode_headers().map_err(|e| e.to_string())?;
+    let info = decoder.info().ok_or("JPEG header missing")?;
+    let (width, height) = (u32::from(info.width), u32::from(info.height));
+    let output_size = decoder
+        .output_buffer_size()
+        .ok_or("JPEG decoded size overflow")?;
+    if output_size as u64 > MAX_DECODE_BYTES
+        || u64::from(width) * u64::from(height) * 7 > MAX_DECODE_BYTES
+    {
+        return Err("JPEG decoded buffer exceeds memory limit".into());
+    }
+    let cmyk = decoder.decode().map_err(|e| e.to_string())?;
+    let input = Profile::new_icc(icc).map_err(|e| e.to_string())?;
+    let output = Profile::new_srgb();
+    let mut rgb = vec![0; (u64::from(width) * u64::from(height) * 3) as usize];
+    let transform = Transform::new(
+        &input,
+        PixelFormat::CMYK_8,
+        &output,
+        PixelFormat::RGB_8,
+        Intent::Perceptual,
+    )
+    .map_err(|e| e.to_string())?;
+    transform.transform_pixels(&cmyk, &mut rgb);
+    image::RgbImage::from_raw(width, height, rgb)
+        .map(DynamicImage::ImageRgb8)
+        .ok_or_else(|| "invalid transformed CMYK pixels".into())
+}
+
 fn check_limit(width: u32, height: u32, limit: u64) -> Result<(), PreviewError> {
     if u64::from(width) * u64::from(height) > limit {
         return Err(PreviewError::PixelLimit {
@@ -223,6 +347,45 @@ fn check_limit(width: u32, height: u32, limit: u64) -> Result<(), PreviewError> 
             height,
             limit,
         });
+    }
+    Ok(())
+}
+
+fn check_webp_frame_limits(bytes: &[u8], limit: u64) -> Result<(), PreviewError> {
+    if bytes.get(0..4) != Some(b"RIFF") || bytes.get(8..12) != Some(b"WEBP") {
+        return Ok(());
+    }
+    let mut offset = 12_usize;
+    while offset.checked_add(8).is_some_and(|end| end <= bytes.len()) {
+        let tag = &bytes[offset..offset + 4];
+        let length = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap()) as usize;
+        let data_start = offset + 8;
+        let Some(data_end) = data_start.checked_add(length) else {
+            break;
+        };
+        if data_end > bytes.len() {
+            break;
+        }
+        let data = &bytes[data_start..data_end];
+        let dimensions = if tag == b"VP8 " && data.len() >= 10 && data[3..6] == [0x9d, 0x01, 0x2a] {
+            Some((
+                u16::from_le_bytes([data[6], data[7]]) & 0x3fff,
+                u16::from_le_bytes([data[8], data[9]]) & 0x3fff,
+            ))
+        } else if tag == b"VP8L" && data.len() >= 5 && data[0] == 0x2f {
+            let w = 1 + u32::from(data[1]) + (u32::from(data[2] & 0x3f) << 8);
+            let h = 1
+                + (u32::from(data[2] >> 6))
+                + (u32::from(data[3]) << 2)
+                + (u32::from(data[4] & 0x0f) << 10);
+            Some((w as u16, h as u16))
+        } else {
+            None
+        };
+        if let Some((width, height)) = dimensions {
+            check_limit(u32::from(width), u32::from(height), limit)?;
+        }
+        offset = data_end + (length & 1);
     }
     Ok(())
 }
@@ -264,13 +427,71 @@ fn cache_path(root: &Path, hash: &str, kind: Kind, format: RenditionFormat) -> P
         .join(format!("{hash}-{kind}.{ext}"))
 }
 
+fn ensure_cache_dirs(root: &Path, file: &Path) -> Result<(), PreviewError> {
+    let root = fs::canonicalize(root)?;
+    let shard = file
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
+    let mut current = root.clone();
+    for component in [".dimagine", "cache", "previews", shard.as_str()] {
+        if component.is_empty() {
+            continue;
+        }
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+                return Err(PreviewError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cache path contains a symlink or non-directory",
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(error) => return Err(error.into()),
+        }
+        let resolved = fs::canonicalize(&current)?;
+        if !resolved.starts_with(&root) {
+            return Err(PreviewError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cache path resolves outside the library",
+            )));
+        }
+        current = resolved;
+    }
+    Ok(())
+}
+
+fn valid_cache_hit(path: &Path, expected: (u32, u32), format: RenditionFormat) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(reader) = ImageReader::open(path) else {
+        return false;
+    };
+    let expected_format = match format {
+        RenditionFormat::Jpeg => ImageFormat::Jpeg,
+        RenditionFormat::Png => ImageFormat::Png,
+    };
+    let mut reader = reader;
+    reader.set_format(expected_format);
+    let Ok(reader) = reader.into_dimensions() else {
+        return false;
+    };
+    reader == expected
+}
+
 fn write_atomic(
     path: &Path,
     image: &DynamicImage,
     format: RenditionFormat,
 ) -> Result<(), PreviewError> {
     let parent = path.parent().expect("cache path has a parent");
-    fs::create_dir_all(parent)?;
     let mut temp = Builder::new().prefix(".preview-").tempfile_in(parent)?;
     match format {
         RenditionFormat::Jpeg => {
@@ -293,6 +514,14 @@ fn write_atomic(
     }
     temp.flush()?;
     temp.as_file().sync_all()?;
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || meta.is_file() {
+            #[cfg(windows)]
+            fs::remove_file(path)?;
+        } else if meta.is_dir() {
+            fs::remove_dir_all(path)?;
+        }
+    }
     fs::rename(temp.path(), path)?;
     Ok(())
 }
@@ -306,12 +535,6 @@ fn has_transparency(image: &DynamicImage) -> bool {
         DynamicImage::ImageRgba32F(img) => img.pixels().any(|p| p.0[3] < 1.0),
         _ => false,
     }
-}
-
-fn has_icc_marker(bytes: &[u8]) -> bool {
-    [b"ICC_PROFILE".as_slice(), b"iCCP", b"ICCP"]
-        .iter()
-        .any(|marker| bytes.windows(marker.len()).any(|w| w == *marker))
 }
 
 fn apply_orientation(image: &mut DynamicImage, bytes: &[u8]) {
@@ -456,5 +679,144 @@ mod tests {
             Options { pixel_limit: 4 },
         );
         assert!(matches!(result, Err(PreviewError::PixelLimit { .. })));
+    }
+
+    #[test]
+    fn oversized_encoded_image_is_rejected_before_reading_payload() {
+        let dir = temp_library();
+        let source = dir.path().join("large.bmp");
+        fs::write(&source, b"BM").unwrap();
+        File::options()
+            .write(true)
+            .open(&source)
+            .unwrap()
+            .set_len(MAX_ENCODED_BYTES + 1)
+            .unwrap();
+        assert!(matches!(
+            ensure(dir.path(), source, &[Kind::Thumb]),
+            Err(PreviewError::ResourceLimit(_))
+        ));
+    }
+
+    #[test]
+    fn webp_embedded_frame_dimensions_are_checked_before_decode() {
+        let mut data = b"RIFF\0\0\0\0WEBP".to_vec();
+        data.extend_from_slice(b"VP8X");
+        data.extend_from_slice(&10_u32.to_le_bytes());
+        data.extend_from_slice(&[0; 10]);
+        data.extend_from_slice(b"VP8 ");
+        data.extend_from_slice(&10_u32.to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0x9d, 1, 0x2a, 0xff, 0x3f, 0xff, 0x3f]);
+        let riff_len = (data.len() - 8) as u32;
+        data[4..8].copy_from_slice(&riff_len.to_le_bytes());
+        assert!(matches!(
+            check_webp_frame_limits(&data, 1),
+            Err(PreviewError::PixelLimit {
+                width: 16_383,
+                height: 16_383,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn decoder_limit_errors_keep_their_resource_category() {
+        let error = ImageError::Limits(image::error::LimitError::from_kind(
+            image::error::LimitErrorKind::InsufficientMemory,
+        ));
+        assert!(matches!(
+            map_image_error(error),
+            PreviewError::ResourceLimit(_)
+        ));
+        let unsupported =
+            ImageError::Unsupported(image::error::UnsupportedError::from_format_and_kind(
+                ImageFormat::Png.into(),
+                image::error::UnsupportedErrorKind::GenericFeature("fixture".into()),
+            ));
+        assert!(matches!(
+            map_image_error(unsupported),
+            PreviewError::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn apng_uses_the_first_animation_frame_instead_of_default_image() {
+        let dir = temp_library();
+        let source = dir.path().join("poster-apng.png");
+        let file = File::create(&source).unwrap();
+        let mut encoder = png::Encoder::new(file, 2, 2);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_animated(1, 0).unwrap();
+        encoder.set_sep_def_img(true).unwrap();
+        let mut writer = encoder.write_header().unwrap();
+        writer
+            .write_image_data(&[255, 0, 0, 255].repeat(4))
+            .unwrap();
+        writer
+            .write_image_data(&[0, 0, 255, 255].repeat(4))
+            .unwrap();
+        drop(writer);
+        let result = ensure(dir.path(), source, &[Kind::Thumb]).unwrap();
+        let decoded = image::open(&result[0].path).unwrap().to_rgba8();
+        assert!(
+            decoded.pixels().all(|p| p.0[2] > p.0[0]),
+            "first animation frame should be blue"
+        );
+    }
+
+    #[test]
+    fn embedded_icc_profile_is_converted_to_srgb() {
+        let dir = temp_library();
+        let source = dir.path().join("profiled.png");
+        let profile = Profile::new_srgb();
+        let icc = profile.icc().unwrap();
+        let file = File::create(&source).unwrap();
+        let image = ImageBuffer::from_pixel(1, 1, Rgb([30_u8, 80, 160]));
+        let mut encoder = image::codecs::png::PngEncoder::new(file);
+        encoder.set_icc_profile(icc).unwrap();
+        encoder
+            .write_image(&image, 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        let rendition = ensure(dir.path(), source, &[Kind::Thumb]).unwrap();
+        assert_eq!(rendition[0].colour_status, ColourStatus::Srgb);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_directory_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_library();
+        let source = dir.path().join("source.bmp");
+        ImageBuffer::from_pixel(2, 2, Rgb([1_u8, 2, 3]))
+            .save(&source)
+            .unwrap();
+        let outside = temp_library();
+        fs::create_dir_all(dir.path().join(".dimagine/cache")).unwrap();
+        symlink(outside.path(), dir.path().join(".dimagine/cache/previews")).unwrap();
+        assert!(matches!(
+            ensure(dir.path(), source, &[Kind::Thumb]),
+            Err(PreviewError::Io(_))
+        ));
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn invalid_cache_directory_entry_is_replaced_with_valid_rendition() {
+        let dir = temp_library();
+        let source = dir.path().join("source.bmp");
+        ImageBuffer::from_pixel(2, 2, Rgb([1_u8, 2, 3]))
+            .save(&source)
+            .unwrap();
+        let first = ensure(dir.path(), &source, &[Kind::Thumb]).unwrap();
+        fs::remove_file(&first[0].path).unwrap();
+        fs::create_dir(&first[0].path).unwrap();
+        fs::write(first[0].path.join("stale"), b"cache debris").unwrap();
+        let repaired = ensure(dir.path(), source, &[Kind::Thumb]).unwrap();
+        assert!(valid_cache_hit(
+            &repaired[0].path,
+            (2, 2),
+            RenditionFormat::Jpeg
+        ));
     }
 }
