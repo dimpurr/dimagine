@@ -8,6 +8,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use percent_encoding::percent_decode_str;
 use pulldown_cmark::{html, Event, Options, Parser};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+use unicode_normalization::UnicodeNormalization;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp",
@@ -316,8 +318,30 @@ impl Catalog for FsCatalog {
                     return Err(CatalogError::Forbidden);
                 }
                 candidate.push(part);
-                let metadata =
-                    fs::symlink_metadata(&candidate).map_err(|_| CatalogError::NotFound)?;
+                let metadata = match fs::symlink_metadata(&candidate) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        let parent = candidate.parent().ok_or(CatalogError::NotFound)?;
+                        let mut matched = None;
+                        if let Ok(entries) = fs::read_dir(parent) {
+                            let part_str = part.to_string_lossy();
+                            let part_nfc: String = part_str.nfc().collect();
+                            for entry in entries.flatten() {
+                                let ename = entry.file_name();
+                                let ename_str = ename.to_string_lossy();
+                                if ename_str.nfc().eq(part_nfc.chars()) {
+                                    candidate.pop();
+                                    candidate.push(&ename);
+                                    if let Ok(m) = fs::symlink_metadata(&candidate) {
+                                        matched = Some(m);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        matched.ok_or(CatalogError::NotFound)?
+                    }
+                };
                 if metadata.file_type().is_symlink() {
                     return Err(CatalogError::Forbidden);
                 }
@@ -564,7 +588,11 @@ async fn login(
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
-    let folder = route_tail(uri.path(), "/folder/");
+    let raw = route_tail(uri.path(), "/folder/");
+    let folder = match percent_decode_str(&raw).decode_utf8() {
+        Ok(s) => s.into_owned(),
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     let catalog = state.catalog.clone();
     match tokio::task::spawn_blocking(move || {
         render_folder_data(&AppState { catalog, ..state }, &folder)

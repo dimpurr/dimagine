@@ -389,6 +389,7 @@ dependencies = [
  "axum",
  "httpdate",
  "mime_guess",
+ "percent-encoding",
  "pulldown-cmark",
  "saphyr",
  "serde",
@@ -399,6 +400,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower",
+ "unicode-normalization",
  "uuid",
 ]
 
