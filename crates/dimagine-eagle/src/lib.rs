@@ -306,23 +306,39 @@ pub fn import(
             continue;
         }
         let original_name = metadata.get("name").and_then(Value::as_str).unwrap_or("");
-        let expected = item_dir.join(format!(
-            "{original_name}.{}",
-            metadata.get("ext").and_then(Value::as_str).unwrap_or("")
-        ));
-        let expected_metadata = fs::symlink_metadata(&expected);
-        if matches!(expected_metadata, Ok(ref metadata) if metadata.file_type().is_symlink()) {
-            report.skipped.push(skip(
-                item,
-                SkipReasonCode::Symlink,
-                "original image is a symlink",
-            ));
-            continue;
+        let raw_ext = metadata.get("ext").and_then(Value::as_str).unwrap_or("");
+        let candidate_filename = format!("{original_name}.{raw_ext}");
+        let mut name_components = Path::new(original_name).components();
+        let original_name_is_normal = matches!(
+            name_components.next(),
+            Some(std::path::Component::Normal(_))
+        ) && name_components.next().is_none();
+        let mut candidate_components = Path::new(&candidate_filename).components();
+        let candidate_is_normal = matches!(
+            candidate_components.next(),
+            Some(std::path::Component::Normal(_))
+        ) && candidate_components.next().is_none();
+
+        let mut expected_is_file = false;
+        let mut expected_path = None;
+        if original_name_is_normal && candidate_is_normal {
+            let expected = item_dir.join(&candidate_filename);
+            let expected_metadata = fs::symlink_metadata(&expected);
+            if matches!(expected_metadata, Ok(ref metadata) if metadata.file_type().is_symlink()) {
+                report.skipped.push(skip(
+                    item,
+                    SkipReasonCode::Symlink,
+                    "original image is a symlink",
+                ));
+                continue;
+            }
+            if matches!(expected_metadata, Ok(ref metadata) if metadata.file_type().is_file()) {
+                expected_is_file = true;
+                expected_path = Some(expected);
+            }
         }
-        let expected_is_file = Path::new(original_name).components().count() == 1
-            && matches!(expected_metadata, Ok(metadata) if metadata.file_type().is_file());
         let original = if expected_is_file {
-            expected
+            expected_path.expect("expected path must exist when is_file is true")
         } else {
             match fallback_original(&item_dir)
                 .map_err(|error| partial_io(error, dst_library, &report))?

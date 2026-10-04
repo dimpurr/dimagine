@@ -505,6 +505,24 @@ fn skips_symlinked_eagle_entries_without_copying_external_files() {
     assert!(!dst.join("inbox/external.png").exists());
 }
 
+#[test]
+fn rejects_root_or_prefix_components_in_source_item_metadata() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Escape.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images/root-name.info")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    fs::write(
+        src.join("images/root-name.info/metadata.json"),
+        br#"{"name":"/","ext":"png"}"#,
+    )
+    .unwrap();
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 0);
+    assert_eq!(report.skipped.len(), 1);
+    assert_eq!(report.skipped[0].reason_code, SkipReasonCode::OriginalMissing);
+}
+
 #[cfg(unix)]
 #[test]
 fn refuses_symlink_traversal_in_allowed_destination_settings() {
