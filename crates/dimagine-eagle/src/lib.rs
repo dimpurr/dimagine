@@ -391,13 +391,25 @@ pub fn import(
         let filename = unique_name(&home, &name, &ext, &mut taken)
             .map_err(|error| partial_io(error, dst_library, &report))?;
         let destination_image = home.join(&filename);
-        if let Err(error) = copy_item_transactionally(&original, &destination_image, &raw) {
-            report.skipped.push(skip(
-                item,
-                SkipReasonCode::CopyFailed,
-                format!("copy failed (not downloaded?): {error}"),
-            ));
-            continue;
+        match copy_item_transactionally(&original, &destination_image, &raw) {
+            Ok(()) => {}
+            Err(CopyItemError::Skipped(error)) => {
+                report.skipped.push(skip(
+                    item,
+                    SkipReasonCode::CopyFailed,
+                    format!("copy failed (not downloaded?): {error}"),
+                ));
+                continue;
+            }
+            Err(CopyItemError::CleanupFailed { error, retained }) => {
+                let mut retained_list = retained_artifacts(dst_library, &report);
+                retained_list.extend(retained);
+                return Err(ImportError::PartialIo {
+                    error,
+                    progress: report,
+                    retained_artifacts: retained_list,
+                });
+            }
         }
         let raw_filename = format!("{filename}.eagle.json");
         if generated_name {
@@ -564,7 +576,20 @@ fn create_confined_dirs(root: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn copy_item_transactionally(source: &Path, image: &Path, raw: &[u8]) -> io::Result<()> {
+#[derive(Debug)]
+enum CopyItemError {
+    Skipped(io::Error),
+    CleanupFailed {
+        error: io::Error,
+        retained: Vec<PathBuf>,
+    },
+}
+
+fn copy_item_transactionally(
+    source: &Path,
+    image: &Path,
+    raw: &[u8],
+) -> Result<(), CopyItemError> {
     let parent = image.parent().expect("image destination has parent");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -576,19 +601,86 @@ fn copy_item_transactionally(source: &Path, image: &Path, raw: &[u8]) -> io::Res
         image.file_name().unwrap().to_string_lossy()
     ));
     let raw_tmp = parent.join(format!(".dimagine-tmp-{nonce}.raw"));
-    let result = (|| {
+    let mut published_image = false;
+    let result = (|| -> io::Result<()> {
         fs::copy(source, &image_tmp)?;
         fs::write(&raw_tmp, raw)?;
         fs::rename(&image_tmp, image)?;
-        if let Err(error) = fs::rename(&raw_tmp, &raw_path) {
-            let _ = fs::remove_file(image);
-            return Err(error);
-        }
+        published_image = true;
+        fs::rename(&raw_tmp, &raw_path)?;
         Ok(())
     })();
-    let _ = fs::remove_file(&image_tmp);
-    let _ = fs::remove_file(&raw_tmp);
-    result
+
+    if let Err(error) = result {
+        let mut cleanup_error = None;
+        let mut retained = Vec::new();
+
+        if published_image {
+            if let Err(err) = fs::remove_file(image) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    cleanup_error = Some(err);
+                    retained.push(image.to_path_buf());
+                }
+            }
+        }
+        if image_tmp.exists() {
+            if let Err(err) = fs::remove_file(&image_tmp) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(err);
+                    }
+                    retained.push(image_tmp.clone());
+                }
+            }
+        }
+        if raw_tmp.exists() {
+            if let Err(err) = fs::remove_file(&raw_tmp) {
+                if err.kind() != io::ErrorKind::NotFound {
+                    if cleanup_error.is_none() {
+                        cleanup_error = Some(err);
+                    }
+                    retained.push(raw_tmp.clone());
+                }
+            }
+        }
+
+        if let Some(err) = cleanup_error {
+            return Err(CopyItemError::CleanupFailed {
+                error: io::Error::new(
+                    err.kind(),
+                    format!("cleanup failed: {err}; initial error: {error}"),
+                ),
+                retained,
+            });
+        }
+
+        return Err(CopyItemError::Skipped(error));
+    }
+
+    let clean_img = match fs::remove_file(&image_tmp) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    };
+    let clean_raw = match fs::remove_file(&raw_tmp) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = clean_img {
+        return Err(CopyItemError::CleanupFailed {
+            error: err,
+            retained: vec![image_tmp],
+        });
+    }
+    if let Err(err) = clean_raw {
+        return Err(CopyItemError::CleanupFailed {
+            error: err,
+            retained: vec![raw_tmp],
+        });
+    }
+
+    Ok(())
 }
 
 fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -602,12 +694,30 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         fs::write(&temporary, bytes)?;
         fs::rename(&temporary, path)
     })();
-    let _ = fs::remove_file(temporary);
-    result
+    let clean = match fs::remove_file(&temporary) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    };
+    match result {
+        Ok(()) => clean,
+        Err(err) => {
+            if let Err(cleanup_err) = clean {
+                return Err(io::Error::new(
+                    cleanup_err.kind(),
+                    format!(
+                        "failed to clean temporary file {}: {cleanup_err}; write error: {err}",
+                        temporary.display()
+                    ),
+                ));
+            }
+            Err(err)
+        }
+    }
 }
 
 fn retained_artifacts(root: &Path, report: &ImportReport) -> Vec<PathBuf> {
-    report
+    let mut artifacts: Vec<PathBuf> = report
         .imported
         .iter()
         .flat_map(|item| {
@@ -625,7 +735,21 @@ fn retained_artifacts(root: &Path, report: &ImportReport) -> Vec<PathBuf> {
             ]
         })
         .filter(|path| path.exists())
-        .collect()
+        .collect();
+
+    let collections_dir = root.join("collections");
+    if collections_dir.is_dir() {
+        if let Ok(entries) = fs::read_dir(&collections_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    artifacts.push(path);
+                }
+            }
+        }
+    }
+
+    artifacts
 }
 
 fn partial_io(error: io::Error, root: &Path, report: &ImportReport) -> ImportError {
@@ -999,9 +1123,9 @@ fn write_collection_and_report(
         }
         collection.push("".to_owned());
     }
-    fs::write(
-        collection_dir.join(format!("{library}.md")),
-        collection.join("\n"),
+    write_atomically(
+        &collection_dir.join(format!("{library}.md")),
+        collection.join("\n").as_bytes(),
     )?;
 
     let date = now.format("%Y%m%d");
@@ -1034,9 +1158,9 @@ fn write_collection_and_report(
     for skipped in &report.skipped {
         lines.push(format!("| {} | {} |", skipped.item, skipped.reason));
     }
-    fs::write(
-        collection_dir.join(format!("_import-{library}-{date}.md")),
-        format!("{}\n", lines.join("\n")),
+    write_atomically(
+        &collection_dir.join(format!("_import-{library}-{date}.md")),
+        format!("{}\n", lines.join("\n")).as_bytes(),
     )
 }
 
@@ -1074,7 +1198,7 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_item_transactionally;
+    use super::{copy_item_transactionally, CopyItemError};
     use std::fs;
     use tempfile::TempDir;
 
@@ -1089,5 +1213,25 @@ mod tests {
         assert!(!image.exists());
         assert!(!temp.path().join("photo.png.eagle.json").exists());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_item_copy_rolls_back_published_image_when_companion_rename_fails() {
+        let temp = TempDir::new().unwrap();
+        let source_file = temp.path().join("source.png");
+        fs::write(&source_file, b"content").unwrap();
+        let image = temp.path().join("photo.png");
+        let raw_path = temp.path().join("photo.png.eagle.json");
+        fs::create_dir(&raw_path).unwrap();
+        fs::write(raw_path.join("blocker"), b"blocker").unwrap();
+
+        let err = copy_item_transactionally(&source_file, &image, b"raw").unwrap_err();
+        match err {
+            CopyItemError::Skipped(_) => {}
+            CopyItemError::CleanupFailed { .. } => {
+                panic!("expected clean rollback (Skipped), got CleanupFailed");
+            }
+        }
+        assert!(!image.exists(), "published image must be rolled back on companion failure");
     }
 }

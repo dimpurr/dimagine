@@ -1,4 +1,4 @@
-use dimagine_eagle::{import, ImportOptions, SkipReasonCode};
+use dimagine_eagle::{import, ImportError, ImportOptions, SkipReasonCode};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde_json::json;
 use std::fs;
@@ -553,6 +553,34 @@ fn does_not_write_through_leaf_symlinks_in_settings() {
         .unwrap()
         .file_type()
         .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn post_item_failure_reports_partial_io_with_retained_artifacts() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Fixture.library");
+    let dst = temp.path().join("dest");
+    fake_library(&src);
+
+    fs::create_dir_all(dst.join(".obsidian")).unwrap();
+    fs::set_permissions(dst.join(".obsidian"), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = import(&src, &dst, ImportOptions::default());
+    // Restore permissions so cleanup succeeds
+    let _ = fs::set_permissions(dst.join(".obsidian"), fs::Permissions::from_mode(0o755));
+
+    match result {
+        Err(ImportError::PartialIo { progress, retained_artifacts, .. }) => {
+            assert_eq!(progress.imported.len(), 3);
+            assert!(!retained_artifacts.is_empty(), "retained artifacts must be reported");
+            for artifact in &retained_artifacts {
+                assert!(artifact.exists(), "reported artifact {} must exist", artifact.display());
+            }
+        }
+        other => panic!("expected PartialIo, got {:?}", other),
+    }
 }
 
 #[test]
