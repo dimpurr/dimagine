@@ -7,6 +7,7 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Library format 0.1 draft (`docs/FORMAT.md`) and the agent skill (`SKILL.md`).
 - Project restart: README, MIT license, contributor and agent rules, vision and
   documentation index.
 

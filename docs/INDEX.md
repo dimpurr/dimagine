@@ -7,8 +7,9 @@ Release history is in [CHANGELOG.md](../CHANGELOG.md).
 When documents disagree, use this order:
 
 1. Running code and tests define what is actually shipped.
-2. `FORMAT.md` (planned) defines the on-disk library format.
-3. `HLD.md` (planned) defines architecture, indexing and the CLI/API surface.
+2. `FORMAT.md` defines the on-disk library format.
+3. `HLD.md` (planned) defines how the optional tools work: indexing, previews,
+   search, import and the CLI/API surface.
 4. `VISION.md` defines product intent and deliberate scope.
 5. `CHANGELOG.md` records what shipped; it is not a specification.
 6. `README.md` is the public orientation.
@@ -22,8 +23,9 @@ document and link to it from the others.
 | Question | Owner |
 | --- | --- |
 | Why the project exists and what is out of scope | `docs/VISION.md` |
-| How a library is laid out on disk; sidecar and collection schema | `docs/FORMAT.md` (planned) |
-| How indexing, search, import and the CLI/API work | `docs/HLD.md` (planned) |
+| What a library is on disk: images, notes, collections, boards, `.dimagine/` | `docs/FORMAT.md` |
+| How an agent should work with a library | `SKILL.md` (a working summary of `FORMAT.md`; the format wins on conflict) |
+| How the optional tools work | `docs/HLD.md` (planned) |
 | What shipped in a release | `CHANGELOG.md` |
 | Checks and commit conventions | `CONTRIBUTING.md` |
 | Durable contributor and agent rules | `CLAUDE.md` (`AGENTS.md` points to it) |

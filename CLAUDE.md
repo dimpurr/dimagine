@@ -11,16 +11,19 @@ whether it will still be true in six months; if unsure, write a pointer.
 
 ## Invariants
 
-1. **Files are the source of truth.** Original images, one sidecar metadata file
-   per image, and collection files are the library. Any database is a derived
-   index and must be rebuildable from the files alone.
-2. **Originals are never modified.** Imports copy; previews and other derived
-   files are generated next to the library, never written over an original.
-3. **An unknown is never recorded as empty.** "Not found", "unreadable" and
+1. **The library is a folder, and the files are the source of truth.** Images,
+   their notes, collections and boards are plain files. Any cache, index or
+   database is derived and must be rebuildable from the files alone.
+2. **Tools are optional.** Code in this repository must work on a library that no
+   dimagine tool has touched, must tolerate files edited by hand or by agents,
+   and must never make a library depend on it.
+3. **Originals are never modified.** Tools may copy, move or rename images only
+   when asked; they never rewrite image bytes.
+4. **An unknown is never recorded as empty.** "Not found", "unreadable" and
    "not present" are different states and stay different all the way to what
    the user or agent sees.
-4. **Provenance is kept.** Every imported item records where it came from, when,
-   and by which importer, and keeps the source's original metadata.
+5. **Provenance is kept.** Every imported image records where it came from, and
+   the source's original metadata is stored verbatim beside it.
 
 ## Repository rules
 
@@ -28,6 +31,8 @@ whether it will still be true in six months; if unsure, write a pointer.
 - No personal data, machine names, local paths, credentials or tokens.
 - One home per fact: update the owning document named in `docs/INDEX.md` and
   link to it from elsewhere; do not restate it.
+- `docs/FORMAT.md` is a public contract. Changes must keep existing libraries
+  readable and must update `SKILL.md` and the format changelog in the same commit.
 
 ## Checks
 
