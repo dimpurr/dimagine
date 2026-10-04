@@ -296,6 +296,12 @@ async fn special_character_and_unicode_urls_round_trip() {
     assert_eq!(root_page.status(), StatusCode::OK);
     let root_html = body(root_page).await;
 
+    // Verify phone tile layout styles
+    assert!(root_html.contains("aspect-ratio:1"));
+    assert!(root_html.contains("object-fit:cover"));
+    assert!(root_html
+        .contains("@media(max-width:420px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}"));
+
     // Verify folder links in root
     assert!(root_html.contains("/folder/pixiv%20%26%20twitter"));
     assert!(root_html.contains("/folder/a%2Bb"));
