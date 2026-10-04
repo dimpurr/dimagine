@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error as StdError;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
@@ -1039,20 +1040,35 @@ fn write_collection_and_report(
     )
 }
 
+fn write_absent_file(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Ok(meta) = fs::symlink_metadata(target) {
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+    }
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    file.write_all(bytes)
+}
+
 fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
     let snippets = root.join(".obsidian").join("snippets");
     create_confined_dirs(root, &snippets)?;
-    let css = snippets.join("dimagine-gallery.css");
-    if !css.exists() {
-        fs::write(css, ".dimagine-gallery .image-embed { display:inline-block; width:24%; margin:0.4%; vertical-align:top; }\n.dimagine-gallery .image-embed img { width:100%; height:auto; border-radius:4px; }\n")?;
-    }
-    let appearance = root.join(".obsidian").join("appearance.json");
-    if !appearance.exists() {
-        fs::write(
-            appearance,
-            "{\"enabledCssSnippets\": [\"dimagine-gallery\"]}",
-        )?;
-    }
+    write_absent_file(
+        &snippets.join("dimagine-gallery.css"),
+        b".dimagine-gallery .image-embed { display:inline-block; width:24%; margin:0.4%; vertical-align:top; }\n.dimagine-gallery .image-embed img { width:100%; height:auto; border-radius:4px; }\n",
+    )?;
+    write_absent_file(
+        &root.join(".obsidian").join("appearance.json"),
+        b"{\"enabledCssSnippets\": [\"dimagine-gallery\"]}",
+    )?;
     Ok(())
 }
 

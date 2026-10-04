@@ -521,6 +521,40 @@ fn refuses_symlink_traversal_in_allowed_destination_settings() {
     assert!(!external.join("dimagine-gallery.css").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn does_not_write_through_leaf_symlinks_in_settings() {
+    use std::os::unix::fs::symlink;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Fixture.library");
+    let dst = temp.path().join("dest");
+    fake_library(&src);
+    fs::create_dir_all(dst.join(".obsidian/snippets")).unwrap();
+    let external_css = temp.path().join("external.css");
+    fs::write(&external_css, b"external css").unwrap();
+    let victim = src.join("images/victim.txt");
+    symlink(&external_css, dst.join(".obsidian/snippets/dimagine-gallery.css")).unwrap();
+    symlink(&victim, dst.join(".obsidian/appearance.json")).unwrap();
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 3);
+    assert!(
+        !victim.exists(),
+        "settings writes must not follow dangling symlinks into the source"
+    );
+    assert_eq!(
+        fs::read(temp.path().join("external.css")).unwrap(),
+        b"external css"
+    );
+    assert!(fs::symlink_metadata(dst.join(".obsidian/snippets/dimagine-gallery.css"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(fs::symlink_metadata(dst.join(".obsidian/appearance.json"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
 #[test]
 fn python_prototype_golden_tree_and_note_content() {
     let temp = TempDir::new().unwrap();
