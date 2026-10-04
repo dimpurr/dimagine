@@ -5,8 +5,14 @@ welcome once the first usable version ships.
 
 ## Checks
 
-No code has landed yet, so there are no checks. When the first code lands, the
-exact commands go here, each must exit 0, and CI runs the same set.
+Run all three; each must exit 0. CI runs the same set on ubuntu-latest and
+macos-latest.
+
+```
+cargo fmt --all -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
 
 ## Commits
 

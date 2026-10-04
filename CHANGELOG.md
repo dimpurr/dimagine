@@ -7,10 +7,12 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Security and streaming fixes for the read-only serve viewer: sanitized Markdown,
+- Core checks: grouped duplicate-ID findings, incomplete-read exit reporting, bounded note reads, native path tracking, and stricter link/collection checks.
+- Rust workspace with the first two read-only CLI commands, `dimagine scan` (library summary) and `dimagine check` (findings), plus CI.
+- Read-only web viewer (`dimagine-serve`): sanitized Markdown,
   bounded login/session state, hidden-path checks, streaming media, and secure
   cache/cookie behavior.
-- YAML front matter parsing through `saphyr`, with explicit malformed-note diagnostics.
+- Viewer front matter parsing through `saphyr`, with explicit malformed-note diagnostics.
 - Prototype scripts: an Eagle importer and a tool that adds missing
   self-embeds (`scripts/prototype/`).
 - Format 0.1 draft revision: image notes end with an embed of their own image;
