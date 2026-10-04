@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: darwin-arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: darwin-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build dimagine
+        run: cargo build --locked --release --package dimagine --target "${{ matrix.target }}"
+      - name: Package archive
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist
+          cp "target/${TARGET}/release/dimagine" dist/dimagine
+          chmod 755 dist/dimagine
+          tar -C dist -czf "dist/dimagine-${PLATFORM}.tar.gz" dimagine
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/dimagine-${{ matrix.platform }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Create GitHub release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: sha256sum dimagine-*.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: dist/*
+          generate_release_notes: true
