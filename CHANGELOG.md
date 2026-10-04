@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Prototype scripts: an Eagle importer and a tool that adds missing
+  self-embeds (`scripts/prototype/`).
+- Format 0.1 draft revision: image notes end with an embed of their own image;
+  file names avoid `[ ] # ^ |`.
 - Library format 0.1 draft (`docs/FORMAT.md`) and the agent skill (`SKILL.md`).
 - Project restart: README, MIT license, contributor and agent rules, vision and
   documentation index.

@@ -52,6 +52,10 @@ the extension rather than rename the file.
 Other files (video, PDF, archives) may live in a library. Version 0.1 does not
 describe them; tools must leave them untouched.
 
+File names should avoid `[`, `]`, `#`, `^` and `|`. These characters break
+wikilinks (§5.1). Tools that create files must replace them; tools that find
+them in existing names should report them, not rename.
+
 ### 2.2 Ignored paths
 
 Tools must ignore: any file or folder whose name starts with `.` (including
@@ -99,11 +103,13 @@ sources:
 ---
 
 Free Markdown about the image. Links to other notes work as usual: [[sleep-pv]].
+
+![[girl-underwater.jpg]]
 ```
 
 | Property | Type | Meaning |
 | --- | --- | --- |
-| `id` | string (ULID) | Stable reference handle (§3.2). |
+| `id` | string (ULID) | Stable reference handle (§3.3). |
 | `title` | string | Human title. |
 | `tags` | list of strings | Tags, without `#`. |
 | `rating` | integer 0–5 | User rating. |
@@ -113,14 +119,32 @@ Free Markdown about the image. Links to other notes work as usual: [[sleep-pv]].
 | `created` | date or datetime | When the image was made, if known. |
 | `imported` | datetime with offset | When it entered this library. |
 | `copied_from` | string (`id`) | Set on a copy that received a new `id`. |
-| `sources` | list of maps | One entry per import (§3.3). |
+| `sources` | list of maps | One entry per import (§3.4). |
 
 Dates and times use ISO 8601. Datetimes must carry a UTC offset.
 
 Write strings that YAML could misread (`no`, `yes`, `on`, `off`, values
 starting with `@`, `*`, `&`, `!`, `%`, or containing `: `) in quotes.
 
-### 3.2 The `id` property
+### 3.2 The self-embed
+
+An image note should end with an embed of its own image, so that any Markdown
+viewer shows the picture together with its note:
+
+```markdown
+![[girl-underwater.jpg]]
+```
+
+- Use the bare file name when it is unique in the library, otherwise the path
+  (§5.1), as for any other link.
+- The self-embed is a preview, not a membership: tools must not treat an image
+  note as a collection of its own image (§5).
+- Tools that write a note add the self-embed if it is missing and keep it as the
+  last block. A note without one is still valid.
+- When the image is renamed or moved to a place where its bare name is no longer
+  unique, the self-embed is updated like any other link (§7).
+
+### 3.3 The `id` property
 
 - `id` is optional. A person or agent may leave it out.
 - If present it must be a ULID (26 characters, Crockford base32) that is unique
@@ -136,7 +160,7 @@ starting with `@`, `*`, `&`, `!`, `%`, or containing `: `) in quotes.
 The `id` lets tools notice that an image moved (same `id`, new path) and repair
 links that still point at the old path. Links themselves stay plain paths (§5).
 
-### 3.3 Sources and raw metadata
+### 3.4 Sources and raw metadata
 
 Each import appends one entry to `sources`. When the source provides its own
 metadata, the importer stores it verbatim next to the image as
@@ -156,7 +180,8 @@ structure when there is one (for example an Eagle folder path).
 ## 5. Collections
 
 A collection is a Markdown note that embeds images. Order of embeds is the order
-of the collection. Any note can be a collection; adding `kind: collection` to its
+of the collection. Any note can be a collection, except that an image note's
+self-embed (§3.2) does not make it one. Adding `kind: collection` to its
 properties lets tools list it as one.
 
 ```markdown
@@ -208,9 +233,9 @@ These are plain file operations. To keep a library consistent:
 
 - Move or rename an image together with its note and raw files.
 - After a move or rename, update links that used the old path or name. A tool
-  may do this automatically using `id` (§3.2).
+  may do this automatically using `id` (§3.3).
 - A copied image is a new image. If its note was copied too, the duplicate `id`
-  is resolved as in §3.2.
+  is resolved as in §3.3.
 - Tools that delete should move files to `.dimagine/trash/` rather than remove
   them.
 
@@ -253,3 +278,4 @@ cannot keep that promise will describe a migration.
 | Version | Date | Change |
 | --- | --- | --- |
 | 0.1 | 2026-10-04 | First draft. |
+| 0.1 | 2026-10-04 | Draft revision: image notes end with a self-embed (§3.2); file names avoid `[ ] # ^ \|` (§2.1). |

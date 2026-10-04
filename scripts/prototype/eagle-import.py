@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Prototype: copy an Eagle library into a dimagine library (docs/FORMAT.md 0.1).
+
+The Eagle library is only read, never modified. The target folder must be empty
+or missing. This script is a prototype; the `dimagine import eagle` tool will
+replace it.
+
+Usage: eagle-import.py <path/to/Name.library> <target-library> [--name NAME]
+"""
+import argparse, json, os, re, shutil, sys, glob, random, time, datetime, unicodedata
+from collections import Counter
+
+IMG = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif', 'tif', 'tiff', 'bmp'}
+B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
+GENERIC = re.compile(r'^(image|download|untitled|pasted image.*|img[_-]?\d+|screenshot.*|[0-9a-f]{16,})$', re.I)
+
+ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+ap.add_argument('src', help='Eagle library folder (Name.library)')
+ap.add_argument('dst', help='target dimagine library folder (empty or missing)')
+ap.add_argument('--name', help='label for this Eagle library (default: folder name without .library)')
+a = ap.parse_args()
+SRC, DST = os.path.abspath(os.path.expanduser(a.src)), os.path.abspath(os.path.expanduser(a.dst))
+LIB = a.name or re.sub(r'\.library$', '', os.path.basename(SRC.rstrip('/')))
+
+def ulid():
+    n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
+    return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
+
+def clean(s):
+    s = unicodedata.normalize('NFC', s or '')
+    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f]', '-', s).strip().strip('.')
+    return s[:120]
+
+q = lambda v: json.dumps(v, ensure_ascii=False)
+now = datetime.datetime.now().astimezone()
+NOW = now.isoformat(timespec='seconds')
+
+if not os.path.exists(os.path.join(SRC, 'metadata.json')):
+    sys.exit(f'not an Eagle library (no metadata.json): {SRC}')
+if os.path.exists(DST) and any(not n.startswith('.') for n in os.listdir(DST)):
+    sys.exit(f'refuse: {DST} exists and is not empty')
+
+root = json.load(open(os.path.join(SRC, 'metadata.json')))
+fpath = {}
+def walk(fs, p=''):
+    for f in fs:
+        sub = (p + '/' if p else '') + (clean(f['name']) or f['id'])
+        fpath[f['id']] = sub
+        walk(f.get('children', []), sub)
+walk(root.get('folders', []))
+
+taken = {}  # folder -> lower-case names in use
+def unique(d, name, ext):
+    s = taken.setdefault(d, {n.lower() for n in os.listdir(d)} if os.path.isdir(d) else set())
+    base, k = name, 1
+    while f'{base}.{ext}'.lower() in s:
+        k += 1
+        base = f'{name}-{k}'
+    s.add(f'{base}.{ext}'.lower())
+    return f'{base}.{ext}'
+
+skipped, members, notes, renamed, dangling = [], {}, [], 0, 0
+for d in sorted(glob.glob(os.path.join(SRC, 'images', '*.info'))):
+    item = os.path.basename(d)[:-5]
+    mp = os.path.join(d, 'metadata.json')
+    if not os.path.exists(mp):
+        skipped.append((item, 'no metadata.json')); continue
+    try:
+        raw = open(mp, 'rb').read(); m = json.loads(raw)
+    except Exception as e:
+        skipped.append((item, f'unreadable metadata: {e}')); continue
+    if m.get('isDeleted'):
+        skipped.append((item, 'in Eagle trash')); continue
+    ext = (m.get('ext') or '').lower()
+    if ext not in IMG:
+        skipped.append((item, f'not an image ({ext or "no ext"})')); continue
+    orig = os.path.join(d, f"{m.get('name')}.{m.get('ext')}")
+    if not os.path.exists(orig):
+        c = [f for f in os.listdir(d) if f != 'metadata.json' and not f.endswith('_thumbnail.png')]
+        if not c:
+            skipped.append((item, 'original file missing')); continue
+        orig = os.path.join(d, c[0])
+    fids = m.get('folders') or []
+    paths = [fpath[f] for f in fids if f in fpath]
+    dangling += len(fids) - len(paths)
+    home = os.path.join(DST, 'Eagle', LIB, paths[0]) if paths else os.path.join(DST, 'inbox')
+    os.makedirs(home, exist_ok=True)
+    name = clean(m.get('name'))
+    if not name or GENERIC.match(name):
+        name = now.strftime('%Y%m%d-%H%M%S') + '-' + ulid()[-4:].lower(); renamed += 1
+    fname = unique(home, name, ext)
+    try:
+        shutil.copy2(orig, os.path.join(home, fname))
+    except Exception as e:
+        skipped.append((item, f'copy failed (not downloaded?): {e}')); continue
+    open(os.path.join(home, fname + '.eagle.json'), 'wb').write(raw)
+    fm = ['---', f'id: {ulid()}', f'title: {q(m.get("name") or fname)}']
+    if m.get('tags'): fm.append(f'tags: {q(m["tags"])}')
+    if m.get('star'): fm.append(f'rating: {int(m["star"])}')
+    if m.get('url'): fm.append(f'source: {q(m["url"])}')
+    if m.get('width') and m.get('height'): fm += [f'width: {m["width"]}', f'height: {m["height"]}']
+    fm += [f'imported: {NOW}', 'sources:', '  - type: eagle', f'    library: {q(LIB)}',
+           f'    item: {q(m.get("id") or item)}', f'    folders: {q(paths)}', f'    imported: {NOW}',
+           '    importer: "eagle-import prototype 0.2"', f'    raw: {q(fname + ".eagle.json")}', '---', '']
+    rel = os.path.relpath(os.path.join(home, fname), DST)
+    notes.append((os.path.join(home, fname + '.md'), fm, (m.get('annotation') or '').strip(), fname, rel))
+    for p in (paths or ['(no Eagle folder)']):
+        members.setdefault(p, []).append(rel)
+
+# Write notes last, so the self-embed (FORMAT §3.2) can use the bare name only when it is unique.
+names = Counter(f.lower() for dp, dn, fn in os.walk(DST) for f in fn
+                if not any(part.startswith('.') for part in os.path.relpath(dp, DST).split(os.sep) if part != '.'))
+for path, fm, body, fname, rel in notes:
+    embed = fname if names[fname.lower()] == 1 else rel
+    text = '\n'.join(fm) + '\n' + (body + '\n\n' if body else '') + f'![[{embed}]]\n'
+    open(path, 'w').write(text)
+
+cdir = os.path.join(DST, 'Eagle', LIB); os.makedirs(cdir, exist_ok=True)
+lines = ['---', 'kind: collection', f'title: {q(LIB + " (Eagle import)")}', 'cssclasses: [dimagine-gallery]', '---', '',
+         f'All images imported from the Eagle library {LIB}, grouped by their Eagle folder.', '']
+for p in sorted(members, key=lambda x: (x.startswith('('), x)):
+    lines += [f'## {p} ({len(members[p])})', ''] + [f'![[{r}]]' for r in members[p]] + ['']
+open(os.path.join(cdir, f'{LIB}.md'), 'w').write('\n'.join(lines))
+
+rep = ['---', f'title: {q("Import report " + LIB)}', f'imported: {NOW}', '---', '', f'# Import report: Eagle → {LIB}', '',
+       f'- Source: Eagle library `{os.path.basename(SRC)}` (read only, not modified)', f'- Imported: {len(notes)}',
+       f'- Skipped: {len(skipped)}', f'- Renamed (no meaningful name): {renamed}',
+       f'- Folder references that pointed to deleted Eagle folders: {dangling}', '',
+       '| Eagle item | Reason skipped |', '|---|---|'] + [f'| {i} | {r} |' for i, r in skipped]
+open(os.path.join(cdir, f'_import-{LIB}-{now.strftime("%Y%m%d")}.md'), 'w').write('\n'.join(rep) + '\n')
+
+# Optional viewing aid for Obsidian: lays out collection embeds as a grid. Safe to delete.
+sn = os.path.join(DST, '.obsidian', 'snippets'); os.makedirs(sn, exist_ok=True)
+open(os.path.join(sn, 'dimagine-gallery.css'), 'w').write(
+    '.dimagine-gallery .image-embed { display:inline-block; width:24%; margin:0.4%; vertical-align:top; }\n'
+    '.dimagine-gallery .image-embed img { width:100%; height:auto; border-radius:4px; }\n')
+apj = os.path.join(DST, '.obsidian', 'appearance.json')
+if not os.path.exists(apj):
+    json.dump({'enabledCssSnippets': ['dimagine-gallery']}, open(apj, 'w'))
+
+print(json.dumps({'dst': DST, 'imported': len(notes), 'skipped': len(skipped),
+                  'skip_reasons': Counter(r.split(':')[0].split(' (')[0] for _, r in skipped),
+                  'renamed': renamed, 'dangling_folder_refs': dangling,
+                  'folders': {k: len(v) for k, v in members.items()}}, ensure_ascii=False, indent=1))

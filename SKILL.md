@@ -38,12 +38,13 @@ items in `inbox/` and suggest topic folders later.
 
 1. Copy the image into the chosen folder. Keep a meaningful file name if it has
    one.
-2. If the image has no meaningful name (`image.png`, `download.jpg`,
+2. Avoid `[ ] # ^ |` in file names; they break links. Replace them with `-`.
+3. If the image has no meaningful name (`image.png`, `download.jpg`,
    `IMG_1234.jpg`, a pasted image), name it after the import time plus four
    characters: `20261004-143012-q3f7.jpg`.
-3. If a file with that name already exists in the folder, add `-2`, `-3`, ...
+4. If a file with that name already exists in the folder, add `-2`, `-3`, ...
    before the extension.
-4. Only if there is something to record (source, author, tags, a note), write an
+5. Only if there is something to record (source, author, tags, a note), write an
    image note next to it.
 
 ## Write an image note
@@ -62,8 +63,13 @@ imported: 2026-10-04T14:30:12+01:00
 ---
 
 Why this image is here, what to notice, related ideas.
+
+![[girl-underwater.jpg]]
 ```
 
+- End the note with an embed of its own image, so the picture shows when the
+  note is opened. Use the bare file name if it is unique in the library,
+  otherwise the path. This preview does not make the note a collection.
 - Tags are a YAML list without `#`.
 - Datetimes are ISO 8601 with a UTC offset.
 - Quote strings YAML could misread: `"no"`, `"on"`, `"Note: draft"`.
@@ -118,6 +124,7 @@ grep -rn --include='*.md' --include='*.canvas' 'refs/girl.jpg' .
 ```
 
 If the bare name was used in links and is still unique, nothing needs changing.
+This includes the self-embed at the end of the image's own note.
 
 ## Search
 
