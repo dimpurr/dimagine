@@ -2,7 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
-use dimagine_serve::{router, Catalog, FsCatalog, OriginalPreview, ServeConfig};
+use dimagine_serve::{router, CachedPreview, Catalog, FsCatalog, OriginalPreview, ServeConfig};
 use std::fs;
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -456,6 +456,144 @@ async fn special_character_and_unicode_urls_round_trip() {
             resp.status(),
             StatusCode::OK,
             "expected rejection for {bad_uri}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn real_preview_generation_and_caching_and_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+
+    let art = root.join("art");
+    fs::create_dir_all(&art).unwrap();
+
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc,
+        0xcf, 0xc0, 0x50, 0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    fs::write(art.join("cat.png"), TINY_PNG).unwrap();
+    fs::write(art.join("photo.heic"), b"fake heic bytes").unwrap();
+
+    let catalog = FsCatalog::new(root).unwrap();
+    let previews = CachedPreview::new(root);
+    let app = router(catalog, previews, ServeConfig::default());
+    let (app, cookie) = login(app).await;
+
+    // 1. Image page has link to original and view rendition
+    let page_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/image/art/cat.png")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page_resp.status(), StatusCode::OK);
+    let page_html = body(page_resp).await;
+    assert!(page_html.contains("href=\"/raw/art/cat.png\""));
+    assert!(page_html.contains("src=\"/media/art/cat.png\""));
+
+    // 2. Request thumb rendition -> generated on demand, cached with long cache headers
+    let thumb_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/thumb/art/cat.png")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(thumb_resp.status(), StatusCode::OK);
+    assert_eq!(
+        thumb_resp.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+    assert!(thumb_resp.headers().contains_key("etag"));
+
+    // Cache entry exists under .dimagine/cache/
+    let cache_dir = root.join(".dimagine/cache/previews");
+    assert!(cache_dir.is_dir());
+
+    // 3. Request view rendition -> generated on demand with long cache headers
+    let view_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/media/art/cat.png")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(view_resp.status(), StatusCode::OK);
+    assert_eq!(
+        view_resp.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
+
+    // 4. Request raw original -> serves original bytes with private, no-cache
+    let raw_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/raw/art/cat.png")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(raw_resp.status(), StatusCode::OK);
+    assert_eq!(raw_resp.headers()["cache-control"], "private, no-cache");
+    assert_eq!(
+        to_bytes(raw_resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+        TINY_PNG
+    );
+
+    // 5. Unsupported format (HEIC) falls back to original image
+    let heic_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/thumb/art/photo.heic")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(heic_resp.status(), StatusCode::OK);
+    assert_eq!(heic_resp.headers()["cache-control"], "private, no-cache");
+    assert_eq!(
+        to_bytes(heic_resp.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+        b"fake heic bytes"
+    );
+
+    // 6. Verify nothing is written outside .dimagine/cache/
+    let dot_dimagine = root.join(".dimagine");
+    for entry in fs::read_dir(&dot_dimagine).unwrap() {
+        let entry = entry.unwrap();
+        assert_eq!(
+            entry.file_name(),
+            "cache",
+            "only cache directory should be created in .dimagine"
         );
     }
 }
