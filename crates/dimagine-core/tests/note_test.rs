@@ -56,6 +56,14 @@ fn unterminated_front_matter_is_reported() {
 }
 
 #[test]
+fn opening_delimiter_at_eof_is_reported_without_panicking() {
+    let note = parse_note("---");
+    assert!(!note.has_front_matter);
+    assert!(note.error.is_some());
+    assert_eq!(note.body, "");
+}
+
+#[test]
 fn invalid_yaml_reports_line_and_column() {
     // `a: b: c` is not valid YAML: "mapping values are not allowed".
     let text = "---\ntitle: Lost at Sea\na: b: c\n---\nbody\n";

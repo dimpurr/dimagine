@@ -187,8 +187,8 @@ fn finds_duplicate_ids_nfc_and_case_insensitive() {
         .collect();
     assert_eq!(
         duplicates.len(),
-        2,
-        "one finding per sharing note: {findings:?}"
+        1,
+        "one finding per duplicate id group: {findings:?}"
     );
 }
 
@@ -390,8 +390,10 @@ fn finds_unreadable_image_and_file() {
             && *sev == Severity::Error),
         "{findings:?}"
     );
-    // Reading finished (the walk covered everything); it is still exit 1.
-    assert_eq!(run(&lib).exit_code(), 1);
+    // Any failed read is incomplete, so negative results prove nothing.
+    let report = run(&lib);
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
     // Restore for TempDir cleanup.
     std::fs::set_permissions(
         tmp.path().join("dark.jpg"),
@@ -403,6 +405,168 @@ fn finds_unreadable_image_and_file() {
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
+}
+
+#[test]
+fn note_limit_reports_incomplete_read() {
+    let tmp = tmp("note-limit");
+    write(tmp.path(), "large.md", "123456789");
+    let lib = open_library(tmp.path());
+    let report = check::run_with_limit(&lib, 4);
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::NOTE_TOO_LARGE));
+}
+
+#[test]
+fn file_removed_after_walk_is_an_incomplete_read() {
+    let tmp = tmp("removed-after-walk");
+    write(tmp.path(), "vanished.jpg", jpg());
+    let lib = open_library(tmp.path());
+    std::fs::remove_file(tmp.path().join("vanished.jpg")).unwrap();
+    let report = run(&lib);
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::UNREADABLE_IMAGE));
+}
+
+#[test]
+fn eof_delimiter_yields_invalid_yaml_finding_without_panicking() {
+    let tmp = tmp("eof-front-matter");
+    write(tmp.path(), "a.md", "---");
+    let report = run(&open_library(tmp.path()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::INVALID_YAML));
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn grouped_duplicate_contains_each_path_once() {
+    let tmp = tmp("dup-group");
+    for name in ["a.md", "b.md", "c.md"] {
+        write(
+            tmp.path(),
+            name,
+            "---\nid: 01JA8X3Q7K2M9V4T6R1B5N0C3Q\n---\n",
+        );
+    }
+    let report = run(&open_library(tmp.path()));
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.code == check::codes::DUPLICATE_ID)
+        .unwrap();
+    assert_eq!(
+        finding.detail.as_ref().unwrap()["paths"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+}
+
+#[test]
+fn missing_and_ambiguous_markdown_note_links_are_reported() {
+    let tmp = tmp("note-links");
+    write(tmp.path(), "a/ideas.md", "note\n");
+    write(tmp.path(), "b/ideas.md", "note\n");
+    write(tmp.path(), "collection.md", "[[missing.md]] [[ideas.md]]\n");
+    let report = run(&open_library(tmp.path()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::MISSING_LINK && f.message.contains("missing.md")));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::AMBIGUOUS_LINK && f.message.contains("ideas.md")));
+}
+
+#[test]
+fn canvas_paths_are_library_root_relative() {
+    let tmp = tmp("canvas-root");
+    write(tmp.path(), "refs/x.jpg", jpg());
+    write(
+        tmp.path(),
+        "boards/a.canvas",
+        r#"{"nodes":[{"id":"1","type":"file","file":"x.jpg"}]}"#,
+    );
+    let report = run(&open_library(tmp.path()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.path == "boards/a.canvas" && f.code == check::codes::MISSING_LINK));
+}
+
+#[test]
+fn ambiguous_image_embed_does_not_satisfy_self_preview() {
+    let tmp = tmp("ambiguous-self");
+    write(tmp.path(), "a/x.jpg", jpg());
+    write(tmp.path(), "b/x.jpg", jpg());
+    write(tmp.path(), "a/x.jpg.md", "![[x.jpg]]\n");
+    let report = run(&open_library(tmp.path()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.path == "a/x.jpg.md" && f.code == check::codes::MISSING_SELF_EMBED));
+}
+
+#[test]
+#[cfg(unix)]
+fn non_utf8_paths_keep_distinct_native_identity() {
+    use std::os::unix::ffi::OsStringExt;
+    let tmp = tmp("non-utf8");
+    let raw_name = std::ffi::OsString::from_vec(b"x\xff.jpg".to_vec());
+    let raw_path = std::path::PathBuf::from(raw_name.clone());
+    let utf8_path = std::path::PathBuf::from("x�.jpg");
+    let lib = dimagine_core::Library {
+        root: tmp.path().to_path_buf(),
+        files: vec![
+            dimagine_core::library::FileEntry {
+                rel: "x�.jpg".into(),
+                name: "x�.jpg".into(),
+                path: raw_path,
+                native_name: raw_name,
+                class: dimagine_core::FileClass::Image,
+            },
+            dimagine_core::library::FileEntry {
+                rel: "x�.jpg".into(),
+                name: "x�.jpg".into(),
+                path: utf8_path,
+                native_name: "x�.jpg".into(),
+                class: dimagine_core::FileClass::Image,
+            },
+        ],
+        ignored: Default::default(),
+        unreadable_dirs: Vec::new(),
+    };
+    assert_ne!(lib.files[0].path, lib.files[1].path);
+    let report = run(&lib);
+    assert!(report.has_non_utf8_paths);
+}
+
+#[test]
+#[cfg(unix)]
+fn special_files_are_skipped_with_incomplete_finding() {
+    use std::ffi::CString;
+    let tmp = tmp("special");
+    let fifo = CString::new(tmp.path().join("wait.jpg").as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let report = run(&open_library(tmp.path()));
+    assert!(report
+        .findings
+        .iter()
+        .any(|f| f.code == check::codes::SPECIAL_FILE));
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
 }
 
 #[test]

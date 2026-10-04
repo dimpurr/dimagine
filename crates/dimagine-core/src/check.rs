@@ -14,12 +14,13 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 
 use crate::format;
-use crate::library::{FileClass, FileEntry, Library};
-use crate::links::{self, key, Link, LinkSyntax, Outcome, Resolver, TargetClass};
+use crate::library::{open_regular, FileClass, FileEntry, Library};
+use crate::links::{self, key, Link, Outcome, Resolver, TargetClass};
 use crate::note::{self, IdProperty};
 use crate::sniff;
 
 pub const SCHEMA: &str = "dimagine.check/0.1";
+pub const DEFAULT_MAX_NOTE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,6 +44,8 @@ pub mod codes {
     pub const INVALID_CANVAS: &str = "invalid_canvas";
     pub const BAD_FILENAME_CHAR: &str = "bad_filename_char";
     pub const MISSING_SELF_EMBED: &str = "missing_self_embed";
+    pub const SPECIAL_FILE: &str = "special_file";
+    pub const NOTE_TOO_LARGE: &str = "note_too_large";
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -50,6 +53,7 @@ pub struct Finding {
     pub severity: Severity,
     pub code: &'static str,
     pub path: String,
+    pub path_non_utf8: bool,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<serde_json::Value>,
@@ -59,9 +63,12 @@ pub struct Finding {
 pub struct CheckReport {
     /// The library root as it will be shown to the user.
     pub library: String,
+    /// At least one displayed path contains lossy replacement characters.
+    pub has_non_utf8_paths: bool,
     /// False when some directory could not be listed: missing and ambiguous
     /// link findings then prove nothing (FORMAT §1.5).
     pub read_complete: bool,
+    pub read_warning: Option<&'static str>,
     pub unreadable_dirs: Vec<crate::library::UnreadableEntry>,
     pub findings: Vec<Finding>,
 }
@@ -99,22 +106,30 @@ impl CheckReport {
 
 /// Run all 0.1 checks over a walked library. Read-only.
 pub fn run(library: &Library) -> CheckReport {
+    run_with_limit(library, DEFAULT_MAX_NOTE_BYTES)
+}
+
+pub fn run_with_limit(library: &Library, max_note_bytes: u64) -> CheckReport {
     let mut report = CheckReport {
         library: library.root.display().to_string(),
+        has_non_utf8_paths: library.root.to_str().is_none()
+            || library.files.iter().any(|f| f.path.to_str().is_none()),
         read_complete: library.fully_read(),
+        read_warning: (!library.fully_read())
+            .then_some("Reading did not finish; missing and ambiguous results prove nothing."),
         unreadable_dirs: library.unreadable_dirs.clone(),
         findings: Vec::new(),
     };
     let resolver = Resolver::new(&library.files);
     // Image notes pair with same-folder images (FORMAT §3).
-    let image_paths: HashSet<String> = library
+    let image_paths: HashSet<std::path::PathBuf> = library
         .files
         .iter()
         .filter(|f| f.class == FileClass::Image)
-        .map(|f| key(&f.rel))
+        .map(|f| f.path.clone())
         .collect();
     // id key -> (note path, id as written), NFC + case-insensitive.
-    let mut ids: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut ids: HashMap<String, Vec<(String, String, bool)>> = HashMap::new();
 
     for entry in &library.files {
         check_file_name(entry, &mut report.findings);
@@ -130,35 +145,56 @@ pub fn run(library: &Library) -> CheckReport {
                     &resolver,
                     &mut ids,
                     &mut report.findings,
+                    max_note_bytes,
                 );
             }
             FileClass::Canvas => {
                 check_canvas(library, entry, &resolver, &mut report.findings);
             }
             FileClass::Raw | FileClass::Other => {}
+            FileClass::Special => report.findings.push(Finding {
+                severity: Severity::Error,
+                code: codes::SPECIAL_FILE,
+                path: entry.rel.clone(),
+                path_non_utf8: entry.path.to_str().is_none(),
+                message: "special filesystem entry was skipped".to_string(),
+                detail: None,
+            }),
         }
     }
 
     for (_, mut notes) in ids {
         if notes.len() > 1 {
             notes.sort();
-            for (path, id) in &notes {
-                let others: Vec<&str> = notes
-                    .iter()
-                    .filter(|(p, _)| p != path)
-                    .map(|(p, _)| p.as_str())
-                    .collect();
-                report.findings.push(Finding {
-                    severity: Severity::Error,
-                    code: codes::DUPLICATE_ID,
-                    path: path.clone(),
-                    message: format!("duplicate id `{id}` also used by {}", others.join(", ")),
-                    detail: Some(serde_json::json!({ "id": id, "also_in": others })),
-                });
-            }
+            let paths: Vec<&str> = notes.iter().map(|(path, _, _)| path.as_str()).collect();
+            let path_lossy: Vec<bool> = notes.iter().map(|(_, _, lossy)| *lossy).collect();
+            let id = &notes[0].1;
+            report.findings.push(Finding {
+                severity: Severity::Error,
+                code: codes::DUPLICATE_ID,
+                path: notes[0].0.clone(),
+                path_non_utf8: notes[0].2,
+                message: format!("duplicate id `{id}` is used by {} notes", paths.len()),
+                detail: Some(
+                    serde_json::json!({ "id": id, "paths": paths, "paths_non_utf8": path_lossy }),
+                ),
+            });
         }
     }
 
+    report.read_complete &= !report.findings.iter().any(|finding| {
+        matches!(
+            finding.code,
+            codes::UNREADABLE_IMAGE
+                | codes::UNREADABLE_FILE
+                | codes::NOTE_TOO_LARGE
+                | codes::SPECIAL_FILE
+        )
+    });
+    if !report.read_complete {
+        report.read_warning =
+            Some("Reading did not finish; missing and ambiguous results prove nothing.");
+    }
     report
         .findings
         .sort_by(|a, b| (&a.path, a.code, &a.message).cmp(&(&b.path, b.code, &b.message)));
@@ -172,6 +208,7 @@ fn check_file_name(entry: &FileEntry, findings: &mut Vec<Finding>) {
             severity: Severity::Warning,
             code: codes::BAD_FILENAME_CHAR,
             path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
             message: format!(
                 "file name contains {} (these characters break wikilinks)",
                 bad.iter()
@@ -199,6 +236,7 @@ fn check_image(library: &Library, entry: &FileEntry, findings: &mut Vec<Finding>
                 severity: Severity::Error,
                 code: codes::UNREADABLE_IMAGE,
                 path: entry.rel.clone(),
+                path_non_utf8: entry.path.to_str().is_none(),
                 message,
                 detail: None,
             });
@@ -211,6 +249,7 @@ fn check_image(library: &Library, entry: &FileEntry, findings: &mut Vec<Finding>
             severity: Severity::Error,
             code: codes::FORMAT_MISMATCH,
             path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
             message: format!(
                 "content does not match the extension: expected {} content, sniffed {}",
                 expected.as_str(),
@@ -228,18 +267,56 @@ fn check_image(library: &Library, entry: &FileEntry, findings: &mut Vec<Finding>
 fn check_note(
     library: &Library,
     entry: &FileEntry,
-    image_paths: &HashSet<String>,
+    image_paths: &HashSet<std::path::PathBuf>,
     resolver: &Resolver,
-    ids: &mut HashMap<String, Vec<(String, String)>>,
+    ids: &mut HashMap<String, Vec<(String, String, bool)>>,
     findings: &mut Vec<Finding>,
+    max_note_bytes: u64,
 ) {
-    let bytes = match std::fs::read(library.root.join(&entry.rel)) {
-        Ok(bytes) => bytes,
+    let file = match open_regular(&library.root, entry) {
+        Ok(file) => file,
         Err(err) => {
             findings.push(unreadable(entry, format!("cannot read the note: {err}")));
             return;
         }
     };
+    if file
+        .metadata()
+        .is_ok_and(|meta| meta.len() > max_note_bytes)
+    {
+        findings.push(Finding {
+            severity: Severity::Error,
+            code: codes::NOTE_TOO_LARGE,
+            path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+            message: format!("note exceeds the {max_note_bytes}-byte read limit"),
+            detail: Some(serde_json::json!({"limit_bytes": max_note_bytes})),
+        });
+        return;
+    }
+    let mut bytes = Vec::new();
+    use std::io::Read;
+    let read_result = file
+        .take(max_note_bytes.saturating_add(1))
+        .read_to_end(&mut bytes);
+    let bytes = match read_result {
+        Ok(_) => bytes,
+        Err(err) => {
+            findings.push(unreadable(entry, format!("cannot read the note: {err}")));
+            return;
+        }
+    };
+    if bytes.len() as u64 > max_note_bytes {
+        findings.push(Finding {
+            severity: Severity::Error,
+            code: codes::NOTE_TOO_LARGE,
+            path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+            message: format!("note exceeds the {max_note_bytes}-byte read limit"),
+            detail: Some(serde_json::json!({"limit_bytes": max_note_bytes})),
+        });
+        return;
+    }
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
         Err(_) => {
@@ -258,6 +335,7 @@ fn check_note(
             severity: Severity::Error,
             code: codes::INVALID_YAML,
             path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
             message: format!("invalid front matter: {}{}", error.message, location),
             detail: Some(serde_json::json!({
                 "line": error.line,
@@ -272,6 +350,7 @@ fn check_note(
                 severity: Severity::Error,
                 code: codes::INVALID_ID,
                 path: entry.rel.clone(),
+                path_non_utf8: entry.path.to_str().is_none(),
                 message: format!("`id` is not a valid ULID: {id}"),
                 detail: None,
             });
@@ -281,6 +360,7 @@ fn check_note(
                 severity: Severity::Error,
                 code: codes::INVALID_ID,
                 path: entry.rel.clone(),
+                path_non_utf8: entry.path.to_str().is_none(),
                 message: "`id` is not a string".to_string(),
                 detail: None,
             });
@@ -288,9 +368,11 @@ fn check_note(
         Some(IdProperty::Text(id)) => {
             // Duplicate detection compares NFC-normalised, case-insensitively:
             // a ULID spelled with different case is still the same id.
-            ids.entry(key(&id))
-                .or_default()
-                .push((entry.rel.clone(), id));
+            ids.entry(key(&id)).or_default().push((
+                entry.rel.clone(),
+                id,
+                entry.path.to_str().is_none(),
+            ));
         }
         None => {}
     }
@@ -310,7 +392,35 @@ fn check_note(
         }
         match outcome {
             Outcome::Resolved(_) => {}
-            Outcome::NotImageTarget => {}
+            Outcome::NotImageTarget => {
+                if let Some(note_outcome) =
+                    resolver.resolve_note_reference(&link.target, entry.dir())
+                {
+                    match note_outcome {
+                        Outcome::NotFound => findings.push(Finding {
+                            severity: Severity::Warning,
+                            code: codes::MISSING_LINK,
+                            path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+                            message: format!("note link to `{}` on line {} does not match any file", link.raw, link.line),
+                            detail: Some(serde_json::json!({"line": link.line, "target": link.raw, "kind": "note"})),
+                        }),
+                        Outcome::Ambiguous(candidates) => {
+                            let mut names: Vec<String> = candidates.iter().map(|&i| library.files[i].rel.clone()).collect();
+                            names.sort();
+                            findings.push(Finding {
+                                severity: Severity::Warning,
+                                code: codes::AMBIGUOUS_LINK,
+                                path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+                                message: format!("ambiguous note link to `{}` on line {}", link.raw, link.line),
+                                detail: Some(serde_json::json!({"line": link.line, "target": link.raw, "matches": names, "kind": "note"})),
+                            });
+                        }
+                        Outcome::Resolved(_) | Outcome::NotImageTarget => {}
+                    }
+                }
+            }
             Outcome::NotFound => {
                 // The resolver only yields NotFound for targets that claim to
                 // be images: an image extension, or extensionless Markdown
@@ -319,6 +429,7 @@ fn check_note(
                     severity: Severity::Warning,
                     code: codes::MISSING_LINK,
                     path: entry.rel.clone(),
+                    path_non_utf8: entry.path.to_str().is_none(),
                     message: format!(
                         "link to `{}` on line {} does not match any file",
                         link.raw, link.line
@@ -334,7 +445,11 @@ fn check_note(
                 // guess: image-ext targets and extensionless image referrals.
                 // Ambiguous note links stay out of scope for 0.1.
                 let class = links::target_class(&link.target);
-                if class == TargetClass::Image || class == TargetClass::None {
+                if class == TargetClass::Image
+                    || class == TargetClass::None
+                    || (class == TargetClass::Text
+                        && link.target.to_ascii_lowercase().ends_with(".md"))
+                {
                     let mut names: Vec<String> = candidates
                         .iter()
                         .map(|&i| library.files[i].rel.clone())
@@ -344,6 +459,7 @@ fn check_note(
                         severity: Severity::Warning,
                         code: codes::AMBIGUOUS_LINK,
                         path: entry.rel.clone(),
+                        path_non_utf8: entry.path.to_str().is_none(),
                         message: format!(
                             "ambiguous link to `{}` on line {}: could be {}",
                             link.raw,
@@ -363,11 +479,13 @@ fn check_note(
 
     if entry.class == FileClass::ImageNote {
         if let Some(image_rel) = entry.paired_image_rel() {
-            if !image_paths.contains(&key(image_rel)) {
+            let paired_path = entry.paired_image_path().expect("image note path");
+            if !image_paths.contains(&paired_path) {
                 findings.push(Finding {
                     severity: Severity::Error,
                     code: codes::NOTE_WITHOUT_IMAGE,
                     path: entry.rel.clone(),
+                    path_non_utf8: entry.path.to_str().is_none(),
                     message: format!("image note has no matching image `{image_rel}`"),
                     detail: None,
                 });
@@ -376,6 +494,7 @@ fn check_note(
                     severity: Severity::Info,
                     code: codes::MISSING_SELF_EMBED,
                     path: entry.rel.clone(),
+                    path_non_utf8: entry.path.to_str().is_none(),
                     message: format!("image note does not embed its own image `{image_rel}`"),
                     detail: None,
                 });
@@ -390,7 +509,7 @@ fn check_note(
 fn note_self_embed(
     library: &Library,
     entry: &FileEntry,
-    image_paths: &HashSet<String>,
+    image_paths: &HashSet<std::path::PathBuf>,
     link: &Link,
     outcome: &Outcome,
     self_embed_seen: &mut bool,
@@ -398,29 +517,17 @@ fn note_self_embed(
     if !link.syntax.is_strong_image() {
         return;
     }
-    let Some(image_rel) = entry.paired_image_rel() else {
+    let Some(_) = entry.paired_image_path() else {
         return;
     };
-    if !image_paths.contains(&key(image_rel)) {
+    let paired_path = entry.paired_image_path().expect("image note path");
+    if !image_paths.contains(&paired_path) {
         return; // unpaired; note_without_image covers it
     }
     if let Outcome::Resolved(idx) = outcome {
-        if key(&library.files[*idx].rel) == key(image_rel) {
+        if library.files[*idx].path == paired_path {
             *self_embed_seen = true;
-            return;
         }
-    }
-    // The prototype also accepted the bare image name, and the path spelled
-    // out, even when a resolver could not decide (ambiguous bare names).
-    let image_name = library
-        .files
-        .iter()
-        .find(|f| key(&f.rel) == key(image_rel))
-        .map(|f| f.name.clone())
-        .unwrap_or_default();
-    let target_key = key(&link.target);
-    if target_key == key(&image_name) || target_key == key(image_rel) {
-        *self_embed_seen = true;
     }
 }
 
@@ -431,8 +538,16 @@ fn check_canvas(
     resolver: &Resolver,
     findings: &mut Vec<Finding>,
 ) {
-    let bytes = match std::fs::read(library.root.join(&entry.rel)) {
-        Ok(bytes) => bytes,
+    let mut file = match open_regular(&library.root, entry) {
+        Ok(file) => file,
+        Err(err) => {
+            findings.push(unreadable(entry, format!("cannot read the canvas: {err}")));
+            return;
+        }
+    };
+    let mut bytes = Vec::new();
+    let bytes = match std::io::Read::read_to_end(&mut file, &mut bytes) {
+        Ok(_) => bytes,
         Err(err) => {
             findings.push(unreadable(entry, format!("cannot read the canvas: {err}")));
             return;
@@ -454,6 +569,7 @@ fn check_canvas(
                 severity: Severity::Error,
                 code: codes::INVALID_CANVAS,
                 path: entry.rel.clone(),
+                path_non_utf8: entry.path.to_str().is_none(),
                 message: format!("canvas is not valid JSON: {err}"),
                 detail: None,
             });
@@ -461,7 +577,7 @@ fn check_canvas(
         }
     };
     for reference in links::extract_canvas_refs(&canvas) {
-        let outcome = resolver.resolve(&reference.file, entry.dir(), LinkSyntax::CanvasFileNode);
+        let outcome = resolver.resolve_canvas(&reference.file);
         match outcome {
             Outcome::Resolved(_) | Outcome::NotImageTarget => {}
             Outcome::NotFound => {
@@ -469,6 +585,7 @@ fn check_canvas(
                     severity: Severity::Warning,
                     code: codes::MISSING_LINK,
                     path: entry.rel.clone(),
+                    path_non_utf8: entry.path.to_str().is_none(),
                     message: format!(
                         "canvas file node `{}` does not match any file",
                         reference.file
@@ -489,6 +606,7 @@ fn check_canvas(
                     severity: Severity::Warning,
                     code: codes::AMBIGUOUS_LINK,
                     path: entry.rel.clone(),
+                    path_non_utf8: entry.path.to_str().is_none(),
                     message: format!(
                         "ambiguous canvas file node `{}`: could be {}",
                         reference.file,
@@ -514,6 +632,7 @@ fn unreadable(entry: &FileEntry, message: String) -> Finding {
         severity: Severity::Error,
         code: codes::UNREADABLE_FILE,
         path: entry.rel.clone(),
+        path_non_utf8: entry.path.to_str().is_none(),
         message,
         detail: None,
     }
@@ -523,7 +642,7 @@ fn unreadable(entry: &FileEntry, message: String) -> Finding {
 /// an unreadable-image finding.
 fn read_head(library: &Library, entry: &FileEntry, limit: usize) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let mut file = std::fs::File::open(library.root.join(&entry.rel))
+    let mut file = open_regular(&library.root, entry)
         .map_err(|err| format!("cannot read the image: {err}"))?;
     let mut head = vec![0u8; limit];
     let read = file

@@ -3,8 +3,8 @@
 //! Walking rules (FORMAT §2.2): ignore entries whose names start with `.`
 //! (including `.dimagine/`), `._*` resource-fork files, `Thumbs.db` and
 //! `desktop.ini`; never follow symbolic links. Non-UTF-8 names are handled
-//! lossily: dimagine assumes UTF-8 names, but a file with a broken name is
-//! still listed (never silently dropped) and simply never matches a link.
+//! for identity and I/O as native paths. A lossy UTF-8 spelling is used only
+//! for display; non-UTF-8 names never become string-based link lookup keys.
 //!
 //! A directory that cannot be listed does not abort the walk: it is recorded
 //! and the library is reported as NOT fully read. "Unknown is not empty"
@@ -12,6 +12,7 @@
 //! unreliable, which is why `unreadable_dirs` exists and why both `scan` and
 //! `check` distinguish it from ordinary findings.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,16 +33,43 @@ pub enum FileClass {
     Canvas,
     /// Anything else.
     Other,
+    /// A FIFO, socket, device, or other non-regular filesystem entry.
+    Special,
 }
 
-/// A regular file in the library, already classified by name.
+/// A library entry, already classified by its name and filesystem type.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
-    /// Path relative to the library root, `/`-separated, as found on disk.
+    /// Lossy display path relative to the library root, `/`-separated.
     pub rel: String,
     /// File name only.
     pub name: String,
+    /// Native library-relative path used for filesystem access and identity.
+    pub path: PathBuf,
+    /// Native final path component, retained independently of display text.
+    pub native_name: OsString,
     pub class: FileClass,
+}
+
+/// Open a walked entry without following a replacement symlink, then verify
+/// that the opened object is still a regular file before reading its bytes.
+pub fn open_regular(root: &Path, entry: &FileEntry) -> std::io::Result<fs::File> {
+    use std::fs::OpenOptions;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(root.join(&entry.path))?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "entry is not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 impl FileEntry {
@@ -71,6 +99,32 @@ impl FileEntry {
             _ => None,
         }
     }
+
+    /// Native path of the image paired with this image note.
+    pub fn paired_image_path(&self) -> Option<PathBuf> {
+        if self.class != FileClass::ImageNote {
+            return None;
+        }
+        let name = paired_name_os(&self.native_name)?;
+        Some(self.path.with_file_name(name))
+    }
+}
+
+#[cfg(unix)]
+fn paired_name_os(name: &std::ffi::OsStr) -> Option<OsString> {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let bytes = name.as_bytes();
+    let stem = bytes.get(..bytes.len().checked_sub(3)?)?;
+    if !bytes[bytes.len() - 3..].eq_ignore_ascii_case(b".md") {
+        return None;
+    }
+    Some(OsString::from_vec(stem.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn paired_name_os(name: &std::ffi::OsStr) -> Option<OsString> {
+    let name = name.to_str()?;
+    strip_suffix_ignore_case(name, ".md").map(OsString::from)
 }
 
 /// Counts of ignored entries, by reason (FORMAT §2.2).
@@ -87,6 +141,7 @@ pub struct IgnoredCounts {
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct UnreadableEntry {
     pub path: String,
+    pub path_non_utf8: bool,
     pub reason: String,
 }
 
@@ -132,42 +187,60 @@ impl Library {
             ignored: IgnoredCounts::default(),
             unreadable_dirs: Vec::new(),
         };
-        library.walk_dir(root, "");
+        library.walk_dir(root);
         Ok(library)
     }
 
-    fn walk_dir(&mut self, dir: &Path, prefix: &str) {
+    fn walk_dir(&mut self, dir: &Path) {
         let read = match fs::read_dir(dir) {
             Ok(r) => r,
             Err(err) => {
                 self.unreadable_dirs.push(UnreadableEntry {
-                    path: prefix.to_string(),
+                    path: dir
+                        .strip_prefix(&self.root)
+                        .unwrap_or(dir)
+                        .display()
+                        .to_string(),
+                    path_non_utf8: dir
+                        .strip_prefix(&self.root)
+                        .unwrap_or(dir)
+                        .to_str()
+                        .is_none(),
                     reason: err.to_string(),
                 });
                 return;
             }
         };
         // Collect first so the walk order is deterministic on every platform.
-        let mut entries: Vec<(String, PathBuf)> = Vec::new();
+        let mut entries: Vec<(OsString, PathBuf)> = Vec::new();
         let mut partial_err: Option<std::io::Error> = None;
         for entry in read {
             match entry {
                 Ok(dirent) => {
-                    let name = dirent.file_name().to_string_lossy().into_owned();
-                    entries.push((name, dirent.path()));
+                    entries.push((dirent.file_name(), dirent.path()));
                 }
                 Err(err) => partial_err = Some(err),
             }
         }
         if let Some(err) = partial_err {
             self.unreadable_dirs.push(UnreadableEntry {
-                path: prefix.to_string(),
+                path: dir
+                    .strip_prefix(&self.root)
+                    .unwrap_or(dir)
+                    .display()
+                    .to_string(),
+                path_non_utf8: dir
+                    .strip_prefix(&self.root)
+                    .unwrap_or(dir)
+                    .to_str()
+                    .is_none(),
                 reason: format!("partial directory listing: {err}"),
             });
         }
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        for (name, path) in entries {
+        for (native_name, path) in entries {
+            let name = native_name.to_string_lossy().into_owned();
             // FORMAT §2.2: ignore dot paths, resource forks and OS metadata
             // files, in folders just as much as in files.
             if let Some(reason) = format::ignore_reason(&name) {
@@ -176,27 +249,47 @@ impl Library {
             }
             // FORMAT §2.2: do not follow symlinks at all while scanning,
             // whether they point inside or outside the library.
-            let is_dir = match fs::symlink_metadata(&path) {
+            let metadata = match fs::symlink_metadata(&path) {
                 Ok(meta) if meta.file_type().is_symlink() => {
                     self.ignored.symlink += 1;
                     self.ignored.total += 1;
                     continue;
                 }
-                Ok(meta) => meta.is_dir(),
+                Ok(meta) => meta,
                 Err(err) => {
                     self.unreadable_dirs.push(UnreadableEntry {
-                        path: join_rel(prefix, &name),
+                        path: path
+                            .strip_prefix(&self.root)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string(),
+                        path_non_utf8: path
+                            .strip_prefix(&self.root)
+                            .unwrap_or(&path)
+                            .to_str()
+                            .is_none(),
                         reason: format!("could not inspect path: {err}"),
                     });
                     continue;
                 }
             };
-            let rel = join_rel(prefix, &name);
-            if is_dir {
-                self.walk_dir(&path, &rel);
+            let rel_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
+            let rel = rel_path.to_string_lossy().replace('\\', "/");
+            if metadata.is_dir() {
+                self.walk_dir(&path);
             } else {
-                let class = classify(&name);
-                self.files.push(FileEntry { rel, name, class });
+                let class = if metadata.is_file() {
+                    classify(&name)
+                } else {
+                    FileClass::Special
+                };
+                self.files.push(FileEntry {
+                    rel,
+                    name,
+                    path: rel_path,
+                    native_name,
+                    class,
+                });
             }
         }
     }
@@ -208,14 +301,6 @@ impl Library {
             IgnoreReason::ResourceFork => self.ignored.resource_fork += 1,
             IgnoreReason::OsMetadata => self.ignored.os_metadata += 1,
         }
-    }
-}
-
-fn join_rel(prefix: &str, name: &str) -> String {
-    if prefix.is_empty() {
-        name.to_string()
-    } else {
-        format!("{prefix}/{name}")
     }
 }
 

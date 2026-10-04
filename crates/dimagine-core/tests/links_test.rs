@@ -15,6 +15,8 @@ fn files(rels: &[&str]) -> Vec<FileEntry> {
             FileEntry {
                 rel: rel.to_string(),
                 name: name.to_string(),
+                path: std::path::PathBuf::from(rel),
+                native_name: std::ffi::OsString::from(name),
                 class: dimagine_core::library::classify(name),
             }
         })
@@ -58,6 +60,18 @@ fn markdown_paths_angle_brackets_titles_and_percent_encoding() {
     assert_eq!(links[0].raw, "my file.jpg");
     assert_eq!(links[1].target, "my file.jpg");
     assert_eq!(links[2].target, "space shot.jpg");
+}
+
+#[test]
+fn markdown_destinations_accept_balanced_parentheses() {
+    let links = extract_markdown_links(
+        "![](<shot(1).jpg>)\n![](shot(1).jpg)\n![](shot\\(2\\).jpg)\n",
+        1,
+    );
+    assert_eq!(links.len(), 3);
+    assert_eq!(links[0].target, "shot(1).jpg");
+    assert_eq!(links[1].target, "shot(1).jpg");
+    assert_eq!(links[2].target, "shot(2).jpg");
 }
 
 #[test]
@@ -120,6 +134,8 @@ fn entry(rel: &str, class: FileClass) -> FileEntry {
     FileEntry {
         rel: rel.to_string(),
         name: rel.rsplit('/').next().unwrap().to_string(),
+        path: std::path::PathBuf::from(rel),
+        native_name: std::ffi::OsString::from(rel.rsplit('/').next().unwrap()),
         class,
     }
 }

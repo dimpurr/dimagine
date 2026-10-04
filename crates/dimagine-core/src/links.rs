@@ -166,7 +166,7 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
             b'!' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
                 match find_byte(bytes, b']', i + 2) {
                     Some(alt_end) if alt_end + 1 < bytes.len() && bytes[alt_end + 1] == b'(' => {
-                        match find_byte(bytes, b')', alt_end + 2) {
+                        match markdown_destination_end(bytes, alt_end + 2) {
                             Some(close) => {
                                 push_markdown(&mut links, &body[alt_end + 2..close], line_at(i));
                                 i = close + 1;
@@ -241,7 +241,9 @@ fn push_markdown(links: &mut Vec<Link>, path_raw: &str, line: usize) {
             None => path_raw,
         }
     };
-    let outer = strip_display_parts(inner);
+    let outer = strip_display_parts(inner)
+        .replace("\\(", "(")
+        .replace("\\)", ")");
     let decoded = percent_decode_str(&outer)
         .decode_utf8()
         .map(|cow| cow.into_owned().trim().to_string())
@@ -283,6 +285,41 @@ fn find_byte(haystack: &[u8], needle: u8, from: usize) -> Option<usize> {
         .iter()
         .position(|&b| b == needle)
         .map(|p| p + from)
+}
+
+fn markdown_destination_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut angle = false;
+    let mut escaped = false;
+    for (offset, &byte) in bytes.iter().enumerate().skip(from) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if byte == b'<' {
+            angle = true;
+            continue;
+        }
+        if byte == b'>' && angle {
+            angle = false;
+            continue;
+        }
+        if angle {
+            continue;
+        }
+        match byte {
+            b'(' => depth += 1,
+            b')' if depth == 0 => return Some(offset),
+            b')' => depth -= 1,
+            b'\n' if depth == 0 => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Byte ranges of fenced code blocks (``` and ~~~), including their fences.
@@ -345,11 +382,18 @@ impl Resolver {
         let mut image_stem_index: HashMap<String, Vec<usize>> = HashMap::new();
         let mut path_index: HashMap<String, Vec<usize>> = HashMap::new();
         for (idx, entry) in files.iter().enumerate() {
-            name_index.entry(key(&entry.name)).or_default().push(idx);
-            path_index.entry(key(&entry.rel)).or_default().push(idx);
-            if entry.class == FileClass::Image {
-                let stem = format::file_stem(&entry.name);
-                image_stem_index.entry(key(stem)).or_default().push(idx);
+            // A lossy display spelling is never a lookup key: it could alias
+            // a different valid UTF-8 name. Such entries remain reportable
+            // by their native path, but text links cannot name them safely.
+            if entry.native_name.to_str().is_some() {
+                name_index.entry(key(&entry.name)).or_default().push(idx);
+                if entry.class == FileClass::Image {
+                    let stem = format::file_stem(&entry.name);
+                    image_stem_index.entry(key(stem)).or_default().push(idx);
+                }
+            }
+            if entry.path.to_str().is_some() {
+                path_index.entry(key(&entry.rel)).or_default().push(idx);
             }
         }
         Resolver {
@@ -423,6 +467,42 @@ impl Resolver {
                 TargetClass::Image => Outcome::NotFound,
                 TargetClass::Text | TargetClass::Other => Outcome::NotImageTarget,
             }
+        }
+    }
+
+    /// Resolve a Canvas file node as a library-root path (FORMAT §6).
+    pub fn resolve_canvas(&self, target: &str) -> Outcome {
+        let Some(target) = prepare_target(target) else {
+            return Outcome::NotImageTarget;
+        };
+        if target_class(&target) != TargetClass::Image {
+            return Outcome::NotImageTarget;
+        }
+        self.lookup_path(&target, None).unwrap_or(Outcome::NotFound)
+    }
+
+    /// Resolve explicit local Markdown note references so missing and
+    /// ambiguous note links are not hidden by image-only classification.
+    pub fn resolve_note_reference(&self, target: &str, note_dir: &str) -> Option<Outcome> {
+        let target = prepare_target(target)?;
+        if !target.to_ascii_lowercase().ends_with(".md") {
+            return None;
+        }
+        if target.contains('/') {
+            if let Some(out) = self.lookup_path(&target, None) {
+                return Some(out);
+            }
+            if let Some(out) = self.lookup_path(&target, Some(note_dir)) {
+                return Some(out);
+            }
+            Some(Outcome::NotFound)
+        } else {
+            Some(
+                self.name_index
+                    .get(&key(&target))
+                    .map(|hits| collapse(hits.iter().copied()))
+                    .unwrap_or(Outcome::NotFound),
+            )
         }
     }
 

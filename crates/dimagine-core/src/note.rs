@@ -154,7 +154,9 @@ fn split_front_matter(text: &str) -> FmSplit<'_> {
     if s[..first_line_end].trim_end_matches('\r') != "---" {
         return FmSplit::NoFrontMatter { body: s };
     }
-    let mut body_start = first_line_end + 1;
+    // `first_line_end + 1` is past EOF for a three-byte `---` file. Keep the
+    // cursor inside the source before attempting to slice it below.
+    let mut body_start = (first_line_end + 1).min(s.len());
     let mut line_no = 2usize;
     let mut cursor = body_start;
     loop {

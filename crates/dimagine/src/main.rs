@@ -34,6 +34,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Maximum bytes read from one Markdown note (default: 8388608).
+    #[arg(long, global = true, default_value_t = dimagine_core::check::DEFAULT_MAX_NOTE_BYTES)]
+    max_note_bytes: u64,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse(); // clap exits with code 2 on usage errors
     let library_dir = resolve_library(&cli.library);
     let json = cli.json;
+    let max_note_bytes = cli.max_note_bytes;
     let library = match Library::open(&library_dir) {
         Ok(library) => library,
         Err(error) => {
@@ -59,7 +64,7 @@ fn main() -> ExitCode {
     };
     match cli.command {
         Command::Scan => {
-            let report = scan::run(&library);
+            let report = scan::run_with_limit(&library, max_note_bytes);
             if json {
                 print_scan_json(&report);
             } else {
@@ -68,7 +73,7 @@ fn main() -> ExitCode {
             ExitCode::from(report.exit_code().try_into().unwrap_or(1))
         }
         Command::Check => {
-            let report = check::run(&library);
+            let report = check::run_with_limit(&library, max_note_bytes);
             if json {
                 print_check_json(&report);
             } else {
@@ -137,10 +142,11 @@ fn print_scan_human(report: &ScanReport) {
         report.image_notes.total, report.image_notes.paired, report.image_notes.unpaired
     );
     println!(
-        "notes: {} ({} collection{})",
+        "notes: {} ({} explicit collections; {} embed collections; {} unknown)",
         report.notes_total,
-        report.collections,
-        if report.collections == 1 { "" } else { "s" }
+        report.collections_explicit,
+        report.collections_embedded,
+        report.collections_unknown
     );
     println!("canvases: {}", report.canvases);
     println!("raw source files: {}", report.raw_files);
@@ -167,7 +173,7 @@ fn print_scan_human(report: &ScanReport) {
             println!("could not read folder {}: {}", dir.path, dir.reason);
         }
         println!(
-            "reading incomplete: the walk did not cover the whole library, \
+            "reading incomplete: some library content could not be read, \
              so the counts above may miss files and any \"not found\" proves nothing"
         );
     }
@@ -222,7 +228,7 @@ fn print_check_human(report: &CheckReport) {
             println!("could not read folder {}: {}", dir.path, dir.reason);
         }
         println!(
-            "reading incomplete: the walk did not cover the whole library, \
+            "reading incomplete: some library content could not be read, \
              so missing and ambiguous link findings prove nothing"
         );
     }

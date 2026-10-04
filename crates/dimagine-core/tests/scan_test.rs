@@ -70,7 +70,7 @@ fn full_library_is_counted() {
 
 #[test]
 #[cfg(unix)]
-fn unreadable_files_are_reported_and_exit_one() {
+fn unreadable_files_are_reported_and_exit_three() {
     let tmp = tmp("scan-unreadable");
     write(tmp.path(), "fine.png", png());
     write(tmp.path(), "broken.jpg", jpg());
@@ -90,12 +90,40 @@ fn unreadable_files_are_reported_and_exit_one() {
     assert_eq!(report.unreadable_files.len(), 1);
     assert_eq!(report.unreadable_files[0].path, "broken.jpg");
     assert!(!report.unreadable_files[0].reason.is_empty());
-    assert_eq!(report.exit_code(), 1);
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
     std::fs::set_permissions(
         tmp.path().join("broken.jpg"),
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
+}
+
+#[test]
+fn explicit_and_embed_collections_are_counted_separately_and_unknowns_stay_unknown() {
+    let tmp = tmp("collection-counts");
+    write(tmp.path(), "photo.jpg", jpg());
+    write(tmp.path(), "photo.jpg.md", "![[photo.jpg]]\n");
+    write(tmp.path(), "ordinary.md", "![[photo.jpg]]\n");
+    write(tmp.path(), "explicit.md", "---\nkind: collection\n---\n");
+    write(tmp.path(), "unknown.md", "---\nkind: [broken\n---\n");
+    let report = scan::run(&open_library(tmp.path()));
+    assert_eq!(report.collections_explicit, 1);
+    assert_eq!(
+        report.collections_embedded, 1,
+        "image note self-preview is not membership"
+    );
+    assert_eq!(report.collections_unknown, 1);
+}
+
+#[test]
+fn note_read_limit_is_configurable_and_incomplete() {
+    let tmp = tmp("scan-note-limit");
+    write(tmp.path(), "note.md", "a longer note\n");
+    let report = scan::run_with_limit(&open_library(tmp.path()), 2);
+    assert!(!report.read_complete);
+    assert_eq!(report.exit_code(), 3);
+    assert!(report.unreadable_files[0].reason.contains("read limit"));
 }
 
 #[test]
