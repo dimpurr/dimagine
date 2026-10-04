@@ -40,8 +40,11 @@ items in `inbox/` and suggest topic folders later.
    one.
 2. Avoid `[ ] # ^ |` in file names; they break links. Replace them with `-`.
 3. If the image has no meaningful name (`image.png`, `download.jpg`,
-   `IMG_1234.jpg`, a pasted image), name it after the import time plus four
-   characters: `20261004-143012-q3f7.jpg`.
+   `IMG_1234.jpg`, a pasted image), build one from its source URL when it has
+   one: `twitter-<user>-<status id>-<photo n>`, `pixiv-<artwork id>` (or
+   `pixiv-<id>-p<n>` for a page), `bilibili-<id>`, otherwise
+   `<site>-<last path segment>`. Without a usable URL, name it after the
+   import time plus four characters: `20261004-143012-q3f7.jpg`.
 4. If a file with that name already exists in the folder, add `-2`, `-3`, ...
    before the extension.
 5. Only if there is something to record (source, author, tags, a note), write an
