@@ -5,8 +5,6 @@ edition = "2021"
 license = "MIT"
 publish = false
 
-[workspace]
-
 [dependencies]
 image = { version = "0.25.8", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 kamadak-exif = "0.6.1"
