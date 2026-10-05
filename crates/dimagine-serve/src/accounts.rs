@@ -59,6 +59,10 @@ pub enum AccountsError {
     Io(std::io::Error),
     Json(serde_json::Error),
     Hash(String),
+    /// The file parsed, but its schema version is not one this build knows.
+    Schema {
+        found: u32,
+    },
 }
 
 impl fmt::Display for AccountsError {
@@ -67,6 +71,10 @@ impl fmt::Display for AccountsError {
             AccountsError::Io(err) => write!(f, "account storage I/O error: {err}"),
             AccountsError::Json(err) => write!(f, "malformed accounts.json: {err}"),
             AccountsError::Hash(err) => write!(f, "password hashing error: {err}"),
+            AccountsError::Schema { found } => write!(
+                f,
+                "unsupported accounts.json schema {found}; expected {CURRENT_SCHEMA}"
+            ),
         }
     }
 }
@@ -76,7 +84,7 @@ impl std::error::Error for AccountsError {
         match self {
             AccountsError::Io(err) => Some(err),
             AccountsError::Json(err) => Some(err),
-            AccountsError::Hash(_) => None,
+            AccountsError::Hash(_) | AccountsError::Schema { .. } => None,
         }
     }
 }
@@ -151,12 +159,21 @@ impl AccountsStore {
 
     /// Read `accounts.json` from disk. If the file does not exist, returns a default
     /// empty structure.
+    ///
+    /// Any other problem — unreadable file, malformed JSON, or a schema version
+    /// this build does not know — is an error, never an empty store: treating a
+    /// broken store as "no users" would silently reopen first-run setup.
     pub fn load(&self) -> Result<AccountsFile, AccountsError> {
         if !self.file_path.exists() {
             return Ok(AccountsFile::default());
         }
         let bytes = fs::read(&self.file_path)?;
         let accounts: AccountsFile = serde_json::from_slice(&bytes)?;
+        if accounts.schema != CURRENT_SCHEMA {
+            return Err(AccountsError::Schema {
+                found: accounts.schema,
+            });
+        }
         Ok(accounts)
     }
 
@@ -200,10 +217,13 @@ impl AccountsStore {
     }
 
     /// Check if at least one user exists in `accounts.json`.
-    pub fn has_users(&self) -> bool {
-        self.load()
-            .map(|doc| !doc.users.is_empty())
-            .unwrap_or(false)
+    ///
+    /// A store that cannot be read is an error, not "no users": callers must
+    /// fail closed (refuse to start, or require authentication) instead of
+    /// falling back to first-run setup.
+    pub fn has_users(&self) -> Result<bool, AccountsError> {
+        let doc = self.load()?;
+        Ok(!doc.users.is_empty())
     }
 
     /// Find a user by email address (case-insensitive comparison).
@@ -356,7 +376,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AccountsStore::new(dir.path());
 
-        assert!(!store.has_users());
+        assert!(!store.has_users().unwrap());
 
         let user = store
             .create_user("Alice@example.com", "pass123", "owner")
@@ -364,7 +384,7 @@ mod tests {
         assert_eq!(user.email, "Alice@example.com");
         assert_eq!(user.role, "owner");
         assert!(verify_password("pass123", &user.password_hash));
-        assert!(store.has_users());
+        assert!(store.has_users().unwrap());
 
         // Duplicate email creation fails
         let dup = store.create_user("alice@example.com", "pass456", "owner");

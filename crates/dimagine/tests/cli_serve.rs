@@ -543,6 +543,118 @@ fn serve_port_in_use_exits_one() {
     );
 }
 
+/// Run `dimagine serve --json` against a caller-owned state directory and
+/// hand back the raw output; used for startup-failure tests where the
+/// process must exit before it ever binds a port.
+fn run_serve(library: &Path, data_dir: &Path) -> std::process::Output {
+    Command::new(BIN)
+        .args([
+            "--json",
+            "serve",
+            "--library",
+            library.to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--port",
+            "0",
+        ])
+        .env_remove("DIMAGINE_PASSCODE")
+        .output()
+        .expect("run dimagine serve")
+}
+
+/// Assert the run exited 1 with an `dimagine.error/0.1` document on stdout
+/// and return the error text.
+fn serve_error_text(output: &std::process::Output) -> String {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a broken accounts store must stop the server: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let error: serde_json::Value = serde_json::from_str(&stdout).expect("error JSON");
+    assert_eq!(error["schema"], "dimagine.error/0.1");
+    error["error"].as_str().unwrap().to_owned()
+}
+
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_refuses_to_start_with_unreadable_accounts_file() {
+    if running_as_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = library("f1-unreadable");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(&accounts, r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("account storage I/O error"), "{error}");
+    assert!(error.contains("Permission denied"), "{error}");
+    // Never falls back to setup: no startup document, no setup code.
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_truncated_accounts_file() {
+    let dir = library("f1-truncated");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(
+        state.0.join("accounts.json"),
+        r#"{"schema":1,"users":[{"id":"01J9XEXAMPLEULID0000000000","#,
+    )
+    .unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("malformed accounts.json"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_empty_accounts_file() {
+    let dir = library("f1-empty");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(state.0.join("accounts.json"), "").unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("malformed accounts.json"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_unknown_schema() {
+    let dir = library("f1-schema");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(
+        state.0.join("accounts.json"),
+        r#"{"schema":999,"users":[]}"#,
+    )
+    .unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("schema 999"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
 #[test]
 fn serve_missing_library_exits_one() {
     let outer = empty_dir("missing-lib");

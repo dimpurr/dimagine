@@ -128,8 +128,17 @@ fn run_create(matches: &ArgMatches, store: &AccountsStore, json: bool) -> ExitCo
         }
     };
 
-    // First user created becomes "owner", subsequent users become "user"
-    let role = if !store.has_users() { "owner" } else { "user" };
+    // First user created becomes "owner", subsequent users become "user".
+    // An unreadable store is a hard error: guessing "owner" here would create
+    // an account in a store whose state is unknown.
+    let role = match store.has_users() {
+        Ok(false) => "owner",
+        Ok(true) => "user",
+        Err(err) => {
+            emit_failure(json, &err.to_string());
+            return ExitCode::from(1);
+        }
+    };
 
     match store.create_user(email, &password, role) {
         Ok(record) => {

@@ -18,7 +18,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Arg, ArgMatches, Command};
-use dimagine_serve::{router, serve, CachedPreview, FsCatalog, ServeConfig};
+use dimagine_serve::{router_from, serve, CachedPreview, FsCatalog, ServeConfig};
+use std::sync::Arc;
 
 use crate::emit_failure;
 
@@ -93,7 +94,16 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .unwrap_or_else(dimagine_serve::accounts::default_data_dir);
     let passcode = passcode_from_env();
     let accounts = dimagine_serve::accounts::AccountsStore::new(&data_dir);
-    let setup_code = if !accounts.has_users() && passcode.is_none() {
+    // An unreadable, malformed, or version-skewed accounts.json must stop the
+    // server: falling back to "no users" would reopen public first-run setup.
+    let has_users = match accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => {
+            emit_failure(json, &err.to_string());
+            return ExitCode::from(1);
+        }
+    };
+    let setup_code = if !has_users && passcode.is_none() {
         Some(dimagine_serve::generate_setup_code())
     } else {
         None
@@ -111,7 +121,13 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .copied()
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let address = SocketAddr::new(bind, port);
-    let app = router(catalog, previews, config.clone());
+    let app = match router_from(Arc::new(catalog), Arc::new(previews), config.clone()) {
+        Ok(app) => app,
+        Err(err) => {
+            emit_failure(json, &err.to_string());
+            return ExitCode::from(1);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

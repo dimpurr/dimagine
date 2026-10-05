@@ -824,6 +824,17 @@ impl ThrottleState {
     }
 }
 
+/// Report an accounts-store failure to the client: 500 with the error text.
+/// The store was validated at startup, so this only fires when it breaks
+/// while the server runs; the error never contains a password or hash.
+fn store_error(err: accounts::AccountsError) -> Response {
+    let mut response = (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Refuse a login attempt without comparing it: 429 with `Retry-After` and an
 /// empty body, so a refused attempt is indistinguishable from any other.
 fn login_refused(retry_after: u64) -> Response {
@@ -838,22 +849,30 @@ fn login_refused(retry_after: u64) -> Response {
 }
 
 /// Build the read-only viewer router.
+///
+/// The accounts store is opened here; a store that cannot be read is a panic
+/// because every caller that can report an error uses [`router_from`] instead.
 pub fn router<C: Catalog, P: PreviewProvider>(
     catalog: C,
     previews: P,
     config: ServeConfig,
 ) -> Router {
     router_from(Arc::new(catalog), Arc::new(previews), config)
+        .expect("accounts store must be readable")
 }
 
 /// Build a router from trait objects for later CLI integration.
+///
+/// Fails when `accounts.json` is unreadable, malformed, or written by an
+/// unknown schema version: the caller must exit non-zero rather than start a
+/// viewer that would silently fall back to first-run setup.
 pub fn router_from(
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
-) -> Router {
+) -> Result<Router, accounts::AccountsError> {
     let accounts = accounts::AccountsStore::new(&config.data_dir);
-    let has_users = accounts.has_users();
+    let has_users = accounts.has_users()?;
     let setup_code = if !has_users && config.passcode.is_none() {
         Some(
             config
@@ -875,7 +894,7 @@ pub fn router_from(
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
     };
-    Router::new()
+    Ok(Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout).post(logout))
         .route("/setup", get(setup_page).post(setup))
@@ -891,12 +910,15 @@ pub fn router_from(
         .route("/api/collection/*path", get(collection_json))
         .route("/api/image/*path", get(image_json))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
-    let has_users = state.accounts.has_users();
+    // A store that fails to load must never reopen setup: fail closed by
+    // treating it as "users exist", so the request goes to /login and is
+    // refused there instead of reaching the account-creation form.
+    let has_users = state.accounts.has_users().unwrap_or(false);
     let is_setup_mode = !has_users && state.config.passcode.is_none();
 
     if is_setup_mode {
@@ -948,7 +970,10 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
 }
 
 async fn setup_page(State(state): State<AppState>) -> Response {
-    let has_users = state.accounts.has_users();
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
+    };
     if has_users || state.config.passcode.is_some() {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
@@ -984,7 +1009,10 @@ struct SetupForm {
 }
 
 async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Response {
-    let has_users = state.accounts.has_users();
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
+    };
     if has_users || state.config.passcode.is_some() {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
@@ -1101,7 +1129,9 @@ async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Re
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
-    let has_users = state.accounts.has_users();
+    // Fail closed: an unreadable store shows the login form, never a redirect
+    // back to /setup.
+    let has_users = state.accounts.has_users().unwrap_or(false);
     let is_setup_mode = !has_users && state.config.passcode.is_none();
     if is_setup_mode {
         return Redirect::to("/setup").into_response();
@@ -1143,7 +1173,10 @@ async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let has_users = state.accounts.has_users();
+    // Fail closed, as in the auth middleware: an unreadable store is treated
+    // as "users exist", so the login attempt is refused instead of reopening
+    // setup.
+    let has_users = state.accounts.has_users().unwrap_or(false);
     let is_setup_mode = !has_users && state.config.passcode.is_none();
     if is_setup_mode {
         return Redirect::to("/setup").into_response();

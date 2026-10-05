@@ -323,6 +323,73 @@ async fn untrusted_peer_ignores_spoofed_forwarded_for() {
     assert_eq!(send(&app, request).await.0, StatusCode::TOO_MANY_REQUESTS);
 }
 
+#[test]
+fn malformed_and_unknown_schema_stores_are_errors_not_empty_stores() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = AccountsStore::new(&state);
+
+    // Truncated mid-record.
+    std::fs::write(
+        store.file_path(),
+        r#"{"schema":1,"users":[{"id":"01J9XEXAMPLEULID0000000000","#,
+    )
+    .unwrap();
+    let err = store.load().unwrap_err();
+    assert!(err.to_string().contains("malformed accounts.json"), "{err}");
+    assert!(store.has_users().is_err());
+
+    // Empty file.
+    std::fs::write(store.file_path(), "").unwrap();
+    assert!(store.load().is_err());
+    assert!(store.has_users().is_err());
+
+    // Unknown schema version.
+    std::fs::write(store.file_path(), r#"{"schema":999,"users":[]}"#).unwrap();
+    let err = store.load().unwrap_err();
+    assert!(err.to_string().contains("schema 999"), "{err}");
+    assert!(store.has_users().is_err());
+
+    // A readable, current-schema store still loads and reports its users.
+    std::fs::write(store.file_path(), r#"{"schema":1,"users":[]}"#).unwrap();
+    assert!(!store.has_users().unwrap());
+    let user = store.create_user("owner@example.com", "secret123", "owner");
+    assert!(user.is_ok());
+    assert!(store.has_users().unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_store_is_an_error_not_an_empty_store() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root bypasses file permissions; skipping keeps the test honest there.
+    if running_as_root() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = AccountsStore::new(&state);
+    std::fs::write(store.file_path(), r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(store.file_path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(store.load().is_err());
+    let err = store.has_users().unwrap_err();
+    assert!(
+        err.to_string().contains("account storage I/O error"),
+        "{err}"
+    );
+    let _ = std::fs::set_permissions(store.file_path(), std::fs::Permissions::from_mode(0o600));
+}
+
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 #[tokio::test(start_paused = true)]
 async fn trusted_proxy_keys_throttle_on_last_forwarded_hop() {
     let root = tempfile::tempdir().unwrap();
