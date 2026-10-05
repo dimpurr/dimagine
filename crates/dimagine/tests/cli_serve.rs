@@ -798,7 +798,7 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
             "owner@example.com",
             "--password-stdin",
         ],
-        "secret123\n",
+        "secret123456\n",
     );
     assert_eq!(
         output.status.code(),
@@ -821,7 +821,7 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
             "second@example.com",
             "--password-stdin",
         ],
-        "secret456\n",
+        "secret456789\n",
     );
     assert_eq!(output.status.code(), Some(0));
 
@@ -844,7 +844,7 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
             "owner@example.com",
             "--password-stdin",
         ],
-        "other\n",
+        "other1234567\n",
     );
     assert_eq!(output.status.code(), Some(1));
 
@@ -859,7 +859,7 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
             "owner@example.com",
             "--password-stdin",
         ],
-        "newpass456\n",
+        "newpass45678\n",
     );
     assert_eq!(
         output.status.code(),
@@ -889,12 +889,55 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
     let (status, cookie) = post_form(
         &address,
         "/login",
-        "email=owner%40example.com&password=newpass456",
+        "email=owner%40example.com&password=newpass45678",
     );
     assert_eq!(status, "303");
     let cookie = cookie.expect("login sets a session cookie");
     assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
     server.kill();
+}
+
+#[test]
+fn user_cli_refuses_passwords_below_the_minimum() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // create refuses a short password with a clear message.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "short\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+
+    // passwd refuses a short password too.
+    let output = run_user(
+        &[
+            "user",
+            "passwd",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "short\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+
+    // Neither attempt created an account.
+    assert!(!state.0.join("accounts.json").exists());
 }
 
 #[test]
@@ -926,7 +969,7 @@ fn setup_flow_over_http_and_restart() {
 
     // The right code creates the owner and signs in.
     let body = format!(
-        "email=owner%40example.com&password=secret123&confirm_password=secret123&setup_code={code}"
+        "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code={code}"
     );
     let (status, cookie) = post_form(&address, "/setup", &body);
     assert_eq!(status, "303");

@@ -101,7 +101,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123&confirm_password=secret123&setup_code=wrong-code",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=wrong-code",
         ),
     )
     .await;
@@ -113,7 +113,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123&confirm_password=other&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=secret123456&confirm_password=other-password&setup_code=setup-code-abcdef",
         ),
     )
     .await;
@@ -124,7 +124,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123&confirm_password=secret123&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
         ),
     )
     .await;
@@ -145,7 +145,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
             &app,
             post(
                 "/setup",
-                "email=second%40example.com&password=secret123&confirm_password=secret123&setup_code=setup-code-abcdef",
+                "email=second%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
             )
         )
         .await
@@ -169,6 +169,55 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
             & 0o777;
         assert_eq!(mode, 0o600, "accounts.json must be 0600, got {mode:o}");
     }
+}
+
+#[tokio::test]
+async fn setup_refuses_short_and_empty_passwords() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, Some("setup-code-abcdef"), None);
+
+    // The form tells the operator about the minimum up front.
+    let (status, html) = body_text(&app, get("/setup", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("minlength=\"12\""), "{html}");
+
+    // A password below the minimum is refused with a clear message, even
+    // when both fields match and the setup code is valid.
+    let (status, html) = body_text(
+        &app,
+        post(
+            "/setup",
+            "email=owner%40example.com&password=short&confirm_password=short&setup_code=setup-code-abcdef",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(html.contains("at least 12 characters"), "{html}");
+    assert!(!root.path().join("state/accounts.json").exists());
+
+    // An empty password is refused too (the two empty fields match).
+    let (status, _) = body_text(
+        &app,
+        post(
+            "/setup",
+            "email=owner%40example.com&password=&confirm_password=&setup_code=setup-code-abcdef",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!root.path().join("state/accounts.json").exists());
+
+    // A password of exactly 12 characters is accepted.
+    let (status, headers, _) = send(
+        &app,
+        post(
+            "/setup",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/");
 }
 
 #[tokio::test]

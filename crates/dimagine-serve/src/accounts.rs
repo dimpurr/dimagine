@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 /// Default schema version for accounts.json.
 pub const CURRENT_SCHEMA: u32 = 1;
 
+/// Minimum password length enforced by the setup form and the user CLI.
+pub const MIN_PASSWORD_LENGTH: usize = 12;
+
 /// In-memory representation of `accounts.json`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AccountsFile {

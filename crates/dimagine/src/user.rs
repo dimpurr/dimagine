@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
-use dimagine_serve::accounts::{default_data_dir, AccountsStore};
+use dimagine_serve::accounts::{default_data_dir, AccountsStore, MIN_PASSWORD_LENGTH};
 
 use crate::emit_failure;
 
@@ -107,6 +107,11 @@ fn read_password(password_stdin: bool) -> Result<String, String> {
     let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
     if trimmed.is_empty() {
         return Err("password cannot be empty".to_string());
+    }
+    if trimmed.len() < MIN_PASSWORD_LENGTH {
+        return Err(format!(
+            "password must be at least {MIN_PASSWORD_LENGTH} characters"
+        ));
     }
     Ok(trimmed)
 }

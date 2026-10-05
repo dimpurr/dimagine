@@ -5,6 +5,7 @@
 
 pub mod accounts;
 
+use crate::accounts::MIN_PASSWORD_LENGTH;
 use axum::{
     body::Body,
     extract::{Form, Path, State},
@@ -969,6 +970,26 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     Redirect::to("/login").into_response()
 }
 
+/// The setup form, optionally preceded by an error paragraph. This is the
+/// single place that knows the form's fields, so the password `minlength`
+/// lives here and not in every error page.
+fn setup_form_html(error: Option<&str>) -> String {
+    let error = error
+        .map(|message| format!("<p>{message}</p>"))
+        .unwrap_or_default();
+    format!(
+        "{error}<form method=\"post\">\
+         <h2>Welcome to dimagine</h2>\
+         <p>Create the owner account to finish server setup.</p>\
+         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+         <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+         <button type=\"submit\">Complete Setup</button>\
+         </form>"
+    )
+}
+
 async fn setup_page(State(state): State<AppState>) -> Response {
     let has_users = match state.accounts.has_users() {
         Ok(has_users) => has_users,
@@ -977,18 +998,7 @@ async fn setup_page(State(state): State<AppState>) -> Response {
     if has_users || state.config.passcode.is_some() {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
-    let html = layout(
-        "Initial Setup",
-        "<form method=\"post\">\
-         <h2>Welcome to dimagine</h2>\
-         <p>Create the owner account to finish server setup.</p>\
-         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-         <label>Password <input name=\"password\" type=\"password\" required></label>\
-         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
-         <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-         <button type=\"submit\">Complete Setup</button>\
-         </form>",
-    );
+    let html = layout("Initial Setup", &setup_form_html(None));
     let mut response = Html(html).into_response();
     response
         .headers_mut()
@@ -1028,14 +1038,7 @@ async fn setup(
     if trimmed_email.is_empty() || !trimmed_email.contains('@') {
         let error_html = layout(
             "Initial Setup",
-            "<p>Please enter a valid email address.</p>\
-             <form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required></label>\
-             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
-             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-             <button type=\"submit\">Complete Setup</button>\
-             </form>",
+            &setup_form_html(Some("Please enter a valid email address.")),
         );
         let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
         response
@@ -1044,17 +1047,24 @@ async fn setup(
         return response;
     }
 
-    if form.password.is_empty() || form.password != form.confirm_password {
+    if form.password != form.confirm_password {
         let error_html = layout(
             "Initial Setup",
-            "<p>Passwords do not match.</p>\
-             <form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required></label>\
-             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
-             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-             <button type=\"submit\">Complete Setup</button>\
-             </form>",
+            &setup_form_html(Some("Passwords do not match.")),
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if form.password.len() < MIN_PASSWORD_LENGTH {
+        let error_html = layout(
+            "Initial Setup",
+            &setup_form_html(Some(&format!(
+                "Password must be at least {MIN_PASSWORD_LENGTH} characters."
+            ))),
         );
         let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
         response
@@ -1082,14 +1092,7 @@ async fn setup(
     {
         let error_html = layout(
             "Initial Setup",
-            "<p>Invalid setup code.</p>\
-             <form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required></label>\
-             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
-             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-             <button type=\"submit\">Complete Setup</button>\
-             </form>",
+            &setup_form_html(Some("Invalid setup code.")),
         );
         let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
         response
@@ -1156,19 +1159,22 @@ async fn login_page(State(state): State<AppState>) -> Response {
     }
 
     let form_html = if has_users {
-        "<form method=\"post\">\
-         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-         <label>Password <input name=\"password\" type=\"password\" required></label>\
-         <button>Sign in</button>\
-         </form>"
+        format!(
+            "<form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+             <button>Sign in</button>\
+             </form>"
+        )
     } else {
         "<form method=\"post\">\
          <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
          <button>Sign in</button>\
          </form>"
+            .to_string()
     };
 
-    let mut response = Html(layout("Sign in", form_html)).into_response();
+    let mut response = Html(layout("Sign in", &form_html)).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1248,22 +1254,25 @@ async fn login(
 
     if !authenticated {
         let error_body = if has_users {
-            "<p>Incorrect email or password.</p>\
-             <form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required></label>\
-             <button>Sign in</button>\
-             </form>"
+            format!(
+                "<p>Incorrect email or password.</p>\
+                 <form method=\"post\">\
+                 <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+                 <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+                 <button>Sign in</button>\
+                 </form>"
+            )
         } else {
             "<p>Incorrect passcode.</p>\
              <form method=\"post\">\
              <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
              <button>Sign in</button>\
              </form>"
+                .to_string()
         };
         let mut response = (
             StatusCode::UNAUTHORIZED,
-            Html(layout("Sign in", error_body)),
+            Html(layout("Sign in", &error_body)),
         )
             .into_response();
         response
