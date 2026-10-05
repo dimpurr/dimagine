@@ -58,5 +58,8 @@
   {"url": "https://10.0.0.1/dp/B0ABCD1234", "name": null},
   {"url": "https://999.999.999.999/12345678", "name": null},
   {"url": "https://[::ffff:192.168.1.5]/img/12345678", "name": null},
+  {"url": "https://user@example.com/img/1234567890", "name": "example-1234567890"},
+  {"url": "https://user:secret@example.com/img/1234567890", "name": "example-1234567890"},
+  {"url": "https://user@192.168.1.5:8080/img/1234567890", "name": null},
   {"url": "not a url at all", "name": null}
 ]
