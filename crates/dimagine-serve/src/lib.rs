@@ -8,6 +8,8 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use dimagine_core::library::{FileClass, FileEntry, Library};
+use dimagine_core::links::{extract_markdown_links, Outcome, Resolver};
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{html, Event, Options, Parser};
 use saphyr::{LoadableYamlNode, Yaml};
@@ -47,6 +49,31 @@ pub struct Collection {
     pub title: String,
     /// Ordered image paths.
     pub members: Vec<CollectionMember>,
+    /// Embeds that did not resolve to exactly one image, shown on the
+    /// collection page instead of being silently dropped (FORMAT §5.1).
+    pub diagnostics: Vec<CollectionDiagnostic>,
+}
+
+/// Why one embed is not a member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum DiagnosticKind {
+    /// The bare name matched several files; the viewer must not guess
+    /// (FORMAT §5.1 rule 3).
+    Ambiguous,
+    /// The target claims an image but matches nothing (FORMAT §5.1).
+    Missing,
+}
+
+/// One embed that resolved to no single image.
+#[derive(Clone, Debug, Serialize)]
+pub struct CollectionDiagnostic {
+    /// The embed target as written between the brackets.
+    pub target: String,
+    /// 1-based line of the embed in the note file.
+    pub line: usize,
+    pub kind: DiagnosticKind,
+    /// Candidate paths when [`DiagnosticKind::Ambiguous`].
+    pub candidates: Vec<String>,
 }
 
 /// One image and its adjacent caption in a collection.
@@ -107,9 +134,15 @@ pub enum PreviewKind {
 }
 
 /// Filesystem catalog that follows FORMAT §2.2 while scanning.
+///
+/// The library is walked once with `dimagine-core` at construction; the walk
+/// feeds the link resolver and the collection listing. Note contents are read
+/// live on every request, so edits to a note are visible without a restart.
 #[derive(Clone, Debug)]
 pub struct FsCatalog {
     root: PathBuf,
+    library: Library,
+    resolver: Arc<Resolver>,
 }
 
 impl FsCatalog {
@@ -119,7 +152,13 @@ impl FsCatalog {
         if !root.is_dir() {
             return Err(CatalogError::NotFound);
         }
-        Ok(Self { root })
+        let library = Library::open(&root).map_err(|_| CatalogError::NotFound)?;
+        let resolver = Arc::new(Resolver::new(&library.files));
+        Ok(Self {
+            root,
+            library,
+            resolver,
+        })
     }
 
     fn scan_images(&self, directory: &FsPath) -> Result<Vec<ImageEntry>, CatalogError> {
@@ -153,33 +192,34 @@ impl FsCatalog {
 
     fn collections_in(&self, folder: &str) -> Result<Vec<Collection>, CatalogError> {
         let folder_path = self.resolve_path(folder)?;
+        if !folder_path.is_dir() {
+            return Err(CatalogError::NotFound);
+        }
+        let folder_rel = folder_path
+            .strip_prefix(&self.root)
+            .unwrap_or(&folder_path)
+            .to_path_buf();
         let mut items = Vec::new();
-        for entry in fs::read_dir(folder_path).map_err(|_| CatalogError::NotFound)? {
-            let entry = entry.map_err(|_| CatalogError::Unreadable)?;
-            let meta = entry.file_type().map_err(|_| CatalogError::Unreadable)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if ignored_name(&name) || meta.is_symlink() || !meta.is_file() || !name.ends_with(".md")
-            {
+        for entry in self.library.files.iter().filter(|entry| {
+            matches!(entry.class, FileClass::Note | FileClass::ImageNote)
+                && entry.path.parent() == Some(folder_rel.as_path())
+        }) {
+            let text = fs::read_to_string(self.root.join(&entry.path))
+                .map_err(|_| CatalogError::Unreadable)?;
+            let parsed = parse_note(&text);
+            let (members, diagnostics) =
+                collect_collection(&self.resolver, &self.library.files, entry, &parsed, &text);
+            if !is_collection(&parsed, &members, &diagnostics) {
                 continue;
             }
-            let text = fs::read_to_string(entry.path()).map_err(|_| CatalogError::Unreadable)?;
-            let parsed = parse_note(&text);
-            let props = &parsed.properties;
-            let body = parsed.body.as_str();
-            if yaml_string(props, "kind").as_deref() == Some("collection") {
-                let entry_path = entry.path();
-                let rel = entry_path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| CatalogError::Forbidden)?;
-                let path = rel.to_string_lossy().replace('\\', "/");
-                let title = yaml_string(props, "title")
-                    .unwrap_or_else(|| name.trim_end_matches(".md").to_string());
-                items.push(Collection {
-                    path: path.clone(),
-                    title,
-                    members: collect_members(&self.root, &path, body),
-                });
-            }
+            let title = yaml_string(&parsed.properties, "title")
+                .unwrap_or_else(|| entry.name.trim_end_matches(".md").to_string());
+            items.push(Collection {
+                path: entry.rel.clone(),
+                title,
+                members,
+                diagnostics,
+            });
         }
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
@@ -223,23 +263,36 @@ impl Catalog for FsCatalog {
         if !safe.is_file() {
             return Err(CatalogError::NotFound);
         }
+        let native_name = safe.file_name().unwrap_or_default().to_os_string();
+        let name = native_name.to_string_lossy().into_owned();
+        let class = dimagine_core::library::classify(&name);
+        if !matches!(class, FileClass::Note | FileClass::ImageNote) {
+            return Err(CatalogError::NotFound);
+        }
+        let rel = safe
+            .strip_prefix(&self.root)
+            .map_err(|_| CatalogError::Forbidden)?
+            .to_path_buf();
         let text = fs::read_to_string(&safe).map_err(|_| CatalogError::Unreadable)?;
         let parsed = parse_note(&text);
-        if parsed.error.is_some()
-            || yaml_string(&parsed.properties, "kind").as_deref() != Some("collection")
-        {
+        let note = FileEntry {
+            rel: rel.to_string_lossy().into_owned(),
+            name: name.clone(),
+            path: rel,
+            native_name,
+            class,
+        };
+        let (members, diagnostics) =
+            collect_collection(&self.resolver, &self.library.files, &note, &parsed, &text);
+        if !is_collection(&parsed, &members, &diagnostics) {
             return Err(CatalogError::NotFound);
         }
         Ok(Collection {
             path: path.to_owned(),
-            title: yaml_string(&parsed.properties, "title").unwrap_or_else(|| {
-                safe.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .trim_end_matches(".md")
-                    .to_string()
-            }),
-            members: collect_members(&self.root, path, &parsed.body),
+            title: yaml_string(&parsed.properties, "title")
+                .unwrap_or_else(|| name.trim_end_matches(".md").to_string()),
+            members,
+            diagnostics,
         })
     }
 
@@ -1064,7 +1117,25 @@ fn render_folder_data_html(data: FolderData) -> Response {
     .into_response()
 }
 fn collection_html(c: &Collection) -> String {
-    c.members.iter().map(|m| format!("<figure><a href=\"/image/{}\"><img loading=\"lazy\" src=\"/media/{}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>", encode_path(&m.path), encode_path(&m.path), escape_html(&m.path), escape_html(&m.caption))).collect::<String>()
+    let figures: String = c.members.iter().map(|m| format!("<figure><a href=\"/image/{}\"><img loading=\"lazy\" src=\"/media/{}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>", encode_path(&m.path), encode_path(&m.path), escape_html(&m.path), escape_html(&m.caption))).collect();
+    let diagnostics: String = c.diagnostics.iter().map(|d| match d.kind {
+        DiagnosticKind::Ambiguous => format!(
+            "<p class=\"error\">Line {}: <code>{}</code> matches several files, not guessing: {}</p>",
+            d.line,
+            escape_html(&d.target),
+            d.candidates
+                .iter()
+                .map(|candidate| escape_html(candidate))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        DiagnosticKind::Missing => format!(
+            "<p class=\"error\">Line {}: <code>{}</code> matches no file</p>",
+            d.line,
+            escape_html(&d.target)
+        ),
+    }).collect();
+    format!("{figures}{diagnostics}")
 }
 fn json_result<T: Serialize>(result: Result<T, CatalogError>) -> Response {
     match result {
@@ -1116,6 +1187,7 @@ fn is_image(path: &FsPath) -> bool {
 struct ParsedNote {
     properties: serde_json::Value,
     body: String,
+    body_line: usize,
     error: Option<String>,
 }
 fn parse_note(text: &str) -> ParsedNote {
@@ -1124,6 +1196,7 @@ fn parse_note(text: &str) -> ParsedNote {
         return ParsedNote {
             properties: serde_json::Value::Null,
             body: String::new(),
+            body_line: 1,
             error: None,
         };
     };
@@ -1131,29 +1204,36 @@ fn parse_note(text: &str) -> ParsedNote {
         return ParsedNote {
             properties: serde_json::Value::Null,
             body: text.to_owned(),
+            body_line: 1,
             error: None,
         };
     }
     let mut offset = first.len();
     let yaml_start = offset;
+    let mut line_no = 1usize;
     for line in lines {
+        line_no += 1;
         if line.trim_end_matches(['\r', '\n']) == "---" {
             let yaml = &text[yaml_start..offset];
             let body = text[offset + line.len()..].to_owned();
+            let body_line = line_no + 1;
             return match Yaml::load_from_str(yaml) {
                 Ok(documents) if documents.len() == 1 => ParsedNote {
                     properties: yaml_to_json(&documents[0]),
                     body,
+                    body_line,
                     error: None,
                 },
                 Ok(_) => ParsedNote {
                     properties: serde_json::Value::Null,
                     body,
+                    body_line,
                     error: Some("front matter must contain exactly one YAML document".to_owned()),
                 },
                 Err(error) => ParsedNote {
                     properties: serde_json::Value::Null,
                     body,
+                    body_line,
                     error: Some(error.to_string()),
                 },
             };
@@ -1163,6 +1243,7 @@ fn parse_note(text: &str) -> ParsedNote {
     ParsedNote {
         properties: serde_json::Value::Null,
         body: text.to_owned(),
+        body_line: 2,
         error: Some("front matter has no closing delimiter".to_owned()),
     }
 }
@@ -1206,93 +1287,83 @@ fn yaml_json_string(value: &serde_json::Value) -> String {
 fn yaml_string(value: &serde_json::Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(ToOwned::to_owned)
 }
-fn collect_members(root: &FsPath, note_path: &str, body: &str) -> Vec<CollectionMember> {
-    let mut out = Vec::new();
-    let mut lines = body.lines().peekable();
-    while let Some(line) = lines.next() {
-        let target = if let Some(start) = line.find("![[") {
-            line[start + 3..]
-                .split("]]")
-                .next()
-                .map(|s| s.split('|').next().unwrap_or(s).trim().to_string())
-        } else if let Some(start) = line.find("](") {
-            line[start + 2..]
-                .split(')')
-                .next()
-                .map(|s| s.trim_matches(['<', '>']).to_string())
-        } else {
-            None
-        };
-        // TODO(core-wiring): Replace this lightweight extractor with the shared core parser.
-        if let Some(target) = target {
-            if let Some(path) = resolve_embed(root, note_path, &target) {
-                if image_note_self_embed(root, note_path, &path) {
+/// A note is a collection when it embeds at least one image (FORMAT §5), when
+/// an embed is reported as ambiguous or missing, or when it carries
+/// `kind: collection`, which exists so tools list it (FORMAT §5). An image
+/// note's self-embed never counts (FORMAT §3.2).
+fn is_collection(
+    parsed: &ParsedNote,
+    members: &[CollectionMember],
+    diagnostics: &[CollectionDiagnostic],
+) -> bool {
+    !members.is_empty()
+        || !diagnostics.is_empty()
+        || yaml_string(&parsed.properties, "kind").as_deref() == Some("collection")
+}
+
+/// Extract the image members of one note with the shared core parser and
+/// resolver, and collect the embeds that resolved to no single image.
+fn collect_collection(
+    resolver: &Resolver,
+    files: &[FileEntry],
+    note: &FileEntry,
+    parsed: &ParsedNote,
+    text: &str,
+) -> (Vec<CollectionMember>, Vec<CollectionDiagnostic>) {
+    let links = extract_markdown_links(&parsed.body, parsed.body_line);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut members = Vec::new();
+    let mut diagnostics = Vec::new();
+    for link in links.iter().filter(|link| link.syntax.is_strong_image()) {
+        match resolver.resolve(&link.target, note, link.syntax) {
+            Outcome::Resolved(idx) if files[idx].class == FileClass::Image => {
+                let image = &files[idx];
+                if is_self_embed(note, image) {
                     continue;
                 }
-                let caption = match lines.peek() {
-                    Some(next)
-                        if !next.trim().is_empty() && !next.trim_start().starts_with("![[") =>
-                    {
-                        lines.next().unwrap_or("").to_string()
-                    }
-                    _ => String::new(),
-                };
-                out.push(CollectionMember { path, caption });
+                members.push(CollectionMember {
+                    path: image.rel.clone(),
+                    caption: caption_after(&lines, link.line),
+                });
             }
+            Outcome::Ambiguous(hits) => diagnostics.push(CollectionDiagnostic {
+                target: link.target.clone(),
+                line: link.line,
+                kind: DiagnosticKind::Ambiguous,
+                candidates: hits.iter().map(|&idx| files[idx].rel.clone()).collect(),
+            }),
+            Outcome::NotFound => diagnostics.push(CollectionDiagnostic {
+                target: link.target.clone(),
+                line: link.line,
+                kind: DiagnosticKind::Missing,
+                candidates: Vec::new(),
+            }),
+            Outcome::NotImageTarget | Outcome::Resolved(_) => {}
         }
     }
-    out
+    (members, diagnostics)
 }
-fn resolve_embed(root: &FsPath, note: &str, target: &str) -> Option<String> {
-    // TODO(core-wiring): Shared core owns unique bare-name resolution and diagnostics.
-    let note_parent = FsPath::new(note).parent().unwrap_or(FsPath::new(""));
-    let candidates = [root.join(target), root.join(note_parent).join(target)];
-    for candidate in candidates {
-        let Ok(relative) = candidate.strip_prefix(root) else {
-            continue;
-        };
-        let mut checked = root.to_path_buf();
-        let mut safe = true;
-        for component in relative.components() {
-            let Component::Normal(part) = component else {
-                safe = false;
-                break;
-            };
-            if ignored_name(&part.to_string_lossy()) {
-                safe = false;
-                break;
-            }
-            checked.push(part);
-            if fs::symlink_metadata(&checked)
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(true)
-            {
-                safe = false;
-                break;
-            }
-        }
-        if !safe {
-            continue;
-        }
-        let Ok(canonical) = fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if canonical.starts_with(root)
-            && canonical.strip_prefix(root).ok().is_some_and(|relative| {
-                relative
-                    .components()
-                    .all(|c| !ignored_name(&c.as_os_str().to_string_lossy()))
-            })
-            && canonical.is_file()
-            && is_image(&canonical)
-        {
-            return canonical
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.to_string_lossy().replace('\\', "/"));
-        }
+
+/// FORMAT §3.2: an image note's embed of its own image is a preview, not a
+/// membership.
+fn is_self_embed(note: &FileEntry, image: &FileEntry) -> bool {
+    note.class == FileClass::ImageNote
+        && note
+            .paired_image_path()
+            .is_some_and(|paired| paired == image.path)
+}
+
+/// The caption is the line directly after an embed, when it is neither empty
+/// nor itself an embed (FORMAT §5).
+fn caption_after(lines: &[&str], link_line: usize) -> String {
+    let Some(next) = lines.get(link_line) else {
+        return String::new();
+    };
+    let trimmed = next.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with("![") {
+        return String::new();
     }
-    None
+    next.to_string()
 }
 
 fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
@@ -1307,13 +1378,6 @@ fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
         }
     }
     sessions.insert(token, now + SESSION_SECONDS);
-}
-fn image_note_self_embed(root: &FsPath, note: &str, member: &str) -> bool {
-    let Some(image_note) = note.strip_suffix(".md") else {
-        return false;
-    };
-    let image_note = root.join(image_note);
-    is_image(&image_note) && image_note == root.join(member)
 }
 fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out = vec![("Library".to_string(), String::new())];
