@@ -1,6 +1,8 @@
 //! End-to-end CLI tests for the core-plugins switch
 //! (`<library>/.dimagine/core-plugins.json`, ADR-013): a disabled built-in
-//! plugin disappears from help and usage.
+//! plugin disappears from help and usage. Tests that drive a specific
+//! subcommand are cfg-gated to its feature, so a --no-default-features
+//! build of the binary has no equivalent surface to test.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -46,8 +48,9 @@ fn set_switch(library: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
 }
 
-/// The library used for import (fixture-free): an empty folder with two
-/// images, so scan works and import could run if it were enabled.
+/// The library used for import: an empty folder with two images, so scan
+/// works and import could run if it were enabled.
+#[cfg(feature = "import-eagle")]
 fn library(tag: &str) -> TempDir {
     let dir = tmp(tag);
     std::fs::write(dir.0.join("one.jpg"), b"not really a jpeg").unwrap();
@@ -55,6 +58,7 @@ fn library(tag: &str) -> TempDir {
 }
 
 #[test]
+#[cfg(feature = "import-eagle")]
 fn switch_off_hides_import_eagle() {
     let lib = library("off");
     set_switch(&lib.0, r#"{"import-eagle": false}"#);
@@ -75,6 +79,7 @@ fn switch_off_hides_import_eagle() {
 }
 
 #[test]
+#[cfg(feature = "import-eagle")]
 fn switch_missing_file_offers_everything() {
     let lib = tmp("missing");
     let lib_arg = lib.0.to_str().unwrap();
@@ -86,6 +91,7 @@ fn switch_missing_file_offers_everything() {
 }
 
 #[test]
+#[cfg(feature = "import-eagle")]
 fn switch_malformed_file_warns_and_offers_everything() {
     let lib = tmp("malformed");
     set_switch(&lib.0, "{definitely not json");
@@ -101,6 +107,7 @@ fn switch_malformed_file_warns_and_offers_everything() {
 }
 
 #[test]
+#[cfg(feature = "import-eagle")]
 fn switch_unknown_and_wrong_typed_keys_warn_but_keep_defaults() {
     let lib = tmp("unknown");
     set_switch(&lib.0, r#"{"vector-search": true, "import-eagle": "off"}"#);
@@ -137,6 +144,7 @@ fn switch_false_for_all_plugins_leaves_scan_and_check() {
 }
 
 #[test]
+#[cfg(feature = "import-eagle")]
 fn switch_is_honoured_when_the_flag_comes_after_the_subcommand() {
     let lib = library("after");
     set_switch(&lib.0, r#"{"import-eagle": false}"#);

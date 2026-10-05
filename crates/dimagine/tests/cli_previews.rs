@@ -1,4 +1,6 @@
-//! End-to-end CLI tests for `dimagine previews` on synthetic libraries.
+#![cfg(feature = "previews")]
+//! Compiled only when the matching built-in plugin feature is on; with
+//! --no-default-features the plugin subcommands do not exist.
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

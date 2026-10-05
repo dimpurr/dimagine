@@ -57,7 +57,7 @@ fn main() -> ExitCode {
 }
 
 fn cli(plugins: &CorePlugins) -> Command {
-    let mut command = Command::new("dimagine")
+    let command = Command::new("dimagine")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
         .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. Commands only read the library; derived data lives in .dimagine/ and can always be deleted.")
@@ -94,23 +94,30 @@ fn cli(plugins: &CorePlugins) -> Command {
         .subcommand_required(true)
         .arg_required_else_help(true);
     // Built-in plugins: compiled per Cargo feature, then switched per library
-    // (ADR-013). Disabled plugins do not appear in help or usage.
+    // (ADR-013). Disabled plugins do not appear in help or usage. Each block
+    // rebinds `command`, so no feature combination leaves an unused `mut`.
     #[cfg(feature = "import-eagle")]
-    if plugins.import_eagle {
-        command = command.subcommand(import::command());
-    }
+    let command = if plugins.import_eagle {
+        command.subcommand(import::command())
+    } else {
+        command
+    };
     #[cfg(not(feature = "import-eagle"))]
     let _ = &plugins.import_eagle;
     #[cfg(feature = "previews")]
-    if plugins.previews {
-        command = command.subcommand(previews::command());
-    }
+    let command = if plugins.previews {
+        command.subcommand(previews::command())
+    } else {
+        command
+    };
     #[cfg(not(feature = "previews"))]
     let _ = &plugins.previews;
     #[cfg(feature = "serve")]
-    if plugins.serve {
-        command = command.subcommand(serve::command());
-    }
+    let command = if plugins.serve {
+        command.subcommand(serve::command())
+    } else {
+        command
+    };
     #[cfg(not(feature = "serve"))]
     let _ = &plugins.serve;
     command

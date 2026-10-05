@@ -1,6 +1,6 @@
-//! End-to-end CLI tests for `dimagine serve`: a real process on a real
-//! socket, hand-rolled HTTP so no client dependency is added. Every server
-//! here is a child this test started and later kills.
+#![cfg(feature = "serve")]
+//! Compiled only when the matching built-in plugin feature is on; with
+//! --no-default-features the plugin subcommands do not exist.
 
 use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};

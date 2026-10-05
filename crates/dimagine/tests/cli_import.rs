@@ -1,5 +1,6 @@
-//! End-to-end CLI tests for `dimagine import eagle` on synthetic Eagle
-//! libraries. Synthetic data only; no real image library is touched.
+#![cfg(feature = "import-eagle")]
+//! Compiled only when the matching built-in plugin feature is on; with
+//! --no-default-features the plugin subcommands do not exist.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
