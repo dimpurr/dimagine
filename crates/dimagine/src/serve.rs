@@ -46,6 +46,21 @@ pub fn command() -> Command {
                 .default_value("127.0.0.1")
                 .help("IP address to listen on (default: 127.0.0.1, reachable only from this machine)."),
         )
+        .arg(
+            Arg::new("trusted_proxy")
+                .long("trusted-proxy")
+                .value_name("IP")
+                .value_parser(clap::value_parser!(IpAddr))
+                .action(clap::ArgAction::Append)
+                .help("Trusted reverse proxy IP address (repeatable)."),
+        )
+        .arg(
+            Arg::new("data_dir")
+                .long("data-dir")
+                .value_name("DIR")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+                .help("State directory where accounts are stored (default: $XDG_STATE_HOME/dimagine or ~/.local/state/dimagine)."),
+        )
         .after_help(format!(
             "The passcode comes from the {PASSCODE_ENV} environment variable; \
              when unset, the viewer's built-in default applies."
@@ -66,8 +81,18 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }
     };
     let previews = CachedPreview::new(library_dir);
+    let trusted_proxies = sub
+        .get_many::<IpAddr>("trusted_proxy")
+        .map(|vals| vals.copied().collect())
+        .unwrap_or_default();
+    let data_dir = sub
+        .get_one::<std::path::PathBuf>("data_dir")
+        .cloned()
+        .unwrap_or_else(dimagine_serve::accounts::default_data_dir);
     let config = ServeConfig {
         passcode: passcode_from_env(),
+        trusted_proxies,
+        data_dir,
         ..ServeConfig::default()
     };
     let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);

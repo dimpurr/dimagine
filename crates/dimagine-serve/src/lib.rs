@@ -585,7 +585,7 @@ impl std::fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 /// Viewer configuration.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ServeConfig {
     /// Shared passcode.
     pub passcode: String,
@@ -593,6 +593,10 @@ pub struct ServeConfig {
     pub cookie_name: String,
     /// Set this when the viewer is served directly over HTTPS.
     pub https: bool,
+    /// Trusted reverse proxy IP addresses.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// State directory for accounts.json.
+    pub data_dir: PathBuf,
 }
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -600,8 +604,36 @@ impl Default for ServeConfig {
             passcode: "2333".to_string(),
             cookie_name: "dimagine_session".to_string(),
             https: false,
+            trusted_proxies: Vec::new(),
+            data_dir: accounts::default_data_dir(),
         }
     }
+}
+
+/// Resolve client IP for rate limiting and logging.
+///
+/// When the direct TCP peer is a trusted reverse proxy, the client IP is extracted
+/// from the LAST hop of the `X-Forwarded-For` header. For untrusted peers (or if the
+/// header is absent/malformed), the TCP peer IP is used directly, ignoring the header.
+pub fn resolve_client_ip(
+    peer_addr: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    let Some(peer) = peer_addr else {
+        return "unknown".to_string();
+    };
+    let peer_ip = peer.ip();
+    if trusted_proxies.contains(&peer_ip) {
+        if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(last_hop) = forwarded.split(',').next_back().map(str::trim) {
+                if let Ok(ip) = last_hop.parse::<std::net::IpAddr>() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+    peer_ip.to_string()
 }
 
 #[derive(Clone)]
@@ -876,11 +908,14 @@ struct LoginForm {
 async fn login(
     State(state): State<AppState>,
     client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_key = client
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
+    let client_key = resolve_client_ip(
+        client.map(|c| c.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
     // Bound how many guesses are in flight before anything else: a parallel
     // wave of guesses is refused without the passcode ever being compared.
     let _slot = match state.login_slots.clone().try_acquire_owned() {
@@ -1803,5 +1838,58 @@ mod regression_unit_tests {
             &custom,
             "0.0.0.0:3000".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn trusted_proxy_client_ip_resolution() {
+        let trusted_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let untrusted_peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let trusted_peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        // Untrusted peer with X-Forwarded-For is ignored
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(Some(untrusted_peer), &headers, &[trusted_ip]),
+            "198.51.100.7"
+        );
+
+        // Trusted proxy with single hop X-Forwarded-For
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &headers, &[trusted_ip]),
+            "203.0.113.195"
+        );
+
+        // Trusted proxy with multi-hop X-Forwarded-For extracts LAST hop
+        let mut multi_headers = HeaderMap::new();
+        multi_headers.insert(
+            "x-forwarded-for",
+            "10.0.0.1, 192.168.1.1, 203.0.113.50".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &multi_headers, &[trusted_ip]),
+            "203.0.113.50"
+        );
+
+        // Trusted proxy with invalid last hop falls back to peer IP
+        let mut invalid_headers = HeaderMap::new();
+        invalid_headers.insert("x-forwarded-for", "invalid-ip-string".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &invalid_headers, &[trusted_ip]),
+            "127.0.0.1"
+        );
+
+        // Trusted proxy with missing header returns peer IP
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &empty_headers, &[trusted_ip]),
+            "127.0.0.1"
+        );
+
+        // No peer addr returns "unknown"
+        assert_eq!(
+            resolve_client_ip(None, &headers, &[trusted_ip]),
+            "unknown"
+        );
     }
 }
