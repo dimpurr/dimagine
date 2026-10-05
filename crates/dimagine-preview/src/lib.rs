@@ -682,11 +682,17 @@ fn cache_path(root: &Path, hash: &str, kind: Kind, format: RenditionFormat) -> P
 
 /// A cache entry location. On unix the containing directory is pinned by an
 /// `O_NOFOLLOW`-opened descriptor, so later path component swaps cannot
-/// redirect reads or writes outside the containing directory.
+/// redirect reads or writes outside the containing directory. On windows
+/// every path component is re-validated without following reparse points
+/// before publication and the published entry is re-verified after the
+/// rename.
 struct CacheTarget {
     #[cfg(windows)]
     /// Nominal published path, used for path-based validation and write.
     path: PathBuf,
+    #[cfg(windows)]
+    /// Canonical library root the published path must stay inside.
+    root: PathBuf,
     #[cfg(unix)]
     name: OsString,
     #[cfg(unix)]
@@ -736,37 +742,11 @@ fn prepare_cache_dir(root: &Path, file: &Path) -> Result<CacheTarget, PreviewErr
     {
         let mut current = canonical_root.clone();
         for component in components {
-            current.push(component);
-            if let Err(error) = fs::symlink_metadata(&current) {
-                if error.kind() != io::ErrorKind::NotFound {
-                    return Err(error.into());
-                }
-                if let Err(error) = fs::create_dir(&current) {
-                    // Another writer may have created the component in the
-                    // meantime; proceed only when the winner is a directory.
-                    if error.kind() != io::ErrorKind::AlreadyExists {
-                        return Err(error.into());
-                    }
-                }
-            }
-            let meta = fs::symlink_metadata(&current)?;
-            if meta.file_type().is_symlink() || !meta.is_dir() {
-                return Err(PreviewError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "cache path contains a symlink or non-directory",
-                )));
-            }
-            let resolved = fs::canonicalize(&current)?;
-            if !resolved.starts_with(&canonical_root) {
-                return Err(PreviewError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "cache path resolves outside the library",
-                )));
-            }
-            current = resolved;
+            current = validate_cache_component(&canonical_root, &current, component, true)?;
         }
         Ok(CacheTarget {
             path: file.to_owned(),
+            root: canonical_root,
         })
     }
 }
@@ -811,15 +791,152 @@ fn valid_cache_hit(target: &CacheTarget, expected: (u32, u32), format: Rendition
 }
 
 #[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(windows)]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+/// Open a directory without following a reparse point at the final
+/// component, the Windows counterpart of an `O_NOFOLLOW | O_DIRECTORY`
+/// open.
+#[cfg(windows)]
+fn open_dir_nofollow(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+}
+
+/// Open a regular cache file without following a reparse point, so an
+/// entry swapped for one between preparation and this open cannot
+/// redirect the read; the handle metadata is authoritative about what
+/// was opened.
+#[cfg(windows)]
 fn open_regular_file_at(path: &Path) -> io::Result<File> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_file() || meta.file_type().is_symlink() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if is_reparse_point(&meta) || !meta.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "cache entry is not a regular file",
         ));
     }
-    File::open(path)
+    Ok(file)
+}
+
+/// True when the metadata describes any reparse point, not only the
+/// symlink and junction tags `FileType::is_symlink` reports.
+#[cfg(windows)]
+fn is_reparse_point(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+/// The error returned when a cache path component is a reparse point
+/// or not a directory.
+#[cfg(windows)]
+fn cache_component_error() -> PreviewError {
+    PreviewError::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "cache path contains a symlink or non-directory",
+    ))
+}
+
+/// Validate one cache path component: it must be a directory and not
+/// a reparse point, both on disk and through a handle opened without
+/// following reparse points, and it must resolve inside `root`. With
+/// `create`, a missing component is created first; an `AlreadyExists`
+/// failure means a concurrent writer won the creation race, and the
+/// winner is validated instead.
+#[cfg(windows)]
+fn validate_cache_component(
+    root: &Path,
+    parent: &Path,
+    component: &OsStr,
+    create: bool,
+) -> Result<PathBuf, PreviewError> {
+    let path = parent.join(component);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) => {
+            if is_reparse_point(&meta) || !meta.is_dir() {
+                return Err(cache_component_error());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound && create => {
+            if let Err(error) = fs::create_dir(&path) {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error.into());
+                }
+            }
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let handle = open_dir_nofollow(&path)?;
+    let meta = handle.metadata()?;
+    if is_reparse_point(&meta) || !meta.is_dir() {
+        return Err(cache_component_error());
+    }
+    let resolved = fs::canonicalize(&path)?;
+    if !resolved.starts_with(root) {
+        return Err(PreviewError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache path resolves outside the library",
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Re-validate every cache path component between the library root and
+/// the cache shard, refusing when any component is a reparse point, is
+/// not a directory, or resolves outside the root.
+#[cfg(windows)]
+fn revalidate_cache_chain(root: &Path, shard: &OsStr) -> Result<(), PreviewError> {
+    let components: [&OsStr; 4] = [
+        OsStr::new(".dimagine"),
+        OsStr::new("cache"),
+        OsStr::new("previews"),
+        shard,
+    ];
+    if components.iter().any(|component| component.is_empty()) {
+        return Err(PreviewError::Io(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache file path misses its shard component",
+        )));
+    }
+    let mut current = root.to_owned();
+    for component in components {
+        current = validate_cache_component(root, &current, component, false)?;
+    }
+    Ok(())
+}
+
+/// Re-verify a cache entry after publication: it must be a regular
+/// file resolving inside the library root. A component swapped for a
+/// reparse point during publication redirects the rename, and this
+/// check detects the escape.
+#[cfg(windows)]
+fn verify_published_entry(root: &Path, path: &Path) -> Result<(), PreviewError> {
+    let meta = fs::symlink_metadata(path)?;
+    if is_reparse_point(&meta) || !meta.is_file() {
+        return Err(PreviewError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache entry is not a regular file",
+        )));
+    }
+    let resolved = fs::canonicalize(path)?;
+    if !resolved.starts_with(root) {
+        return Err(PreviewError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cache entry resolves outside the library",
+        )));
+    }
+    Ok(())
 }
 
 fn encode_rendition(
@@ -852,7 +969,10 @@ fn encode_rendition(
 /// Publish an encoded rendition atomically into the pinned cache directory.
 /// On unix the temporary file is created, written, synced and renamed through
 /// the same directory descriptor, so swapping a path component between
-/// preparation and publication cannot redirect the bytes elsewhere.
+/// preparation and publication cannot redirect the bytes elsewhere. On
+/// windows every component is re-validated without following reparse points
+/// before the rename and the published entry is re-verified after it, so a
+/// component swapped for a reparse point cannot redirect the write.
 fn write_atomic(
     target: &CacheTarget,
     image: &DynamicImage,
@@ -868,18 +988,27 @@ fn write_atomic(
         let parent = target.path.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent")
         })?;
+        // Refuse to write when any component became a reparse point
+        // or escaped the library since the target was prepared.
+        revalidate_cache_chain(&target.root, &cache_shard(&target.path))?;
         let mut temp = Builder::new().prefix(".preview-").tempfile_in(parent)?;
         temp.write_all(&encoded)?;
         temp.flush()?;
         temp.as_file().sync_all()?;
+        // Re-validate right before mutating the cache so a component
+        // swapped while the rendition was written cannot redirect the
+        // removal or the rename.
+        revalidate_cache_chain(&target.root, &cache_shard(&target.path))?;
+        // The rename replaces an existing file or reparse point entry
+        // atomically without following it; only a stale directory
+        // blocks the rename and must be removed first.
         if let Ok(meta) = fs::symlink_metadata(&target.path) {
-            if meta.file_type().is_symlink() || meta.is_file() {
-                fs::remove_file(&target.path)?;
-            } else if meta.is_dir() {
+            if meta.is_dir() && !is_reparse_point(&meta) {
                 fs::remove_dir_all(&target.path)?;
             }
         }
         fs::rename(temp.path(), &target.path)?;
+        verify_published_entry(&target.root, &target.path)?;
     }
     Ok(())
 }
