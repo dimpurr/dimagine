@@ -30,7 +30,11 @@ fn library() -> (TempDir, axum::Router) {
     .unwrap();
     fs::write(temp.path().join(".ignored.png"), b"ignored").unwrap();
     let catalog = FsCatalog::new(temp.path()).unwrap();
-    let app = router(catalog, OriginalPreview, ServeConfig::default());
+    let config = ServeConfig {
+        data_dir: temp.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog, OriginalPreview, config);
     (temp, app)
 }
 
@@ -278,7 +282,11 @@ async fn special_character_and_unicode_urls_round_trip() {
     .unwrap();
 
     let catalog = FsCatalog::new(root).unwrap();
-    let app = router(catalog, OriginalPreview, ServeConfig::default());
+    let config = ServeConfig {
+        data_dir: temp.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog, OriginalPreview, config);
     let (app, cookie) = login(app).await;
 
     // 1. Root page generates links to subfolders and collections
@@ -487,7 +495,11 @@ async fn real_preview_generation_and_caching_and_fallback() {
 
     let catalog = FsCatalog::new(root).unwrap();
     let previews = CachedPreview::new(root);
-    let app = router(catalog, previews, ServeConfig::default());
+    let config = ServeConfig {
+        data_dir: temp.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog, previews, config);
     let (app, cookie) = login(app).await;
 
     // 1. Image page has link to original and view rendition

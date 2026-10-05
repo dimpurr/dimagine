@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+rpassword = "7"
 dimagine-core = { path = "../dimagine-core" }
 dimagine-eagle = { path = "../dimagine-eagle", optional = true }
 dimagine-preview = { path = "../dimagine-preview", optional = true }

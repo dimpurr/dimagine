@@ -66,20 +66,64 @@ fn empty_dir(tag: &str) -> PathBuf {
     dir
 }
 
+/// A throwaway state directory for one spawned server; removed on drop so no
+/// test ever reads or writes the real user state directory.
+fn state_dir() -> DirGuard {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let name = format!(
+        "dimagine-cli-serve-state-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let dir = std::env::var("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join(name);
+    std::fs::create_dir_all(&dir).expect("create state dir");
+    DirGuard(dir)
+}
+
 struct Server {
     child: Option<Child>,
     address: String,
+    setup_code: Option<String>,
+    state: Option<DirGuard>,
     stdout: std::process::ChildStdout,
 }
 
 impl Server {
     fn start(library: &Path, extra: &[&str], envs: &[(&str, &str)]) -> Server {
+        let state = state_dir();
+        let mut server = Server::start_inner(library, extra, envs, &state.0);
+        server.state = Some(state);
+        server
+    }
+
+    /// Start a server against a caller-owned state directory, so a test can
+    /// restart it and still see the same accounts.
+    fn start_with_data_dir(
+        library: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+        data_dir: &Path,
+    ) -> Server {
+        Server::start_inner(library, extra, envs, data_dir)
+    }
+
+    fn start_inner(
+        library: &Path,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+        data_dir: &Path,
+    ) -> Server {
         let mut command = Command::new(BIN);
         let mut all: Vec<String> = vec![
             "--json".into(),
             "serve".into(),
             "--library".into(),
             library.to_string_lossy().into_owned(),
+            "--data-dir".into(),
+            data_dir.to_string_lossy().into_owned(),
         ];
         for value in extra {
             all.push((*value).to_string());
@@ -95,6 +139,11 @@ impl Server {
             command.env(key, value);
         }
         Server::spawn(command)
+    }
+
+    /// The isolated state directory this server was started with.
+    fn state_dir(&self) -> &Path {
+        &self.state.as_ref().expect("server state dir").0
     }
 
     fn spawn(mut command: Command) -> Server {
@@ -116,6 +165,7 @@ impl Server {
             }
         };
         assert_eq!(document["schema"], "dimagine.serve/0.1", "{document}");
+        let setup_code = document["setup_code"].as_str().map(ToString::to_string);
         let address = document["address"]
             .as_str()
             .expect("address field")
@@ -126,12 +176,18 @@ impl Server {
         Server {
             child: Some(child),
             address,
+            setup_code,
+            state: None,
             stdout,
         }
     }
 
     fn url(&self) -> &str {
         &self.address
+    }
+
+    fn setup_code(&self) -> Option<&str> {
+        self.setup_code.as_deref()
     }
 
     /// Kill the server and hand back its stderr; the tests assert on the
@@ -273,7 +329,11 @@ fn header_of<'a>(response: &'a str, name: &str) -> Option<&'a str> {
 #[test]
 fn serve_login_page_and_redirect_for_anonymous() {
     let dir = library("anonymous");
-    let server = Server::start(&dir.root, &["--port", "0"], &[]);
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
     let address = server.url().to_string();
 
     let response = http_get(&address, "/", None);
@@ -298,7 +358,11 @@ fn serve_login_page_and_redirect_for_anonymous() {
 #[test]
 fn serve_login_with_default_passcode_shows_the_library() {
     let dir = library("default-pass");
-    let server = Server::start(&dir.root, &["--port", "0"], &[]);
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
     let address = server.url().to_string();
 
     let (status, cookie) = post_login(&address, "2333");
@@ -351,7 +415,11 @@ fn serve_login_with_default_passcode_shows_the_library() {
 #[test]
 fn serve_wrong_passcode_is_rejected() {
     let dir = library("wrong-pass");
-    let server = Server::start(&dir.root, &["--port", "0"], &[]);
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
     let address = server.url().to_string();
 
     let body = "passcode=wrong";
@@ -398,17 +466,139 @@ fn serve_passcode_from_env_overrides_the_default() {
 }
 
 #[test]
-fn serve_empty_passcode_env_falls_back_to_the_default() {
+fn serve_empty_passcode_env_enters_setup_mode() {
     let dir = library("empty-pass");
     let server = Server::start(&dir.root, &["--port", "0"], &[("DIMAGINE_PASSCODE", "")]);
     let address = server.url().to_string();
 
-    let (status, cookie) = post_login(&address, "2333");
-    assert_eq!(status, "303");
-    let page = http_get(&address, "/", Some(&cookie.unwrap()));
-    assert_eq!(status_of(&page), "200");
+    let response = http_get(&address, "/", None);
+    assert_eq!(status_of(&response), "303");
+    assert!(
+        header_of(&response, "location")
+            .unwrap()
+            .starts_with("/setup"),
+        "{response}"
+    );
+    let setup_page = http_get(&address, "/setup", None);
+    assert_eq!(status_of(&setup_page), "200");
+    assert!(setup_page.contains("Initial Setup"), "{setup_page}");
+    // Merely visiting setup does not create an account file.
+    assert!(!server.state_dir().join("accounts.json").exists());
 
     server.kill();
+}
+
+#[test]
+fn serve_secure_cookies_flag_sets_secure_on_session_cookie() {
+    let dir = library("secure-cookies");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--secure-cookies"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+
+    let (status, cookie) = post_login(&address, "2333");
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("login sets a session cookie");
+    assert!(cookie.contains("Secure"), "{cookie}");
+
+    server.kill();
+}
+
+#[test]
+fn serve_session_cookie_is_not_secure_over_plain_http_by_default() {
+    let dir = library("plain-cookies");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+
+    let (status, cookie) = post_login(&address, "2333");
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("login sets a session cookie");
+    assert!(!cookie.contains("Secure"), "{cookie}");
+
+    server.kill();
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_warns_once_about_world_readable_store_at_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = library("f6-serve-mode");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(
+        &accounts,
+        r#"{"schema":1,"users":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z"}]}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // The server loads the store at startup and on every request; the
+    // warning must appear exactly once, not once per request.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    assert_eq!(status_of(&http_get(&address, "/login", None)), "200");
+    let stderr = server.kill();
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("WARNING"))
+        .count();
+    assert_eq!(warnings, 1, "stderr: {stderr}");
+    assert!(stderr.contains("0644"), "{stderr}");
+}
+
+#[test]
+fn serve_warns_when_trusted_proxy_family_cannot_match_bind() {
+    let dir = library("f8-family");
+    // ::1 can never be the TCP peer of a server bound to 127.0.0.1.
+    let server = Server::start(
+        &dir.root,
+        &[
+            "--port",
+            "0",
+            "--bind",
+            "127.0.0.1",
+            "--trusted-proxy",
+            "::1",
+        ],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    // The server still starts and serves.
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    let stderr = server.kill();
+    assert!(
+        stderr.contains("WARNING") && stderr.contains("::1"),
+        "expected a family-mismatch warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("IPv6") && stderr.contains("IPv4"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn serve_quiet_when_trusted_proxy_family_matches_bind() {
+    let dir = library("f8-family-ok");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--trusted-proxy", "127.0.0.1"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("can never match"),
+        "a matching proxy must not warn: {stderr}"
+    );
 }
 
 #[test]
@@ -416,7 +606,11 @@ fn serve_default_passcode_on_non_loopback_bind_warns() {
     let dir = library("warn");
     // Bind to all local IPv4 interfaces while reaching it on loopback; the
     // serve crate must warn that the default passcode is active.
-    let server = Server::start(&dir.root, &["--port", "0", "--bind", "0.0.0.0"], &[]);
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--bind", "0.0.0.0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
     let address = server.url().to_string();
     let (status, cookie) = post_login(&address, "2333");
     assert_eq!(status, "303");
@@ -460,6 +654,209 @@ fn serve_port_in_use_exits_one() {
         error["error"].as_str().unwrap().contains("cannot listen"),
         "{error}"
     );
+}
+
+/// Run `dimagine serve --json` against a caller-owned state directory and
+/// hand back the raw output; used for startup-failure tests where the
+/// process must exit before it ever binds a port.
+fn run_serve(library: &Path, data_dir: &Path) -> std::process::Output {
+    Command::new(BIN)
+        .args([
+            "--json",
+            "serve",
+            "--library",
+            library.to_str().unwrap(),
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "--port",
+            "0",
+        ])
+        .env_remove("DIMAGINE_PASSCODE")
+        .output()
+        .expect("run dimagine serve")
+}
+
+/// Assert the run exited 1 with an `dimagine.error/0.1` document on stdout
+/// and return the error text.
+fn serve_error_text(output: &std::process::Output) -> String {
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a broken accounts store must stop the server: {:?}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let error: serde_json::Value = serde_json::from_str(&stdout).expect("error JSON");
+    assert_eq!(error["schema"], "dimagine.error/0.1");
+    error["error"].as_str().unwrap().to_owned()
+}
+
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_refuses_to_start_with_unreadable_accounts_file() {
+    if running_as_root() {
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let dir = library("f1-unreadable");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(&accounts, r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("account storage I/O error"), "{error}");
+    assert!(error.contains("Permission denied"), "{error}");
+    // Never falls back to setup: no startup document, no setup code.
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_truncated_accounts_file() {
+    let dir = library("f1-truncated");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(
+        state.0.join("accounts.json"),
+        r#"{"schema":1,"users":[{"id":"01J9XEXAMPLEULID0000000000","#,
+    )
+    .unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("malformed accounts.json"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_empty_accounts_file() {
+    let dir = library("f1-empty");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(state.0.join("accounts.json"), "").unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("malformed accounts.json"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_with_unknown_schema() {
+    let dir = library("f1-schema");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    std::fs::write(
+        state.0.join("accounts.json"),
+        r#"{"schema":999,"users":[]}"#,
+    )
+    .unwrap();
+
+    let output = run_serve(&dir.root, &state.0);
+    let error = serve_error_text(&output);
+    assert!(error.contains("schema 999"), "{error}");
+    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+}
+
+#[test]
+fn serve_refuses_to_start_when_the_users_key_is_missing() {
+    let dir = library("f1-users-key");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    // The `users` key renamed by another build, and the same file with the key
+    // dropped entirely: present, current-schema, but unreadable as a store.
+    for contents in [
+        r#"{"schema":1,"accounts":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z"}]}"#,
+        r#"{"schema":1}"#,
+    ] {
+        std::fs::write(state.0.join("accounts.json"), contents).unwrap();
+
+        let output = run_serve(&dir.root, &state.0);
+        let error = serve_error_text(&output);
+        assert!(error.contains("malformed accounts.json"), "{error}");
+        assert!(
+            error.contains("users"),
+            "the error must name the key: {error}"
+        );
+        // Never falls back to setup: no startup document, no setup code.
+        assert!(!output.stdout.windows(10).any(|w| w == b"setup_code"));
+        assert!(
+            std::fs::read_to_string(state.0.join("accounts.json")).unwrap() == contents,
+            "a refused start must not rewrite the store"
+        );
+    }
+}
+
+#[test]
+fn serve_first_run_without_an_accounts_file_opens_setup() {
+    let dir = library("f1-first-run");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    assert!(!state.0.join("accounts.json").exists());
+
+    // No store at all is the one shape that still means first run.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert!(
+        server.setup_code().is_some(),
+        "a first run prints a one-time setup code"
+    );
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/setup"));
+    assert!(http_get(&address, "/setup", None).contains("Initial Setup"));
+    // Merely serving setup creates no store.
+    assert!(!state.0.join("accounts.json").exists());
+
+    server.kill();
+}
+
+#[test]
+fn serve_keeps_unknown_top_level_accounts_fields_across_a_write() {
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(
+        &accounts,
+        r#"{"schema":1,"server_note":"keep me","users":[]}"#,
+    )
+    .unwrap();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // Requiring `users` must not reject or drop unknown fields (ADR-014).
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = std::fs::read_to_string(&accounts).unwrap();
+    assert!(raw.contains("server_note"), "{raw}");
+    assert!(raw.contains("owner@example.com"), "{raw}");
 }
 
 #[test]
@@ -512,4 +909,407 @@ fn serve_lists_in_help_with_default_bind_and_port() {
     assert!(stdout.contains("8917"), "{stdout}");
     assert!(stdout.contains("127.0.0.1"), "{stdout}");
     assert!(stdout.contains("DIMAGINE_PASSCODE"), "{stdout}");
+}
+
+fn post_form(address: &str, path: &str, body: &str) -> (String, Option<String>) {
+    let response = http_request(
+        address,
+        &format!(
+            "POST {path} HTTP/1.1\r\nHost: viewer\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        ),
+    );
+    (
+        status_of(&response).to_string(),
+        header_of(&response, "set-cookie").map(str::to_string),
+    )
+}
+
+/// Run a `dimagine user ...` invocation with the given standard input.
+fn run_user(args: &[&str], stdin_data: &str) -> std::process::Output {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .env_remove("DIMAGINE_PASSCODE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn dimagine user");
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(stdin_data.as_bytes());
+    }
+    child.wait_with_output().expect("wait for dimagine user")
+}
+
+#[test]
+fn user_cli_create_passwd_list_and_login_round_trip() {
+    let dir = library("user-cli");
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // An empty state lists nothing.
+    let output = run_user(&["user", "list", "--data-dir", &data_dir], "");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(String::from_utf8_lossy(&output.stdout).trim().is_empty());
+
+    // The first account becomes the owner; the second is a plain user.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("owner@example.com"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "second@example.com",
+            "--password-stdin",
+        ],
+        "secret456789\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let listed =
+        String::from_utf8_lossy(&run_user(&["user", "list", "--data-dir", &data_dir], "").stdout)
+            .into_owned();
+    assert!(listed.contains("owner@example.com"), "{listed}");
+    assert!(listed.contains("second@example.com"), "{listed}");
+    assert!(listed.contains("owner"), "{listed}");
+    assert!(listed.contains("user"), "{listed}");
+
+    // A duplicate email is refused.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "other1234567\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+
+    // Change the owner's password.
+    let output = run_user(
+        &[
+            "user",
+            "passwd",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "newpass45678\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The running viewer uses the same state directory: setup is gone, the
+    // old password is refused, the new one signs in.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/login"));
+    assert!(http_get(&address, "/login", None).contains("Email"));
+
+    let (status, _) = post_form(
+        &address,
+        "/login",
+        "email=owner%40example.com&password=secret123",
+    );
+    assert_eq!(status, "401");
+    let (status, cookie) = post_form(
+        &address,
+        "/login",
+        "email=owner%40example.com&password=newpass45678",
+    );
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("login sets a session cookie");
+    assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
+    server.kill();
+}
+
+/// Build a `script` command that runs `args` under a pseudo-terminal.
+/// macOS takes the command after the output file; util-linux wants `-c`.
+fn pty_command(args: &[&str]) -> Command {
+    let mut command = Command::new("script");
+    if cfg!(target_os = "macos") {
+        command.arg("-q").arg("/dev/null").args(args);
+    } else {
+        command.arg("-qec").arg(args.join(" ")).arg("/dev/null");
+    }
+    command
+}
+
+/// Run a command under a pty, feeding `input` to it only after `delay`, and
+/// return everything the pty printed. The delay lets the child start and (for
+/// a password prompt) disable echo before the input arrives.
+fn run_under_pty(args: &[&str], input: &str, delay: Duration) -> String {
+    let mut child = pty_command(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn script");
+    let mut stdin = child.stdin.take().expect("script stdin");
+    let input = input.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = stdin.write_all(input.as_bytes());
+        // Hold the pty master open until the child is done with it.
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let output = child.wait_with_output().expect("wait for script");
+    assert!(
+        output.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn interactive_password_prompt_does_not_echo_the_password() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+    let password = "secret123456";
+
+    // No --password-stdin: the prompt path runs under a pty, and the password
+    // is fed only after the prompt has been printed. With echo disabled by the
+    // prompt, the password must not appear in the terminal output.
+    let output = run_under_pty(
+        &[
+            BIN,
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "pty@example.com",
+        ],
+        &format!("{password}\n"),
+        Duration::from_secs(2),
+    );
+
+    assert!(output.contains("Password: "), "{output}");
+    assert!(
+        !output.contains(password),
+        "the password was echoed to the terminal: {output}"
+    );
+    assert!(output.contains("created user pty@example.com"), "{output}");
+    assert!(state.0.join("accounts.json").exists());
+}
+
+#[test]
+fn interactive_prompt_reads_piped_stdin_without_the_flag() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // No --password-stdin and no terminal: the prompt path falls back to
+    // reading the piped line, so `echo <password> | dimagine user create`
+    // keeps working.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Password: "),
+        "the prompt is still printed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.0.join("accounts.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn user_cli_warns_about_world_readable_store_and_repairs_it_on_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(&accounts, r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // list warns (and does not fail) about the loose mode.
+    let output = run_user(&["user", "list", "--data-dir", &data_dir], "");
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WARNING"), "{stderr}");
+    assert!(stderr.contains("0644"), "{stderr}");
+
+    // The next write repairs the mode to 0600.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = std::fs::metadata(&accounts).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the write must repair the mode, got {mode:o}");
+}
+
+#[test]
+fn user_cli_refuses_passwords_below_the_minimum() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // create refuses a short password with a clear message.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "short\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+
+    // passwd refuses a short password too.
+    let output = run_user(
+        &[
+            "user",
+            "passwd",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "short\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+
+    // Neither attempt created an account.
+    assert!(!state.0.join("accounts.json").exists());
+}
+
+#[test]
+fn setup_flow_over_http_and_restart() {
+    let dir = library("setup-http");
+    let state = state_dir();
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    let code = server
+        .setup_code()
+        .expect("first run prints a one-time setup code")
+        .to_string();
+
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/setup"));
+    assert!(http_get(&address, "/setup", None).contains("Initial Setup"));
+
+    // A wrong one-time code is refused and creates nothing.
+    let (status, _) = post_form(
+        &address,
+        "/setup",
+        "email=owner%40example.com&password=secret123&confirm_password=secret123&setup_code=wrong",
+    );
+    assert_eq!(status, "400");
+    assert!(!state.0.join("accounts.json").exists());
+
+    // The right code creates the owner and signs in.
+    let body = format!(
+        "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code={code}"
+    );
+    let (status, cookie) = post_form(&address, "/setup", &body);
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("setup signs the owner in");
+    assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+
+    let accounts = state.0.join("accounts.json");
+    assert!(accounts.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&accounts).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "accounts.json must be 0600, got {mode:o}");
+    }
+
+    server.kill();
+
+    // Restart on the same state: no code is printed and /setup is a 404.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    assert!(server.setup_code().is_none());
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/login"));
+    server.kill();
 }

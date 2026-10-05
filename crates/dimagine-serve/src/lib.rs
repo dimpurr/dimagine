@@ -1,4 +1,11 @@
-//! Read-only, passcode-protected web viewer for a dimagine library.
+//! Read-only web viewer for a dimagine library, protected either by a shared
+//! passcode (legacy mode) or by a single owner account (ADR-014). Accounts
+//! live outside the library in a state directory; first run walks through a
+//! one-time setup flow.
+
+pub mod accounts;
+
+use crate::accounts::MIN_PASSWORD_LENGTH;
 use axum::{
     body::Body,
     extract::{Form, Path, State},
@@ -582,23 +589,71 @@ impl std::fmt::Display for CatalogError {
 impl std::error::Error for CatalogError {}
 
 /// Viewer configuration.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ServeConfig {
-    /// Shared passcode.
-    pub passcode: String,
+    /// Shared passcode (legacy compatibility mode).
+    pub passcode: Option<String>,
     /// Cookie name used for the in-memory session.
     pub cookie_name: String,
     /// Set this when the viewer is served directly over HTTPS.
     pub https: bool,
+    /// Trusted reverse proxy IP addresses.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
+    /// State directory for accounts.json.
+    pub data_dir: PathBuf,
+    /// Pre-configured setup code (if None and setup mode is active, generated automatically).
+    pub setup_code: Option<String>,
 }
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
-            passcode: "2333".to_string(),
+            passcode: Some("2333".to_string()),
             cookie_name: "dimagine_session".to_string(),
             https: false,
+            trusted_proxies: Vec::new(),
+            data_dir: accounts::default_data_dir(),
+            setup_code: None,
         }
     }
+}
+
+/// Generate a random setup code with at least 12 characters.
+pub fn generate_setup_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    (0..16)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARS.len());
+            CHARS[idx] as char
+        })
+        .collect()
+}
+
+/// Resolve client IP for rate limiting and logging.
+///
+/// When the direct TCP peer is a trusted reverse proxy, the client IP is extracted
+/// from the LAST hop of the `X-Forwarded-For` header. For untrusted peers (or if the
+/// header is absent/malformed), the TCP peer IP is used directly, ignoring the header.
+pub fn resolve_client_ip(
+    peer_addr: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    let Some(peer) = peer_addr else {
+        return "unknown".to_string();
+    };
+    let peer_ip = peer.ip();
+    if trusted_proxies.contains(&peer_ip) {
+        if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+            if let Some(last_hop) = forwarded.split(',').next_back().map(str::trim) {
+                if let Ok(ip) = last_hop.parse::<std::net::IpAddr>() {
+                    return ip.to_string();
+                }
+            }
+        }
+    }
+    peer_ip.to_string()
 }
 
 #[derive(Clone)]
@@ -606,6 +661,8 @@ struct AppState {
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
+    accounts: accounts::AccountsStore,
+    setup_code: Arc<Mutex<Option<String>>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     throttles: Arc<Mutex<ThrottleState>>,
     admission: Arc<tokio::sync::Semaphore>,
@@ -768,6 +825,17 @@ impl ThrottleState {
     }
 }
 
+/// Report an accounts-store failure to the client: 500 with the error text.
+/// The store was validated at startup, so this only fires when it breaks
+/// while the server runs; the error never contains a password or hash.
+fn store_error(err: accounts::AccountsError) -> Response {
+    let mut response = (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Refuse a login attempt without comparing it: 429 with `Retry-After` and an
 /// empty body, so a refused attempt is indistinguishable from any other.
 fn login_refused(retry_after: u64) -> Response {
@@ -782,31 +850,55 @@ fn login_refused(retry_after: u64) -> Response {
 }
 
 /// Build the read-only viewer router.
+///
+/// The accounts store is opened here; a store that cannot be read is a panic
+/// because every caller that can report an error uses [`router_from`] instead.
 pub fn router<C: Catalog, P: PreviewProvider>(
     catalog: C,
     previews: P,
     config: ServeConfig,
 ) -> Router {
     router_from(Arc::new(catalog), Arc::new(previews), config)
+        .expect("accounts store must be readable")
 }
 
 /// Build a router from trait objects for later CLI integration.
+///
+/// Fails when `accounts.json` is unreadable, malformed, or written by an
+/// unknown schema version: the caller must exit non-zero rather than start a
+/// viewer that would silently fall back to first-run setup.
 pub fn router_from(
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
-) -> Router {
+) -> Result<Router, accounts::AccountsError> {
+    let accounts = accounts::AccountsStore::new(&config.data_dir);
+    let has_users = accounts.has_users()?;
+    let setup_code = if !has_users && config.passcode.is_none() {
+        Some(
+            config
+                .setup_code
+                .clone()
+                .unwrap_or_else(generate_setup_code),
+        )
+    } else {
+        None
+    };
     let state = AppState {
         catalog,
         previews,
         config,
+        accounts,
+        setup_code: Arc::new(Mutex::new(setup_code)),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
     };
-    Router::new()
+    Ok(Router::new()
         .route("/login", get(login_page).post(login))
+        .route("/logout", get(logout).post(logout))
+        .route("/setup", get(setup_page).post(setup))
         .route("/", get(folder_page))
         .route("/folder/*path", get(folder_page))
         .route("/collection/*path", get(collection_page))
@@ -819,13 +911,32 @@ pub fn router_from(
         .route("/api/collection/*path", get(collection_json))
         .route("/api/image/*path", get(image_json))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    if request.uri().path() == "/login" {
+    let path = request.uri().path();
+    // A store that fails to load must never reopen setup: fail closed by
+    // treating it as "users exist", so the request goes to /login and is
+    // refused there instead of reaching the account-creation form.
+    let has_users = state.accounts.has_users().unwrap_or(false);
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+
+    if is_setup_mode {
+        if path == "/setup" {
+            return next.run(request).await;
+        }
+        return Redirect::to("/setup").into_response();
+    }
+
+    if path == "/setup" {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    if path == "/login" || path == "/logout" {
         return next.run(request).await;
     }
+
     let token = request
         .headers()
         .get(header::COOKIE)
@@ -853,31 +964,250 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
             .or_insert(HeaderValue::from_static("private, no-cache"));
         return response;
     }
-    if request.uri().path().starts_with("/api/") {
+    if path.starts_with("/api/") {
         return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
     Redirect::to("/login").into_response()
 }
 
-async fn login_page() -> Response {
-    let mut response = Html(layout("Sign in", "<form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label><button>Sign in</button></form>")).into_response();
+/// The setup form, optionally preceded by an error paragraph. This is the
+/// single place that knows the form's fields, so the password `minlength`
+/// lives here and not in every error page.
+fn setup_form_html(error: Option<&str>) -> String {
+    let error = error
+        .map(|message| format!("<p>{message}</p>"))
+        .unwrap_or_default();
+    format!(
+        "{error}<form method=\"post\">\
+         <h2>Welcome to dimagine</h2>\
+         <p>Create the owner account to finish server setup.</p>\
+         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+         <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+         <button type=\"submit\">Complete Setup</button>\
+         </form>"
+    )
+}
+
+async fn setup_page(State(state): State<AppState>) -> Response {
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
+    };
+    if has_users || state.config.passcode.is_some() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    let html = layout("Initial Setup", &setup_form_html(None));
+    let mut response = Html(html).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+
 #[derive(Deserialize)]
+struct SetupForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    confirm_password: String,
+    #[serde(default)]
+    setup_code: String,
+}
+
+async fn setup(
+    State(state): State<AppState>,
+    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    Form(form): Form<SetupForm>,
+) -> Response {
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
+    };
+    if has_users || state.config.passcode.is_some() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    // Refuse everything that can be refused without waiting on the lock, so a
+    // request that is going to fail never queues behind a slow argon2 hash.
+    let trimmed_email = form.email.trim();
+    if trimmed_email.is_empty() || !trimmed_email.contains('@') {
+        let error_html = layout(
+            "Initial Setup",
+            &setup_form_html(Some("Please enter a valid email address.")),
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if form.password != form.confirm_password {
+        let error_html = layout(
+            "Initial Setup",
+            &setup_form_html(Some("Passwords do not match.")),
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if form.password.len() < MIN_PASSWORD_LENGTH {
+        let error_html = layout(
+            "Initial Setup",
+            &setup_form_html(Some(&format!(
+                "Password must be at least {MIN_PASSWORD_LENGTH} characters."
+            ))),
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    // One critical section spans the code check, the account creation, and the
+    // code invalidation. A second concurrent request blocks on this lock and
+    // then finds the code gone, instead of consuming it a second time and
+    // overwriting the first account.
+    let mut active_code = state.setup_code.lock().unwrap();
+    let Some(expected_code) = active_code.clone() else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+
+    let code_input = form.setup_code.trim();
+    if code_input.is_empty()
+        || code_input
+            .as_bytes()
+            .ct_eq(expected_code.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
+        let error_html = layout(
+            "Initial Setup",
+            &setup_form_html(Some("Invalid setup code.")),
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if let Err(err) = state
+        .accounts
+        .create_user(trimmed_email, &form.password, "owner")
+    {
+        // The code stays valid: a transient store failure must not burn the
+        // one-time code, or the operator would have to restart the server.
+        let error_html = layout(
+            "Initial Setup",
+            &format!("<p>Failed to create account: {err}</p>"),
+        );
+        let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    // Invalidate setup code so it cannot be used again.
+    *active_code = None;
+    drop(active_code);
+
+    let token = uuid::Uuid::new_v4().to_string();
+    store_session(
+        &mut state.sessions.lock().unwrap(),
+        token.clone(),
+        now_seconds(),
+    );
+    let mut response = Redirect::to("/").into_response();
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        state.config.cookie_name,
+        token,
+        SESSION_SECONDS,
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn login_page(State(state): State<AppState>) -> Response {
+    // Fail closed: an unreadable store shows the login form, never a redirect
+    // back to /setup.
+    let has_users = state.accounts.has_users().unwrap_or(false);
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+    if is_setup_mode {
+        return Redirect::to("/setup").into_response();
+    }
+
+    let form_html = if has_users {
+        format!(
+            "<form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+             <button>Sign in</button>\
+             </form>"
+        )
+    } else {
+        "<form method=\"post\">\
+         <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
+         <button>Sign in</button>\
+         </form>"
+            .to_string()
+    };
+
+    let mut response = Html(layout("Sign in", &form_html)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Deserialize, Default)]
 struct LoginForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
     passcode: String,
 }
+
 async fn login(
     State(state): State<AppState>,
     client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_key = client
-        .map(|c| c.0.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
+    // Fail closed, as in the auth middleware: an unreadable store is treated
+    // as "users exist", so the login attempt is refused instead of reopening
+    // setup.
+    let has_users = state.accounts.has_users().unwrap_or(false);
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+    if is_setup_mode {
+        return Redirect::to("/setup").into_response();
+    }
+
+    let client_key =
+        resolve_client_ip(client.map(|c| c.0), &headers, &state.config.trusted_proxies);
     // Bound how many guesses are in flight before anything else: a parallel
     // wave of guesses is refused without the passcode ever being compared.
     let _slot = match state.login_slots.clone().try_acquire_owned() {
@@ -898,19 +1228,59 @@ async fn login(
     let millis =
         (100u64.saturating_mul(1u64.checked_shl(delay_step.min(6)).unwrap_or(u64::MAX))).min(5000);
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
-    if form
-        .passcode
-        .as_bytes()
-        .ct_eq(state.config.passcode.as_bytes())
-        .unwrap_u8()
-        != 1
-    {
-        let mut response = (StatusCode::UNAUTHORIZED, Html(layout("Sign in", "<p>Incorrect passcode.</p><form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\"></label><button>Sign in</button></form>"))).into_response();
+
+    let authenticated = if has_users {
+        let user_opt = state
+            .accounts
+            .find_user_by_email(&form.email)
+            .ok()
+            .flatten();
+        if let Some(user) = user_opt {
+            accounts::verify_password(&form.password, &user.password_hash)
+        } else {
+            const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$eW91cnNhbHQxMjM0NTY3OA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+            let _ = accounts::verify_password(&form.password, DUMMY_HASH);
+            false
+        }
+    } else if let Some(ref expected_passcode) = state.config.passcode {
+        form.passcode
+            .as_bytes()
+            .ct_eq(expected_passcode.as_bytes())
+            .unwrap_u8()
+            == 1
+    } else {
+        false
+    };
+
+    if !authenticated {
+        let error_body = if has_users {
+            format!(
+                "<p>Incorrect email or password.</p>\
+                 <form method=\"post\">\
+                 <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+                 <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
+                 <button>Sign in</button>\
+                 </form>"
+            )
+        } else {
+            "<p>Incorrect passcode.</p>\
+             <form method=\"post\">\
+             <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
+             <button>Sign in</button>\
+             </form>"
+                .to_string()
+        };
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Html(layout("Sign in", &error_body)),
+        )
+            .into_response();
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return response;
     }
+
     {
         let mut throttles = state.throttles.lock().unwrap();
         throttles.record_success(&client_key);
@@ -927,7 +1297,11 @@ async fn login(
         state.config.cookie_name,
         token,
         SESSION_SECONDS,
-        if state.config.https { "; Secure" } else { "" }
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -936,6 +1310,66 @@ async fn login(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let token = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| cookie_value(v, &state.config.cookie_name));
+    if let Some(token) = token {
+        state.sessions.lock().unwrap().remove(&token);
+    }
+    let mut response = Redirect::to("/login").into_response();
+    let cookie = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        state.config.cookie_name,
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// Decide whether a session cookie must carry `Secure`.
+///
+/// `Secure` is set when the viewer is served directly over HTTPS
+/// (`config.https`, raised by the `--secure-cookies` flag), or when the
+/// request arrived through a trusted reverse proxy that terminated TLS: the
+/// TCP peer is a configured trusted proxy and its `X-Forwarded-Proto` header
+/// says `https`. The header is honoured only from a trusted peer, so a direct
+/// client can never influence the flag.
+fn cookie_secure(
+    state: &AppState,
+    peer: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+) -> bool {
+    if state.config.https {
+        return true;
+    }
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !state.config.trusted_proxies.contains(&peer.ip()) {
+        return false;
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|proto| proto.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
@@ -1647,7 +2081,7 @@ pub async fn serve(
 }
 
 fn default_passcode_warning(config: &ServeConfig, address: std::net::SocketAddr) -> bool {
-    config.passcode == "2333" && !address.ip().is_loopback()
+    config.passcode.as_deref() == Some("2333") && !address.ip().is_loopback()
 }
 
 #[cfg(test)]
@@ -1793,12 +2227,62 @@ mod regression_unit_tests {
             "0.0.0.0:3000".parse().unwrap()
         ));
         let custom = ServeConfig {
-            passcode: "different".to_owned(),
+            passcode: Some("different".to_owned()),
             ..config
         };
         assert!(!default_passcode_warning(
             &custom,
             "0.0.0.0:3000".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn trusted_proxy_client_ip_resolution() {
+        let trusted_ip: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let untrusted_peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+        let trusted_peer: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+
+        // Untrusted peer with X-Forwarded-For is ignored
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.195".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(Some(untrusted_peer), &headers, &[trusted_ip]),
+            "198.51.100.7"
+        );
+
+        // Trusted proxy with single hop X-Forwarded-For
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &headers, &[trusted_ip]),
+            "203.0.113.195"
+        );
+
+        // Trusted proxy with multi-hop X-Forwarded-For extracts LAST hop
+        let mut multi_headers = HeaderMap::new();
+        multi_headers.insert(
+            "x-forwarded-for",
+            "10.0.0.1, 192.168.1.1, 203.0.113.50".parse().unwrap(),
+        );
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &multi_headers, &[trusted_ip]),
+            "203.0.113.50"
+        );
+
+        // Trusted proxy with invalid last hop falls back to peer IP
+        let mut invalid_headers = HeaderMap::new();
+        invalid_headers.insert("x-forwarded-for", "invalid-ip-string".parse().unwrap());
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &invalid_headers, &[trusted_ip]),
+            "127.0.0.1"
+        );
+
+        // Trusted proxy with missing header returns peer IP
+        let empty_headers = HeaderMap::new();
+        assert_eq!(
+            resolve_client_ip(Some(trusted_peer), &empty_headers, &[trusted_ip]),
+            "127.0.0.1"
+        );
+
+        // No peer addr returns "unknown"
+        assert_eq!(resolve_client_ip(None, &headers, &[trusted_ip]), "unknown");
     }
 }
