@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- One `dimagine` binary: `import eagle`, `previews` and `serve` subcommands as
+  built-in plugins (Cargo features, on by default), switchable per library in
+  `.dimagine/core-plugins.json`. `previews` reports images that fail to decode.
 - Skill: images with meaningless names are named `<site>-<id>` from an
   ID-shaped token in their source URL path (query strings and tracking
   segments ignored) before falling back to the import time.
