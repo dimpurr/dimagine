@@ -7,6 +7,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Eagle import: IP-literal hosts get no site label; Rust and Python agree on
+  meaningless names; YAML escapes every forbidden character; superscript
+  Windows device names are cleaned; the Python selftest runs in CI.
 - Viewer: links and collections resolved through dimagine-core (`../` embeds,
   collections without `kind`, ambiguous and missing members shown explicitly).
 - Index: `finish_scan` without an active scan is rejected instead of pruning.
