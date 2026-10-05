@@ -7,6 +7,8 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer: links and collections resolved through dimagine-core (`../` embeds,
+  collections without `kind`, ambiguous and missing members shown explicitly).
 - Index: `finish_scan` without an active scan is rejected instead of pruning.
 - Previews: on Windows, cache writes refuse reparse points and re-verify paths.
 - One `dimagine` binary: `import eagle`, `previews` and `serve` subcommands as
