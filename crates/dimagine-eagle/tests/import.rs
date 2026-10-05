@@ -347,6 +347,97 @@ fn emitted_frontmatter_round_trips_adversarial_strings_as_yaml() {
     assert_eq!(doc["sources"][0]["item"].as_str(), Some("item\u{2028}id"));
 }
 
+/// YAML printable characters, restated from the YAML 1.2 specification so the
+/// test does not trust the crate's own helper: tab, LF, CR, U+0020..U+007E,
+/// U+0085, U+00A0..U+D7FF, U+E000..U+FFFD, U+10000..U+10FFFF.
+fn yaml_printable(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | '\u{0085}')
+        || ('\u{0020}'..='\u{007e}').contains(&character)
+        || ('\u{00a0}'..='\u{d7ff}').contains(&character)
+        || ('\u{e000}'..='\u{fffd}').contains(&character)
+        || ('\u{10000}'..='\u{10ffff}').contains(&character)
+}
+
+fn frontmatter_of(note: &str) -> &str {
+    note.strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0
+}
+
+#[test]
+fn emitted_frontmatter_escapes_yaml_forbidden_characters() {
+    // Every character class YAML forbids in a scalar: C0 controls, DEL, the C1
+    // block U+0080..U+009F, the non-characters U+FFFE/U+FFFF, and the line
+    // separators. All must reach the reader as `\uXXXX` escapes.
+    let forbidden = [
+        "\u{0000}", "\u{0007}", "\u{001f}", "\u{007f}", "\u{0080}", "\u{0081}", "\u{0085}",
+        "\u{009f}", "\u{2028}", "\u{2029}", "\u{fffe}", "\u{ffff}",
+    ]
+    .concat();
+    // The item name doubles as the original file name, and NUL, U+FFFE and
+    // U+FFFF cannot be part of a file name on every platform, so those three
+    // are exercised through the fields that never reach the file system.
+    let name_safe = [
+        "\u{0007}", "\u{007f}", "\u{0080}", "\u{0081}", "\u{0085}", "\u{009f}", "\u{2028}",
+        "\u{2029}",
+    ]
+    .concat();
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("C1.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    let title = format!("plain{name_safe}title");
+    let url = format!("https://example.test/{forbidden}path");
+    let tags = vec![
+        format!("tag{forbidden}end"),
+        "back\\slash".to_owned(),
+        "quote\"inside".to_owned(),
+        "plain".to_owned(),
+    ];
+    let item_id = format!("item{forbidden}id");
+    let original = format!("{title}.png");
+    item(
+        &src,
+        "forbidden",
+        json!({"id": item_id, "name": title, "ext": "png",
+               "url": url, "tags": tags}),
+        Some((&original, b"pixels")),
+    );
+    let report = import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("C1".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.imported.len(), 1, "skipped: {:?}", report.skipped);
+    let note = fs::read_to_string(dst.join(format!("{}.md", report.imported[0].path))).unwrap();
+    let frontmatter = frontmatter_of(&note);
+    for (index, character) in frontmatter.chars().enumerate() {
+        assert!(
+            yaml_printable(character),
+            "raw character U+{:04X} at byte {index} of the frontmatter",
+            character as u32
+        );
+    }
+    let parsed = Yaml::load_from_str(frontmatter).expect("frontmatter parses as YAML");
+    let doc = &parsed[0];
+    assert_eq!(doc["title"].as_str(), Some(title.as_str()));
+    assert_eq!(doc["source"].as_str(), Some(url.as_str()));
+    let parsed_tags: Vec<_> = doc["tags"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parsed_tags, tags);
+    assert_eq!(doc["sources"][0]["item"].as_str(), Some(item_id.as_str()));
+}
+
 #[test]
 fn empty_tags_are_omitted_from_image_note() {
     let temp = TempDir::new().unwrap();
@@ -370,6 +461,120 @@ fn empty_tags_are_omitted_from_image_note() {
         .0;
     let parsed = Yaml::load_from_str(frontmatter).unwrap();
     assert!(parsed[0].as_mapping_get("tags").is_none());
+}
+
+#[test]
+fn reserved_library_label_is_prefixed_and_used_everywhere() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Reserved.library");
+    let dst = temp.path().join("out");
+    fake_library(&src);
+    let report = import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("COM¹".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.imported.len(), 3);
+    for item in &report.imported {
+        assert!(
+            item.path.starts_with("Eagle/_COM¹/") || !item.path.contains("Eagle/"),
+            "library label must be cleaned in reported paths: {}",
+            item.path
+        );
+    }
+    assert!(dst.join("Eagle/_COM¹/_COM¹.md").is_file());
+    assert!(
+        dst.join("Eagle/_COM¹/_import-_COM¹-20261005.md").is_file()
+            || fs::read_dir(dst.join("Eagle/_COM¹"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .any(|name| name.starts_with("_import-_COM¹-")),
+        "import report must use the cleaned label"
+    );
+    // Nothing named like the unprefixed device: not the folder, not the
+    // collection note, not the import report.
+    assert!(!dst.join("Eagle/COM¹").exists());
+    assert!(!dst.join("Eagle/_COM¹/COM¹.md").exists());
+    assert!(!fs::read_dir(dst.join("Eagle/_COM¹"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .any(|name| name.contains("COM¹") && name.starts_with("_import-COM¹")));
+    let note =
+        fs::read_to_string(dst.join("Eagle/_COM¹/Deep -Blue- - - -/Café/Same.png.md")).unwrap();
+    // The display label is kept verbatim in the image note, so a reader still
+    // sees the name the user gave. The collection note and the import report
+    // title use the prefixed form, because they are written inside the library
+    // folder and follow its name.
+    assert!(note.contains(r#"library: "COM¹""#), "note: {note}");
+    let collection = fs::read_to_string(dst.join("Eagle/_COM¹/_COM¹.md")).unwrap();
+    assert!(
+        collection.contains(r#"title: "_COM¹ (Eagle import)""#),
+        "collection: {collection}"
+    );
+}
+
+#[test]
+fn prefixes_windows_reserved_names_including_superscript_digits() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Reserved.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(&json!({"folders":[{"id":"sup","name":"COM²"}]})).unwrap(),
+    )
+    .unwrap();
+    item(
+        &src,
+        "sup",
+        json!({"name":"COM²", "ext":"png", "folders":["sup"]}),
+        Some(("COM\u{b2}.png", b"superscript")),
+    );
+    item(
+        &src,
+        "lpt",
+        json!({"name":"lpt³", "ext":"png"}),
+        Some(("lpt\u{b3}.png", b"superscript-lpt")),
+    );
+    item(
+        &src,
+        "zero",
+        json!({"name":"COM0", "ext":"png"}),
+        Some(("COM0.png", b"not-reserved")),
+    );
+    item(
+        &src,
+        "four",
+        json!({"name":"COM\u{2074}", "ext":"png"}),
+        Some(("COM\u{2074}.png", b"not-reserved-either")),
+    );
+    import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("Reserved".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(dst.join("Eagle/Reserved/_COM²/_COM².png")).unwrap(),
+        b"superscript"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/_lpt³.png")).unwrap(),
+        b"superscript-lpt"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/COM0.png")).unwrap(),
+        b"not-reserved"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/COM\u{2074}.png")).unwrap(),
+        b"not-reserved-either"
+    );
 }
 
 #[test]
@@ -790,4 +995,51 @@ fn generic_name_uses_url_identifier() {
     let report = import(&src, &dst, ImportOptions::default()).unwrap();
     assert_eq!(report.renamed, 1);
     assert!(dst.join("inbox/pximg-12345678.jpg").is_file());
+}
+
+#[test]
+fn ip_literal_host_falls_back_to_time_based_name() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Ip.library");
+    let dst = temp.path().join("dest");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), b"{\"version\":4,\"folders\":[]}").unwrap();
+    item(
+        &src,
+        "v4",
+        json!({"id":"v4", "name":"image", "ext":"jpg",
+               "url":"http://192.168.1.5:8080/img/1234567890"}),
+        Some(("image.jpg", b"jpg-v4")),
+    );
+    item(
+        &src,
+        "v6",
+        json!({"id":"v6", "name":"Screenshot", "ext":"jpg",
+               "url":"https://[2001:db8::1]/photo/12345678"}),
+        Some(("Screenshot.jpg", b"jpg-v6")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.renamed, 2);
+    let mut names: Vec<String> = fs::read_dir(dst.join("inbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".jpg"))
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "names: {names:?}");
+    for name in &names {
+        let stem = name.trim_end_matches(".jpg");
+        let bytes = stem.as_bytes();
+        assert!(
+            bytes.len() == 8 + 1 + 6 + 1 + 4
+                && bytes[0..8].iter().all(u8::is_ascii_digit)
+                && bytes[8] == b'-'
+                && bytes[9..15].iter().all(u8::is_ascii_digit)
+                && bytes[15] == b'-'
+                && bytes[16..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            "expected a time-based name, got {name}"
+        );
+    }
 }

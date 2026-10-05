@@ -26,3 +26,5 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Eagle prototype selftest
+        run: python3 scripts/prototype/eagle-import.py --selftest

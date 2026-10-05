@@ -12,7 +12,6 @@ from collections import Counter
 
 IMG = {'jpg', 'jpeg', 'png', 'gif', 'webp', 'avif', 'heic', 'heif', 'tif', 'tiff', 'bmp'}
 B32 = '0123456789ABCDEFGHJKMNPQRSTVWXYZ'
-GENERIC = re.compile(r'^(image|download|untitled|pasted image.*|img[_-]?\d+|screenshot.*|[0-9a-f]{16,})$', re.I)
 
 ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 ap.add_argument('src', nargs='?', help='Eagle library folder (Name.library)')
@@ -22,6 +21,36 @@ ap.add_argument('--selftest', action='store_true', help='check name_from_url aga
 a = ap.parse_args()
 
 TWO_PART_SUFFIXES = {'co.uk', 'co.jp', 'com.cn', 'com.au'}
+# Four labels of one to three ASCII digits: any dotted-quad IPv4 literal, even a
+# malformed one such as 999.999.999.999, yields no site label.
+IPV4_LITERAL = re.compile(r'\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
+GENERIC_EXACT = {'image', 'download', 'untitled'}
+GENERIC_PREFIXES = ('pasted image', 'screenshot')
+GENERIC_IMG = re.compile(r'\Aimg([_-]?[0-9]+)\Z')
+GENERIC_HASH = re.compile(r'\A[0-9a-f]{16,}\Z')
+
+def is_generic(name):
+    r"""Whether an Eagle item name is a placeholder that carries no information.
+
+    A name is generic when, after lowercasing, it is exactly `image`, `download`
+    or `untitled`; starts with `pasted image` or `screenshot`; is `img` plus at
+    most one `_` or `-` separator plus ASCII digits; or is at least 16 ASCII hex
+    digits (a hash).
+
+    Deliberately ASCII-only where the earlier implementations disagreed:
+    separators are exactly one `_` or `-` (`img__12` is a real name, not a
+    placeholder) and digits are ASCII (`img١٢` is a real name, not a
+    placeholder), and the match never tolerates a trailing newline (`\A`/`\Z`,
+    not `^`/`$`, and no IGNORECASE, which would case-fold non-ASCII letters).
+    Mirrors Rust `is_generic`; both are checked against the shared rows in
+    crates/dimagine-eagle/tests/fixtures/generic-names.json.
+    """
+    lower = name.lower()
+    if lower in GENERIC_EXACT or lower.startswith(GENERIC_PREFIXES):
+        return True
+    if GENERIC_IMG.match(lower):
+        return True
+    return bool(GENERIC_HASH.match(lower))
 
 def _strip_scheme(url):
     low = url.lower()
@@ -29,6 +58,27 @@ def _strip_scheme(url):
         if low.startswith(scheme):
             return url[len(scheme):]
     return None
+
+def _site_from_authority(authority):
+    """Site label for the host part of a URL authority, or None.
+
+    Userinfo is dropped and any port is ignored, including the port after a
+    bracketed IPv6 literal. An IP literal host never produces a label: not a
+    bracketed IPv6 literal ([::1]:3000), not a dotted-quad IPv4 literal
+    (192.168.1.5) and not a bare, unbracketed IPv6 literal such as 2001:db8::1
+    (illegal in an authority but common in pasted URLs). A None result means
+    the caller falls back to the time-based generated name; the host itself is
+    never substituted. Mirrors Rust `site_from_authority`.
+    """
+    authority = authority.rsplit('@', 1)[-1]
+    if authority.startswith('['):
+        return None
+    if authority.count(':') > 1:
+        return None
+    host = authority.split(':', 1)[0].lower()
+    if IPV4_LITERAL.match(host):
+        return None
+    return _site_from_host(host)
 
 def _site_from_host(host):
     labels = [p for p in host.split('.') if p]
@@ -59,7 +109,7 @@ def name_from_url(url):
     slash = rest.find('/')
     authority, path = (rest[:slash], rest[slash:]) if slash >= 0 else (rest, '')
     authority = authority.rsplit('@', 1)[-1]
-    site = _site_from_host(authority.split(':', 1)[0].lower())
+    site = _site_from_authority(authority)
     if not site:
         return None
     first_digits = first_mixed = None
@@ -78,16 +128,127 @@ def name_from_url(url):
     ident = first_digits or first_mixed
     return f'{site}-{ident}' if ident else None
 
+def selftest():
+    """Check this prototype against the fixtures the Rust tests also read.
+
+    Returns a list of (check, input, expected, actual) failures and the number
+    of rows checked. Run with --selftest; this is what CI runs.
+    """
+    base = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
+                        'crates', 'dimagine-eagle', 'tests', 'fixtures')
+
+    def rows(fixture):
+        with open(os.path.join(base, fixture), encoding='utf-8') as handle:
+            return json.load(handle)
+
+    failures, checked = [], 0
+    for row in rows('url-names.json'):
+        checked += 1
+        actual = name_from_url(row['url'])
+        if actual != row['name']:
+            failures.append(('name_from_url', row['url'], row['name'], actual))
+    for row in rows('generic-names.json'):
+        checked += 1
+        actual = is_generic(row['name'])
+        if actual != row['generic']:
+            failures.append(('is_generic', row['name'], row['generic'], actual))
+    for row in rows('reserved-names.json'):
+        checked += 1
+        actual = is_windows_reserved(row['name'])
+        if actual != row['reserved']:
+            failures.append(('is_windows_reserved', row['name'], row['reserved'], actual))
+    for name, cleaned in (('COM\u00b9', '_COM\u00b9'), ('lpt3.png', '_lpt3.png'), ('CON', '_CON'),
+                          ('COM0', 'COM0'), ('console', 'console'), ('COM\u2074', 'COM\u2074')):
+        checked += 1
+        actual = clean(name)
+        if actual != cleaned:
+            failures.append(('clean', name, cleaned, actual))
+    forbidden = '\x00\x07\x1f\x7f\x80\x81\x85\x9f\u2028\u2029\ufffe\ufffd'
+    for value in (f'plain{forbidden}title', 'back\\slash "quoted"', '١٢'):
+        checked += 1
+        raw = sorted({f'U+{ord(character):04X}'
+                      for character in yaml_scalar(value) if not yaml_printable(character)})
+        if raw:
+            failures.append(('yaml_scalar', value, 'no YAML-forbidden characters', raw))
+    return failures, checked
+
+def yaml_printable(character):
+    """YAML printable characters (YAML 1.2 c-printable).
+
+    Tab, LF, CR, U+0020..U+007E, U+0085, U+00A0..U+D7FF, U+E000..U+FFFD and
+    U+10000..U+10FFFF. Mirrors Rust `yaml_printable`.
+    """
+    return (character in '\t\n\r\x85'
+            or '\x20' <= character <= '\x7e'
+            or '\xa0' <= character <= '\ud7ff'
+            or '\ue000' <= character <= '\ufffd'
+            or '\U00010000' <= character <= '\U0010ffff')
+
+YAML_FORBIDDEN = re.compile('[^\\t\\n\\r\\x20-\\x7e\\x85\\xa0-\\ud7ff\\ue000-\\ufffd'
+                            '\\U00010000-\\U0010ffff]')
+
+def yaml_scalar(value):
+    """Render a value as a YAML scalar, escaping everything YAML forbids.
+
+    The value is serialized as JSON first — that keeps quoting, escaping and
+    non-string types consistent — and then every character YAML does not accept
+    becomes a \\uXXXX escape: the C0 controls (already escaped by JSON), DEL,
+    the C1 control block U+0080..U+009F, the non-characters U+FFFE and U+FFFF,
+    and the line separators U+2028 and U+2029. Escapes JSON already produced are
+    printable ASCII, so they are never escaped twice. Mirrors Rust
+    `escape_yaml_forbidden`.
+    """
+    return YAML_FORBIDDEN.sub(lambda match: '\\u%04X' % ord(match.group()),
+                              json.dumps(value, ensure_ascii=False))
+
+
+def ulid():
+    n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
+    return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
+
+WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'}
+# 1-9 plus the superscript spellings Windows accepts for COM1-COM3 and LPT1-LPT3.
+RESERVED_DEVICE_INDEX = frozenset('123456789\u00b9\u00b2\u00b3')
+
+def is_windows_reserved(name):
+    """Whether a name would collide with a reserved Windows device name.
+
+    Windows refuses to create `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and
+    `LPT1` to `LPT9` with any extension, and it also accepts the superscript
+    digit spellings of `COM1` to `COM3` and `LPT1` to `LPT3` (`COM1`, `COM2`,
+    `COM3`, `LPT1`, `LPT2`, `LPT3` written with U+00B9, U+00B2, U+00B3) as
+    the very same devices. Matching is on the ASCII-uppercased stem, the part
+    before the first dot, so the case matters but the extension does not.
+
+    A library has to stay usable when it is synced to a Windows machine, so
+    `clean` prefixes such a name with `_`. Mirrors Rust `is_windows_reserved`;
+    both are checked against the shared rows in
+    crates/dimagine-eagle/tests/fixtures/reserved-names.json.
+    """
+    stem = name.split('.', 1)[0].upper() if name else ''
+    if stem in WINDOWS_RESERVED:
+        return True
+    if len(stem) == 4 and stem[:3] in ('COM', 'LPT'):
+        return stem[3] in RESERVED_DEVICE_INDEX
+    return False
+
+def clean(s):
+    # \x7f-\x9f keeps DEL and the C1 controls, which Rust treats as control
+    # characters, out of file names as well.
+    s = unicodedata.normalize('NFC', s or '')
+    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f\x7f-\x9f]', '-', s).strip().strip('.')
+    s = s[:120]
+    # A library has to stay usable when it is synced to a Windows machine.
+    return '_' + s if is_windows_reserved(s) else s
+
+q = yaml_scalar
+
 if a.selftest:
-    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..',
-                           'crates', 'dimagine-eagle', 'tests', 'fixtures', 'url-names.json')
-    cases = json.load(open(fixture))
-    bad = [(c['url'], c['name'], name_from_url(c['url'])) for c in cases
-           if name_from_url(c['url']) != c['name']]
-    if bad:
-        print('FAIL', bad)
+    failures, checked = selftest()
+    if failures:
+        print('FAIL', failures)
         sys.exit(1)
-    print(f'ok {len(cases)} cases')
+    print(f'ok {checked} cases')
     sys.exit(0)
 
 if not a.src or not a.dst:
@@ -95,16 +256,6 @@ if not a.src or not a.dst:
 SRC, DST = os.path.abspath(os.path.expanduser(a.src)), os.path.abspath(os.path.expanduser(a.dst))
 LIB = a.name or re.sub(r'\.library$', '', os.path.basename(SRC.rstrip('/')))
 
-def ulid():
-    n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
-    return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
-
-def clean(s):
-    s = unicodedata.normalize('NFC', s or '')
-    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f]', '-', s).strip().strip('.')
-    return s[:120]
-
-q = lambda v: json.dumps(v, ensure_ascii=False)
 now = datetime.datetime.now().astimezone()
 NOW = now.isoformat(timespec='seconds')
 
@@ -159,7 +310,7 @@ for d in sorted(glob.glob(os.path.join(SRC, 'images', '*.info'))):
     home = os.path.join(DST, 'Eagle', LIB, paths[0]) if paths else os.path.join(DST, 'inbox')
     os.makedirs(home, exist_ok=True)
     name = clean(m.get('name'))
-    if not name or GENERIC.match(name):
+    if not name or is_generic(name):
         derived = name_from_url(m.get('url'))
         name = clean(derived) if derived else now.strftime('%Y%m%d-%H%M%S') + '-' + ulid()[-4:].lower()
         renamed += 1

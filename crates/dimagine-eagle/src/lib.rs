@@ -974,16 +974,39 @@ fn safe_component(input: &str, max_bytes: usize) -> String {
     if result.is_empty() {
         return result;
     }
-    let stem = result.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0');
-    if reserved {
+    if is_windows_reserved(&result) {
         result.insert(0, '_');
     }
     result
+}
+
+/// Whether a name would collide with a reserved Windows device name.
+///
+/// Windows refuses to create `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and
+/// `LPT1` to `LPT9` with any extension, and it also accepts the superscript
+/// digit spellings of `COM1` to `COM3` and `LPT1` to `LPT3` (`COM¹`, `COM²`,
+/// `COM³`, `LPT¹`, `LPT²`, `LPT³`) as the very same devices. Matching is on the
+/// ASCII-uppercased stem, the part before the first dot, so the case matters but
+/// the extension does not.
+///
+/// A library has to stay usable when it is synced to a Windows machine, so
+/// [`safe_component`] prefixes such a name with `_`. The Python prototype
+/// mirrors this in `is_windows_reserved`; both are checked against the shared
+/// rows in `tests/fixtures/reserved-names.json`.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(suffix) = stem.strip_prefix(prefix) {
+            let mut characters = suffix.chars();
+            if let (Some(index), None) = (characters.next(), characters.next()) {
+                return matches!(index, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}');
+            }
+        }
+    }
+    false
 }
 
 fn suffixed_component(base: &str, suffix: usize, max_bytes: usize) -> String {
@@ -992,21 +1015,34 @@ fn suffixed_component(base: &str, suffix: usize, max_bytes: usize) -> String {
     safe_component(&format!("{shortened}{suffix}"), max_bytes)
 }
 
+/// Whether an Eagle item name is a placeholder that carries no information.
+///
+/// A name is generic when, after Unicode lowercasing, it is exactly `image`,
+/// `download` or `untitled`; starts with `pasted image` or `screenshot`; is
+/// `img` plus at most one `_` or `-` separator plus ASCII digits; or is at
+/// least 16 ASCII hex digits (a hash).
+///
+/// Deliberately ASCII-only where the earlier implementations disagreed:
+/// separators are exactly one `_` or `-` (`img__12` is a real name, not a
+/// placeholder) and digits are ASCII (`img١٢` is a real name, not a
+/// placeholder), and the match never tolerates a trailing newline. The Python
+/// prototype mirrors this in `is_generic`; both are checked against the shared
+/// rows in `tests/fixtures/generic-names.json`.
 fn is_generic(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower == "image"
-        || lower == "download"
-        || lower == "untitled"
-        || lower.starts_with("pasted image")
-        || lower.starts_with("screenshot")
-        || {
-            let digits = lower
-                .strip_prefix("img")
-                .unwrap_or("")
-                .trim_start_matches(['_', '-']);
-            !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    if matches!(lower.as_str(), "image" | "download" | "untitled") {
+        return true;
+    }
+    if lower.starts_with("pasted image") || lower.starts_with("screenshot") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("img") {
+        let digits = rest.strip_prefix(['_', '-']).unwrap_or(rest);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return true;
         }
-        || (lower.len() >= 16 && lower.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+    lower.len() >= 16 && lower.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Derive a generic `<site>-<id>` name from a source URL.
@@ -1017,6 +1053,10 @@ fn is_generic(name: &str) -> bool {
 /// otherwise the first mixed letter/digit identifier (6-24 chars). Tokens
 /// longer than 24 characters are treated as hashes and ignored. Returns `None`
 /// for non-http(s) URLs or when no identifier-shaped token is present.
+///
+/// An IP literal host yields no site label (see [`site_from_authority`]), so
+/// such URLs also return `None` and the importer falls back to its time-based
+/// generated name.
 pub fn name_from_url(url: &str) -> Option<String> {
     let rest = strip_scheme(url)?;
     let end = rest.find(['?', '#']).unwrap_or(rest.len());
@@ -1026,8 +1066,7 @@ pub fn name_from_url(url: &str) -> Option<String> {
         None => (rest, ""),
     };
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = authority.split(':').next().unwrap_or(authority);
-    let site = site_label(&host.to_ascii_lowercase())?;
+    let site = site_from_authority(authority)?;
     let mut first_digits: Option<&str> = None;
     let mut first_mixed: Option<&str> = None;
     for segment in path.split('/') {
@@ -1064,6 +1103,51 @@ fn strip_scheme(url: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Site label for the host part of a URL authority, or `None`.
+///
+/// Userinfo is dropped and any port is ignored, including the port that follows
+/// a bracketed IPv6 literal. An IP literal host never produces a label: neither
+/// a bracketed IPv6 literal (`[::1]:3000`) nor a dotted-quad IPv4 literal
+/// (`192.168.1.5`), and neither a bare, unbracketed IPv6 literal such as
+/// `2001:db8::1`, which cannot appear in a legal authority but is common in
+/// pasted URLs. Callers treat `None` as "no site in this URL" and fall back to
+/// the time-based generated name; they never substitute the host itself.
+///
+/// The Python prototype mirrors this in `_site_from_authority`.
+fn site_from_authority(authority: &str) -> Option<String> {
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, ip_literal) = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((host, _port)) => (host, true),
+            None => return None,
+        },
+        None => {
+            if authority.matches(':').count() > 1 {
+                return None;
+            }
+            let host = authority.split(':').next().unwrap_or(authority);
+            (host, is_ipv4_literal(host))
+        }
+    };
+    if ip_literal {
+        return None;
+    }
+    site_label(&host.to_ascii_lowercase())
+}
+
+/// True for dotted-quad IPv4 literals such as `192.168.1.5`.
+///
+/// Deliberately lenient: four labels of one to three ASCII digits are enough,
+/// so a malformed literal such as `999.999.999.999` also yields no site label.
+/// The Python prototype mirrors this in `IPV4_LITERAL`.
+fn is_ipv4_literal(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() == 4
+        && labels.iter().all(|label| {
+            (1..=3).contains(&label.len()) && label.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn site_label(host: &str) -> Option<String> {
@@ -1113,13 +1197,56 @@ fn unique_name(
     Ok(format!("{candidate}.{ext}"))
 }
 
+/// Render a JSON value as a YAML scalar, escaping everything YAML forbids.
+///
+/// The value is serialized as JSON first — that keeps quoting, escaping and
+/// non-string types consistent — and then every character YAML does not accept
+/// is replaced by a `\uXXXX` escape, see [`escape_yaml_forbidden`].
 fn yaml_quote(value: &Value) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    json.replace('\u{007f}', "\\u007F")
-        .replace('\u{0085}', "\\u0085")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    escape_yaml_forbidden(&json)
 }
+
+/// Escape every character YAML forbids, in a JSON-serialized value.
+///
+/// YAML printable characters are tab, LF, CR, U+0020..U+007E, U+0085,
+/// U+00A0..U+D7FF, U+E000..U+FFFD and U+10000..U+10FFFF. Everything else has
+/// to reach the reader as an escape inside the double-quoted scalar: the C0
+/// controls (already escaped by the JSON serializer), DEL, the C1 control block
+/// U+0080..U+009F, the non-characters U+FFFE and U+FFFF, and the line
+/// separators U+2028 and U+2029, which also break JavaScript readers. An
+/// escaped character is preserved exactly, so the reader sees the original
+/// scalar.
+///
+/// Backslash sequences the JSON serializer produced are copied through
+/// untouched, so their escapes are not escaped again. The Python prototype
+/// mirrors this in `yaml_scalar`.
+fn escape_yaml_forbidden(json: &str) -> String {
+    let mut escaped = String::with_capacity(json.len());
+    let mut characters = json.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            escaped.push('\\');
+            if let Some(escape) = characters.next() {
+                escaped.push(escape);
+            }
+        } else if yaml_printable(character) {
+            escaped.push(character);
+        } else {
+            escaped.push_str(&format!("\\u{:04X}", character as u32));
+        }
+    }
+    escaped
+}
+
+fn yaml_printable(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | '\u{0085}')
+        || ('\u{0020}'..='\u{007e}').contains(&character)
+        || ('\u{00a0}'..='\u{d7ff}').contains(&character)
+        || ('\u{e000}'..='\u{fffd}').contains(&character)
+        || ('\u{10000}'..='\u{10ffff}').contains(&character)
+}
+
 fn yaml_string(value: &str) -> String {
     yaml_quote(&Value::String(value.to_owned()))
 }
@@ -1368,9 +1495,46 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_item_transactionally, CopyItemError};
+    use super::{copy_item_transactionally, is_generic, is_windows_reserved, CopyItemError};
+    use serde_json::Value;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn shared_rows(fixture: &str) -> Vec<(String, bool)> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let bytes =
+            fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let rows: Value = serde_json::from_slice(&bytes).expect("fixture is JSON");
+        let rows = rows.as_array().expect("fixture is a JSON array");
+        assert!(rows.len() >= 40, "expected at least 40 rows in {fixture}");
+        rows.iter()
+            .map(|row| {
+                let name = row["name"].as_str().expect("name string").to_owned();
+                let expected = row["generic"]
+                    .as_bool()
+                    .or_else(|| row["reserved"].as_bool())
+                    .expect("generic or reserved boolean");
+                (name, expected)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generic_name_gate_matches_shared_fixture() {
+        for (name, expected) in shared_rows("generic-names.json") {
+            assert_eq!(is_generic(&name), expected, "name: {name:?}");
+        }
+    }
+
+    #[test]
+    fn windows_reserved_name_gate_matches_shared_fixture() {
+        for (name, expected) in shared_rows("reserved-names.json") {
+            assert_eq!(is_windows_reserved(&name), expected, "name: {name:?}");
+        }
+    }
 
     #[test]
     fn failed_item_copy_leaves_no_published_or_temporary_artifacts() {
@@ -1411,7 +1575,6 @@ mod tests {
     #[test]
     fn iterative_drop_handles_deep_nesting_without_stack_overflow() {
         use super::drop_value_iteratively;
-        use serde_json::Value;
 
         let mut val = Value::Null;
         for _ in 0..10_000 {
