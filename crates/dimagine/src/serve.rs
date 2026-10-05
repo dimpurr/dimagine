@@ -90,7 +90,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }
     };
     let previews = CachedPreview::new(library_dir);
-    let trusted_proxies = sub
+    let trusted_proxies: Vec<IpAddr> = sub
         .get_many::<IpAddr>("trusted_proxy")
         .map(|vals| vals.copied().collect())
         .unwrap_or_default();
@@ -114,6 +114,23 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     } else {
         None
     };
+    let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);
+    let bind = sub
+        .get_one::<IpAddr>("bind")
+        .copied()
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    // A proxy whose address family can never equal a connecting peer's
+    // address would silently disable per-client limiting (every client
+    // collapses onto the peer address), so say so at startup.
+    for proxy in &trusted_proxies {
+        if proxy.is_ipv4() != bind.is_ipv4() {
+            eprintln!(
+                "WARNING: --trusted-proxy {proxy} is {} but --bind {bind} is {}; this proxy can never match a connecting peer",
+                if proxy.is_ipv4() { "IPv4" } else { "IPv6" },
+                if bind.is_ipv4() { "IPv4" } else { "IPv6" },
+            );
+        }
+    }
     let config = ServeConfig {
         passcode,
         trusted_proxies,
@@ -122,11 +139,6 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         https: sub.get_flag("secure_cookies"),
         ..ServeConfig::default()
     };
-    let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);
-    let bind = sub
-        .get_one::<IpAddr>("bind")
-        .copied()
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
     let address = SocketAddr::new(bind, port);
     let app = match router_from(Arc::new(catalog), Arc::new(previews), config.clone()) {
         Ok(app) => app,

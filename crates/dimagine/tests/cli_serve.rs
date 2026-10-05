@@ -555,6 +555,53 @@ fn serve_warns_once_about_world_readable_store_at_startup() {
 }
 
 #[test]
+fn serve_warns_when_trusted_proxy_family_cannot_match_bind() {
+    let dir = library("f8-family");
+    // ::1 can never be the TCP peer of a server bound to 127.0.0.1.
+    let server = Server::start(
+        &dir.root,
+        &[
+            "--port",
+            "0",
+            "--bind",
+            "127.0.0.1",
+            "--trusted-proxy",
+            "::1",
+        ],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    // The server still starts and serves.
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    let stderr = server.kill();
+    assert!(
+        stderr.contains("WARNING") && stderr.contains("::1"),
+        "expected a family-mismatch warning: {stderr}"
+    );
+    assert!(
+        stderr.contains("IPv6") && stderr.contains("IPv4"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn serve_quiet_when_trusted_proxy_family_matches_bind() {
+    let dir = library("f8-family-ok");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--trusted-proxy", "127.0.0.1"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("can never match"),
+        "a matching proxy must not warn: {stderr}"
+    );
+}
+
+#[test]
 fn serve_default_passcode_on_non_loopback_bind_warns() {
     let dir = library("warn");
     // Bind to all local IPv4 interfaces while reaching it on loopback; the
