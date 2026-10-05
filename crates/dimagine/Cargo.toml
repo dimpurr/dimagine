@@ -1,9 +1,17 @@
 [package]
 name = "dimagine"
-description = "dimagine: tools for a folder-of-images image library (scan and check)."
+description = "dimagine: tools for a folder-of-images image library (scan, check, import, previews, serve)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[features]
+# Built-in plugins are Cargo features, enabled by default (ADR-013). A build
+# with --no-default-features still ships the always-on `scan` and `check`.
+default = ["import-eagle", "previews", "serve"]
+import-eagle = ["dep:dimagine-eagle"]
+previews = ["dep:dimagine-preview"]
+serve = ["dep:dimagine-serve", "dep:tokio"]
 
 [[bin]]
 name = "dimagine"
@@ -12,5 +20,9 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 dimagine-core = { path = "../dimagine-core" }
+dimagine-eagle = { path = "../dimagine-eagle", optional = true }
+dimagine-preview = { path = "../dimagine-preview", optional = true }
+dimagine-serve = { path = "../dimagine-serve", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

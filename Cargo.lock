@@ -373,8 +373,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "dimagine-core",
+ "dimagine-eagle",
+ "dimagine-preview",
+ "dimagine-serve",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

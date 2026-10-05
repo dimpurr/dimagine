@@ -1,5 +1,7 @@
 //! The dimagine command-line interface, version 0.1: `scan` and `check`,
-//! both strictly read-only.
+//! both strictly read-only, plus built-in plugin subcommands that are
+//! compiled per Cargo feature (ADR-013): `import eagle`, `previews` and
+//! `serve`.
 //!
 //! Exit codes (HLD):
 //!
@@ -9,86 +11,166 @@
 //! - `3` did not finish reading the library, so every "not found" in the
 //!   output proves nothing.
 
+#[cfg(feature = "import-eagle")]
+mod import;
+mod plugins;
+#[cfg(feature = "previews")]
+mod previews;
+#[cfg(feature = "serve")]
+mod serve;
+
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use dimagine_core::check::{self, CheckReport, Severity};
 use dimagine_core::library::Library;
 use dimagine_core::scan::{self, ScanReport};
 
-#[derive(Parser)]
-#[command(
-    name = "dimagine",
-    version,
-    about = "Tools for a dimagine image library: a plain folder of images with optional Markdown notes.",
-    after_help = "Both commands read the library and never modify it. Every command takes --library <dir> (default: the current directory) and --json for machine-readable output."
-)]
-struct Cli {
-    /// The library folder to read (default: the current directory).
-    #[arg(long, global = true, value_name = "DIR")]
-    library: Option<PathBuf>,
+use plugins::CorePlugins;
 
-    /// Print one machine-readable JSON document instead of human text.
-    #[arg(long, global = true)]
-    json: bool,
-
-    /// Maximum bytes read from one Markdown note (default: 8388608).
-    #[arg(long, global = true, default_value_t = dimagine_core::check::DEFAULT_MAX_NOTE_BYTES)]
-    max_note_bytes: u64,
-
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Summarise the library: images, notes, collections, boards.
-    Scan,
-    /// Report problems in the library; never changes files.
-    Check,
-}
+// The clap default is a plain literal; keep it in sync with the core constant.
+const _: () = assert!(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES == 8_388_608);
 
 fn main() -> ExitCode {
-    let cli = Cli::parse(); // clap exits with code 2 on usage errors
-    let library_dir = resolve_library(&cli.library);
-    let json = cli.json;
-    let max_note_bytes = cli.max_note_bytes;
-    let library = match Library::open(&library_dir) {
+    // The offered subcommands depend on the library's switch file, so the
+    // library is resolved before clap runs; a misread falls back to the
+    // current directory, which is also clap's default for the flag.
+    let plugins = CorePlugins::load(&plugins::library_hint(std::env::args_os()));
+    let matches = cli(&plugins).get_matches(); // clap exits with code 2 on usage errors
+    let Some((name, sub)) = matches.subcommand() else {
+        return ExitCode::from(2);
+    };
+    let library_dir = resolve_library(sub);
+    match name {
+        "scan" => run_scan(sub, &library_dir),
+        "check" => run_check(sub, &library_dir),
+        #[cfg(feature = "import-eagle")]
+        "import" => import::run(sub, &library_dir),
+        #[cfg(feature = "previews")]
+        "previews" => previews::run(sub, &library_dir),
+        #[cfg(feature = "serve")]
+        "serve" => serve::run(sub, &library_dir),
+        other => unreachable!("clap already rejected unknown subcommand {other}"),
+    }
+}
+
+fn cli(plugins: &CorePlugins) -> Command {
+    let command = Command::new("dimagine")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
+        .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. Commands only read the library; derived data lives in .dimagine/ and can always be deleted.")
+        .arg(
+            Arg::new("library")
+                .long("library")
+                .value_name("DIR")
+                .global(true)
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("The library folder to read (default: the current directory)."),
+        )
+        .arg(
+            Arg::new("json")
+                .long("json")
+                .global(true)
+                .action(ArgAction::SetTrue)
+                .help("Print one machine-readable JSON document instead of human text."),
+        )
+        .arg(
+            Arg::new("max_note_bytes")
+                .long("max-note-bytes")
+                .value_name("BYTES")
+                .global(true)
+                .value_parser(clap::value_parser!(u64))
+                .default_value("8388608")
+                .help("Maximum bytes read from one Markdown note (default: 8388608)."),
+        )
+        .subcommand(
+            Command::new("scan").about("Summarise the library: images, notes, collections, boards."),
+        )
+        .subcommand(
+            Command::new("check").about("Report problems in the library; never changes files."),
+        )
+        .subcommand_required(true)
+        .arg_required_else_help(true);
+    // Built-in plugins: compiled per Cargo feature, then switched per library
+    // (ADR-013). Disabled plugins do not appear in help or usage. Each block
+    // rebinds `command`, so no feature combination leaves an unused `mut`.
+    #[cfg(feature = "import-eagle")]
+    let command = if plugins.import_eagle {
+        command.subcommand(import::command())
+    } else {
+        command
+    };
+    #[cfg(not(feature = "import-eagle"))]
+    let _ = &plugins.import_eagle;
+    #[cfg(feature = "previews")]
+    let command = if plugins.previews {
+        command.subcommand(previews::command())
+    } else {
+        command
+    };
+    #[cfg(not(feature = "previews"))]
+    let _ = &plugins.previews;
+    #[cfg(feature = "serve")]
+    let command = if plugins.serve {
+        command.subcommand(serve::command())
+    } else {
+        command
+    };
+    #[cfg(not(feature = "serve"))]
+    let _ = &plugins.serve;
+    command
+}
+
+fn resolve_library(sub: &ArgMatches) -> PathBuf {
+    sub.get_one::<PathBuf>("library")
+        .cloned()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn run_scan(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let max_note_bytes = sub
+        .get_one::<u64>("max_note_bytes")
+        .copied()
+        .unwrap_or(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES);
+    let library = match Library::open(library_dir) {
         Ok(library) => library,
         Err(error) => {
             emit_failure(json, &error.to_string());
             return ExitCode::from(1);
         }
     };
-    match cli.command {
-        Command::Scan => {
-            let report = scan::run_with_limit(&library, max_note_bytes);
-            if json {
-                print_scan_json(&report);
-            } else {
-                print_scan_human(&report);
-            }
-            ExitCode::from(report.exit_code().try_into().unwrap_or(1))
-        }
-        Command::Check => {
-            let report = check::run_with_limit(&library, max_note_bytes);
-            if json {
-                print_check_json(&report);
-            } else {
-                print_check_human(&report);
-            }
-            ExitCode::from(report.exit_code().try_into().unwrap_or(1))
-        }
+    let report = scan::run_with_limit(&library, max_note_bytes);
+    if json {
+        print_scan_json(&report);
+    } else {
+        print_scan_human(&report);
     }
+    ExitCode::from(report.exit_code().try_into().unwrap_or(1))
 }
 
-fn resolve_library(flag: &Option<PathBuf>) -> PathBuf {
-    match flag {
-        Some(path) => path.clone(),
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let max_note_bytes = sub
+        .get_one::<u64>("max_note_bytes")
+        .copied()
+        .unwrap_or(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES);
+    let library = match Library::open(library_dir) {
+        Ok(library) => library,
+        Err(error) => {
+            emit_failure(json, &error.to_string());
+            return ExitCode::from(1);
+        }
+    };
+    let report = check::run_with_limit(&library, max_note_bytes);
+    if json {
+        print_check_json(&report);
+    } else {
+        print_check_human(&report);
     }
+    ExitCode::from(report.exit_code().try_into().unwrap_or(1))
 }
 
 fn emit_failure(json: bool, message: &str) {
