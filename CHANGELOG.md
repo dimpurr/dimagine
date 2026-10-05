@@ -7,6 +7,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Accounts: the viewer has a single owner account (email + password, argon2id)
+  created on first visit with a one-time setup code printed at startup;
+  `dimagine user` creates, lists and changes passwords; the account store lives
+  outside the library (`--data-dir`), refuses to start when it is unreadable or
+  malformed, and keeps unknown fields. Passcode mode still works until an account
+  exists. `--trusted-proxy` takes the client address from `X-Forwarded-For`
+  only from listed proxies; session cookies get `Secure` behind an HTTPS proxy
+  or with `--secure-cookies`; passwords need at least 12 characters.
 - Viewer hardening: login attempts are throttled before comparison, bounded
   in flight and charged against per-client and global budgets; expensive
   requests are admission-bounded (503 + Retry-After); ETags come from the
