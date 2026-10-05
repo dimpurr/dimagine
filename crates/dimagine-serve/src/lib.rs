@@ -609,7 +609,32 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     throttles: Arc<Mutex<ThrottleState>>,
     admission: Arc<tokio::sync::Semaphore>,
+    login_slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// At most this many login attempts may be in flight at once, across all
+/// clients. Guesses are refused here — before the passcode is looked at — so
+/// a brute-force wave cannot test many passcodes at the same time.
+pub const LOGIN_CONCURRENCY_LIMIT: usize = 2;
+
+/// Attempts one client may spend inside `LOGIN_BUDGET_WINDOW_SECS` before the
+/// server stops comparing its guesses. Charged before the comparison, so the
+/// passcode is never even looked at once the budget is gone.
+pub const LOGIN_FAILURE_BUDGET: u32 = 10;
+
+/// Attempts all clients together may spend inside `LOGIN_BUDGET_WINDOW_SECS`.
+/// This is the backstop that keeps the per-client budget from being farmed out
+/// across many source addresses, and it is not affected by client eviction.
+pub const LOGIN_GLOBAL_FAILURE_BUDGET: u32 = 100;
+
+/// Length of the login attempt budget window. Budgets are restored, never
+/// permanently withdrawn, so there is no lockout.
+pub const LOGIN_BUDGET_WINDOW_SECS: u64 = 15 * 60;
+
+/// Clients kept in memory. Past this the least recently seen one is dropped;
+/// forgetting a client only restores that client's own budget, never the
+/// global one.
+const MAX_TRACKED_CLIENTS: usize = 1024;
 
 /// Bound on concurrently expensive requests: directory listings and
 /// media streaming (which may generate previews). Excess requests get
@@ -628,36 +653,126 @@ fn admission_denied() -> Response {
     response
 }
 
+/// Attempts spent by one client (or by every client together) inside the
+/// current budget window.
+#[derive(Clone, Copy, Default)]
+struct LoginBudget {
+    spent: u32,
+    window_start: u64,
+    last_seen: u64,
+}
+
+impl LoginBudget {
+    /// Attempts spent in the window containing `now`, starting a fresh window
+    /// first if the previous one has passed. A clock that steps backwards keeps
+    /// the current window rather than handing out a second budget.
+    fn spent_in_window(&mut self, now: u64) -> u32 {
+        if now.saturating_sub(self.window_start) >= LOGIN_BUDGET_WINDOW_SECS {
+            self.window_start = now;
+            self.spent = 0;
+        }
+        self.last_seen = now;
+        self.spent
+    }
+
+    fn charge(&mut self, now: u64) {
+        self.spent = self.spent.saturating_add(1);
+        self.last_seen = now;
+    }
+
+    /// Seconds until this window rolls over and the budget is restored.
+    fn retry_after(&self, now: u64) -> u64 {
+        LOGIN_BUDGET_WINDOW_SECS
+            .saturating_sub(now.saturating_sub(self.window_start))
+            .max(1)
+    }
+}
+
 #[derive(Default)]
 struct ThrottleState {
-    clients: HashMap<String, (u32, u64)>,
-    global_failures: u32,
+    clients: HashMap<String, LoginBudget>,
+    global: LoginBudget,
+}
+
+/// What the pre-comparison login gate decided about one attempt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginGate {
+    /// The attempt may be compared against the passcode. Carries the
+    /// escalating delay step.
+    Compare(u32),
+    /// Refused without comparing; `retry_after` seconds until the budget is
+    /// restored.
+    Refused { retry_after: u64 },
 }
 
 impl ThrottleState {
-    /// Record one failed attempt, returning the escalating delay step.
-    /// The client map stays bounded by evicting the least recently seen
-    /// client; failure counts saturate instead of overflowing.
-    fn record_failure(&mut self, client_key: &str, now: u64) -> u32 {
-        self.global_failures = self.global_failures.saturating_add(1);
-        if self.clients.len() >= 1024 && !self.clients.contains_key(client_key) {
+    /// Decide whether one login attempt may be compared, charging it to both
+    /// the per-client and the global budget when it may. Runs before the
+    /// passcode is read, so a refused attempt costs the caller nothing and
+    /// reveals nothing about the guess.
+    fn admit(&mut self, client_key: &str, now: u64) -> LoginGate {
+        let global = self.global.spent_in_window(now);
+        let global_retry = self.global.retry_after(now);
+        let (spent, client_retry) = match self.clients.get_mut(client_key) {
+            Some(client) => {
+                let spent = client.spent_in_window(now);
+                (spent, client.retry_after(now))
+            }
+            None => (0, LOGIN_BUDGET_WINDOW_SECS),
+        };
+        if spent >= LOGIN_FAILURE_BUDGET {
+            return LoginGate::Refused {
+                retry_after: client_retry,
+            };
+        }
+        if global >= LOGIN_GLOBAL_FAILURE_BUDGET {
+            return LoginGate::Refused {
+                retry_after: global_retry,
+            };
+        }
+        self.charge_client(client_key, now);
+        self.global.charge(now);
+        LoginGate::Compare(spent.saturating_add(1).max(global.saturating_add(1)))
+    }
+
+    /// Charge an admitted attempt, keeping the client map bounded by evicting
+    /// the least recently seen client.
+    fn charge_client(&mut self, client_key: &str, now: u64) {
+        if self.clients.len() >= MAX_TRACKED_CLIENTS && !self.clients.contains_key(client_key) {
             if let Some(oldest) = self
                 .clients
                 .iter()
-                .min_by_key(|(_, (_, seen))| *seen)
+                .min_by_key(|(_, budget)| budget.last_seen)
                 .map(|(key, _)| key.clone())
             {
                 self.clients.remove(&oldest);
             }
         }
-        let entry = self
-            .clients
+        self.clients
             .entry(client_key.to_owned())
-            .or_insert((0, now));
-        entry.0 = entry.0.saturating_add(1);
-        entry.1 = now;
-        self.global_failures.max(entry.0)
+            .or_default()
+            .charge(now);
     }
+
+    /// A successful login restores that client's budget. The global budget is
+    /// deliberately left alone: a success must not be able to hand an attacker
+    /// a fresh global allowance.
+    fn record_success(&mut self, client_key: &str) {
+        self.clients.remove(client_key);
+    }
+}
+
+/// Refuse a login attempt without comparing it: 429 with `Retry-After` and an
+/// empty body, so a refused attempt is indistinguishable from any other.
+fn login_refused(retry_after: u64) -> Response {
+    let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Build the read-only viewer router.
@@ -682,6 +797,7 @@ pub fn router_from(
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
+        login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
     };
     Router::new()
         .route("/login", get(login_page).post(login))
@@ -756,15 +872,25 @@ async fn login(
     let client_key = client
         .map(|c| c.0.ip().to_string())
         .unwrap_or_else(|| "unknown".to_owned());
-    // Throttle before comparing so parallel guesses cannot bypass the
-    // back-off and response timing never reveals whether a guess was
-    // correct: every attempt pays the same escalating delay.
-    let delay = {
+    // Bound how many guesses are in flight before anything else: a parallel
+    // wave of guesses is refused without the passcode ever being compared.
+    let _slot = match state.login_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return login_refused(1),
+    };
+    // Then charge the attempt to the per-client and the global budget, still
+    // before comparing, so an exhausted budget refuses without comparing and
+    // response timing never reveals whether a guess was correct: every attempt
+    // that is compared pays the same escalating delay.
+    let delay_step = {
         let mut throttle = state.throttles.lock().unwrap();
-        throttle.record_failure(&client_key, now_seconds())
+        match throttle.admit(&client_key, now_seconds()) {
+            LoginGate::Compare(step) => step,
+            LoginGate::Refused { retry_after } => return login_refused(retry_after),
+        }
     };
     let millis =
-        (100u64.saturating_mul(1u64.checked_shl(delay.min(6)).unwrap_or(u64::MAX))).min(5000);
+        (100u64.saturating_mul(1u64.checked_shl(delay_step.min(6)).unwrap_or(u64::MAX))).min(5000);
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
     if form
         .passcode
@@ -781,8 +907,7 @@ async fn login(
     }
     {
         let mut throttles = state.throttles.lock().unwrap();
-        throttles.clients.remove(&client_key);
-        throttles.global_failures = 0;
+        throttles.record_success(&client_key);
     }
     let token = uuid::Uuid::new_v4().to_string();
     store_session(
@@ -1541,23 +1666,113 @@ mod regression_unit_tests {
     }
 
     #[test]
-    fn throttle_state_stays_bounded_and_saturates() {
+    fn login_budget_bounds_comparisons_per_client_and_globally() {
+        // One client cannot spend more than its per-window budget, however
+        // many guesses it fires: only the first ones are ever compared.
         let mut throttle = ThrottleState::default();
-        for index in 0..2000u64 {
-            throttle.record_failure(&format!("client-{index}"), index);
+        let mut compared = 0;
+        for attempt in 0..1_000u64 {
+            // Two guesses per second: the whole wave is inside one window.
+            if matches!(throttle.admit("one", attempt / 2), LoginGate::Compare(_)) {
+                compared += 1;
+            }
         }
-        assert!(throttle.clients.len() <= 1024);
-        assert_eq!(throttle.global_failures, 2000);
-        let mut client_only = ThrottleState::default();
-        let mut last = 0;
-        for index in 0..10u64 {
-            last = client_only.record_failure("one", index);
-            assert_eq!(last, index as u32 + 1);
+        assert_eq!(compared, LOGIN_FAILURE_BUDGET);
+        // A refused attempt says when the budget comes back...
+        assert!(matches!(
+            throttle.admit("one", LOGIN_BUDGET_WINDOW_SECS / 2),
+            LoginGate::Refused { retry_after } if retry_after > 0
+        ));
+        // ...and a window that has passed restores it: no permanent lockout.
+        let mut compared = 0;
+        for attempt in 0..1_000u64 {
+            let now = LOGIN_BUDGET_WINDOW_SECS + attempt / 2;
+            if matches!(throttle.admit("one", now), LoginGate::Compare(_)) {
+                compared += 1;
+            }
         }
-        assert_eq!(last, 10);
-        client_only.global_failures = u32::MAX;
-        client_only.record_failure("one", 99);
-        assert_eq!(client_only.global_failures, u32::MAX);
+        assert_eq!(compared, LOGIN_FAILURE_BUDGET);
+
+        // Spreading the guesses over many clients cannot beat the global
+        // budget either.
+        let mut throttle = ThrottleState::default();
+        let mut compared = 0;
+        for attempt in 0..1_000u64 {
+            if matches!(
+                throttle.admit(&format!("client-{attempt}"), 0),
+                LoginGate::Compare(_)
+            ) {
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, LOGIN_GLOBAL_FAILURE_BUDGET);
+        assert!(matches!(
+            throttle.admit("client-new", 0),
+            LoginGate::Refused { .. }
+        ));
+
+        // A success restores that client's own budget and only that client's:
+        // the global allowance is not handed back.
+        let mut throttle = ThrottleState::default();
+        for attempt in 0..LOGIN_FAILURE_BUDGET as u64 {
+            throttle.admit("one", attempt);
+        }
+        throttle.record_success("one");
+        assert!(matches!(
+            throttle.admit("one", LOGIN_FAILURE_BUDGET as u64),
+            LoginGate::Compare(_)
+        ));
+        assert_eq!(throttle.clients["one"].spent, 1);
+        assert_eq!(
+            throttle.global.spent,
+            LOGIN_FAILURE_BUDGET + 1,
+            "a success must not hand back the global allowance"
+        );
+    }
+
+    #[test]
+    fn login_budget_keeps_tracked_clients_bounded_and_saturates() {
+        // One window per global budget's worth of guesses, so the map really
+        // does overflow and the eviction path runs.
+        let mut throttle = ThrottleState::default();
+        let mut admitted = 0;
+        for index in 0..2_000u64 {
+            let now = index / LOGIN_GLOBAL_FAILURE_BUDGET as u64 * LOGIN_BUDGET_WINDOW_SECS;
+            if matches!(
+                throttle.admit(&format!("client-{index}"), now),
+                LoginGate::Compare(_)
+            ) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, 2_000);
+        assert!(throttle.clients.len() <= MAX_TRACKED_CLIENTS);
+        // Counters saturate instead of wrapping, and a refused attempt is not
+        // charged at all.
+        let mut only = ThrottleState::default();
+        only.global.spent = u32::MAX;
+        only.admit("one", 0);
+        assert_eq!(only.global.spent, u32::MAX);
+        assert!(only.clients.is_empty());
+    }
+
+    #[test]
+    fn configured_budget_pushes_a_four_digit_keyspace_past_an_hour() {
+        // Projection, not a wall-clock measurement: at the configured budget
+        // an attacker needs at least this long to try every four-digit
+        // passcode, whichever bound binds first.
+        const FOUR_DIGIT_KEYSPACE: u64 = 10_000;
+        const ONE_HOUR: u64 = 60 * 60;
+        let per_client_windows = FOUR_DIGIT_KEYSPACE.div_ceil(LOGIN_FAILURE_BUDGET as u64);
+        let global_windows = FOUR_DIGIT_KEYSPACE.div_ceil(LOGIN_GLOBAL_FAILURE_BUDGET as u64);
+        let per_client = per_client_windows * LOGIN_BUDGET_WINDOW_SECS;
+        let global = global_windows * LOGIN_BUDGET_WINDOW_SECS;
+        let worst_case = per_client.min(global);
+        assert!(
+            worst_case >= ONE_HOUR,
+            "full keyspace reachable in {worst_case}s, under the {ONE_HOUR}s floor \
+             (per-client {per_client}s, global {global}s)"
+        );
     }
 
     #[test]

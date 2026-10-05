@@ -4,7 +4,7 @@ use axum::{
 };
 use dimagine_serve::{
     router, Catalog, CatalogError, Collection, FsCatalog, ImageDetail, ImageEntry, OriginalPreview,
-    ServeConfig,
+    ServeConfig, LOGIN_CONCURRENCY_LIMIT,
 };
 use std::{
     fs,
@@ -155,7 +155,7 @@ async fn login_throttles_failures_and_success_remains_available() {
 }
 
 #[tokio::test]
-async fn concurrent_wrong_guesses_are_throttled_before_comparison() {
+async fn concurrent_wrong_guesses_are_bounded_before_comparison() {
     let root = tempfile::tempdir().unwrap();
     let app = app_for(&root, ServeConfig::default());
     let wrong = || {
@@ -172,26 +172,41 @@ async fn concurrent_wrong_guesses_are_throttled_before_comparison() {
         let app = app.clone();
         tasks.push(tokio::spawn(async move {
             let response = app.oneshot(wrong()).await.unwrap();
-            (response.status(), bytes(response).await)
+            let status = response.status();
+            let retry_after = response.headers().get("retry-after").cloned();
+            (status, retry_after, bytes(response).await)
         }));
     }
     let mut outcomes = Vec::new();
     for task in tasks {
         outcomes.push(task.await.unwrap());
     }
-    // The back-off is computed from the shared failure count before the
-    // passcode is compared, so a parallel burst pays the escalating delay
-    // (100ms, 200ms, 400ms, 800ms) instead of sleeping only 100ms each.
-    assert!(start.elapsed() >= std::time::Duration::from_millis(800));
-    assert!(outcomes
+    // All four guesses are in flight at once, but only
+    // LOGIN_CONCURRENCY_LIMIT may be: the excess is refused before the
+    // passcode is compared, so a wave cannot test more passcodes than that.
+    let compared = outcomes
         .iter()
-        .all(|(status, _)| *status == StatusCode::UNAUTHORIZED));
-    assert!(outcomes.iter().all(|(_, body)| *body == outcomes[0].1));
+        .filter(|(status, _, _)| *status == StatusCode::UNAUTHORIZED)
+        .count();
+    assert_eq!(compared, LOGIN_CONCURRENCY_LIMIT);
+    for (status, retry_after, body) in &outcomes {
+        if *status != StatusCode::TOO_MANY_REQUESTS {
+            continue;
+        }
+        assert!(
+            retry_after.is_some(),
+            "a refused login attempt must say when to retry"
+        );
+        assert!(body.is_empty(), "a refused attempt reveals nothing");
+    }
+    // The compared guesses paid the escalating delay, computed before the
+    // passcode was read, so a parallel burst is slowed instead of free.
+    assert!(start.elapsed() >= std::time::Duration::from_millis(200));
     // The delay is paid before comparing, so a correct passcode is delayed
-    // too, and success stays available after failures (no lockout).
+    // too, and success stays available after the burst (no lockout).
     let start = std::time::Instant::now();
     let cookie = login(&app, "2333").await;
-    assert!(start.elapsed() >= std::time::Duration::from_millis(1600));
+    assert!(start.elapsed() >= std::time::Duration::from_millis(800));
     assert!(cookie.starts_with("dimagine_session="));
 }
 
