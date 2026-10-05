@@ -7,14 +7,18 @@ publish = false
 
 
 [dependencies]
+argon2 = "0.5"
 axum = { version = "0.7", features = ["form", "json"] }
 ammonia = "4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dimagine-core = { path = "../dimagine-core" }
 dimagine-preview = { path = "../dimagine-preview" }
 httpdate = "1"
 mime_guess = "2"
 percent-encoding = "2.3"
 pulldown-cmark = "0.10"
+rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 saphyr = "0.1"
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +26,7 @@ serde_json = "1"
 subtle = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "fs", "io-util", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["io"] }
+ulid = "1.2"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
 

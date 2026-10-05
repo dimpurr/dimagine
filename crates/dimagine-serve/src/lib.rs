@@ -1,4 +1,7 @@
 //! Read-only, passcode-protected web viewer for a dimagine library.
+
+pub mod accounts;
+
 use axum::{
     body::Body,
     extract::{Form, Path, State},
