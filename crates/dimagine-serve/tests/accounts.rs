@@ -439,6 +439,50 @@ fn running_as_root() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(unix)]
+#[test]
+fn save_creates_data_dir_with_0700() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    let store = AccountsStore::new(&state);
+    assert!(!state.exists());
+
+    store
+        .create_user("owner@example.com", "secret123", "owner")
+        .unwrap();
+
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700, "the data dir must be 0700, got {mode:o}");
+}
+
+#[cfg(unix)]
+#[test]
+fn permissions_warning_reports_group_or_world_readable_store() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = AccountsStore::new(&state);
+
+    // No file: no warning.
+    assert!(store.permissions_warning().is_none());
+
+    // 0600: no warning.
+    std::fs::write(store.file_path(), r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(store.file_path(), std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(store.permissions_warning().is_none());
+
+    // Group- or world-readable: warning naming the mode.
+    for mode in [0o640, 0o604, 0o644] {
+        std::fs::set_permissions(store.file_path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        let warning = store
+            .permissions_warning()
+            .unwrap_or_else(|| panic!("mode {mode:o} must warn"));
+        assert!(warning.contains(&format!("{mode:04o}")), "{warning}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_setup_requests_consume_the_code_only_once() {
     let root = tempfile::tempdir().unwrap();

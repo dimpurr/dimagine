@@ -524,6 +524,36 @@ fn serve_session_cookie_is_not_secure_over_plain_http_by_default() {
     server.kill();
 }
 
+#[cfg(unix)]
+#[test]
+fn serve_warns_once_about_world_readable_store_at_startup() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = library("f6-serve-mode");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(
+        &accounts,
+        r#"{"schema":1,"users":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z"}]}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // The server loads the store at startup and on every request; the
+    // warning must appear exactly once, not once per request.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+    assert_eq!(status_of(&http_get(&address, "/login", None)), "200");
+    let stderr = server.kill();
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("WARNING"))
+        .count();
+    assert_eq!(warnings, 1, "stderr: {stderr}");
+    assert!(stderr.contains("0644"), "{stderr}");
+}
+
 #[test]
 fn serve_default_passcode_on_non_loopback_bind_warns() {
     let dir = library("warn");
@@ -999,6 +1029,47 @@ fn interactive_prompt_reads_piped_stdin_without_the_flag() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(state.0.join("accounts.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn user_cli_warns_about_world_readable_store_and_repairs_it_on_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(&accounts, r#"{"schema":1,"users":[]}"#).unwrap();
+    std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // list warns (and does not fail) about the loose mode.
+    let output = run_user(&["user", "list", "--data-dir", &data_dir], "");
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("WARNING"), "{stderr}");
+    assert!(stderr.contains("0644"), "{stderr}");
+
+    // The next write repairs the mode to 0600.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = std::fs::metadata(&accounts).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the write must repair the mode, got {mode:o}");
 }
 
 #[test]

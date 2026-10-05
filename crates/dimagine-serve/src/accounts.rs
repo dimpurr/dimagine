@@ -143,6 +143,12 @@ pub fn verify_password(password: &str, hash_str: &str) -> bool {
         .is_ok()
 }
 
+/// Process-wide guard so the loose-permissions warning is printed once per
+/// process (at startup, when the first load happens) and not again on every
+/// request-time load or for every store instance.
+static WARNED_PERMISSIONS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Thread-safe manager for reading and atomically writing `accounts.json`.
 #[derive(Clone, Debug)]
 pub struct AccountsStore {
@@ -170,6 +176,7 @@ impl AccountsStore {
         if !self.file_path.exists() {
             return Ok(AccountsFile::default());
         }
+        self.warn_if_loose_permissions();
         let bytes = fs::read(&self.file_path)?;
         let accounts: AccountsFile = serde_json::from_slice(&bytes)?;
         if accounts.schema != CURRENT_SCHEMA {
@@ -180,10 +187,65 @@ impl AccountsStore {
         Ok(accounts)
     }
 
+    /// Return a warning message when `accounts.json` exists with permissions
+    /// looser than 0600 (group- or world-readable), or `None` when the mode is
+    /// acceptable or the file is absent. The store still loads: the warning
+    /// is an operator signal, not a failure.
+    pub fn permissions_warning(&self) -> Option<String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = fs::metadata(&self.file_path).ok()?;
+            let mode = metadata.permissions().mode() & 0o777;
+            (mode & 0o077 != 0).then(|| {
+                format!(
+                    "{} is mode {mode:04o}; expected 0600 (argon2id password hashes must not be group/world-readable)",
+                    self.file_path.display()
+                )
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// Print the loose-permissions warning once per process. The first load
+    /// happens at startup, so in practice this fires there; a store made
+    /// loose later (by a backup extraction, say) warns on the next read.
+    fn warn_if_loose_permissions(&self) {
+        let Some(warning) = self.permissions_warning() else {
+            return;
+        };
+        if WARNED_PERMISSIONS
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            eprintln!("WARNING: {warning}");
+        }
+    }
+
     /// Write `AccountsFile` atomically to `accounts.json` with permissions 0600 on Unix.
+    ///
+    /// The state directory is created 0700 when missing, and the fresh 0600
+    /// temp file is renamed over the target, so a write also repairs an
+    /// `accounts.json` left world-readable by a backup extraction.
     pub fn save(&self, accounts: &AccountsFile) -> Result<(), AccountsError> {
         let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
-        fs::create_dir_all(parent)?;
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // The directory holds password hashes: owner-only.
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
 
         let random_suffix: u64 = rand::random();
         let tmp_path = parent.join(format!(".accounts.json.tmp.{random_suffix}"));
