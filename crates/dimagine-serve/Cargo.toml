@@ -28,3 +28,6 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+# test-util gives the login tests a virtual clock, so an escalating back-off
+# is exercised without spending real seconds on it.
+tokio = { version = "1", features = ["test-util"] }

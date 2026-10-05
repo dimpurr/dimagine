@@ -520,11 +520,10 @@ async fn real_preview_generation_and_caching_and_fallback() {
         .await
         .unwrap();
     assert_eq!(thumb_resp.status(), StatusCode::OK);
-    assert_eq!(
-        thumb_resp.headers()["cache-control"],
-        "private, max-age=31536000, immutable"
-    );
+    assert_eq!(thumb_resp.headers()["cache-control"], "private, no-cache");
     assert!(thumb_resp.headers().contains_key("etag"));
+    let thumb_etag = thumb_resp.headers()["etag"].to_str().unwrap().to_owned();
+    to_bytes(thumb_resp.into_body(), usize::MAX).await.unwrap();
 
     // Cache entry exists under .dimagine/cache/
     let cache_dir = root.join(".dimagine/cache/previews");
@@ -543,10 +542,23 @@ async fn real_preview_generation_and_caching_and_fallback() {
         .await
         .unwrap();
     assert_eq!(view_resp.status(), StatusCode::OK);
-    assert_eq!(
-        view_resp.headers()["cache-control"],
-        "private, max-age=31536000, immutable"
-    );
+    assert_eq!(view_resp.headers()["cache-control"], "private, no-cache");
+
+    // 3b. Rendition URLs carry no content hash, so they revalidate
+    // through the content-hash ETag instead of caching immutably.
+    let revalidated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/thumb/art/cat.png")
+                .header("cookie", &cookie)
+                .header("if-none-match", &thumb_etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
 
     // 4. Request raw original -> serves original bytes with private, no-cache
     let raw_resp = app
