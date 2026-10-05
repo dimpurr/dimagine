@@ -1174,13 +1174,56 @@ fn unique_name(
     Ok(format!("{candidate}.{ext}"))
 }
 
+/// Render a JSON value as a YAML scalar, escaping everything YAML forbids.
+///
+/// The value is serialized as JSON first — that keeps quoting, escaping and
+/// non-string types consistent — and then every character YAML does not accept
+/// is replaced by a `\uXXXX` escape, see [`escape_yaml_forbidden`].
 fn yaml_quote(value: &Value) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    json.replace('\u{007f}', "\\u007F")
-        .replace('\u{0085}', "\\u0085")
-        .replace('\u{2028}', "\\u2028")
-        .replace('\u{2029}', "\\u2029")
+    escape_yaml_forbidden(&json)
 }
+
+/// Escape every character YAML forbids, in a JSON-serialized value.
+///
+/// YAML printable characters are tab, LF, CR, U+0020..U+007E, U+0085,
+/// U+00A0..U+D7FF, U+E000..U+FFFD and U+10000..U+10FFFF. Everything else has
+/// to reach the reader as an escape inside the double-quoted scalar: the C0
+/// controls (already escaped by the JSON serializer), DEL, the C1 control block
+/// U+0080..U+009F, the non-characters U+FFFE and U+FFFF, and the line
+/// separators U+2028 and U+2029, which also break JavaScript readers. An
+/// escaped character is preserved exactly, so the reader sees the original
+/// scalar.
+///
+/// Backslash sequences the JSON serializer produced are copied through
+/// untouched, so their escapes are not escaped again. The Python prototype
+/// mirrors this in `yaml_scalar`.
+fn escape_yaml_forbidden(json: &str) -> String {
+    let mut escaped = String::with_capacity(json.len());
+    let mut characters = json.chars();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            escaped.push('\\');
+            if let Some(escape) = characters.next() {
+                escaped.push(escape);
+            }
+        } else if yaml_printable(character) {
+            escaped.push(character);
+        } else {
+            escaped.push_str(&format!("\\u{:04X}", character as u32));
+        }
+    }
+    escaped
+}
+
+fn yaml_printable(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | '\u{0085}')
+        || ('\u{0020}'..='\u{007e}').contains(&character)
+        || ('\u{00a0}'..='\u{d7ff}').contains(&character)
+        || ('\u{e000}'..='\u{fffd}').contains(&character)
+        || ('\u{10000}'..='\u{10ffff}').contains(&character)
+}
+
 fn yaml_string(value: &str) -> String {
     yaml_quote(&Value::String(value.to_owned()))
 }

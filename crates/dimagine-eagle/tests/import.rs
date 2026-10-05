@@ -347,6 +347,97 @@ fn emitted_frontmatter_round_trips_adversarial_strings_as_yaml() {
     assert_eq!(doc["sources"][0]["item"].as_str(), Some("item\u{2028}id"));
 }
 
+/// YAML printable characters, restated from the YAML 1.2 specification so the
+/// test does not trust the crate's own helper: tab, LF, CR, U+0020..U+007E,
+/// U+0085, U+00A0..U+D7FF, U+E000..U+FFFD, U+10000..U+10FFFF.
+fn yaml_printable(character: char) -> bool {
+    matches!(character, '\t' | '\n' | '\r' | '\u{0085}')
+        || ('\u{0020}'..='\u{007e}').contains(&character)
+        || ('\u{00a0}'..='\u{d7ff}').contains(&character)
+        || ('\u{e000}'..='\u{fffd}').contains(&character)
+        || ('\u{10000}'..='\u{10ffff}').contains(&character)
+}
+
+fn frontmatter_of(note: &str) -> &str {
+    note.strip_prefix("---\n")
+        .unwrap()
+        .split_once("\n---\n")
+        .unwrap()
+        .0
+}
+
+#[test]
+fn emitted_frontmatter_escapes_yaml_forbidden_characters() {
+    // Every character class YAML forbids in a scalar: C0 controls, DEL, the C1
+    // block U+0080..U+009F, the non-characters U+FFFE/U+FFFF, and the line
+    // separators. All must reach the reader as `\uXXXX` escapes.
+    let forbidden = [
+        "\u{0000}", "\u{0007}", "\u{001f}", "\u{007f}", "\u{0080}", "\u{0081}", "\u{0085}",
+        "\u{009f}", "\u{2028}", "\u{2029}", "\u{fffe}", "\u{ffff}",
+    ]
+    .concat();
+    // The item name doubles as the original file name, and NUL, U+FFFE and
+    // U+FFFF cannot be part of a file name on every platform, so those three
+    // are exercised through the fields that never reach the file system.
+    let name_safe = [
+        "\u{0007}", "\u{007f}", "\u{0080}", "\u{0081}", "\u{0085}", "\u{009f}", "\u{2028}",
+        "\u{2029}",
+    ]
+    .concat();
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("C1.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    let title = format!("plain{name_safe}title");
+    let url = format!("https://example.test/{forbidden}path");
+    let tags = vec![
+        format!("tag{forbidden}end"),
+        "back\\slash".to_owned(),
+        "quote\"inside".to_owned(),
+        "plain".to_owned(),
+    ];
+    let item_id = format!("item{forbidden}id");
+    let original = format!("{title}.png");
+    item(
+        &src,
+        "forbidden",
+        json!({"id": item_id, "name": title, "ext": "png",
+               "url": url, "tags": tags}),
+        Some((&original, b"pixels")),
+    );
+    let report = import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("C1".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.imported.len(), 1, "skipped: {:?}", report.skipped);
+    let note = fs::read_to_string(dst.join(format!("{}.md", report.imported[0].path))).unwrap();
+    let frontmatter = frontmatter_of(&note);
+    for (index, character) in frontmatter.chars().enumerate() {
+        assert!(
+            yaml_printable(character),
+            "raw character U+{:04X} at byte {index} of the frontmatter",
+            character as u32
+        );
+    }
+    let parsed = Yaml::load_from_str(frontmatter).expect("frontmatter parses as YAML");
+    let doc = &parsed[0];
+    assert_eq!(doc["title"].as_str(), Some(title.as_str()));
+    assert_eq!(doc["source"].as_str(), Some(url.as_str()));
+    let parsed_tags: Vec<_> = doc["tags"]
+        .as_vec()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(parsed_tags, tags);
+    assert_eq!(doc["sources"][0]["item"].as_str(), Some(item_id.as_str()));
+}
+
 #[test]
 fn empty_tags_are_omitted_from_image_note() {
     let temp = TempDir::new().unwrap();

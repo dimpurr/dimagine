@@ -152,7 +152,43 @@ def selftest():
         actual = is_generic(row['name'])
         if actual != row['generic']:
             failures.append(('is_generic', row['name'], row['generic'], actual))
+    forbidden = '\x00\x07\x1f\x7f\x80\x81\x85\x9f\u2028\u2029\ufffe\ufffd'
+    for value in (f'plain{forbidden}title', 'back\\slash "quoted"', '١٢'):
+        checked += 1
+        raw = sorted({f'U+{ord(character):04X}'
+                      for character in yaml_scalar(value) if not yaml_printable(character)})
+        if raw:
+            failures.append(('yaml_scalar', value, 'no YAML-forbidden characters', raw))
     return failures, checked
+
+def yaml_printable(character):
+    """YAML printable characters (YAML 1.2 c-printable).
+
+    Tab, LF, CR, U+0020..U+007E, U+0085, U+00A0..U+D7FF, U+E000..U+FFFD and
+    U+10000..U+10FFFF. Mirrors Rust `yaml_printable`.
+    """
+    return (character in '\t\n\r\x85'
+            or '\x20' <= character <= '\x7e'
+            or '\xa0' <= character <= '\ud7ff'
+            or '\ue000' <= character <= '\ufffd'
+            or '\U00010000' <= character <= '\U0010ffff')
+
+YAML_FORBIDDEN = re.compile('[^\\t\\n\\r\\x20-\\x7e\\x85\\xa0-\\ud7ff\\ue000-\\ufffd'
+                            '\\U00010000-\\U0010ffff]')
+
+def yaml_scalar(value):
+    """Render a value as a YAML scalar, escaping everything YAML forbids.
+
+    The value is serialized as JSON first — that keeps quoting, escaping and
+    non-string types consistent — and then every character YAML does not accept
+    becomes a \\uXXXX escape: the C0 controls (already escaped by JSON), DEL,
+    the C1 control block U+0080..U+009F, the non-characters U+FFFE and U+FFFF,
+    and the line separators U+2028 and U+2029. Escapes JSON already produced are
+    printable ASCII, so they are never escaped twice. Mirrors Rust
+    `escape_yaml_forbidden`.
+    """
+    return YAML_FORBIDDEN.sub(lambda match: '\\u%04X' % ord(match.group()),
+                              json.dumps(value, ensure_ascii=False))
 
 if a.selftest:
     failures, checked = selftest()
@@ -172,11 +208,13 @@ def ulid():
     return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
 
 def clean(s):
+    # \x7f-\x9f keeps DEL and the C1 controls, which Rust treats as control
+    # characters, out of file names as well.
     s = unicodedata.normalize('NFC', s or '')
-    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f]', '-', s).strip().strip('.')
+    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f\x7f-\x9f]', '-', s).strip().strip('.')
     return s[:120]
 
-q = lambda v: json.dumps(v, ensure_ascii=False)
+q = yaml_scalar
 now = datetime.datetime.now().astimezone()
 NOW = now.isoformat(timespec='seconds')
 
