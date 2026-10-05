@@ -67,7 +67,7 @@ fn empty_dir(tag: &str) -> PathBuf {
 }
 
 struct Server {
-    child: Child,
+    child: Option<Child>,
     address: String,
     stdout: std::process::ChildStdout,
 }
@@ -124,7 +124,7 @@ impl Server {
         let stdout = reader.into_inner();
         wait_listening(&address);
         Server {
-            child,
+            child: Some(child),
             address,
             stdout,
         }
@@ -134,17 +134,36 @@ impl Server {
         &self.address
     }
 
+    /// Kill the server and hand back its stderr; the tests assert on the
+    /// crate's warnings there.
     fn kill(mut self) -> String {
-        // Kill first so the pipes reach EOF and the reads finish.
-        let _ = self.child.kill();
+        // Drop runs shutdown again, which is now a no-op.
+        self.shutdown()
+    }
+
+    /// Kill the child (if still there), wait for it, and drain its output
+    /// pipes. Killing first guarantees both pipes reach EOF, so the reads
+    /// finish.
+    fn shutdown(&mut self) -> String {
         let mut stderr = String::new();
-        if let Some(mut pipe) = self.child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
+        if let Some(mut child) = self.child.take() {
+            let pipe = child.stderr.take();
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut stderr);
+            }
         }
-        let _ = self.child.wait();
-        let mut rest = String::new();
-        let _ = self.stdout.read_to_string(&mut rest);
+        let mut drain = String::new();
+        let _ = self.stdout.read_to_string(&mut drain);
         stderr
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        // A panicking test must not leak its server process.
+        let _ = self.shutdown();
     }
 }
 
