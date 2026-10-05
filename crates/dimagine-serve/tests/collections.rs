@@ -167,7 +167,11 @@ fn unicode_embed_resolves_and_round_trips() {
 #[tokio::test]
 async fn collection_page_shows_ambiguous_and_missing_diagnostics() {
     let root = library();
-    let app = router(catalog(&root), OriginalPreview, ServeConfig::default());
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog(&root), OriginalPreview, config);
     let cookie = login(&app).await;
     let ambiguous = app
         .clone()

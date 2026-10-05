@@ -15,7 +15,10 @@ use tower::ServiceExt;
 
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\nsynthetic-png-data";
 
-fn app_for(root: &TempDir, config: ServeConfig) -> axum::Router {
+fn app_for(root: &TempDir, mut config: ServeConfig) -> axum::Router {
+    // Keep account state inside the test's own directory: no test may read or
+    // write the real user state directory.
+    config.data_dir = root.path().join("state");
     router(
         FsCatalog::new(root.path()).unwrap(),
         OriginalPreview,
@@ -79,7 +82,11 @@ async fn sidecar_symlink_is_rejected_and_hidden_paths_are_inaccessible() {
     )
     .unwrap();
     let catalog = FsCatalog::new(root.path()).unwrap();
-    let app = router(catalog.clone(), OriginalPreview, ServeConfig::default());
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog.clone(), OriginalPreview, config);
     let cookie = login(&app, "2333").await;
     #[cfg(unix)]
     {
@@ -404,7 +411,12 @@ impl Catalog for SlowListingCatalog {
 
 #[tokio::test]
 async fn over_bound_requests_get_503_with_retry_after() {
-    let app = router(SlowListingCatalog, OriginalPreview, ServeConfig::default());
+    let state = tempfile::tempdir().unwrap();
+    let config = ServeConfig {
+        data_dir: state.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(SlowListingCatalog, OriginalPreview, config);
     let cookie = login(&app, "2333").await;
     let mut tasks = Vec::new();
     for _ in 0..12 {
