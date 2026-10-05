@@ -344,14 +344,13 @@ impl Index {
     }
 
     /// Commits the scan and deletes file/note/link rows whose paths vanished.
+    ///
+    /// An active scan is required: call [`Index::begin_scan`] first. Finishing without one
+    /// returns [`IndexError::ScanNotActive`] (or [`IndexError::ScanAborted`] after
+    /// [`Index::abort_scan`]) and prunes nothing, so a caller that lost its `begin_scan`
+    /// can never empty the index.
     pub fn finish_scan(&mut self, seen_paths: &[String]) -> Result<(), IndexError> {
-        if self.scan_aborted {
-            return Err(IndexError::ScanAborted);
-        }
-        if !self.scan_active {
-            self.conn()?.execute_batch("BEGIN IMMEDIATE;")?;
-            self.scan_active = true;
-        }
+        self.ensure_scan_active()?;
         let result = (|| {
             let conn = self.conn()?;
             for path in seen_paths {
@@ -1181,5 +1180,172 @@ mod tests {
             .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanNotActive)
+        ));
+    }
+
+    /// Populates files, a note, and links through a real scan so later tests have rows
+    /// that a mis-guarded `finish_scan` would delete.
+    fn seeded_index(dir: &tempfile::TempDir) -> Index {
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("keep.jpg", 3, 4, Some(&"a".repeat(64))))
+            .unwrap();
+        index
+            .upsert_file(&file("second.jpg", 5, 6, Some(&"b".repeat(64))))
+            .unwrap();
+        index
+            .upsert_note(&note("keep.jpg.md", Some("stable-id"), "keep", &[]))
+            .unwrap();
+        index.set_note_body("keep.jpg.md", "body text").unwrap();
+        index
+            .replace_links(
+                "keep.jpg.md",
+                &[LinkRecord {
+                    src: "keep.jpg.md".into(),
+                    raw: "[[second.jpg]]".into(),
+                    target: Some("second.jpg".into()),
+                    state: LinkState::Resolved,
+                }],
+            )
+            .unwrap();
+        index
+            .finish_scan(&["keep.jpg".into(), "second.jpg".into(), "keep.jpg.md".into()])
+            .unwrap();
+        index
+    }
+
+    fn row_counts(index: &Index) -> (i64, i64, i64, i64) {
+        let conn = index.conn().unwrap();
+        let count = |sql: &str| conn.query_row(sql, [], |row| row.get(0)).unwrap();
+        (
+            count("SELECT count(*) FROM files"),
+            count("SELECT count(*) FROM notes"),
+            count("SELECT count(*) FROM links"),
+            count("SELECT count(*) FROM moved_from"),
+        )
+    }
+
+    fn moved_from_paths(index: &Index) -> Vec<String> {
+        let conn = index.conn().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT path FROM moved_from ORDER BY path")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<Result<Vec<String>, _>>().unwrap()
+    }
+
+    #[test]
+    fn finish_scan_without_an_active_scan_never_prunes_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = seeded_index(&dir);
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+        assert!(moved_from_paths(&index).is_empty());
+        assert!(index.moved_candidates().unwrap().is_empty());
+
+        assert!(matches!(
+            index.finish_scan(&["keep.jpg".into()]),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+        assert!(moved_from_paths(&index).is_empty());
+        assert!(!index.needs_hash("keep.jpg", 3, 4).unwrap());
+        assert_eq!(index.by_sha256(&"a".repeat(64)).unwrap(), ["keep.jpg"]);
+    }
+
+    #[test]
+    fn finish_scan_on_a_fresh_index_cannot_empty_a_later_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let mut index = Index::open(dir.path()).unwrap();
+            assert!(matches!(
+                index.finish_scan(&["never-scanned.jpg".into()]),
+                Err(IndexError::ScanNotActive)
+            ));
+        }
+
+        let mut index = seeded_index(&dir);
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+    }
+
+    #[test]
+    fn finish_scan_twice_needs_a_new_scan_and_keeps_the_first_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = seeded_index(&dir);
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+
+        index.begin_scan().unwrap();
+        index.finish_scan(&["keep.jpg".into()]).unwrap();
+        assert_eq!(row_counts(&index), (1, 0, 0, 2));
+        assert_eq!(moved_from_paths(&index), ["keep.jpg.md", "second.jpg"]);
+        assert!(index.moved_candidates().unwrap().is_empty());
+    }
+
+    #[test]
+    fn abort_scan_without_an_active_scan_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = seeded_index(&dir);
+
+        index.abort_scan();
+        index.abort_scan();
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+        assert!(matches!(
+            index.upsert_file(&file("outside.jpg", 1, 1, None)),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanNotActive)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+
+        index.begin_scan().unwrap();
+        index.abort_scan();
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanAborted)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+        assert!(matches!(
+            index.finish_scan(&[]),
+            Err(IndexError::ScanAborted)
+        ));
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+
+        index.begin_scan().unwrap();
+        index.finish_scan(&["keep.jpg".into()]).unwrap();
+        assert_eq!(row_counts(&index), (1, 0, 0, 2));
+    }
+
+    #[test]
+    fn dropping_an_index_mid_scan_keeps_every_committed_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = seeded_index(&dir);
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("keep.jpg", 99, 100, Some(&"a".repeat(64))))
+            .unwrap();
+        drop(index);
+
+        let index = Index::open(dir.path()).unwrap();
+        assert_eq!(row_counts(&index), (2, 1, 1, 0));
+        assert!(!index.needs_hash("keep.jpg", 3, 4).unwrap());
     }
 }
