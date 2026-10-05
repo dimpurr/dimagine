@@ -1,4 +1,7 @@
-//! Read-only, passcode-protected web viewer for a dimagine library.
+//! Read-only web viewer for a dimagine library, protected either by a shared
+//! passcode (legacy mode) or by a single owner account (ADR-014). Accounts
+//! live outside the library in a state directory; first run walks through a
+//! one-time setup flow.
 
 pub mod accounts;
 
@@ -587,8 +590,8 @@ impl std::error::Error for CatalogError {}
 /// Viewer configuration.
 #[derive(Clone, Debug)]
 pub struct ServeConfig {
-    /// Shared passcode.
-    pub passcode: String,
+    /// Shared passcode (legacy compatibility mode).
+    pub passcode: Option<String>,
     /// Cookie name used for the in-memory session.
     pub cookie_name: String,
     /// Set this when the viewer is served directly over HTTPS.
@@ -597,17 +600,33 @@ pub struct ServeConfig {
     pub trusted_proxies: Vec<std::net::IpAddr>,
     /// State directory for accounts.json.
     pub data_dir: PathBuf,
+    /// Pre-configured setup code (if None and setup mode is active, generated automatically).
+    pub setup_code: Option<String>,
 }
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
-            passcode: "2333".to_string(),
+            passcode: Some("2333".to_string()),
             cookie_name: "dimagine_session".to_string(),
             https: false,
             trusted_proxies: Vec::new(),
             data_dir: accounts::default_data_dir(),
+            setup_code: None,
         }
     }
+}
+
+/// Generate a random setup code with at least 12 characters.
+pub fn generate_setup_code() -> String {
+    use rand::Rng;
+    let mut rng = rand::rng();
+    const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    (0..16)
+        .map(|_| {
+            let idx = rng.random_range(0..CHARS.len());
+            CHARS[idx] as char
+        })
+        .collect()
 }
 
 /// Resolve client IP for rate limiting and logging.
@@ -641,6 +660,8 @@ struct AppState {
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
+    accounts: accounts::AccountsStore,
+    setup_code: Arc<Mutex<Option<String>>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     throttles: Arc<Mutex<ThrottleState>>,
     admission: Arc<tokio::sync::Semaphore>,
@@ -831,10 +852,24 @@ pub fn router_from(
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
 ) -> Router {
+    let accounts = accounts::AccountsStore::new(&config.data_dir);
+    let has_users = accounts.has_users();
+    let setup_code = if !has_users && config.passcode.is_none() {
+        Some(
+            config
+                .setup_code
+                .clone()
+                .unwrap_or_else(generate_setup_code),
+        )
+    } else {
+        None
+    };
     let state = AppState {
         catalog,
         previews,
         config,
+        accounts,
+        setup_code: Arc::new(Mutex::new(setup_code)),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
@@ -842,6 +877,8 @@ pub fn router_from(
     };
     Router::new()
         .route("/login", get(login_page).post(login))
+        .route("/logout", get(logout).post(logout))
+        .route("/setup", get(setup_page).post(setup))
         .route("/", get(folder_page))
         .route("/folder/*path", get(folder_page))
         .route("/collection/*path", get(collection_page))
@@ -858,9 +895,25 @@ pub fn router_from(
 }
 
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
-    if request.uri().path() == "/login" {
+    let path = request.uri().path();
+    let has_users = state.accounts.has_users();
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+
+    if is_setup_mode {
+        if path == "/setup" {
+            return next.run(request).await;
+        }
+        return Redirect::to("/setup").into_response();
+    }
+
+    if path == "/setup" {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    if path == "/login" || path == "/logout" {
         return next.run(request).await;
     }
+
     let token = request
         .headers()
         .get(header::COOKIE)
@@ -888,34 +941,216 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
             .or_insert(HeaderValue::from_static("private, no-cache"));
         return response;
     }
-    if request.uri().path().starts_with("/api/") {
+    if path.starts_with("/api/") {
         return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
     }
     Redirect::to("/login").into_response()
 }
 
-async fn login_page() -> Response {
-    let mut response = Html(layout("Sign in", "<form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label><button>Sign in</button></form>")).into_response();
+async fn setup_page(State(state): State<AppState>) -> Response {
+    let has_users = state.accounts.has_users();
+    if has_users || state.config.passcode.is_some() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+    let html = layout(
+        "Initial Setup",
+        "<form method=\"post\">\
+         <h2>Welcome to dimagine</h2>\
+         <p>Create the owner account to finish server setup.</p>\
+         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" required></label>\
+         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+         <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+         <button type=\"submit\">Complete Setup</button>\
+         </form>",
+    );
+    let mut response = Html(html).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
+
 #[derive(Deserialize)]
+struct SetupForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    confirm_password: String,
+    #[serde(default)]
+    setup_code: String,
+}
+
+async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Response {
+    let has_users = state.accounts.has_users();
+    if has_users || state.config.passcode.is_some() {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    let active_code = state.setup_code.lock().unwrap().clone();
+    let Some(expected_code) = active_code else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+
+    let code_input = form.setup_code.trim();
+    if code_input.is_empty()
+        || code_input
+            .as_bytes()
+            .ct_eq(expected_code.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
+        let error_html = layout(
+            "Initial Setup",
+            "<p>Invalid setup code.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+             <button type=\"submit\">Complete Setup</button>\
+             </form>",
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    let trimmed_email = form.email.trim();
+    if trimmed_email.is_empty() || !trimmed_email.contains('@') {
+        let error_html = layout(
+            "Initial Setup",
+            "<p>Please enter a valid email address.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+             <button type=\"submit\">Complete Setup</button>\
+             </form>",
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if form.password.is_empty() || form.password != form.confirm_password {
+        let error_html = layout(
+            "Initial Setup",
+            "<p>Passwords do not match.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+             <button type=\"submit\">Complete Setup</button>\
+             </form>",
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    if let Err(err) = state
+        .accounts
+        .create_user(trimmed_email, &form.password, "owner")
+    {
+        let error_html = layout(
+            "Initial Setup",
+            &format!("<p>Failed to create account: {err}</p>"),
+        );
+        let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
+    // Invalidate setup code so it cannot be used again
+    *state.setup_code.lock().unwrap() = None;
+
+    let token = uuid::Uuid::new_v4().to_string();
+    store_session(
+        &mut state.sessions.lock().unwrap(),
+        token.clone(),
+        now_seconds(),
+    );
+    let mut response = Redirect::to("/").into_response();
+    let cookie = format!(
+        "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        state.config.cookie_name,
+        token,
+        SESSION_SECONDS,
+        if state.config.https { "; Secure" } else { "" }
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn login_page(State(state): State<AppState>) -> Response {
+    let has_users = state.accounts.has_users();
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+    if is_setup_mode {
+        return Redirect::to("/setup").into_response();
+    }
+
+    let form_html = if has_users {
+        "<form method=\"post\">\
+         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" required></label>\
+         <button>Sign in</button>\
+         </form>"
+    } else {
+        "<form method=\"post\">\
+         <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
+         <button>Sign in</button>\
+         </form>"
+    };
+
+    let mut response = Html(layout("Sign in", form_html)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+#[derive(Deserialize, Default)]
 struct LoginForm {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
     passcode: String,
 }
+
 async fn login(
     State(state): State<AppState>,
     client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    let client_key = resolve_client_ip(
-        client.map(|c| c.0),
-        &headers,
-        &state.config.trusted_proxies,
-    );
+    let has_users = state.accounts.has_users();
+    let is_setup_mode = !has_users && state.config.passcode.is_none();
+    if is_setup_mode {
+        return Redirect::to("/setup").into_response();
+    }
+
+    let client_key =
+        resolve_client_ip(client.map(|c| c.0), &headers, &state.config.trusted_proxies);
     // Bound how many guesses are in flight before anything else: a parallel
     // wave of guesses is refused without the passcode ever being compared.
     let _slot = match state.login_slots.clone().try_acquire_owned() {
@@ -936,19 +1171,56 @@ async fn login(
     let millis =
         (100u64.saturating_mul(1u64.checked_shl(delay_step.min(6)).unwrap_or(u64::MAX))).min(5000);
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
-    if form
-        .passcode
-        .as_bytes()
-        .ct_eq(state.config.passcode.as_bytes())
-        .unwrap_u8()
-        != 1
-    {
-        let mut response = (StatusCode::UNAUTHORIZED, Html(layout("Sign in", "<p>Incorrect passcode.</p><form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\"></label><button>Sign in</button></form>"))).into_response();
+
+    let authenticated = if has_users {
+        let user_opt = state
+            .accounts
+            .find_user_by_email(&form.email)
+            .ok()
+            .flatten();
+        if let Some(user) = user_opt {
+            accounts::verify_password(&form.password, &user.password_hash)
+        } else {
+            const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$eW91cnNhbHQxMjM0NTY3OA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+            let _ = accounts::verify_password(&form.password, DUMMY_HASH);
+            false
+        }
+    } else if let Some(ref expected_passcode) = state.config.passcode {
+        form.passcode
+            .as_bytes()
+            .ct_eq(expected_passcode.as_bytes())
+            .unwrap_u8()
+            == 1
+    } else {
+        false
+    };
+
+    if !authenticated {
+        let error_body = if has_users {
+            "<p>Incorrect email or password.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <button>Sign in</button>\
+             </form>"
+        } else {
+            "<p>Incorrect passcode.</p>\
+             <form method=\"post\">\
+             <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
+             <button>Sign in</button>\
+             </form>"
+        };
+        let mut response = (
+            StatusCode::UNAUTHORIZED,
+            Html(layout("Sign in", error_body)),
+        )
+            .into_response();
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return response;
     }
+
     {
         let mut throttles = state.throttles.lock().unwrap();
         throttles.record_success(&client_key);
@@ -965,6 +1237,30 @@ async fn login(
         state.config.cookie_name,
         token,
         SESSION_SECONDS,
+        if state.config.https { "; Secure" } else { "" }
+    );
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn logout(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let token = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| cookie_value(v, &state.config.cookie_name));
+    if let Some(token) = token {
+        state.sessions.lock().unwrap().remove(&token);
+    }
+    let mut response = Redirect::to("/login").into_response();
+    let cookie = format!(
+        "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+        state.config.cookie_name,
         if state.config.https { "; Secure" } else { "" }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
@@ -1685,7 +1981,7 @@ pub async fn serve(
 }
 
 fn default_passcode_warning(config: &ServeConfig, address: std::net::SocketAddr) -> bool {
-    config.passcode == "2333" && !address.ip().is_loopback()
+    config.passcode.as_deref() == Some("2333") && !address.ip().is_loopback()
 }
 
 #[cfg(test)]
@@ -1831,7 +2127,7 @@ mod regression_unit_tests {
             "0.0.0.0:3000".parse().unwrap()
         ));
         let custom = ServeConfig {
-            passcode: "different".to_owned(),
+            passcode: Some("different".to_owned()),
             ..config
         };
         assert!(!default_passcode_warning(
@@ -1887,9 +2183,6 @@ mod regression_unit_tests {
         );
 
         // No peer addr returns "unknown"
-        assert_eq!(
-            resolve_client_ip(None, &headers, &[trusted_ip]),
-            "unknown"
-        );
+        assert_eq!(resolve_client_ip(None, &headers, &[trusted_ip]), "unknown");
     }
 }

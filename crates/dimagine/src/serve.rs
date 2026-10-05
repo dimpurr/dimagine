@@ -4,11 +4,13 @@
 //! Compiled when the `serve` feature is on and not switched off at runtime
 //! (ADR-013).
 //!
-//! The passcode comes from the `DIMAGINE_PASSCODE` environment variable; when
-//! it is unset (or empty) the viewer falls back to the crate's built-in
-//! default. Binding defaults to loopback: other devices need an explicit
-//! `--bind`, and a default passcode on a non-loopback bind earns a warning
-//! from the serve crate itself.
+//! Accounts live outside the library in the state directory selected by
+//! `--data-dir`. On first run (no accounts yet) the viewer redirects every
+//! page to `/setup`, which needs the one-time setup code printed at startup;
+//! `DIMAGINE_PASSCODE` keeps the legacy shared-passcode mode only while no
+//! account exists. Binding defaults to loopback: other devices need an
+//! explicit `--bind`, and a default passcode on a non-loopback bind earns a
+//! warning from the serve crate itself.
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
@@ -62,8 +64,8 @@ pub fn command() -> Command {
                 .help("State directory where accounts are stored (default: $XDG_STATE_HOME/dimagine or ~/.local/state/dimagine)."),
         )
         .after_help(format!(
-            "The passcode comes from the {PASSCODE_ENV} environment variable; \
-             when unset, the viewer's built-in default applies."
+            "If no users exist and {PASSCODE_ENV} is set, passcode mode is active. \
+             Otherwise, first-run setup requires the one-time code printed at startup."
         ))
 }
 
@@ -89,10 +91,18 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .get_one::<std::path::PathBuf>("data_dir")
         .cloned()
         .unwrap_or_else(dimagine_serve::accounts::default_data_dir);
+    let passcode = passcode_from_env();
+    let accounts = dimagine_serve::accounts::AccountsStore::new(&data_dir);
+    let setup_code = if !accounts.has_users() && passcode.is_none() {
+        Some(dimagine_serve::generate_setup_code())
+    } else {
+        None
+    };
     let config = ServeConfig {
-        passcode: passcode_from_env(),
+        passcode,
         trusted_proxies,
         data_dir,
+        setup_code: setup_code.clone(),
         ..ServeConfig::default()
     };
     let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);
@@ -125,16 +135,22 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
             .map(|addr| format!("http://{addr}"))
             .unwrap_or_else(|_| format!("http://{address}"));
         if json {
-            let document = serde_json::json!({
+            let mut document = serde_json::json!({
                 "schema": SCHEMA,
                 "library": library_dir.display().to_string(),
                 "address": local,
             });
+            if let Some(ref code) = setup_code {
+                document["setup_code"] = serde_json::Value::String(code.clone());
+            }
             // One compact line: long-running processes emit protocol lines,
             // read one line at a time by tools.
             println!("{}", serde_json::to_string(&document).unwrap_or_default());
         } else {
             println!("serving {} at {local}", library_dir.display());
+            if let Some(ref code) = setup_code {
+                println!("One-time setup code: {code}");
+            }
         }
         let _ = std::io::stdout().flush();
         match serve(listener, app, &config).await {
@@ -147,9 +163,8 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     })
 }
 
-fn passcode_from_env() -> String {
+fn passcode_from_env() -> Option<String> {
     std::env::var(PASSCODE_ENV)
         .ok()
         .filter(|passcode| !passcode.is_empty())
-        .unwrap_or_else(|| ServeConfig::default().passcode)
 }

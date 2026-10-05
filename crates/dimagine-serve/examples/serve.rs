@@ -220,7 +220,7 @@ async fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let previews = CachedPreview::new(&library);
     let mut config = ServeConfig::default();
     if let Ok(passcode) = env::var("DIMAGINE_PASSCODE") {
-        config.passcode = passcode;
+        config.passcode = Some(passcode);
     }
     let app = router(catalog, previews, config.clone());
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port))).await?;

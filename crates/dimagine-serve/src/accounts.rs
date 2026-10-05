@@ -162,10 +162,7 @@ impl AccountsStore {
 
     /// Write `AccountsFile` atomically to `accounts.json` with permissions 0600 on Unix.
     pub fn save(&self, accounts: &AccountsFile) -> Result<(), AccountsError> {
-        let parent = self
-            .file_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
+        let parent = self.file_path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
 
         let random_suffix: u64 = rand::random();
@@ -204,7 +201,9 @@ impl AccountsStore {
 
     /// Check if at least one user exists in `accounts.json`.
     pub fn has_users(&self) -> bool {
-        self.load().map(|doc| !doc.users.is_empty()).unwrap_or(false)
+        self.load()
+            .map(|doc| !doc.users.is_empty())
+            .unwrap_or(false)
     }
 
     /// Find a user by email address (case-insensitive comparison).
