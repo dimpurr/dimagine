@@ -1017,6 +1017,10 @@ fn is_generic(name: &str) -> bool {
 /// otherwise the first mixed letter/digit identifier (6-24 chars). Tokens
 /// longer than 24 characters are treated as hashes and ignored. Returns `None`
 /// for non-http(s) URLs or when no identifier-shaped token is present.
+///
+/// An IP literal host yields no site label (see [`site_from_authority`]), so
+/// such URLs also return `None` and the importer falls back to its time-based
+/// generated name.
 pub fn name_from_url(url: &str) -> Option<String> {
     let rest = strip_scheme(url)?;
     let end = rest.find(['?', '#']).unwrap_or(rest.len());
@@ -1026,8 +1030,7 @@ pub fn name_from_url(url: &str) -> Option<String> {
         None => (rest, ""),
     };
     let authority = authority.rsplit('@').next().unwrap_or(authority);
-    let host = authority.split(':').next().unwrap_or(authority);
-    let site = site_label(&host.to_ascii_lowercase())?;
+    let site = site_from_authority(authority)?;
     let mut first_digits: Option<&str> = None;
     let mut first_mixed: Option<&str> = None;
     for segment in path.split('/') {
@@ -1064,6 +1067,51 @@ fn strip_scheme(url: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// Site label for the host part of a URL authority, or `None`.
+///
+/// Userinfo is dropped and any port is ignored, including the port that follows
+/// a bracketed IPv6 literal. An IP literal host never produces a label: neither
+/// a bracketed IPv6 literal (`[::1]:3000`) nor a dotted-quad IPv4 literal
+/// (`192.168.1.5`), and neither a bare, unbracketed IPv6 literal such as
+/// `2001:db8::1`, which cannot appear in a legal authority but is common in
+/// pasted URLs. Callers treat `None` as "no site in this URL" and fall back to
+/// the time-based generated name; they never substitute the host itself.
+///
+/// The Python prototype mirrors this in `_site_from_authority`.
+fn site_from_authority(authority: &str) -> Option<String> {
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let (host, ip_literal) = match authority.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((host, _port)) => (host, true),
+            None => return None,
+        },
+        None => {
+            if authority.matches(':').count() > 1 {
+                return None;
+            }
+            let host = authority.split(':').next().unwrap_or(authority);
+            (host, is_ipv4_literal(host))
+        }
+    };
+    if ip_literal {
+        return None;
+    }
+    site_label(&host.to_ascii_lowercase())
+}
+
+/// True for dotted-quad IPv4 literals such as `192.168.1.5`.
+///
+/// Deliberately lenient: four labels of one to three ASCII digits are enough,
+/// so a malformed literal such as `999.999.999.999` also yields no site label.
+/// The Python prototype mirrors this in `IPV4_LITERAL`.
+fn is_ipv4_literal(host: &str) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    labels.len() == 4
+        && labels.iter().all(|label| {
+            (1..=3).contains(&label.len()) && label.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 fn site_label(host: &str) -> Option<String> {

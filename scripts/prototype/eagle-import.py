@@ -22,6 +22,9 @@ ap.add_argument('--selftest', action='store_true', help='check name_from_url aga
 a = ap.parse_args()
 
 TWO_PART_SUFFIXES = {'co.uk', 'co.jp', 'com.cn', 'com.au'}
+# Four labels of one to three ASCII digits: any dotted-quad IPv4 literal, even a
+# malformed one such as 999.999.999.999, yields no site label.
+IPV4_LITERAL = re.compile(r'\A[0-9]{1,3}(?:\.[0-9]{1,3}){3}\Z')
 
 def _strip_scheme(url):
     low = url.lower()
@@ -29,6 +32,27 @@ def _strip_scheme(url):
         if low.startswith(scheme):
             return url[len(scheme):]
     return None
+
+def _site_from_authority(authority):
+    """Site label for the host part of a URL authority, or None.
+
+    Userinfo is dropped and any port is ignored, including the port after a
+    bracketed IPv6 literal. An IP literal host never produces a label: not a
+    bracketed IPv6 literal ([::1]:3000), not a dotted-quad IPv4 literal
+    (192.168.1.5) and not a bare, unbracketed IPv6 literal such as 2001:db8::1
+    (illegal in an authority but common in pasted URLs). A None result means
+    the caller falls back to the time-based generated name; the host itself is
+    never substituted. Mirrors Rust `site_from_authority`.
+    """
+    authority = authority.rsplit('@', 1)[-1]
+    if authority.startswith('['):
+        return None
+    if authority.count(':') > 1:
+        return None
+    host = authority.split(':', 1)[0].lower()
+    if IPV4_LITERAL.match(host):
+        return None
+    return _site_from_host(host)
 
 def _site_from_host(host):
     labels = [p for p in host.split('.') if p]
@@ -59,7 +83,7 @@ def name_from_url(url):
     slash = rest.find('/')
     authority, path = (rest[:slash], rest[slash:]) if slash >= 0 else (rest, '')
     authority = authority.rsplit('@', 1)[-1]
-    site = _site_from_host(authority.split(':', 1)[0].lower())
+    site = _site_from_authority(authority)
     if not site:
         return None
     first_digits = first_mixed = None

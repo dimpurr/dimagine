@@ -47,5 +47,16 @@
   {"url": "ftp://example.com/12345678", "name": null},
   {"url": "www.amazon.com/dp/B0ABCD1234", "name": null},
   {"url": "https://x.com", "name": null},
+  {"url": "https://[::1]:3000/photo/12345678", "name": null},
+  {"url": "https://[2001:db8::1]/img/987654321", "name": null},
+  {"url": "http://[2001:db8:85a3::8a2e:370:7334]:8080/i/1234567890", "name": null},
+  {"url": "https://user@[fe80::1]/a/123456789", "name": null},
+  {"url": "https://[2001:db8::1", "name": null},
+  {"url": "https://2001:db8::1/img/12345678", "name": null},
+  {"url": "https://127.0.0.1/photo/123456789", "name": null},
+  {"url": "http://192.168.1.5:8080/img/1234567890", "name": null},
+  {"url": "https://10.0.0.1/dp/B0ABCD1234", "name": null},
+  {"url": "https://999.999.999.999/12345678", "name": null},
+  {"url": "https://[::ffff:192.168.1.5]/img/12345678", "name": null},
   {"url": "not a url at all", "name": null}
 ]

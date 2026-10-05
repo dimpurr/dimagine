@@ -791,3 +791,50 @@ fn generic_name_uses_url_identifier() {
     assert_eq!(report.renamed, 1);
     assert!(dst.join("inbox/pximg-12345678.jpg").is_file());
 }
+
+#[test]
+fn ip_literal_host_falls_back_to_time_based_name() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Ip.library");
+    let dst = temp.path().join("dest");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), b"{\"version\":4,\"folders\":[]}").unwrap();
+    item(
+        &src,
+        "v4",
+        json!({"id":"v4", "name":"image", "ext":"jpg",
+               "url":"http://192.168.1.5:8080/img/1234567890"}),
+        Some(("image.jpg", b"jpg-v4")),
+    );
+    item(
+        &src,
+        "v6",
+        json!({"id":"v6", "name":"Screenshot", "ext":"jpg",
+               "url":"https://[2001:db8::1]/photo/12345678"}),
+        Some(("Screenshot.jpg", b"jpg-v6")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.renamed, 2);
+    let mut names: Vec<String> = fs::read_dir(dst.join("inbox"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".jpg"))
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 2, "names: {names:?}");
+    for name in &names {
+        let stem = name.trim_end_matches(".jpg");
+        let bytes = stem.as_bytes();
+        assert!(
+            bytes.len() == 8 + 1 + 6 + 1 + 4
+                && bytes[0..8].iter().all(u8::is_ascii_digit)
+                && bytes[8] == b'-'
+                && bytes[9..15].iter().all(u8::is_ascii_digit)
+                && bytes[15] == b'-'
+                && bytes[16..]
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
+            "expected a time-based name, got {name}"
+        );
+    }
+}
