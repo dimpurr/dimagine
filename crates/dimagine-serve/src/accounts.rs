@@ -51,6 +51,9 @@ pub struct UserRecord {
     pub id: String,
     pub email: String,
     pub password_hash: String,
+    /// Account role. Stored, not yet enforced: today every authenticated
+    /// account reaches the same read-only viewer, and `role` is reserved
+    /// for the future multi-user surface (see the CHANGELOG note).
     pub role: String,
     pub created: String,
     #[serde(flatten)]

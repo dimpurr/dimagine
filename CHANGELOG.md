@@ -41,6 +41,10 @@ All notable changes to this project are documented here. The format follows
 - Project restart: README, MIT license, contributor and agent rules, vision and
   documentation index.
 
+### Changed
+- Documented that the account `role` field is stored but not yet enforced
+  (reserved for the future multi-user surface); there is no behavior change.
+
 ### Removed
 - The 2019 prototype (an Express/Pug Pinterest for illustrators). Its code is
   kept at tag `v0-2019`.
