@@ -442,6 +442,7 @@ version = "0.1.0"
 dependencies = [
  "ammonia",
  "axum",
+ "dimagine-core",
  "dimagine-preview",
  "httpdate",
  "mime_guess",

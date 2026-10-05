@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 axum = { version = "0.7", features = ["form", "json"] }
 ammonia = "4"
+dimagine-core = { path = "../dimagine-core" }
 dimagine-preview = { path = "../dimagine-preview" }
 httpdate = "1"
 mime_guess = "2"
