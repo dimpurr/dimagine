@@ -10,9 +10,11 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use dimagine_serve::{
-    accounts::AccountsStore, router, FsCatalog, OriginalPreview, ServeConfig, LOGIN_FAILURE_BUDGET,
+    accounts::AccountsStore, router, router_from, FsCatalog, OriginalPreview, ServeConfig,
+    LOGIN_FAILURE_BUDGET,
 };
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -437,6 +439,142 @@ fn running_as_root() -> bool {
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
         .unwrap_or(false)
+}
+
+/// Build the router the way the CLI does, so a store that cannot be read is a
+/// returned error instead of a panic.
+fn try_router(root: &TempDir) -> Result<axum::Router, dimagine_serve::accounts::AccountsError> {
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    router_from(
+        Arc::new(FsCatalog::new(root.path()).unwrap()),
+        Arc::new(OriginalPreview),
+        config,
+    )
+}
+
+#[tokio::test]
+async fn a_store_without_the_users_key_is_an_error_not_a_first_run() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+
+    // The `users` key renamed by another build: the file is present, so this
+    // is unambiguously not a first run, but it must not read as "no users".
+    std::fs::write(
+        state.join("accounts.json"),
+        r#"{"schema":1,"accts":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z"}]}"#,
+    )
+    .unwrap();
+
+    let err = AccountsStore::new(&state).has_users().unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("malformed accounts.json"), "{text}");
+    assert!(
+        text.contains("users"),
+        "the error must name the key: {text}"
+    );
+
+    // Building the viewer refuses outright: no router, so no setup page and no
+    // one-time code.
+    let err = try_router(&root).unwrap_err();
+    assert!(err.to_string().contains("users"), "{err}");
+}
+
+#[tokio::test]
+async fn a_store_that_loses_its_users_key_while_running_fails_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    assert_eq!(
+        send(&app, get("/setup", None)).await.0,
+        StatusCode::OK,
+        "the store is absent, so this is a first run"
+    );
+
+    // The file appears with no `users` key under the live server.
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("accounts.json"), r#"{"schema":1}"#).unwrap();
+
+    // The setup form is never rendered and the code never creates an account.
+    for request in [
+        get("/setup", None),
+        post(
+            "/setup",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+        ),
+    ] {
+        let (status, html) = body_text(&app, request).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!html.contains("Initial Setup"), "{html}");
+        assert!(!html.contains("password="), "{html}");
+    }
+    let store = AccountsStore::new(&state);
+    assert!(store.load().is_err());
+    assert_eq!(
+        std::fs::read_to_string(store.file_path()).unwrap(),
+        r#"{"schema":1}"#,
+        "a refused setup must not rewrite the store"
+    );
+}
+
+#[test]
+fn unknown_top_level_fields_still_load_and_survive_a_write() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let store = AccountsStore::new(&state);
+    std::fs::write(
+        store.file_path(),
+        r#"{"schema":1,"server_note":"keep me","users":[]}"#,
+    )
+    .unwrap();
+
+    // Requiring `users` must not turn into rejecting unknown fields: the file
+    // loads with its extra top-level key intact.
+    let doc = store.load().unwrap();
+    assert!(doc.users.is_empty());
+    assert_eq!(
+        doc.extra.get("server_note").unwrap(),
+        &serde_json::Value::String("keep me".into())
+    );
+
+    // A write keeps it.
+    store
+        .create_user("owner@example.com", "secret123", "owner")
+        .unwrap();
+    let raw = std::fs::read_to_string(store.file_path()).unwrap();
+    assert!(raw.contains("server_note"), "{raw}");
+    assert!(raw.contains("owner@example.com"), "{raw}");
+}
+
+#[test]
+fn an_absent_accounts_file_is_a_first_run_and_opens_setup() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    assert!(!state.exists());
+
+    // No file at all is the one shape that still means "no users yet".
+    let store = AccountsStore::new(&state);
+    assert!(!store.has_users().unwrap());
+    assert!(try_router(&root).is_ok());
+}
+
+#[tokio::test]
+async fn a_first_run_without_an_accounts_file_opens_the_setup_page() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    assert!(!root.path().join("state/accounts.json").exists());
+
+    let (status, headers, _) = send(&app, get("/", None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/setup");
+    let (status, html) = body_text(&app, get("/setup", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Initial Setup"), "{html}");
+    assert!(!root.path().join("state/accounts.json").exists());
 }
 
 #[cfg(unix)]

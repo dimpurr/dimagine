@@ -26,10 +26,14 @@ pub const CURRENT_SCHEMA: u32 = 1;
 pub const MIN_PASSWORD_LENGTH: usize = 12;
 
 /// In-memory representation of `accounts.json`.
+///
+/// `users` is required, never defaulted: a store that exists but has no
+/// `users` key is a renamed or hand-edited file, not a first run, and
+/// parsing it as "no users" would silently reopen public setup. Unknown
+/// fields still round-trip through `extra` (ADR-014).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AccountsFile {
     pub schema: u32,
-    #[serde(default)]
     pub users: Vec<UserRecord>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -172,9 +176,10 @@ impl AccountsStore {
     /// Read `accounts.json` from disk. If the file does not exist, returns a default
     /// empty structure.
     ///
-    /// Any other problem — unreadable file, malformed JSON, or a schema version
-    /// this build does not know — is an error, never an empty store: treating a
-    /// broken store as "no users" would silently reopen first-run setup.
+    /// Any other problem — unreadable file, malformed JSON, a missing required
+    /// key such as `users`, or a schema version this build does not know — is an
+    /// error, never an empty store: treating a broken store as "no users" would
+    /// silently reopen first-run setup.
     pub fn load(&self) -> Result<AccountsFile, AccountsError> {
         if !self.file_path.exists() {
             return Ok(AccountsFile::default());
@@ -437,6 +442,38 @@ mod tests {
             let mode = meta.permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "file mode must be 0600, got {:o}", mode);
         }
+    }
+
+    #[test]
+    fn missing_users_key_is_an_error_not_an_empty_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountsStore::new(dir.path());
+
+        // The `users` key renamed by another build: present file, so not a
+        // first run, but it must not read as "no users".
+        fs::write(
+            store.file_path(),
+            r#"{"schema":1,"accts":[{"id":"01J9XEXAMPLEULID0000000000"}]}"#,
+        )
+        .unwrap();
+        let err = store.load().unwrap_err();
+        assert!(err.to_string().contains("malformed accounts.json"), "{err}");
+        assert!(
+            err.to_string().contains("users"),
+            "the error must name the missing key: {err}"
+        );
+        assert!(store.has_users().is_err());
+
+        // No `users` key at all, beside a current schema.
+        fs::write(store.file_path(), r#"{"schema":1}"#).unwrap();
+        assert!(store.load().is_err());
+        assert!(store.has_users().is_err());
+
+        // A genuinely absent file is still a first run.
+        let empty = tempfile::tempdir().unwrap();
+        let first_run = AccountsStore::new(empty.path());
+        assert!(!first_run.has_users().unwrap());
+        assert!(first_run.load().unwrap().users.is_empty());
     }
 
     #[test]

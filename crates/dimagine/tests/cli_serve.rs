@@ -769,6 +769,97 @@ fn serve_refuses_to_start_with_unknown_schema() {
 }
 
 #[test]
+fn serve_refuses_to_start_when_the_users_key_is_missing() {
+    let dir = library("f1-users-key");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    // The `users` key renamed by another build, and the same file with the key
+    // dropped entirely: present, current-schema, but unreadable as a store.
+    for contents in [
+        r#"{"schema":1,"accounts":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z"}]}"#,
+        r#"{"schema":1}"#,
+    ] {
+        std::fs::write(state.0.join("accounts.json"), contents).unwrap();
+
+        let output = run_serve(&dir.root, &state.0);
+        let error = serve_error_text(&output);
+        assert!(error.contains("malformed accounts.json"), "{error}");
+        assert!(
+            error.contains("users"),
+            "the error must name the key: {error}"
+        );
+        // Never falls back to setup: no startup document, no setup code.
+        assert!(!output.stdout.windows(10).any(|w| w == b"setup_code"));
+        assert!(
+            std::fs::read_to_string(state.0.join("accounts.json")).unwrap() == contents,
+            "a refused start must not rewrite the store"
+        );
+    }
+}
+
+#[test]
+fn serve_first_run_without_an_accounts_file_opens_setup() {
+    let dir = library("f1-first-run");
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    assert!(!state.0.join("accounts.json").exists());
+
+    // No store at all is the one shape that still means first run.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert!(
+        server.setup_code().is_some(),
+        "a first run prints a one-time setup code"
+    );
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/setup"));
+    assert!(http_get(&address, "/setup", None).contains("Initial Setup"));
+    // Merely serving setup creates no store.
+    assert!(!state.0.join("accounts.json").exists());
+
+    server.kill();
+}
+
+#[test]
+fn serve_keeps_unknown_top_level_accounts_fields_across_a_write() {
+    let state = state_dir();
+    std::fs::create_dir_all(&state.0).unwrap();
+    let accounts = state.0.join("accounts.json");
+    std::fs::write(
+        &accounts,
+        r#"{"schema":1,"server_note":"keep me","users":[]}"#,
+    )
+    .unwrap();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // Requiring `users` must not reject or drop unknown fields (ADR-014).
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let raw = std::fs::read_to_string(&accounts).unwrap();
+    assert!(raw.contains("server_note"), "{raw}");
+    assert!(raw.contains("owner@example.com"), "{raw}");
+}
+
+#[test]
 fn serve_missing_library_exits_one() {
     let outer = empty_dir("missing-lib");
     let output = Command::new(BIN)
