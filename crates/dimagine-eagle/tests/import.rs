@@ -464,6 +464,120 @@ fn empty_tags_are_omitted_from_image_note() {
 }
 
 #[test]
+fn reserved_library_label_is_prefixed_and_used_everywhere() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Reserved.library");
+    let dst = temp.path().join("out");
+    fake_library(&src);
+    let report = import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("COM¹".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(report.imported.len(), 3);
+    for item in &report.imported {
+        assert!(
+            item.path.starts_with("Eagle/_COM¹/") || !item.path.contains("Eagle/"),
+            "library label must be cleaned in reported paths: {}",
+            item.path
+        );
+    }
+    assert!(dst.join("Eagle/_COM¹/_COM¹.md").is_file());
+    assert!(
+        dst.join("Eagle/_COM¹/_import-_COM¹-20261005.md").is_file()
+            || fs::read_dir(dst.join("Eagle/_COM¹"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .any(|name| name.starts_with("_import-_COM¹-")),
+        "import report must use the cleaned label"
+    );
+    // Nothing named like the unprefixed device: not the folder, not the
+    // collection note, not the import report.
+    assert!(!dst.join("Eagle/COM¹").exists());
+    assert!(!dst.join("Eagle/_COM¹/COM¹.md").exists());
+    assert!(!fs::read_dir(dst.join("Eagle/_COM¹"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .any(|name| name.contains("COM¹") && name.starts_with("_import-COM¹")));
+    let note =
+        fs::read_to_string(dst.join("Eagle/_COM¹/Deep -Blue- - - -/Café/Same.png.md")).unwrap();
+    // The display label is kept verbatim in the image note, so a reader still
+    // sees the name the user gave. The collection note and the import report
+    // title use the prefixed form, because they are written inside the library
+    // folder and follow its name.
+    assert!(note.contains(r#"library: "COM¹""#), "note: {note}");
+    let collection = fs::read_to_string(dst.join("Eagle/_COM¹/_COM¹.md")).unwrap();
+    assert!(
+        collection.contains(r#"title: "_COM¹ (Eagle import)""#),
+        "collection: {collection}"
+    );
+}
+
+#[test]
+fn prefixes_windows_reserved_names_including_superscript_digits() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Reserved.library");
+    let dst = temp.path().join("out");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(
+        src.join("metadata.json"),
+        serde_json::to_vec(&json!({"folders":[{"id":"sup","name":"COM²"}]})).unwrap(),
+    )
+    .unwrap();
+    item(
+        &src,
+        "sup",
+        json!({"name":"COM²", "ext":"png", "folders":["sup"]}),
+        Some(("COM\u{b2}.png", b"superscript")),
+    );
+    item(
+        &src,
+        "lpt",
+        json!({"name":"lpt³", "ext":"png"}),
+        Some(("lpt\u{b3}.png", b"superscript-lpt")),
+    );
+    item(
+        &src,
+        "zero",
+        json!({"name":"COM0", "ext":"png"}),
+        Some(("COM0.png", b"not-reserved")),
+    );
+    item(
+        &src,
+        "four",
+        json!({"name":"COM\u{2074}", "ext":"png"}),
+        Some(("COM\u{2074}.png", b"not-reserved-either")),
+    );
+    import(
+        &src,
+        &dst,
+        ImportOptions {
+            name: Some("Reserved".to_owned()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(dst.join("Eagle/Reserved/_COM²/_COM².png")).unwrap(),
+        b"superscript"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/_lpt³.png")).unwrap(),
+        b"superscript-lpt"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/COM0.png")).unwrap(),
+        b"not-reserved"
+    );
+    assert_eq!(
+        fs::read(dst.join("inbox/COM\u{2074}.png")).unwrap(),
+        b"not-reserved-either"
+    );
+}
+
+#[test]
 fn sanitizes_reserved_trailing_and_multibyte_components() {
     let temp = TempDir::new().unwrap();
     let src = temp.path().join("SafeNames.library");

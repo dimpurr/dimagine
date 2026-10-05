@@ -974,16 +974,39 @@ fn safe_component(input: &str, max_bytes: usize) -> String {
     if result.is_empty() {
         return result;
     }
-    let stem = result.split('.').next().unwrap_or("").to_ascii_uppercase();
-    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
-        || (stem.len() == 4
-            && (stem.starts_with("COM") || stem.starts_with("LPT"))
-            && stem.as_bytes()[3].is_ascii_digit()
-            && stem.as_bytes()[3] != b'0');
-    if reserved {
+    if is_windows_reserved(&result) {
         result.insert(0, '_');
     }
     result
+}
+
+/// Whether a name would collide with a reserved Windows device name.
+///
+/// Windows refuses to create `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and
+/// `LPT1` to `LPT9` with any extension, and it also accepts the superscript
+/// digit spellings of `COM1` to `COM3` and `LPT1` to `LPT3` (`COM¹`, `COM²`,
+/// `COM³`, `LPT¹`, `LPT²`, `LPT³`) as the very same devices. Matching is on the
+/// ASCII-uppercased stem, the part before the first dot, so the case matters but
+/// the extension does not.
+///
+/// A library has to stay usable when it is synced to a Windows machine, so
+/// [`safe_component`] prefixes such a name with `_`. The Python prototype
+/// mirrors this in `is_windows_reserved`; both are checked against the shared
+/// rows in `tests/fixtures/reserved-names.json`.
+fn is_windows_reserved(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(suffix) = stem.strip_prefix(prefix) {
+            let mut characters = suffix.chars();
+            if let (Some(index), None) = (characters.next(), characters.next()) {
+                return matches!(index, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}');
+            }
+        }
+    }
+    false
 }
 
 fn suffixed_component(base: &str, suffix: usize, max_bytes: usize) -> String {
@@ -1472,7 +1495,7 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_item_transactionally, is_generic, CopyItemError};
+    use super::{copy_item_transactionally, is_generic, is_windows_reserved, CopyItemError};
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
@@ -1503,6 +1526,13 @@ mod tests {
     fn generic_name_gate_matches_shared_fixture() {
         for (name, expected) in shared_rows("generic-names.json") {
             assert_eq!(is_generic(&name), expected, "name: {name:?}");
+        }
+    }
+
+    #[test]
+    fn windows_reserved_name_gate_matches_shared_fixture() {
+        for (name, expected) in shared_rows("reserved-names.json") {
+            assert_eq!(is_windows_reserved(&name), expected, "name: {name:?}");
         }
     }
 

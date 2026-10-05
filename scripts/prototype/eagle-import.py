@@ -152,6 +152,17 @@ def selftest():
         actual = is_generic(row['name'])
         if actual != row['generic']:
             failures.append(('is_generic', row['name'], row['generic'], actual))
+    for row in rows('reserved-names.json'):
+        checked += 1
+        actual = is_windows_reserved(row['name'])
+        if actual != row['reserved']:
+            failures.append(('is_windows_reserved', row['name'], row['reserved'], actual))
+    for name, cleaned in (('COM\u00b9', '_COM\u00b9'), ('lpt3.png', '_lpt3.png'), ('CON', '_CON'),
+                          ('COM0', 'COM0'), ('console', 'console'), ('COM\u2074', 'COM\u2074')):
+        checked += 1
+        actual = clean(name)
+        if actual != cleaned:
+            failures.append(('clean', name, cleaned, actual))
     forbidden = '\x00\x07\x1f\x7f\x80\x81\x85\x9f\u2028\u2029\ufffe\ufffd'
     for value in (f'plain{forbidden}title', 'back\\slash "quoted"', '١٢'):
         checked += 1
@@ -190,6 +201,48 @@ def yaml_scalar(value):
     return YAML_FORBIDDEN.sub(lambda match: '\\u%04X' % ord(match.group()),
                               json.dumps(value, ensure_ascii=False))
 
+
+def ulid():
+    n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
+    return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
+
+WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'}
+# 1-9 plus the superscript spellings Windows accepts for COM1-COM3 and LPT1-LPT3.
+RESERVED_DEVICE_INDEX = frozenset('123456789\u00b9\u00b2\u00b3')
+
+def is_windows_reserved(name):
+    """Whether a name would collide with a reserved Windows device name.
+
+    Windows refuses to create `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and
+    `LPT1` to `LPT9` with any extension, and it also accepts the superscript
+    digit spellings of `COM1` to `COM3` and `LPT1` to `LPT3` (`COM1`, `COM2`,
+    `COM3`, `LPT1`, `LPT2`, `LPT3` written with U+00B9, U+00B2, U+00B3) as
+    the very same devices. Matching is on the ASCII-uppercased stem, the part
+    before the first dot, so the case matters but the extension does not.
+
+    A library has to stay usable when it is synced to a Windows machine, so
+    `clean` prefixes such a name with `_`. Mirrors Rust `is_windows_reserved`;
+    both are checked against the shared rows in
+    crates/dimagine-eagle/tests/fixtures/reserved-names.json.
+    """
+    stem = name.split('.', 1)[0].upper() if name else ''
+    if stem in WINDOWS_RESERVED:
+        return True
+    if len(stem) == 4 and stem[:3] in ('COM', 'LPT'):
+        return stem[3] in RESERVED_DEVICE_INDEX
+    return False
+
+def clean(s):
+    # \x7f-\x9f keeps DEL and the C1 controls, which Rust treats as control
+    # characters, out of file names as well.
+    s = unicodedata.normalize('NFC', s or '')
+    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f\x7f-\x9f]', '-', s).strip().strip('.')
+    s = s[:120]
+    # A library has to stay usable when it is synced to a Windows machine.
+    return '_' + s if is_windows_reserved(s) else s
+
+q = yaml_scalar
+
 if a.selftest:
     failures, checked = selftest()
     if failures:
@@ -203,18 +256,6 @@ if not a.src or not a.dst:
 SRC, DST = os.path.abspath(os.path.expanduser(a.src)), os.path.abspath(os.path.expanduser(a.dst))
 LIB = a.name or re.sub(r'\.library$', '', os.path.basename(SRC.rstrip('/')))
 
-def ulid():
-    n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
-    return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
-
-def clean(s):
-    # \x7f-\x9f keeps DEL and the C1 controls, which Rust treats as control
-    # characters, out of file names as well.
-    s = unicodedata.normalize('NFC', s or '')
-    s = re.sub(r'[\\/:*?"<>|\[\]#^\x00-\x1f\x7f-\x9f]', '-', s).strip().strip('.')
-    return s[:120]
-
-q = yaml_scalar
 now = datetime.datetime.now().astimezone()
 NOW = now.isoformat(timespec='seconds')
 
