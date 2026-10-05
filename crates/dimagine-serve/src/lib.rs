@@ -748,9 +748,15 @@ impl ThrottleState {
                 self.clients.remove(&oldest);
             }
         }
+        // A first attempt starts its window now, not at zero: an entry left
+        // with a zeroed window start would look long expired and its next
+        // attempt would be admitted as a free budget.
         self.clients
             .entry(client_key.to_owned())
-            .or_default()
+            .or_insert(LoginBudget {
+                window_start: now,
+                ..LoginBudget::default()
+            })
             .charge(now);
     }
 

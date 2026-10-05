@@ -4,7 +4,7 @@ use axum::{
 };
 use dimagine_serve::{
     router, Catalog, CatalogError, Collection, FsCatalog, ImageDetail, ImageEntry, OriginalPreview,
-    ServeConfig, LOGIN_CONCURRENCY_LIMIT,
+    ServeConfig, LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
 };
 use std::{
     fs,
@@ -208,6 +208,171 @@ async fn concurrent_wrong_guesses_are_bounded_before_comparison() {
     let cookie = login(&app, "2333").await;
     assert!(start.elapsed() >= std::time::Duration::from_millis(800));
     assert!(cookie.starts_with("dimagine_session="));
+}
+
+#[tokio::test(start_paused = true)]
+async fn parallel_guess_wave_cannot_brute_force_the_passcode() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_for(&root, ServeConfig::default());
+    let wave = || {
+        Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+    };
+    // The attack: a wave of wrong guesses big enough to cover a whole
+    // four-digit keyspace, with the right passcode in the middle of it.
+    // The clock is virtual, so the escalating back-off is paid without the
+    // test spending real seconds on it.
+    let mut tasks = Vec::new();
+    for guess in 0..1_000u32 {
+        let app = app.clone();
+        let request = wave()
+            .body(Body::from(format!("passcode={guess:04}")))
+            .unwrap();
+        tasks.push(tokio::spawn(async move {
+            let response = app.oneshot(request).await.unwrap();
+            (
+                response.status(),
+                response.headers().contains_key("retry-after"),
+                response.headers().contains_key("set-cookie"),
+                bytes(response).await,
+            )
+        }));
+    }
+    let app_for_correct = app.clone();
+    tasks.push(tokio::spawn(async move {
+        let response = app_for_correct
+            .oneshot(wave().body(Body::from("passcode=2333")).unwrap())
+            .await
+            .unwrap();
+        (
+            response.status(),
+            response.headers().contains_key("retry-after"),
+            response.headers().contains_key("set-cookie"),
+            bytes(response).await,
+        )
+    }));
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        outcomes.push(task.await.unwrap());
+    }
+    // The server compared at most the budgeted number of guesses, no matter
+    // how many arrived at once.
+    let compared = outcomes
+        .iter()
+        .filter(|(status, ..)| *status == StatusCode::UNAUTHORIZED)
+        .count();
+    assert!(
+        compared <= LOGIN_FAILURE_BUDGET as usize,
+        "{compared} passcodes compared, budget is {LOGIN_FAILURE_BUDGET}"
+    );
+    let refused: Vec<_> = outcomes
+        .iter()
+        .filter(|(status, ..)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .collect();
+    assert_eq!(
+        refused.len() + compared,
+        outcomes.len(),
+        "a guess is either compared or refused, never dropped: {outcomes:?}"
+    );
+    for (_, carries_retry_after, _, body) in &refused {
+        assert!(
+            *carries_retry_after,
+            "a refused guess must say when to retry"
+        );
+        assert!(body.is_empty(), "a refused guess reveals nothing");
+    }
+    // The wave did not sign anybody in: every response came back without a
+    // session cookie, including the one that carried the right passcode.
+    assert_eq!(outcomes[1_000].0, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        outcomes.iter().all(|(_, _, session, _)| !session),
+        "the wave handed out a session cookie"
+    );
+
+    // With nothing competing for the two login slots any more, only the
+    // exhausted budget can refuse: keep guessing until it does.
+    let mut compared = compared;
+    let mut budget_ran_out = false;
+    for guess in 0..LOGIN_FAILURE_BUDGET * 2 {
+        let response = app
+            .clone()
+            .oneshot(
+                wave()
+                    .body(Body::from(format!("passcode=9{guess:03}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        match response.status() {
+            StatusCode::UNAUTHORIZED => compared += 1,
+            StatusCode::TOO_MANY_REQUESTS => {
+                assert!(response.headers().get("retry-after").is_some());
+                budget_ran_out = true;
+                break;
+            }
+            other => panic!("unexpected login status {other}"),
+        }
+    }
+    assert!(budget_ran_out, "the attempt budget never ran out");
+    assert!(
+        compared <= LOGIN_FAILURE_BUDGET as usize,
+        "{compared} passcodes compared in one window, budget is {LOGIN_FAILURE_BUDGET}"
+    );
+
+    // The right passcode is not accepted while the budget is spent: it is
+    // refused without being compared, like any other over-budget guess.
+    let response = app
+        .oneshot(wave().body(Body::from("passcode=2333")).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("retry-after").is_some());
+    assert!(response.headers().get("set-cookie").is_none());
+    assert!(bytes(response).await.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn login_budget_is_keyed_on_the_peer_ip_and_ignores_forwarded_for() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_for(&root, ServeConfig::default());
+    let peer: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+    let guess = |passcode: &str, forwarded: &str| {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-forwarded-for", forwarded)
+            .body(Body::from(format!("passcode={passcode}")))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(peer));
+        request
+    };
+    // A fresh forwarded-for on every guess must not buy a fresh budget: the
+    // attempts are keyed on the peer socket IP, which a client cannot change.
+    let mut refused = None;
+    for attempt in 0..=LOGIN_FAILURE_BUDGET {
+        let response = app
+            .clone()
+            .oneshot(guess("0000", &format!("203.0.113.{attempt}")))
+            .await
+            .unwrap();
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            refused = Some(response);
+            break;
+        }
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert!(
+        refused.is_some(),
+        "a spoofed forwarded-for must not reset the peer ip's budget"
+    );
+    let response = app.oneshot(guess("2333", "203.0.113.250")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().get("set-cookie").is_none());
 }
 
 struct SlowListingCatalog;
