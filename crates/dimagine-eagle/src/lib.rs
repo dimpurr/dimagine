@@ -992,21 +992,34 @@ fn suffixed_component(base: &str, suffix: usize, max_bytes: usize) -> String {
     safe_component(&format!("{shortened}{suffix}"), max_bytes)
 }
 
+/// Whether an Eagle item name is a placeholder that carries no information.
+///
+/// A name is generic when, after Unicode lowercasing, it is exactly `image`,
+/// `download` or `untitled`; starts with `pasted image` or `screenshot`; is
+/// `img` plus at most one `_` or `-` separator plus ASCII digits; or is at
+/// least 16 ASCII hex digits (a hash).
+///
+/// Deliberately ASCII-only where the earlier implementations disagreed:
+/// separators are exactly one `_` or `-` (`img__12` is a real name, not a
+/// placeholder) and digits are ASCII (`img١٢` is a real name, not a
+/// placeholder), and the match never tolerates a trailing newline. The Python
+/// prototype mirrors this in `is_generic`; both are checked against the shared
+/// rows in `tests/fixtures/generic-names.json`.
 fn is_generic(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower == "image"
-        || lower == "download"
-        || lower == "untitled"
-        || lower.starts_with("pasted image")
-        || lower.starts_with("screenshot")
-        || {
-            let digits = lower
-                .strip_prefix("img")
-                .unwrap_or("")
-                .trim_start_matches(['_', '-']);
-            !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+    if matches!(lower.as_str(), "image" | "download" | "untitled") {
+        return true;
+    }
+    if lower.starts_with("pasted image") || lower.starts_with("screenshot") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("img") {
+        let digits = rest.strip_prefix(['_', '-']).unwrap_or(rest);
+        if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return true;
         }
-        || (lower.len() >= 16 && lower.chars().all(|c| c.is_ascii_hexdigit()))
+    }
+    lower.len() >= 16 && lower.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Derive a generic `<site>-<id>` name from a source URL.
@@ -1416,9 +1429,39 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_item_transactionally, CopyItemError};
+    use super::{copy_item_transactionally, is_generic, CopyItemError};
+    use serde_json::Value;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
+
+    fn shared_rows(fixture: &str) -> Vec<(String, bool)> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture);
+        let bytes =
+            fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let rows: Value = serde_json::from_slice(&bytes).expect("fixture is JSON");
+        let rows = rows.as_array().expect("fixture is a JSON array");
+        assert!(rows.len() >= 40, "expected at least 40 rows in {fixture}");
+        rows.iter()
+            .map(|row| {
+                let name = row["name"].as_str().expect("name string").to_owned();
+                let expected = row["generic"]
+                    .as_bool()
+                    .or_else(|| row["reserved"].as_bool())
+                    .expect("generic or reserved boolean");
+                (name, expected)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn generic_name_gate_matches_shared_fixture() {
+        for (name, expected) in shared_rows("generic-names.json") {
+            assert_eq!(is_generic(&name), expected, "name: {name:?}");
+        }
+    }
 
     #[test]
     fn failed_item_copy_leaves_no_published_or_temporary_artifacts() {
@@ -1459,7 +1502,6 @@ mod tests {
     #[test]
     fn iterative_drop_handles_deep_nesting_without_stack_overflow() {
         use super::drop_value_iteratively;
-        use serde_json::Value;
 
         let mut val = Value::Null;
         for _ in 0..10_000 {
