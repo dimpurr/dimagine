@@ -16,6 +16,8 @@ mod import;
 mod plugins;
 #[cfg(feature = "previews")]
 mod previews;
+#[cfg(feature = "serve")]
+mod serve;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,6 +50,8 @@ fn main() -> ExitCode {
         "import" => import::run(sub, &library_dir),
         #[cfg(feature = "previews")]
         "previews" => previews::run(sub, &library_dir),
+        #[cfg(feature = "serve")]
+        "serve" => serve::run(sub, &library_dir),
         other => unreachable!("clap already rejected unknown subcommand {other}"),
     }
 }
@@ -103,6 +107,10 @@ fn cli(plugins: &CorePlugins) -> Command {
     }
     #[cfg(not(feature = "previews"))]
     let _ = &plugins.previews;
+    #[cfg(feature = "serve")]
+    if plugins.serve {
+        command = command.subcommand(serve::command());
+    }
     #[cfg(not(feature = "serve"))]
     let _ = &plugins.serve;
     command
