@@ -937,13 +937,12 @@ async fn media(
                 .unwrap_or_else(|| original.clone()),
             None => original.clone(),
         };
-        let is_preview = served != original;
-        open_hashed_image(&served).map(|r| (r, is_preview))
+        open_hashed_image(&served)
     })
     .await;
     match prepared {
-        Ok(Ok(((file, metadata, etag, mime, mismatch), is_preview))) => {
-            stream_image(file, metadata, etag, mime, mismatch, is_preview, &headers, permit).await
+        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
+            stream_image(file, metadata, etag, mime, mismatch, &headers, permit).await
         }
         Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
         Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
@@ -1013,7 +1012,6 @@ async fn stream_image(
     etag: String,
     mime: &'static str,
     mismatch: bool,
-    is_preview: bool,
     request_headers: &HeaderMap,
     admission: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
@@ -1034,14 +1032,14 @@ async fn stream_image(
     let mut response = Response::new(body);
     let h = response.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-    let cache_control = if is_preview {
-        "private, max-age=31536000, immutable"
-    } else {
-        "private, no-cache"
-    };
+    // Rendition URLs carry no content hash, so they must not be
+    // cached as immutable: the source file or a regenerated
+    // preview can change under the same URL. The ETag is a
+    // SHA-256 of the served bytes, so `no-cache` revalidation is
+    // exact and costs one 304 per reuse.
     h.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static(cache_control),
+        HeaderValue::from_static("private, no-cache"),
     );
     if mismatch {
         h.insert(
