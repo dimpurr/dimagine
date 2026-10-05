@@ -616,6 +616,32 @@ struct ThrottleState {
     global_failures: u32,
 }
 
+impl ThrottleState {
+    /// Record one failed attempt, returning the escalating delay step.
+    /// The client map stays bounded by evicting the least recently seen
+    /// client; failure counts saturate instead of overflowing.
+    fn record_failure(&mut self, client_key: &str, now: u64) -> u32 {
+        self.global_failures = self.global_failures.saturating_add(1);
+        if self.clients.len() >= 1024 && !self.clients.contains_key(client_key) {
+            if let Some(oldest) = self
+                .clients
+                .iter()
+                .min_by_key(|(_, (_, seen))| *seen)
+                .map(|(key, _)| key.clone())
+            {
+                self.clients.remove(&oldest);
+            }
+        }
+        let entry = self
+            .clients
+            .entry(client_key.to_owned())
+            .or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = now;
+        self.global_failures.max(entry.0)
+    }
+}
+
 /// Build the read-only viewer router.
 pub fn router<C: Catalog, P: PreviewProvider>(
     catalog: C,
@@ -711,6 +737,16 @@ async fn login(
     let client_key = client
         .map(|c| c.0.ip().to_string())
         .unwrap_or_else(|| "unknown".to_owned());
+    // Throttle before comparing so parallel guesses cannot bypass the
+    // back-off and response timing never reveals whether a guess was
+    // correct: every attempt pays the same escalating delay.
+    let delay = {
+        let mut throttle = state.throttles.lock().unwrap();
+        throttle.record_failure(&client_key, now_seconds())
+    };
+    let millis =
+        (100u64.saturating_mul(1u64.checked_shl(delay.min(6)).unwrap_or(u64::MAX))).min(5000);
+    tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
     if form
         .passcode
         .as_bytes()
@@ -718,31 +754,6 @@ async fn login(
         .unwrap_u8()
         != 1
     {
-        let delay = {
-            let mut throttle = state.throttles.lock().unwrap();
-            throttle.global_failures = throttle.global_failures.saturating_add(1);
-            let now = now_seconds();
-            if throttle.clients.len() >= 1024 && !throttle.clients.contains_key(&client_key) {
-                if let Some(oldest) = throttle
-                    .clients
-                    .iter()
-                    .min_by_key(|(_, (_, seen))| seen)
-                    .map(|(key, _)| key.clone())
-                {
-                    throttle.clients.remove(&oldest);
-                }
-            }
-            let client_failures = {
-                let entry = throttle.clients.entry(client_key).or_insert((0, now));
-                entry.0 = entry.0.saturating_add(1);
-                entry.1 = now;
-                entry.0
-            };
-            throttle.global_failures.max(client_failures)
-        };
-        let millis =
-            (100u64.saturating_mul(1u64.checked_shl(delay.min(6)).unwrap_or(u64::MAX))).min(5000);
-        tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
         let mut response = (StatusCode::UNAUTHORIZED, Html(layout("Sign in", "<p>Incorrect passcode.</p><form method=\"post\"><label>Passcode <input name=\"passcode\" type=\"password\"></label><button>Sign in</button></form>"))).into_response();
         response
             .headers_mut()
@@ -1464,6 +1475,26 @@ mod regression_unit_tests {
         assert!(!sessions.contains_key("expired"));
         assert!(sessions.contains_key("after-expiry"));
         assert!(sessions.len() <= 10_000);
+    }
+
+    #[test]
+    fn throttle_state_stays_bounded_and_saturates() {
+        let mut throttle = ThrottleState::default();
+        for index in 0..2000u64 {
+            throttle.record_failure(&format!("client-{index}"), index);
+        }
+        assert!(throttle.clients.len() <= 1024);
+        assert_eq!(throttle.global_failures, 2000);
+        let mut client_only = ThrottleState::default();
+        let mut last = 0;
+        for index in 0..10u64 {
+            last = client_only.record_failure("one", index);
+            assert_eq!(last, index as u32 + 1);
+        }
+        assert_eq!(last, 10);
+        client_only.global_failures = u32::MAX;
+        client_only.record_failure("one", 99);
+        assert_eq!(client_only.global_failures, u32::MAX);
     }
 
     #[test]

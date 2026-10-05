@@ -149,6 +149,47 @@ async fn login_throttles_failures_and_success_remains_available() {
 }
 
 #[tokio::test]
+async fn concurrent_wrong_guesses_are_throttled_before_comparison() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_for(&root, ServeConfig::default());
+    let wrong = || {
+        Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(Body::from("passcode=0000"))
+            .unwrap()
+    };
+    let start = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let app = app.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = app.oneshot(wrong()).await.unwrap();
+            (response.status(), bytes(response).await)
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for task in tasks {
+        outcomes.push(task.await.unwrap());
+    }
+    // The back-off is computed from the shared failure count before the
+    // passcode is compared, so a parallel burst pays the escalating delay
+    // (100ms, 200ms, 400ms, 800ms) instead of sleeping only 100ms each.
+    assert!(start.elapsed() >= std::time::Duration::from_millis(800));
+    assert!(outcomes
+        .iter()
+        .all(|(status, _)| *status == StatusCode::UNAUTHORIZED));
+    assert!(outcomes.iter().all(|(_, body)| *body == outcomes[0].1));
+    // The delay is paid before comparing, so a correct passcode is delayed
+    // too, and success stays available after failures (no lockout).
+    let start = std::time::Instant::now();
+    let cookie = login(&app, "2333").await;
+    assert!(start.elapsed() >= std::time::Duration::from_millis(1600));
+    assert!(cookie.starts_with("dimagine_session="));
+}
+
+#[tokio::test]
 async fn secure_cookie_and_cache_policies_are_explicit() {
     let root = tempfile::tempdir().unwrap();
     let config = ServeConfig {
