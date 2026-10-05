@@ -6,7 +6,10 @@ use dimagine_serve::{
     router, Catalog, CatalogError, Collection, FsCatalog, ImageDetail, ImageEntry, OriginalPreview,
     ServeConfig,
 };
-use std::{fs, path::{Path, PathBuf}};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -353,7 +356,7 @@ async fn etag_stays_consistent_while_the_file_is_swapped_concurrently() {
             .clone()
             .oneshot(request("/media/race.png", Some(&cookie)))
             .await
-        .unwrap();
+            .unwrap();
         if response.status() != StatusCode::OK {
             continue;
         }
