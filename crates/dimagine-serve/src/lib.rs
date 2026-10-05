@@ -608,6 +608,24 @@ struct AppState {
     config: ServeConfig,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     throttles: Arc<Mutex<ThrottleState>>,
+    admission: Arc<tokio::sync::Semaphore>,
+}
+
+/// Bound on concurrently expensive requests: directory listings and
+/// media streaming (which may generate previews). Excess requests get
+/// a 503 with Retry-After instead of queueing without limit.
+const ADMISSION_LIMIT: usize = 8;
+
+fn acquire_admission(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    state.admission.clone().try_acquire_owned().ok()
+}
+
+fn admission_denied() -> Response {
+    let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 
 #[derive(Default)]
@@ -663,6 +681,7 @@ pub fn router_from(
         config,
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
+        admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
     };
     Router::new()
         .route("/login", get(login_page).post(login))
@@ -789,6 +808,10 @@ async fn login(
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    let _permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     let raw = route_tail(uri.path(), "/folder/");
     let folder = match percent_decode_str(&raw).decode_utf8() {
         Ok(s) => s.into_owned(),
@@ -806,12 +829,24 @@ async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Res
     }
 }
 async fn folder_root_json(State(state): State<AppState>) -> Response {
+    let _permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     folder_data_blocking(state, String::new()).await
 }
 async fn folder_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    let _permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     folder_data_blocking(state, path).await
 }
 async fn collection_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    let _permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     let catalog = state.catalog.clone();
     match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
         Ok(Ok(c)) => Html(layout(&c.title, &collection_html(&c))).into_response(),
@@ -820,6 +855,10 @@ async fn collection_page(State(state): State<AppState>, Path(path): Path<String>
     }
 }
 async fn collection_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
+    let _permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     let catalog = state.catalog.clone();
     match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
         Ok(result) => json_result(result),
@@ -868,6 +907,10 @@ async fn media(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
+    let permit = match acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return admission_denied(),
+    };
     let kind = if uri.path().starts_with("/thumb/") {
         Some(PreviewKind::Thumb)
     } else if uri.path().starts_with("/raw/") {
@@ -900,7 +943,7 @@ async fn media(
     .await;
     match prepared {
         Ok(Ok(((file, metadata, etag, mime, mismatch), is_preview))) => {
-            stream_image(file, metadata, etag, mime, mismatch, is_preview, &headers).await
+            stream_image(file, metadata, etag, mime, mismatch, is_preview, &headers, permit).await
         }
         Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
         Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
@@ -948,6 +991,22 @@ fn open_hashed_image(
     Ok((file, metadata, etag, mime, mime != extension_mime))
 }
 
+/// A streamed file that keeps its admission permit until the last byte.
+struct AdmittedFile {
+    inner: tokio::fs::File,
+    _admission: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl tokio::io::AsyncRead for AdmittedFile {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
 async fn stream_image(
     file: fs::File,
     metadata: fs::Metadata,
@@ -956,9 +1015,15 @@ async fn stream_image(
     mismatch: bool,
     is_preview: bool,
     request_headers: &HeaderMap,
+    admission: tokio::sync::OwnedSemaphorePermit,
 ) -> Response {
     let file = tokio::fs::File::from_std(file);
-    let stream = tokio_util::io::ReaderStream::new(file);
+    // The admission permit lives for the whole stream, so slow
+    // readers count against the concurrency bound while streaming.
+    let stream = tokio_util::io::ReaderStream::new(AdmittedFile {
+        inner: file,
+        _admission: admission,
+    });
     let body = Body::from_stream(stream);
     let modified = metadata
         .modified()

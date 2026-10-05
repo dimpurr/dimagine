@@ -2,8 +2,11 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
-use dimagine_serve::{router, Catalog, FsCatalog, OriginalPreview, ServeConfig};
-use std::fs;
+use dimagine_serve::{
+    router, Catalog, CatalogError, Collection, FsCatalog, ImageDetail, ImageEntry, OriginalPreview,
+    ServeConfig,
+};
+use std::{fs, path::{Path, PathBuf}};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -187,6 +190,83 @@ async fn concurrent_wrong_guesses_are_throttled_before_comparison() {
     let cookie = login(&app, "2333").await;
     assert!(start.elapsed() >= std::time::Duration::from_millis(1600));
     assert!(cookie.starts_with("dimagine_session="));
+}
+
+struct SlowListingCatalog;
+
+impl Catalog for SlowListingCatalog {
+    fn list_folder(&self, _folder: &str) -> Result<Vec<ImageEntry>, CatalogError> {
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        Ok(Vec::new())
+    }
+    fn list_subfolders(&self, _folder: &str) -> Result<Vec<String>, CatalogError> {
+        Ok(Vec::new())
+    }
+    fn list_collections(&self, _folder: &str) -> Result<Vec<Collection>, CatalogError> {
+        Ok(Vec::new())
+    }
+    fn collection(&self, _path: &str) -> Result<Collection, CatalogError> {
+        Err(CatalogError::NotFound)
+    }
+    fn image_detail(&self, _path: &str) -> Result<ImageDetail, CatalogError> {
+        Err(CatalogError::NotFound)
+    }
+    fn resolve_path(&self, _path: &str) -> Result<PathBuf, CatalogError> {
+        Err(CatalogError::Forbidden)
+    }
+    fn root(&self) -> &Path {
+        Path::new(".")
+    }
+}
+
+#[tokio::test]
+async fn over_bound_requests_get_503_with_retry_after() {
+    let app = router(SlowListingCatalog, OriginalPreview, ServeConfig::default());
+    let cookie = login(&app, "2333").await;
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        tasks.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header("cookie", cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            (response.status(), retry_after)
+        }));
+    }
+    let mut ok = 0;
+    let mut denied = 0;
+    for task in tasks {
+        let (status, retry_after) = task.await.unwrap();
+        match status {
+            StatusCode::OK => {
+                ok += 1;
+                assert!(retry_after.is_none());
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                denied += 1;
+                assert_eq!(retry_after.as_deref(), Some("1"));
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    // The admission bound (8) is respected exactly: 8 listings run
+    // concurrently and the rest are rejected immediately instead of
+    // queueing without a limit.
+    assert_eq!(ok, 8);
+    assert_eq!(denied, 4);
 }
 
 #[tokio::test]
