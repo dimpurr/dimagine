@@ -269,6 +269,110 @@ async fn over_bound_requests_get_503_with_retry_after() {
     assert_eq!(denied, 4);
 }
 
+fn hex_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+#[tokio::test]
+async fn etag_and_streamed_bytes_come_from_the_same_opened_file() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("pic.png"), PNG).unwrap();
+    let app = app_for(&root, ServeConfig::default());
+    let cookie = login(&app, "2333").await;
+    let first = app
+        .clone()
+        .oneshot(request("/media/pic.png", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_etag = first.headers()["etag"].to_str().unwrap().to_owned();
+    let first_bytes = bytes(first).await;
+    // The digest is computed from the very handle that is streamed.
+    assert_eq!(hex_sha256(&first_bytes), first_etag.trim_matches('"'));
+
+    // Replace the file between requests: the stale digest must not
+    // validate, and the new response must hash and stream the
+    // replacement from one open.
+    let replaced = b"\x89PNG\r\n\x1a\nreplaced-bytes";
+    fs::write(root.path().join("pic.png"), replaced).unwrap();
+    let second = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/media/pic.png")
+                .header("cookie", &cookie)
+                .header("if-none-match", &first_etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(second.status(), StatusCode::OK);
+    let second_etag = second.headers()["etag"].to_str().unwrap().to_owned();
+    let second_bytes = bytes(second).await;
+    assert_ne!(second_etag, first_etag);
+    assert_eq!(second_bytes, replaced);
+    assert_eq!(hex_sha256(&second_bytes), second_etag.trim_matches('"'));
+}
+
+#[tokio::test]
+async fn etag_stays_consistent_while_the_file_is_swapped_concurrently() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("race.png");
+    fs::write(&target, PNG).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let target = target.clone();
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut flip = false;
+            while !stop.load(Ordering::SeqCst) {
+                // Atomic replacement, like a cache regeneration:
+                // readers that opened the old inode keep it.
+                let staging = target.with_extension("swp");
+                let bytes = if flip {
+                    PNG
+                } else {
+                    b"\x89PNG\r\n\x1a\nswapped"
+                };
+                if fs::write(&staging, bytes).is_ok() {
+                    let _ = fs::rename(&staging, &target);
+                }
+                flip = !flip;
+            }
+        })
+    };
+    let app = app_for(&root, ServeConfig::default());
+    let cookie = login(&app, "2333").await;
+    let mut served = 0;
+    for _ in 0..50 {
+        let response = app
+            .clone()
+            .oneshot(request("/media/race.png", Some(&cookie)))
+            .await
+        .unwrap();
+        if response.status() != StatusCode::OK {
+            continue;
+        }
+        let etag = response.headers()["etag"]
+            .to_str()
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+        let body = bytes(response).await;
+        // A hash-then-reopen implementation would sometimes pair the
+        // old digest with the new bytes (or vice versa).
+        assert_eq!(hex_sha256(&body), etag);
+        served += 1;
+    }
+    assert!(served > 0);
+    stop.store(true, Ordering::SeqCst);
+    writer.join().unwrap();
+}
+
 #[tokio::test]
 async fn secure_cookie_and_cache_policies_are_explicit() {
     let root = tempfile::tempdir().unwrap();
