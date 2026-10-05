@@ -7,6 +7,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer hardening: login attempts are throttled before comparison, bounded
+  in flight and charged against per-client and global budgets; expensive
+  requests are admission-bounded (503 + Retry-After); ETags come from the
+  streamed file handle; renditions revalidate instead of being immutable.
 - Eagle import: IP-literal hosts get no site label; Rust and Python agree on
   meaningless names; YAML escapes every forbidden character; superscript
   Windows device names are cleaned; the Python selftest runs in CI.
