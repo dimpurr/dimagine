@@ -390,6 +390,84 @@ fn running_as_root() -> bool {
         .unwrap_or(false)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_setup_requests_consume_the_code_only_once() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, Some("setup-code-abcdef"), None);
+
+    let request = |email: &str| {
+        post(
+            "/setup",
+            &format!(
+                "email={email}&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef"
+            ),
+        )
+    };
+
+    // Two requests race the one-time code; exactly one may complete setup.
+    let app_a = app.clone();
+    let app_b = app.clone();
+    let task_a =
+        tokio::spawn(async move { app_a.oneshot(request("owner%40example.com")).await.unwrap() });
+    let task_b = tokio::spawn(async move {
+        app_b
+            .oneshot(request("second%40example.com"))
+            .await
+            .unwrap()
+    });
+    let (response_a, response_b) = (task_a.await.unwrap(), task_b.await.unwrap());
+
+    let outcomes = [
+        (response_a.status(), response_a.headers().clone()),
+        (response_b.status(), response_b.headers().clone()),
+    ];
+    let winners: Vec<_> = outcomes
+        .iter()
+        .filter(|(status, headers)| *status == StatusCode::SEE_OTHER && headers["location"] == "/")
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "exactly one request may complete setup: {outcomes:?}"
+    );
+    for (status, headers) in &outcomes {
+        if *status == StatusCode::SEE_OTHER && headers["location"] == "/" {
+            continue;
+        }
+        // The loser is refused: 404 because the code is gone (or setup is
+        // unreachable now that a user exists).
+        assert_eq!(
+            *status,
+            StatusCode::NOT_FOUND,
+            "the losing request must be refused: {status} {headers:?}"
+        );
+    }
+
+    // The store holds exactly one owner — the second account was not created
+    // and the first was not overwritten.
+    let store = AccountsStore::new(&root.path().join("state"));
+    let doc = store.load().unwrap();
+    assert_eq!(doc.users.len(), 1, "{}", {
+        let emails: Vec<_> = doc.users.iter().map(|u| u.email.as_str()).collect();
+        emails.join(", ")
+    });
+    assert_eq!(doc.users[0].role, "owner");
+
+    // The code is dead: a follow-up request with the same code is refused.
+    assert_eq!(
+        send(
+            &app,
+            post(
+                "/setup",
+                "email=third%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+            )
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn trusted_proxy_keys_throttle_on_last_forwarded_hop() {
     let root = tempfile::tempdir().unwrap();

@@ -1017,37 +1017,8 @@ async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Re
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
     }
 
-    let active_code = state.setup_code.lock().unwrap().clone();
-    let Some(expected_code) = active_code else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-
-    let code_input = form.setup_code.trim();
-    if code_input.is_empty()
-        || code_input
-            .as_bytes()
-            .ct_eq(expected_code.as_bytes())
-            .unwrap_u8()
-            != 1
-    {
-        let error_html = layout(
-            "Initial Setup",
-            "<p>Invalid setup code.</p>\
-             <form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required></label>\
-             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
-             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-             <button type=\"submit\">Complete Setup</button>\
-             </form>",
-        );
-        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return response;
-    }
-
+    // Refuse everything that can be refused without waiting on the lock, so a
+    // request that is going to fail never queues behind a slow argon2 hash.
     let trimmed_email = form.email.trim();
     if trimmed_email.is_empty() || !trimmed_email.contains('@') {
         let error_html = layout(
@@ -1087,10 +1058,47 @@ async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Re
         return response;
     }
 
+    // One critical section spans the code check, the account creation, and the
+    // code invalidation. A second concurrent request blocks on this lock and
+    // then finds the code gone, instead of consuming it a second time and
+    // overwriting the first account.
+    let mut active_code = state.setup_code.lock().unwrap();
+    let Some(expected_code) = active_code.clone() else {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    };
+
+    let code_input = form.setup_code.trim();
+    if code_input.is_empty()
+        || code_input
+            .as_bytes()
+            .ct_eq(expected_code.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
+        let error_html = layout(
+            "Initial Setup",
+            "<p>Invalid setup code.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+             <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
+             <button type=\"submit\">Complete Setup</button>\
+             </form>",
+        );
+        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
+
     if let Err(err) = state
         .accounts
         .create_user(trimmed_email, &form.password, "owner")
     {
+        // The code stays valid: a transient store failure must not burn the
+        // one-time code, or the operator would have to restart the server.
         let error_html = layout(
             "Initial Setup",
             &format!("<p>Failed to create account: {err}</p>"),
@@ -1102,8 +1110,9 @@ async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Re
         return response;
     }
 
-    // Invalidate setup code so it cannot be used again
-    *state.setup_code.lock().unwrap() = None;
+    // Invalidate setup code so it cannot be used again.
+    *active_code = None;
+    drop(active_code);
 
     let token = uuid::Uuid::new_v4().to_string();
     store_session(
