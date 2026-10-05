@@ -1008,7 +1008,12 @@ struct SetupForm {
     setup_code: String,
 }
 
-async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Response {
+async fn setup(
+    State(state): State<AppState>,
+    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+    Form(form): Form<SetupForm>,
+) -> Response {
     let has_users = match state.accounts.has_users() {
         Ok(has_users) => has_users,
         Err(err) => return store_error(err),
@@ -1126,7 +1131,11 @@ async fn setup(State(state): State<AppState>, Form(form): Form<SetupForm>) -> Re
         state.config.cookie_name,
         token,
         SESSION_SECONDS,
-        if state.config.https { "; Secure" } else { "" }
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -1279,7 +1288,11 @@ async fn login(
         state.config.cookie_name,
         token,
         SESSION_SECONDS,
-        if state.config.https { "; Secure" } else { "" }
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -1290,9 +1303,12 @@ async fn login(
     response
 }
 
-async fn logout(State(state): State<AppState>, request: Request<Body>) -> Response {
-    let token = request
-        .headers()
+async fn logout(
+    State(state): State<AppState>,
+    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
+) -> Response {
+    let token = headers
         .get(header::COOKIE)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| cookie_value(v, &state.config.cookie_name));
@@ -1303,7 +1319,11 @@ async fn logout(State(state): State<AppState>, request: Request<Body>) -> Respon
     let cookie = format!(
         "{}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
         state.config.cookie_name,
-        if state.config.https { "; Secure" } else { "" }
+        if cookie_secure(&state, client.map(|c| c.0), &headers) {
+            "; Secure"
+        } else {
+            ""
+        }
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
@@ -1312,6 +1332,35 @@ async fn logout(State(state): State<AppState>, request: Request<Body>) -> Respon
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+/// Decide whether a session cookie must carry `Secure`.
+///
+/// `Secure` is set when the viewer is served directly over HTTPS
+/// (`config.https`, raised by the `--secure-cookies` flag), or when the
+/// request arrived through a trusted reverse proxy that terminated TLS: the
+/// TCP peer is a configured trusted proxy and its `X-Forwarded-Proto` header
+/// says `https`. The header is honoured only from a trusted peer, so a direct
+/// client can never influence the flag.
+fn cookie_secure(
+    state: &AppState,
+    peer: Option<std::net::SocketAddr>,
+    headers: &HeaderMap,
+) -> bool {
+    if state.config.https {
+        return true;
+    }
+    let Some(peer) = peer else {
+        return false;
+    };
+    if !state.config.trusted_proxies.contains(&peer.ip()) {
+        return false;
+    }
+    headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|proto| proto.split(',').next())
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
 }
 
 async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {

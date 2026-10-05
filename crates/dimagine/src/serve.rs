@@ -58,6 +58,12 @@ pub fn command() -> Command {
                 .help("Trusted reverse proxy IP address (repeatable)."),
         )
         .arg(
+            Arg::new("secure_cookies")
+                .long("secure-cookies")
+                .action(clap::ArgAction::SetTrue)
+                .help("Always set the Secure attribute on the session cookie (when serving directly over HTTPS)."),
+        )
+        .arg(
             Arg::new("data_dir")
                 .long("data-dir")
                 .value_name("DIR")
@@ -113,6 +119,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         trusted_proxies,
         data_dir,
         setup_code: setup_code.clone(),
+        https: sub.get_flag("secure_cookies"),
         ..ServeConfig::default()
     };
     let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);

@@ -489,6 +489,42 @@ fn serve_empty_passcode_env_enters_setup_mode() {
 }
 
 #[test]
+fn serve_secure_cookies_flag_sets_secure_on_session_cookie() {
+    let dir = library("secure-cookies");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--secure-cookies"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+
+    let (status, cookie) = post_login(&address, "2333");
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("login sets a session cookie");
+    assert!(cookie.contains("Secure"), "{cookie}");
+
+    server.kill();
+}
+
+#[test]
+fn serve_session_cookie_is_not_secure_over_plain_http_by_default() {
+    let dir = library("plain-cookies");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+
+    let (status, cookie) = post_login(&address, "2333");
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("login sets a session cookie");
+    assert!(!cookie.contains("Secure"), "{cookie}");
+
+    server.kill();
+}
+
+#[test]
 fn serve_default_passcode_on_non_loopback_bind_warns() {
     let dir = library("warn");
     // Bind to all local IPv4 interfaces while reaching it on loopback; the

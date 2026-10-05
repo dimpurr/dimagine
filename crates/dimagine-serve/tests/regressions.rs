@@ -568,6 +568,63 @@ async fn etag_stays_consistent_while_the_file_is_swapped_concurrently() {
     writer.join().unwrap();
 }
 
+/// Log in from a given TCP peer with extra headers, returning the response.
+async fn login_from(
+    app: &axum::Router,
+    peer: std::net::SocketAddr,
+    headers: &[(&str, &str)],
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri("/login")
+        .header("content-type", "application/x-www-form-urlencoded");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut request = builder.body(Body::from("passcode=2333")).unwrap();
+    request
+        .extensions_mut()
+        .insert(axum::extract::ConnectInfo(peer));
+    app.clone().oneshot(request).await.unwrap()
+}
+
+fn set_cookie(response: &axum::response::Response) -> String {
+    response.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[tokio::test(start_paused = true)]
+async fn secure_cookie_follows_forwarded_proto_from_trusted_proxy_only() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = ServeConfig {
+        passcode: Some("2333".to_owned()),
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    config.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    let app = app_for(&root, config);
+    let proxy: std::net::SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let direct: std::net::SocketAddr = "198.51.100.7:40000".parse().unwrap();
+
+    // A trusted proxy that terminated TLS: the cookie is Secure even though
+    // this request arrived over plaintext HTTP.
+    let response = login_from(&app, proxy, &[("x-forwarded-proto", "https")]).await;
+    let cookie = set_cookie(&response);
+    assert!(cookie.contains("Secure"), "{cookie}");
+
+    // The same proxy on a plaintext leg to this server: no Secure.
+    let response = login_from(&app, proxy, &[]).await;
+    let cookie = set_cookie(&response);
+    assert!(!cookie.contains("Secure"), "{cookie}");
+
+    // A direct client cannot turn the flag on by spoofing the header.
+    let response = login_from(&app, direct, &[("x-forwarded-proto", "https")]).await;
+    let cookie = set_cookie(&response);
+    assert!(!cookie.contains("Secure"), "{cookie}");
+}
+
 #[tokio::test]
 async fn secure_cookie_and_cache_policies_are_explicit() {
     let root = tempfile::tempdir().unwrap();
