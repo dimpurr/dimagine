@@ -897,6 +897,110 @@ fn user_cli_create_passwd_list_and_login_round_trip() {
     server.kill();
 }
 
+/// Build a `script` command that runs `args` under a pseudo-terminal.
+/// macOS takes the command after the output file; util-linux wants `-c`.
+fn pty_command(args: &[&str]) -> Command {
+    let mut command = Command::new("script");
+    if cfg!(target_os = "macos") {
+        command.arg("-q").arg("/dev/null").args(args);
+    } else {
+        command.arg("-qec").arg(args.join(" ")).arg("/dev/null");
+    }
+    command
+}
+
+/// Run a command under a pty, feeding `input` to it only after `delay`, and
+/// return everything the pty printed. The delay lets the child start and (for
+/// a password prompt) disable echo before the input arrives.
+fn run_under_pty(args: &[&str], input: &str, delay: Duration) -> String {
+    let mut child = pty_command(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn script");
+    let mut stdin = child.stdin.take().expect("script stdin");
+    let input = input.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let _ = stdin.write_all(input.as_bytes());
+        // Hold the pty master open until the child is done with it.
+        std::thread::sleep(Duration::from_secs(10));
+    });
+    let output = child.wait_with_output().expect("wait for script");
+    assert!(
+        output.status.success(),
+        "script failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn interactive_password_prompt_does_not_echo_the_password() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+    let password = "secret123456";
+
+    // No --password-stdin: the prompt path runs under a pty, and the password
+    // is fed only after the prompt has been printed. With echo disabled by the
+    // prompt, the password must not appear in the terminal output.
+    let output = run_under_pty(
+        &[
+            BIN,
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "pty@example.com",
+        ],
+        &format!("{password}\n"),
+        Duration::from_secs(2),
+    );
+
+    assert!(output.contains("Password: "), "{output}");
+    assert!(
+        !output.contains(password),
+        "the password was echoed to the terminal: {output}"
+    );
+    assert!(output.contains("created user pty@example.com"), "{output}");
+    assert!(state.0.join("accounts.json").exists());
+}
+
+#[test]
+fn interactive_prompt_reads_piped_stdin_without_the_flag() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+
+    // No --password-stdin and no terminal: the prompt path falls back to
+    // reading the piped line, so `echo <password> | dimagine user create`
+    // keeps working.
+    let output = run_user(
+        &[
+            "user",
+            "create",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+        ],
+        "secret123456\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Password: "),
+        "the prompt is still printed: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.0.join("accounts.json").exists());
+}
+
 #[test]
 fn user_cli_refuses_passwords_below_the_minimum() {
     let state = state_dir();

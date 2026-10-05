@@ -7,7 +7,7 @@
 //!
 //! Accounts live outside the library in `--data-dir <DIR>`.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -94,16 +94,24 @@ pub fn run(sub: &ArgMatches) -> ExitCode {
 }
 
 fn read_password(password_stdin: bool) -> Result<String, String> {
-    if !password_stdin {
-        eprint!("Password: ");
-        let _ = std::io::stderr().flush();
-    }
-    let stdin = std::io::stdin();
-    let mut line = String::new();
-    stdin
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| format!("cannot read password from stdin: {e}"))?;
+    let line = if !password_stdin && std::io::stdin().is_terminal() {
+        // Interactive terminal: rpassword disables echo while the password is
+        // typed, so it stays off the screen and out of the scrollback.
+        rpassword::prompt_password("Password: ")
+            .map_err(|e| format!("cannot read password from terminal: {e}"))?
+    } else {
+        if !password_stdin {
+            eprint!("Password: ");
+            let _ = std::io::stderr().flush();
+        }
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        stdin
+            .lock()
+            .read_line(&mut line)
+            .map_err(|e| format!("cannot read password from stdin: {e}"))?;
+        line
+    };
     let trimmed = line.trim_end_matches(['\r', '\n']).to_string();
     if trimmed.is_empty() {
         return Err("password cannot be empty".to_string());
