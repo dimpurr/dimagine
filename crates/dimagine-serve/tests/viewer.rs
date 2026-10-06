@@ -1150,3 +1150,75 @@ async fn a_folder_with_no_images_offers_the_way_out() {
     assert!(html.contains("href=\"/?in=empty\""));
     assert!(html.contains("Clear all filters"));
 }
+
+/// RW37: the scope chips used to paste the user's own words into the page
+/// unescaped. Every hostile scope value must reach the body escaped.
+#[tokio::test]
+async fn hostile_scope_values_reach_the_library_page_only_escaped() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let html = text(
+        &app,
+        "/?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+        &cookie,
+    )
+    .await;
+    assert!(
+        html.contains("q: &lt;img src=x onerror=alert(1)&gt;"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("<img src=x"),
+        "the raw form rendered: {html}"
+    );
+
+    let html = text(&app, "/?tag=%3Cscript%3E%22x%22", &cookie).await;
+    assert!(html.contains("tag: &lt;script&gt;&quot;x&quot;"), "{html}");
+    assert!(!html.contains("<script>"), "the raw form rendered: {html}");
+
+    let html = text(&app, "/?in=%22%3E%3Cimg%20onerror%3E", &cookie).await;
+    assert!(html.contains("in: &quot;&gt;&lt;img onerror&gt;"), "{html}");
+    assert!(
+        !html.contains("\"><img onerror"),
+        "the raw form rendered: {html}"
+    );
+
+    let html = text(&app, "/?c=%22%3E%3Csvg%3E.md", &cookie).await;
+    assert!(
+        html.contains("collection: &quot;&gt;&lt;svg&gt;.md"),
+        "{html}"
+    );
+    assert!(
+        !html.contains("\"><svg>.md"),
+        "the raw form rendered: {html}"
+    );
+}
+
+/// A collection's title is library content, not the page author's words: it
+/// reaches the sidebar and the collections page only escaped.
+#[tokio::test]
+async fn a_collection_title_carrying_markup_reaches_the_page_only_escaped() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.png"), PNG_BYTES).unwrap();
+    fs::write(
+        dir.path().join("set.md"),
+        "---\ntitle: Set <img onerror=x>\n---\n![[a.png]]\n",
+    )
+    .unwrap();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let sidebar = text(&app, "/", &cookie).await;
+    assert!(sidebar.contains("Set &lt;img onerror=x&gt;"), "{sidebar}");
+    assert!(
+        !sidebar.contains("<img onerror"),
+        "the raw form rendered: {sidebar}"
+    );
+
+    let cards = text(&app, "/collections", &cookie).await;
+    assert!(cards.contains("Set &lt;img onerror=x&gt;"), "{cards}");
+    assert!(
+        !cards.contains("<img onerror"),
+        "the raw form rendered: {cards}"
+    );
+}

@@ -158,11 +158,13 @@ pub fn size_toggles(params: &ViewParams) -> String {
     out
 }
 
-/// One removable scope chip.
+/// One removable scope chip. The label quotes the user's own words, so it is
+/// escaped here rather than trusting every caller.
 fn chip(label: &str, remove_url: &str) -> String {
     format!(
         "<span class=\"chip\">{label}<a class=\"chip-remove\" href=\"{url}\" \
          aria-label=\"{remove}\">✕</a></span>",
+        label = escape_html(label),
         url = escape_html(remove_url),
         remove = escape_html(&format!("Remove filter {label}")),
     )
@@ -645,6 +647,84 @@ mod tests {
     #[test]
     fn there_are_no_chips_for_a_plain_library_view() {
         assert!(scope_chips(&ViewParams::default()).is_empty());
+    }
+
+    #[test]
+    fn a_chip_escapes_a_search_word_carrying_markup() {
+        let html = scope_chips(&ViewParams::parse(
+            "q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+        ));
+        assert!(
+            html.contains("q: &lt;img src=x onerror=alert(1)&gt;"),
+            "the escaped form is present: {html}"
+        );
+        assert!(
+            !html.contains("<img src=x"),
+            "the raw form rendered: {html}"
+        );
+    }
+
+    #[test]
+    fn a_chip_escapes_a_tag_name_carrying_script_and_quotes() {
+        let html = scope_chips(&ViewParams::parse("tag=%3Cscript%3E%22x%22"));
+        assert!(html.contains("tag: &lt;script&gt;&quot;x&quot;"), "{html}");
+        assert!(!html.contains("<script>"), "the raw form rendered: {html}");
+        assert!(!html.contains("\"x\""), "a raw quote pair rendered: {html}");
+    }
+
+    #[test]
+    fn a_chip_and_a_crumb_escape_a_folder_name_carrying_markup() {
+        let params = ViewParams::parse("in=%22%3E%3Cimg%20onerror%3E");
+        let chips = scope_chips(&params);
+        assert!(
+            chips.contains("in: &quot;&gt;&lt;img onerror&gt;"),
+            "{chips}"
+        );
+        assert!(
+            !chips.contains("\"><img onerror"),
+            "the raw form rendered: {chips}"
+        );
+        let trail = breadcrumbs(&params);
+        assert!(trail.contains("&quot;&gt;&lt;img onerror&gt;"), "{trail}");
+        assert!(
+            !trail.contains("\"><img onerror"),
+            "the raw form rendered: {trail}"
+        );
+    }
+
+    #[test]
+    fn a_chip_escapes_a_collection_name_carrying_markup() {
+        let html = scope_chips(&ViewParams::parse("c=%22%3E%3Csvg%3E.md"));
+        assert!(
+            html.contains("collection: &quot;&gt;&lt;svg&gt;.md"),
+            "{html}"
+        );
+        assert!(!html.contains("\"><svg"), "the raw form rendered: {html}");
+    }
+
+    #[test]
+    fn a_chip_remove_link_carries_the_rest_of_the_scope_url_encoded() {
+        let html = scope_chips(&ViewParams::parse(
+            "tag=eagle&q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
+        ));
+        assert!(
+            html.contains("href=\"/?q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E\""),
+            "dropping the tag keeps q percent-encoded: {html}"
+        );
+        assert!(
+            html.contains("href=\"/?tag=eagle\""),
+            "dropping q keeps tag: {html}"
+        );
+    }
+
+    #[test]
+    fn a_collection_title_carrying_markup_is_escaped_on_its_card() {
+        let card = collection_card("set.md", "Set <img onerror=x>", 3, None);
+        assert!(card.contains("Set &lt;img onerror=x&gt;"), "{card}");
+        assert!(
+            !card.contains("<img onerror"),
+            "the raw form rendered: {card}"
+        );
     }
 
     #[test]

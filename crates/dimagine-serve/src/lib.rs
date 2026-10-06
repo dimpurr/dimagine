@@ -719,7 +719,7 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
 /// warning and its checkbox live here and not in every error page.
 fn setup_form_html(error: Option<&str>) -> String {
     let error = error
-        .map(|message| format!("<p>{message}</p>"))
+        .map(|message| format!("<p>{}</p>", crate::ui::escape_html(message)))
         .unwrap_or_default();
     format!(
         "{error}<form method=\"post\">\
@@ -861,7 +861,10 @@ async fn setup(
         // it, or the operator would have to restart the server.
         let html = layout(
             "Initial Setup",
-            &format!("<p>Failed to create account: {err}</p>"),
+            &format!(
+                "<p>Failed to create account: {}</p>",
+                crate::ui::escape_html(&err.to_string())
+            ),
         );
         let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response();
         response
