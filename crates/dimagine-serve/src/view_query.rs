@@ -20,7 +20,7 @@ use unicode_normalization::UnicodeNormalization;
 
 pub use dimagine_index::SortKey;
 
-use crate::index_sync::recent_cutoff_ns_at;
+use crate::index_sync::RECENT_LIMIT;
 
 /// Items per page in the viewer grid (Spec §2).
 pub const PAGE_SIZE: u32 = 120;
@@ -150,8 +150,9 @@ pub struct ViewParams {
     pub page: u32,
     /// The untagged lens: only images whose note carries no tag (`untagged=1`).
     pub untagged: bool,
-    /// The recent lens: only images added inside the recent window
-    /// (`recent=1`, spec §3 `VIEWS`).
+    /// The recent lens: the most recently added [`RECENT_LIMIT`] images,
+    /// however old they are (`recent=1`, spec §3 `VIEWS`). A count, not a
+    /// window (W34 audit #10).
     pub recent: bool,
     /// Notices for invalid query parameters that were safely ignored.
     pub notices: Vec<String>,
@@ -411,12 +412,25 @@ impl ViewParams {
 
     /// Convert to a `dimagine_index::ViewQuery`.
     pub fn to_index_query(&self) -> dimagine_index::ViewQuery {
-        self.to_index_query_at(std::time::SystemTime::now())
-    }
-
-    /// Convert to a `dimagine_index::ViewQuery`, taking "now" from the caller
-    /// so the recent window is testable.
-    pub fn to_index_query_at(&self, now: std::time::SystemTime) -> dimagine_index::ViewQuery {
+        // The Recent lens is "the most recently added [`RECENT_LIMIT`]"
+        // (W34 audit #10), so Added-newest-first is the lens's definition,
+        // not a choice: like a collection's embed order, a sort picked beside
+        // it cannot decide which images the lens holds.
+        let (sort, descending) = if self.recent {
+            (SortKey::Added, true)
+        } else {
+            (self.sort, self.direction == Direction::Desc)
+        };
+        let mut offset = u64::from(self.page.saturating_sub(1)) * u64::from(PAGE_SIZE);
+        let mut limit = u64::from(PAGE_SIZE);
+        if self.recent {
+            // The pages stay inside the lens: page one starts at the newest
+            // image, page two ends at the 200th, nothing follows it. The
+            // index's own total counts every match, so `IndexHandle::view`
+            // callers cap the reported total the same way.
+            offset = offset.min(RECENT_LIMIT);
+            limit = limit.min(RECENT_LIMIT - offset);
+        }
         dimagine_index::ViewQuery {
             folder: self.folder.clone(),
             recursive: self.recursive,
@@ -424,11 +438,13 @@ impl ViewParams {
             tags: self.tags.clone(),
             text: self.q.clone(),
             untagged: self.untagged,
-            added_after_ns: self.recent.then(|| recent_cutoff_ns_at(now)),
-            sort: self.sort,
-            descending: self.direction == Direction::Desc,
-            offset: self.page.saturating_sub(1) * PAGE_SIZE,
-            limit: PAGE_SIZE,
+            added_after_ns: None,
+            sort,
+            descending,
+            // Saturating, so an absurd `p` reads as "far past the end" instead
+            // of overflowing on its way to the index.
+            offset: offset.min(u64::from(u32::MAX)) as u32,
+            limit: limit.min(u64::from(u32::MAX)) as u32,
         }
     }
 
@@ -780,14 +796,69 @@ mod tests {
         let recent = ViewParams::parse("recent=1").only_recent();
         assert!(recent.recent);
         assert_eq!(recent.to_query_string(), "recent=1");
-        let cutoff = recent.to_index_query().added_after_ns;
-        assert!(cutoff.is_some_and(|cutoff| cutoff > 0));
+        let query = recent.to_index_query();
+        assert_eq!(query.added_after_ns, None, "Recent counts images, not days");
+        assert_eq!(query.sort, SortKey::Added);
+        assert!(query.descending);
+        assert_eq!(query.offset, 0);
+        assert_eq!(query.limit, PAGE_SIZE);
 
         // `0` is the default, so it is left out of a generated URL.
         assert_eq!(
             ViewParams::parse("untagged=0&recent=0").to_query_string(),
             ""
         );
+    }
+
+    /// W34 audit #10: the lens is the [`RECENT_LIMIT`] most recently added
+    /// images, so its pages stay inside that window and past it there is
+    /// nothing left to page through.
+    #[test]
+    fn the_recent_lens_pages_inside_its_two_hundred() {
+        let first = ViewParams::parse("recent=1").to_index_query();
+        assert_eq!(first.offset, 0);
+        assert_eq!(first.limit, PAGE_SIZE);
+
+        let second = ViewParams::parse("recent=1&p=2").to_index_query();
+        assert_eq!(second.offset, PAGE_SIZE);
+        assert_eq!(
+            second.limit,
+            RECENT_LIMIT as u32 - PAGE_SIZE,
+            "page two carries the images up to the 200th, not past it"
+        );
+
+        let third = ViewParams::parse("recent=1&p=3").to_index_query();
+        assert_eq!(third.offset, RECENT_LIMIT as u32);
+        assert_eq!(third.limit, 0, "nothing follows the 200th image");
+
+        let absurd = ViewParams::parse("recent=1&p=999999").to_index_query();
+        assert_eq!(absurd.offset, RECENT_LIMIT as u32);
+        assert_eq!(absurd.limit, 0);
+    }
+
+    /// The order is part of the lens's definition: like a collection's embed
+    /// order, a sort picked beside Recent cannot decide which images the lens
+    /// holds, so it cannot decide their order either.
+    #[test]
+    fn the_recent_lens_keeps_the_added_order_a_sort_cannot_change_its_mind() {
+        let sorted = ViewParams::parse("recent=1&sort=name&dir=asc").to_index_query();
+        assert_eq!(sorted.sort, SortKey::Added);
+        assert!(sorted.descending);
+
+        // Without the lens, the sort belongs to the reader.
+        let plain = ViewParams::parse("sort=name&dir=asc").to_index_query();
+        assert_eq!(plain.sort, SortKey::Name);
+        assert!(!plain.descending);
+    }
+
+    /// An absurd page number is far past the end of any library, so it reads
+    /// as an empty page instead of overflowing the offset on its way to
+    /// SQLite.
+    #[test]
+    fn an_absurd_page_number_saturates_rather_than_overflows() {
+        let paged = ViewParams::parse("p=4294967295").to_index_query();
+        assert_eq!(paged.offset, u32::MAX);
+        assert_eq!(paged.limit, PAGE_SIZE);
     }
 
     #[test]

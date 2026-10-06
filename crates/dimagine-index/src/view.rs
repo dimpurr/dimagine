@@ -140,7 +140,8 @@ pub struct ViewQuery {
     /// lens; a tag filter cannot express it, because "no tags" is not a tag.
     pub untagged: bool,
     /// Only images added at or after this instant, in ns since the Unix
-    /// epoch. The viewer's "Recent" lens.
+    /// epoch. A general time-window filter; the viewer's Recent lens counts
+    /// images instead of days (RECENT_LIMIT in dimagine-serve).
     pub added_after_ns: Option<i64>,
     pub sort: SortKey,
     pub descending: bool,

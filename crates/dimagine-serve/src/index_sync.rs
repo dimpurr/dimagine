@@ -24,11 +24,16 @@ use std::{
     time::Duration,
 };
 
-/// How far back the sidebar's "Recent" view reaches.
-pub const RECENT_WINDOW_DAYS: u64 = 30;
+/// How many images the "Recent" lens reaches: the `RECENT_LIMIT` most
+/// recently added images, however old they are (W34 audit #10: a count, not
+/// a window — a 30-day window covered 95% of a library imported inside it).
+pub const RECENT_LIMIT: u64 = 200;
 
-const SECONDS_PER_DAY: u64 = 60 * 60 * 24;
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
+/// What the Recent lens calls itself, wherever it is named. The label states
+/// the definition, so it cannot drift from the number the lens keeps.
+pub fn recent_label() -> String {
+    format!("Recent — last {RECENT_LIMIT} added")
+}
 
 /// A folder row for `/api/sidebar`, with its recursive image count.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -74,7 +79,8 @@ pub struct SidebarData {
     pub total: u64,
     /// Images whose note carries no tag.
     pub untagged: u64,
-    /// Images added inside the recent window.
+    /// Images the Recent lens reaches: the most recently added
+    /// [`RECENT_LIMIT`], the whole library when it is smaller than that.
     pub recent: u64,
 }
 
@@ -250,13 +256,10 @@ impl IndexHandle {
                 ..ViewQuery::default()
             },
         )?;
-        let recent = count_matching(
-            index,
-            ViewQuery {
-                added_after_ns: Some(recent_cutoff_ns()),
-                ..ViewQuery::default()
-            },
-        )?;
+        // Recent is the `RECENT_LIMIT` most recently added images (W34 audit
+        // #10), so its size is the whole library capped at the limit — the
+        // same size the view itself reports, 200 or fewer.
+        let recent = total.min(RECENT_LIMIT);
 
         Ok(SidebarData {
             folders: folders
@@ -410,22 +413,6 @@ fn rebuild_index(root: &Path, db_path: &Path) -> Result<Index, IndexUnavailable>
         }
     }
     Index::open(root).map_err(|error| IndexUnavailable(error.to_string()))
-}
-
-/// The `added` cutoff of the recent window, in ns since the Unix epoch.
-pub fn recent_cutoff_ns() -> i64 {
-    recent_cutoff_ns_at(std::time::SystemTime::now())
-}
-
-/// The same cutoff, from an explicit instant so a test can place itself in
-/// time.
-pub fn recent_cutoff_ns_at(now: std::time::SystemTime) -> i64 {
-    let seconds = now
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let days = (seconds / SECONDS_PER_DAY).min(RECENT_WINDOW_DAYS);
-    (seconds - days * SECONDS_PER_DAY) as i64 * NANOS_PER_SECOND
 }
 
 /// How many images a view query matches, without reading the page itself.
@@ -600,17 +587,37 @@ mod tests {
         );
     }
 
+    /// W34 audit #10: Recent is "the last 200 added", not a 30-day window,
+    /// so on a library bigger than the limit the lens caps at the limit and
+    /// the label says the number the lens keeps.
     #[test]
-    fn the_recent_window_is_thirty_days_wide() {
-        let seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let cutoff = recent_cutoff_ns() / NANOS_PER_SECOND;
+    fn recent_is_capped_at_the_last_two_hundred_added() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("refs")).unwrap();
+        for index in 0..205 {
+            fs::write(root.join(format!("refs/img{index:03}.jpg")), JPEG).unwrap();
+        }
+        let handle = IndexHandle::open(root).unwrap();
+
+        let sidebar = handle.sidebar_data().unwrap();
+        assert_eq!(sidebar.total, 205);
         assert_eq!(
-            seconds - cutoff,
-            (RECENT_WINDOW_DAYS * SECONDS_PER_DAY) as i64
+            sidebar.recent, 200,
+            "Recent promises the last {RECENT_LIMIT} added, not the whole library"
         );
+        assert_eq!(recent_label(), "Recent — last 200 added");
+    }
+
+    /// A library smaller than the limit is all Recent: the lens reaches every
+    /// image, whatever its age.
+    #[test]
+    fn a_small_library_is_all_recent() {
+        let dir = test_library();
+        let handle = IndexHandle::open(dir.path()).unwrap();
+        let sidebar = handle.sidebar_data().unwrap();
+        assert_eq!(sidebar.recent, sidebar.total);
+        assert_eq!(sidebar.recent, 4);
     }
 
     #[tokio::test]

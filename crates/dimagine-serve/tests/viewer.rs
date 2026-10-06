@@ -91,6 +91,18 @@ fn flood_library() -> TempDir {
     dir
 }
 
+/// 205 images without notes: enough that a lens which stops at 200 has
+/// something to stop at (W34 audit #10).
+fn big_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("refs")).unwrap();
+    for index in 0..205 {
+        fs::write(root.join(format!("refs/rec-{index:03}.jpg")), PNG_BYTES).unwrap();
+    }
+    dir
+}
+
 async fn login(router: axum::Router) -> (axum::Router, String) {
     let response = router
         .clone()
@@ -602,14 +614,120 @@ async fn untagged_and_recent_are_lenses_with_counts() {
         "only the images whose note carries no tag, got {untagged:?}"
     );
 
-    // `added` is in the past, so Recent is empty on this fixture; what matters
-    // is that the lens filters rather than returning everything.
+    // W34 audit #10: Recent is a count, not a window — the 200 most recently
+    // added images, however old. On this four-image library that is every
+    // image, in the same newest-first order as All.
     let recent = json_paths(&app, "recent=1", &cookie).await;
-    assert!(recent.len() < 4, "recent narrows: {recent:?}");
+    assert_eq!(recent, json_paths(&app, "", &cookie).await);
 
     let sidebar = json(&app, "/api/sidebar", &cookie).await;
     assert_eq!(sidebar["total"], 4);
     assert_eq!(sidebar["untagged"], 2);
+    assert_eq!(sidebar["recent"], 4, "a small library is all recent");
+}
+
+/// W34 audit #10: "Recent" is the 200 most recently added images — not a
+/// 30-day window that quietly covered 95% of a library imported inside it.
+/// On 205 images the lens, the sidebar row, the page count and the paging all
+/// agree: 200, and not one image more. The URL stays `/?recent=1`.
+#[tokio::test]
+async fn recent_is_the_last_two_hundred_not_the_whole_library() {
+    let dir = big_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let sidebar = json(&app, "/api/sidebar", &cookie).await;
+    assert_eq!(sidebar["total"], 205);
+    assert_eq!(sidebar["recent"], 200);
+    assert!(
+        text(&app, "/", &cookie)
+            .await
+            .contains("Recent — last 200 added</span><span class=\"sidebar-row-count\">200"),
+        "the sidebar row states the definition beside the size"
+    );
+
+    let recent = json(&app, "/api/view?recent=1", &cookie).await;
+    assert_eq!(
+        recent["total"], 200,
+        "the view states the lens's own size, 200 or fewer"
+    );
+
+    // The lens is the first 200 images of the library's own newest-first
+    // order: page one carries 120, page two the last 80, and nothing follows
+    // the 200th.
+    let all_page_one = json_paths(&app, "", &cookie).await;
+    let all_page_two = json_paths(&app, "p=2", &cookie).await;
+    let mut expected = all_page_one.clone();
+    expected.extend_from_slice(&all_page_two[..80]);
+    let recent_page_one = json_paths(&app, "recent=1", &cookie).await;
+    let recent_page_two = json_paths(&app, "recent=1&p=2", &cookie).await;
+    assert_eq!(recent_page_one.len(), 120);
+    assert_eq!(recent_page_two.len(), 80, "page two stops at the 200th");
+    let listed: Vec<String> = recent_page_one.into_iter().chain(recent_page_two).collect();
+    assert_eq!(listed, expected, "the lens is the 200 newest by Added");
+
+    let page = json(&app, "/api/view?recent=1&p=3", &cookie).await;
+    assert_eq!(page["total"], 200, "an empty page still states the size");
+    assert!(page["items"].as_array().unwrap().is_empty());
+
+    // The page says all of it: the label states the definition, the count
+    // the size, and "Load more" ends on page two.
+    let html = text(&app, "/?recent=1", &cookie).await;
+    assert!(html.contains("<title>Recent — last 200 added · dimagine</title>"));
+    assert!(html.contains("<h1>Recent — last 200 added</h1>"));
+    assert!(html.contains("<span class=\"result-count\">200 items</span>"));
+    assert!(html.contains("class=\"load-more-btn\" data-next-page=\"2\""));
+    let html = text(&app, "/?recent=1&p=2", &cookie).await;
+    assert!(
+        !html.contains("load-more-btn"),
+        "the 200th image is the last one the lens offers"
+    );
+}
+
+/// W34 audit #12: a narrowed view says its own name, in the tab title and in
+/// a heading above the grid, instead of the generic "Search" that never said
+/// what was on screen.
+#[tokio::test]
+async fn a_narrowed_view_names_itself_in_the_title_and_the_heading() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let html = text(&app, "/?tag=nature", &cookie).await;
+    assert!(
+        html.contains("<title>Tag: nature · dimagine</title>"),
+        "{html}"
+    );
+    assert!(html.contains("<h1>Tag: nature</h1>"));
+
+    // Several tags: every one is named, in the order they narrow.
+    let html = text(&app, "/?tag=wide&tag=nature", &cookie).await;
+    assert!(html.contains("<title>Tag: wide, nature · dimagine</title>"));
+    assert!(html.contains("<h1>Tag: wide, nature</h1>"));
+
+    let html = text(&app, "/?in=refs", &cookie).await;
+    assert!(html.contains("<title>Folder: refs · dimagine</title>"));
+    assert!(html.contains("<h1>Folder: refs</h1>"));
+
+    // A collection is named by what its note calls it.
+    let html = text(&app, "/?c=browse.md", &cookie).await;
+    assert!(html.contains("<title>Collection: Browse · dimagine</title>"));
+    assert!(html.contains("<h1>Collection: Browse</h1>"));
+
+    let html = text(&app, "/?q=landscape", &cookie).await;
+    assert!(html.contains("<title>Search: landscape · dimagine</title>"));
+    assert!(html.contains("<h1>Search: landscape</h1>"));
+
+    // The lenses name themselves too…
+    let html = text(&app, "/?untagged=1", &cookie).await;
+    assert!(html.contains("<title>Untagged · dimagine</title>"));
+    assert!(html.contains("<h1>Untagged</h1>"));
+
+    // …and the whole library stays quietly "Library": it names itself.
+    let html = text(&app, "/", &cookie).await;
+    assert!(html.contains("<title>Library · dimagine</title>"));
+    assert!(
+        !html.contains("<h1"),
+        "the home needs no heading above its pictures: {html}"
+    );
 }
 
 #[tokio::test]
@@ -623,6 +741,12 @@ async fn the_sidebar_counts_match_the_index_counts() {
     assert_eq!(
         sidebar["total"],
         json(&app, "/api/view", &cookie).await["total"]
+    );
+    // Recent states its own size, never more (W34 audit #10).
+    assert_eq!(
+        sidebar["recent"],
+        json(&app, "/api/view?recent=1", &cookie).await["total"],
+        "the Recent row and the Recent view say the same size"
     );
 
     for folder in sidebar["folders"].as_array().unwrap() {

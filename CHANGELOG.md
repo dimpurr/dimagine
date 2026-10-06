@@ -19,8 +19,8 @@ All notable changes to this project are documented here. The format follows
 - Viewer: the index is opened at startup, built before traffic is accepted
   when it is missing or unusable, and refreshed every `--rescan-interval`
   seconds (default 300, `0` disables). Listings and counts come from the index.
-- Index view API: `untagged` and `added_after_ns` filters, for the sidebar's
-  Untagged and Recent lenses.
+- Index view API: `untagged` and `added_after_ns` filters (the Recent lens
+  no longer uses the latter; see below).
 - Accounts: the viewer has a single owner account (email + password, argon2id)
   that the first visitor creates on `/setup` — there is no setup code to copy,
   and while no account exists the server says so at startup and every 10
@@ -88,6 +88,18 @@ All notable changes to this project are documented here. The format follows
   documentation index.
 
 ### Changed
+- Viewer: "Recent" is the 200 most recently added images, however old they
+  are — labelled "Recent — last 200 added" — instead of a fixed 30-day
+  window that covered 95% of a library imported inside it. The sidebar row,
+  the view's own count and `/?recent=1` all state the lens's size: 200 or
+  fewer. The URL is unchanged, and the lens keeps its newest-first order:
+  like a collection's embed order, a sort picked beside Recent cannot
+  decide which images the lens holds.
+- Viewer: a narrowed view names itself, in the tab title and in a heading
+  above the grid — "Tag: x" (every tag named, in the order they narrow),
+  "Folder: path", "Collection: name" (the note's `title`, else the file), or
+  "Search: q" — instead of the generic "Search" that never said what was on
+  screen (W34 audit #12). The whole library stays quietly "Library".
 - Viewer: the collection list — the sidebar section, the `/collections` page
   and the `/api/sidebar` `collections` array — carries only the notes that
   mean to collect: `kind: collection`, or a non-image note that embeds at

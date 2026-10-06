@@ -6,7 +6,7 @@
 use dimagine_index::ViewItem;
 use percent_encoding::utf8_percent_encode;
 
-use crate::index_sync::SidebarData;
+use crate::index_sync::{recent_label, SidebarData};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
 use crate::view_query::{
@@ -333,8 +333,12 @@ pub fn empty_state(params: &ViewParams) -> String {
     } else if params.untagged {
         out.push_str("<h3>Every image has a tag</h3><p>Nothing is untagged right now.</p>");
     } else if params.recent {
+        // W34 audit #10: Recent is "the last 200 added", so an empty lens
+        // means an empty library or filters that match none of it — never a
+        // claim about days.
         out.push_str(
-            "<h3>Nothing added recently</h3><p>No image was added in the last 30 days.</p>",
+            "<h3>Nothing in Recent</h3><p>The library is empty, or the filters beside \
+             Recent match no image.</p>",
         );
     } else {
         out.push_str("<h3>The library is empty</h3><p>Add images and run a scan to see them.</p>");
@@ -404,7 +408,9 @@ pub fn sidebar_sections(
     out.push_str(&sidebar_row("/", "All", data.total, is_all(params)));
     out.push_str(&sidebar_row(
         "/?recent=1",
-        "Recent",
+        // The label states the definition — "the last 200 added" — so the
+        // row can no longer read as a smaller "All" (W34 audit #10).
+        &recent_label(),
         data.recent,
         params.recent,
     ));
@@ -664,7 +670,7 @@ mod tests {
         }
         assert!(html.contains("All</span><span class=\"sidebar-row-count\">612"));
         assert!(html.contains("Untagged</span><span class=\"sidebar-row-count\">9"));
-        assert!(html.contains("Recent</span><span class=\"sidebar-row-count\">40"));
+        assert!(html.contains("Recent — last 200 added</span><span class=\"sidebar-row-count\">40"));
         assert!(html.contains("browse</span><span class=\"sidebar-row-count\">16"));
         // The active lens is marked, and only that one.
         assert!(html.contains("class=\"sidebar-row active\" href=\"/?recent=1\""));
@@ -809,6 +815,15 @@ mod tests {
         let html = empty_state(&ViewParams::default());
         assert!(html.contains("The library is empty"));
         assert!(!html.contains("Clear all filters"));
+    }
+
+    /// W34 audit #10: the lens is a count, so an empty Recent never claims
+    /// anything about days.
+    #[test]
+    fn an_empty_recent_view_claims_no_window() {
+        let html = empty_state(&ViewParams::parse("recent=1"));
+        assert!(html.contains("Nothing in Recent"));
+        assert!(!html.contains("30 days"), "{html}");
     }
 
     #[test]
