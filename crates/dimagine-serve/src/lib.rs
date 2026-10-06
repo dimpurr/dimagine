@@ -50,7 +50,7 @@ use crate::pages::{
     folders::folders_page, image::image_json, image::image_page, library::library_page,
     library::sidebar_json, library::view_json, search::search_page,
 };
-use crate::ui::layout;
+use crate::ui::{layout, shell::Destination};
 
 const SESSION_SECONDS: u64 = 60 * 60 * 24 * 30;
 
@@ -281,15 +281,15 @@ pub(crate) fn index_failure(state: &AppState, as_json: bool) -> Response {
         )
             .into_response()
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, reason).into_response()
+        error_page(state, StatusCode::SERVICE_UNAVAILABLE, &reason)
     }
 }
 
 /// Why the index is unusable, in words a person can act on.
 fn index_reason(state: &AppState) -> String {
     match state.index.sidebar_data() {
-        Ok(_) => "the library index could not answer this query".to_owned(),
-        Err(error) => format!("the library index is unavailable: {error}"),
+        Ok(_) => "The library index could not answer this query.".to_owned(),
+        Err(error) => format!("The library index is unavailable: {error}."),
     }
 }
 
@@ -298,6 +298,65 @@ pub(crate) fn error_response(e: CatalogError) -> Response {
         CatalogError::NotFound => StatusCode::NOT_FOUND.into_response(),
         CatalogError::Forbidden => StatusCode::FORBIDDEN.into_response(),
         CatalogError::Unreadable => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// An error a browser renders as a page: the same frame, banner and
+/// navigation as every other page, with the status and one line a
+/// person can act on. Error pages are HTML pages like any other, so
+/// under `--auth none` they carry the banner too and can never be
+/// mistaken for a login-protected page.
+pub(crate) fn error_page(state: &AppState, status: StatusCode, message: &str) -> Response {
+    let title = error_page_title(status);
+    let body = format!(
+        "<div class=\"empty-state\"><h3>{}</h3><p>{}</p></div>",
+        crate::ui::escape_html(title),
+        crate::ui::escape_html(message)
+    );
+    let frame = Frame {
+        banner: state.banner(),
+        ..Frame::new(title, Destination::Library, body)
+    };
+    let mut response = (status, Html(frame.render())).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// The heading of an error page. The status code is in the response
+/// line already; this is the line a person reads on the page.
+fn error_page_title(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::NOT_FOUND => "Not found",
+        StatusCode::FORBIDDEN => "Not viewable",
+        StatusCode::INTERNAL_SERVER_ERROR => "Server error",
+        StatusCode::SERVICE_UNAVAILABLE => "Index unavailable",
+        _ => "Something went wrong",
+    }
+}
+
+/// A catalog error that answers a page request, as an error page: the
+/// statuses match [`error_response`] for the JSON routes, but a
+/// browser receives a page it can read, with the banner every page
+/// carries.
+pub(crate) fn catalog_error_page(state: &AppState, e: CatalogError) -> Response {
+    match e {
+        CatalogError::NotFound => error_page(
+            state,
+            StatusCode::NOT_FOUND,
+            "This image is not in this library.",
+        ),
+        CatalogError::Forbidden => error_page(
+            state,
+            StatusCode::FORBIDDEN,
+            "This address is outside this library and cannot be shown.",
+        ),
+        CatalogError::Unreadable => error_page(
+            state,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "This image could not be read.",
+        ),
     }
 }
 
@@ -550,19 +609,22 @@ enum Gate {
 
 /// Decide the gate for this request.
 ///
-/// A store that fails to load never opens setup: it is treated as
-/// "accounts exist", so the request goes to `/login` and is refused
-/// there instead of reaching the account-creation form.
-fn gate(state: &AppState) -> Gate {
+/// A *missing* accounts file is the one shape that means "no users"
+/// and an open setup. A store that cannot be read at request time is
+/// not that: it is an error, and the callers answer 500 with the
+/// store's own message. Startup refuses such a store outright, so the
+/// error branch fires only when it breaks while the server runs — and
+/// a read error must never read as "no owner: open setup".
+fn gate(state: &AppState) -> Result<Gate, accounts::AccountsError> {
     if state.config.auth == AuthMode::None {
-        return Gate::Open;
+        return Ok(Gate::Open);
     }
-    let has_users = state.accounts.has_users().unwrap_or(false);
-    if !has_users && state.config.passcode.is_none() {
+    let has_users = state.accounts.has_users()?;
+    Ok(if !has_users && state.config.passcode.is_none() {
         Gate::Setup
     } else {
         Gate::Login
-    }
+    })
 }
 
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
@@ -574,13 +636,24 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     if path.starts_with("/assets/") {
         return next.run(request).await;
     }
-    match gate(&state) {
+    let gate = match gate(&state) {
+        Ok(gate) => gate,
+        // The store was fine at startup and broke while running: fail
+        // the request with the store's error, instead of guessing —
+        // "no users" here would hand the first visitor an open setup.
+        Err(err) => return store_error(err),
+    };
+    match gate {
         Gate::Open => {
             // Nothing to sign in to: `/login` and `/logout` land on
             // the library, and owner creation is not offered here at
             // all.
             if path == "/setup" {
-                return (StatusCode::NOT_FOUND, "Not Found").into_response();
+                return error_page(
+                    &state,
+                    StatusCode::NOT_FOUND,
+                    "There is no setup page on this server.",
+                );
             }
             if path == "/login" || path == "/logout" {
                 return Redirect::to("/").into_response();
@@ -597,7 +670,11 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     }
 
     if path == "/setup" {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        return error_page(
+            &state,
+            StatusCode::NOT_FOUND,
+            "There is no setup page on this server.",
+        );
     }
 
     if path == "/login" || path == "/logout" {
@@ -670,8 +747,9 @@ fn setup_error(status: StatusCode, error: &str) -> Response {
     response
 }
 
-/// A setup response that is not an error page: 404s and redirects,
-/// both with `no-store` like every other credential-bearing response.
+/// A setup response that is not an error page: the redirects of the
+/// setup flow, with `no-store` like every other credential-bearing
+/// response. Error pages carry their own `no-store`.
 fn setup_response(mut response: Response) -> Response {
     response
         .headers_mut()
@@ -686,7 +764,11 @@ async fn setup_page(State(state): State<AppState>) -> Response {
         Err(err) => return store_error(err),
     };
     if has_users || state.config.passcode.is_some() {
-        return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
+        return error_page(
+            &state,
+            StatusCode::NOT_FOUND,
+            "There is no setup page on this server.",
+        );
     }
     let html = layout("Initial Setup", &setup_form_html(None));
     let mut response = Html(html).into_response();
@@ -722,7 +804,11 @@ async fn setup(
         Err(err) => return store_error(err),
     };
     if has_users || state.config.passcode.is_some() {
-        return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
+        return error_page(
+            &state,
+            StatusCode::NOT_FOUND,
+            "There is no setup page on this server.",
+        );
     }
 
     // Refuse everything that can be refused without waiting on the
@@ -813,17 +899,22 @@ async fn setup(
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
-    let gate = gate(&state);
+    let gate = match gate(&state) {
+        Ok(gate) => gate,
+        Err(err) => return store_error(err),
+    };
     match gate {
         // No login exists in this mode: send the visitor to the
         // library.
         Gate::Open => return Redirect::to("/").into_response(),
-        // Fail closed: an unreadable store shows the login form, never
-        // a redirect back to /setup.
+        // No owner and no passcode: the visitor creates the owner.
         Gate::Setup => return Redirect::to("/setup").into_response(),
         Gate::Login => {}
     }
-    let has_users = state.accounts.has_users().unwrap_or(false);
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
+    };
 
     let form_html = if has_users {
         "<form method=\"post\">\
@@ -863,13 +954,18 @@ async fn login(
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Fail closed, as in the auth middleware: an unreadable store is
-    // treated as "users exist", so the login attempt is refused instead
-    // of reopening setup.
-    let has_users = match gate(&state) {
-        Gate::Open => return Redirect::to("/").into_response(),
-        Gate::Setup => return Redirect::to("/setup").into_response(),
-        Gate::Login => state.accounts.has_users().unwrap_or(false),
+    // Fail closed, as in the auth middleware: a store that cannot be
+    // read fails the attempt with 500, because an unreadable store
+    // must never read as "no users" and reopen setup.
+    match gate(&state) {
+        Err(err) => return store_error(err),
+        Ok(Gate::Open) => return Redirect::to("/").into_response(),
+        Ok(Gate::Setup) => return Redirect::to("/setup").into_response(),
+        Ok(Gate::Login) => {}
+    }
+    let has_users = match state.accounts.has_users() {
+        Ok(has_users) => has_users,
+        Err(err) => return store_error(err),
     };
 
     let client_key =

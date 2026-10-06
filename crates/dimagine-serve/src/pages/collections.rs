@@ -16,7 +16,9 @@ use crate::index_sync::SidebarData;
 use crate::ui::components;
 use crate::ui::shell::{Destination, Frame};
 use crate::view_query::{normalise_decoded_path, query_value};
-use crate::{acquire_admission, admission_denied, index_failure, json_result, AppState};
+use crate::{
+    acquire_admission, admission_denied, error_page, index_failure, json_result, AppState,
+};
 
 /// `GET /collections` — title, member count and cover for each collection.
 pub(crate) async fn collections_page(State(state): State<AppState>) -> Response {
@@ -85,7 +87,11 @@ pub(crate) async fn collection_redirect(
 ) -> Response {
     match collection_target(&state, &path, query.as_deref()) {
         Some(target) => Redirect::permanent(&target).into_response(),
-        None => StatusCode::NOT_FOUND.into_response(),
+        None => error_page(
+            &state,
+            StatusCode::NOT_FOUND,
+            "This collection is not in this library.",
+        ),
     }
 }
 

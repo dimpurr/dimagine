@@ -584,6 +584,72 @@ async fn a_store_that_loses_its_users_key_while_running_fails_closed() {
     );
 }
 
+/// RW25d L-1: a store that becomes unreadable while the server runs is
+/// an error at request time — 500 with the store's own message — never
+/// "no users", which would hand the first visitor an open setup.
+#[tokio::test]
+async fn an_unreadable_store_at_request_time_is_a_500_never_an_open_setup() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, None);
+
+    // It starts as a first run: every page points at /setup.
+    let (status, headers, _) = send(&app, get("/", None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/setup");
+
+    // The store breaks under the live server: malformed, so reading it
+    // is an error — a *missing* file is the only "no users" there is.
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join("accounts.json"), r#"{"schema":1}"#).unwrap();
+
+    // Every gate answers 500 with the store's error: no redirect to
+    // /setup and no form of any kind, so nothing can be claimed.
+    let requests = [
+        get("/", None),
+        get("/login", None),
+        get("/setup", None),
+        get("/api/folder", None),
+        post("/login", "email=owner%40example.com&password=secret123"),
+    ];
+    for request in requests {
+        let (status, headers, body) = send(&app, request).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!headers.contains_key("location"));
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            text.contains("accounts.json"),
+            "the error must name the store: {text}"
+        );
+        assert!(!text.contains("Initial Setup"), "{text}");
+        assert!(!text.contains("<form"), "{text}");
+    }
+
+    // A setup POST writes nothing through the error, and the store is
+    // left exactly as it was.
+    let (status, _, _) = send(
+        &app,
+        post(
+            "/setup",
+            "email=sneaky%40example.com&password=secret123456&confirm_password=secret123456",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        std::fs::read_to_string(state.join("accounts.json")).unwrap(),
+        r#"{"schema":1}"#,
+        "a failed request must not rewrite the store"
+    );
+
+    // Removing the broken file is recovery, not lockout: a missing
+    // store is a first run again, and setup opens once more.
+    std::fs::remove_file(state.join("accounts.json")).unwrap();
+    let (status, headers, _) = send(&app, get("/", None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/setup");
+}
+
 #[test]
 fn unknown_top_level_fields_still_load_and_survive_a_write() {
     let root = tempfile::tempdir().unwrap();
@@ -815,6 +881,74 @@ async fn no_auth_mode_serves_every_page_without_a_login() {
     assert_eq!(headers["location"], "/");
 }
 
+/// RW25d L-2: error pages are HTML pages like every other, so under
+/// `--auth none` they carry the banner — an error page without it could
+/// pass for a login-protected one.
+#[tokio::test]
+async fn error_pages_carry_the_no_login_banner() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("girl.jpg"),
+        b"\xff\xd8\xff\xe0not-a-real-jpeg",
+    )
+    .unwrap();
+    // The note path is a directory: the image is there but its note
+    // cannot be read, which makes the image page a 500 on every
+    // platform, without needing file permissions.
+    std::fs::create_dir_all(root.path().join("girl.jpg.md")).unwrap();
+    let app = app_for(&root, Some("open-sesame"), AuthMode::None);
+
+    let checks = [
+        (
+            "/image/absent.jpg",
+            StatusCode::NOT_FOUND,
+            "This image is not in this library.",
+        ),
+        (
+            "/folder/nowhere",
+            StatusCode::NOT_FOUND,
+            "This folder is not in this library.",
+        ),
+        (
+            "/collection/absent.md",
+            StatusCode::NOT_FOUND,
+            "This collection is not in this library.",
+        ),
+        // No owner is created in this mode, so /setup is a 404 page.
+        (
+            "/setup",
+            StatusCode::NOT_FOUND,
+            "There is no setup page on this server.",
+        ),
+        // The unreadable note makes the image page a 500 page.
+        (
+            "/image/girl.jpg",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "This image could not be read.",
+        ),
+    ];
+    for (uri, expected, message) in checks {
+        let (status, headers, body) = send(&app, get(uri, None)).await;
+        assert_eq!(status, expected, "{uri}");
+        assert_eq!(headers["cache-control"], "no-store", "{uri}");
+        let html = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            html.starts_with("<!doctype html>"),
+            "{uri} must be an HTML page, not a bare status: {html}"
+        );
+        assert!(
+            html.contains(NO_LOGIN_BANNER),
+            "{uri} must carry the banner: {html}"
+        );
+        assert!(
+            html.contains("app-shell"),
+            "{uri} must carry the frame: {html}"
+        );
+        // The message says what went wrong; it never reads as "empty".
+        assert!(html.contains(message), "{uri} must say so: {html}");
+    }
+}
+
 #[tokio::test]
 async fn no_auth_mode_does_not_need_the_accounts_store() {
     let root = tempfile::tempdir().unwrap();
@@ -865,6 +999,24 @@ async fn the_account_mode_never_shows_the_no_login_banner() {
     let (status, headers, _) = send(&app, get("/", None)).await;
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(headers["location"], "/login");
+
+    // An error page is a page too: signed in, a missing image is a 404
+    // page, and it must not claim that no login is needed either.
+    let (status, headers, _) = send(
+        &app,
+        post("/login", "email=owner%40example.com&password=secret123"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let cookie = session_cookie(&headers);
+    let (status, _, body) = send(&app, get("/image/absent.png", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let html = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        html.starts_with("<!doctype html>"),
+        "the 404 must be an HTML page: {html}"
+    );
+    assert!(!html.contains(NO_LOGIN_BANNER), "{html}");
 }
 
 #[tokio::test]

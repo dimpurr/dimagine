@@ -123,6 +123,17 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: an accounts store that becomes unreadable while the server runs
+  fails every gated request with 500 and the store's own error message, and
+  the auth gate's comment says what the code does. Read errors were read as
+  "no users", which pointed every page back at `/setup` — the first visitor
+  could try to claim a server whose store had broken under it. A *missing*
+  accounts file is still the one shape that opens setup; startup still
+  refuses an unreadable one.
+- Viewer: error pages (404, 403, 500 and the index-unavailable 503) are
+  HTML pages with the frame and navigation, so under `--auth none` they
+  carry the no-login banner like every other page, instead of answering
+  with a bare status and an empty body.
 - Viewer: the setup form's weak-password hint reads "easy to guess: tick the
   box"; the space was missing.
 - Viewer: the `--auth none` banner is one full-width bar above the whole shell

@@ -16,7 +16,7 @@ use crate::catalog::ImageDetail;
 use crate::ui::shell::Frame;
 use crate::ui::{encode_path, escape_html, markdown_html};
 use crate::view_query::query_value;
-use crate::{error_response, AppState};
+use crate::{catalog_error_page, error_page, error_response, AppState};
 
 /// The destination of "Back to view".
 const DESTINATION: crate::ui::shell::Destination = crate::ui::shell::Destination::Library;
@@ -30,8 +30,17 @@ pub(crate) async fn image_page(
     let catalog = state.catalog.clone();
     let detail = match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
         Ok(Ok(detail)) => detail,
-        Ok(Err(error)) => return error_response(error),
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        // The image page is a page a browser renders, so its errors
+        // are error pages: the frame and the banner every page
+        // carries, and the status the JSON routes answer with.
+        Ok(Err(error)) => return catalog_error_page(&state, error),
+        Err(_) => {
+            return error_page(
+                &state,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The server failed while reading this image.",
+            )
+        }
     };
     let appears_in = state
         .index
