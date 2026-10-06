@@ -170,7 +170,34 @@ def selftest():
                       for character in yaml_scalar(value) if not yaml_printable(character)})
         if raw:
             failures.append(('yaml_scalar', value, 'no YAML-forbidden characters', raw))
+    for row in rows('added-btime.json'):
+        checked += 1
+        actual = added_from_btime(row['metadata'])
+        expected = row['utc']
+        if expected is None:
+            if actual is not None:
+                failures.append(('added_from_btime', row['note'], None, actual))
+            continue
+        if actual is None:
+            # The one row a timezone decides: rendered east of UTC the last
+            # representable instant is year 10000, which is not an ISO 8601
+            # year, so both importers omit it there. Every other instant in
+            # the fixture is inside the range in every timezone.
+            if expected.startswith('9999-'):
+                continue
+            failures.append(('added_from_btime', row['note'], expected, None))
+            continue
+        actual_utc = utc_of(actual)
+        if actual_utc != expected:
+            failures.append(('added_from_btime', row['note'], expected, actual_utc))
     return failures, checked
+
+def utc_of(text):
+    """The instant an `added:` value names, in UTC, so one fixture row can be
+    compared from any timezone: both importers format in the local offset."""
+    moment = datetime.datetime.fromisoformat(text).astimezone(datetime.timezone.utc)
+    return (f'{moment.year:04d}-{moment.month:02d}-{moment.day:02d}'
+            f'T{moment.hour:02d}:{moment.minute:02d}:{moment.second:02d}Z')
 
 def yaml_printable(character):
     """YAML printable characters (YAML 1.2 c-printable).
@@ -205,6 +232,37 @@ def yaml_scalar(value):
 def ulid():
     n = (int(time.time() * 1000) << 80) | random.getrandbits(80)
     return ''.join(B32[(n >> (5 * i)) & 31] for i in range(25, -1, -1))
+
+
+def added_from_btime(m):
+    """ISO 8601 with the local UTC offset from an Eagle btime (epoch ms).
+
+    The same formatting `imported` uses. None when btime is missing or
+    invalid, so the note simply omits `added` (FORMAT §3.1). A JSON number is
+    either an int or a float and Eagle writes floats, so an integral float is
+    accepted and a fractional one is not. A result outside year 0..=9999 is
+    rejected: ISO 8601 has four-digit years, so such a value could not be read
+    back. The range is decided on the UTC instant, the same decision in every
+    timezone, and the local rendering is checked too, because a zone off UTC
+    turns an instant inside the range into year 10000 or year 0 on the clock it
+    writes. Mirrors Rust `added_text`; both are checked against the shared rows
+    in crates/dimagine-eagle/tests/fixtures/added-btime.json.
+    """
+    btime = m.get('btime')
+    if isinstance(btime, bool) or not isinstance(btime, (int, float)):
+        return None
+    if isinstance(btime, float) and not btime.is_integer():
+        return None
+    try:
+        instant = datetime.datetime.fromtimestamp(btime / 1000.0, tz=datetime.timezone.utc)
+        if not 0 <= instant.year <= 9999:
+            return None
+        local = instant.astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
+    if not 0 <= local.year <= 9999:
+        return None
+    return local.isoformat(timespec='seconds')
 
 WINDOWS_RESERVED = {'CON', 'PRN', 'AUX', 'NUL'}
 # 1-9 plus the superscript spellings Windows accepts for COM1-COM3 and LPT1-LPT3.
@@ -325,7 +383,10 @@ for d in sorted(glob.glob(os.path.join(SRC, 'images', '*.info'))):
     if m.get('star'): fm.append(f'rating: {int(m["star"])}')
     if m.get('url'): fm.append(f'source: {q(m["url"])}')
     if m.get('width') and m.get('height'): fm += [f'width: {m["width"]}', f'height: {m["height"]}']
-    fm += [f'imported: {NOW}', 'sources:', '  - type: eagle', f'    library: {q(LIB)}',
+    fm += [f'imported: {NOW}']
+    added = added_from_btime(m)
+    if added: fm.append(f'added: {added}')
+    fm += ['sources:', '  - type: eagle', f'    library: {q(LIB)}',
            f'    item: {q(m.get("id") or item)}', f'    folders: {q(paths)}', f'    imported: {NOW}',
            '    importer: "eagle-import prototype 0.2"', f'    raw: {q(fname + ".eagle.json")}', '---', '']
     rel = os.path.relpath(os.path.join(home, fname), DST)

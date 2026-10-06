@@ -156,6 +156,28 @@ fn self_embed_does_not_make_an_image_note_a_collection() {
     assert!(listed.is_empty());
 }
 
+/// The rule is the shared one the index view queries use: an image note that
+/// says `kind: collection` is listed (FORMAT §5: the property exists so tools
+/// list it) but its own image is not one of its members (FORMAT §3.2).
+#[test]
+fn an_image_note_with_kind_is_listed_without_its_own_image() {
+    let root = library();
+    write_file(&root, "solo/kinded.png", PNG);
+    write_file(
+        &root,
+        "solo/kinded.png.md",
+        "---\nkind: collection\n---\n![[kinded.png]]\n",
+    );
+    let catalog = catalog(&root);
+    let collection = catalog.collection("solo/kinded.png.md").unwrap();
+    assert!(
+        collection.members.is_empty(),
+        "the self-embed is not a member"
+    );
+    let listed = catalog.list_collections("solo").unwrap();
+    assert!(listed.iter().any(|c| c.path == "solo/kinded.png.md"));
+}
+
 #[test]
 fn unicode_embed_resolves_and_round_trips() {
     let root = library();

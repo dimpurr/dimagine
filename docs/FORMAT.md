@@ -91,6 +91,7 @@ source: https://example.com/artwork/12345
 author: Example Artist
 license: unknown
 created: 2021-10-15
+added: 2023-07-12T20:54:07+01:00
 imported: 2026-10-04T14:30:12+01:00
 copied_from:
 sources:
@@ -117,11 +118,19 @@ Free Markdown about the image. Links to other notes work as usual: [[sleep-pv]].
 | `author` | string | Creator of the image, if known. |
 | `license` | string | License or `unknown`. |
 | `created` | date or datetime | When the image was made, if known. |
+| `added` | datetime with offset | When the image first entered the user's collection, possibly in another tool (e.g. Eagle's add time). Tools sort "newest added" by `added`, else `imported`. |
 | `imported` | datetime with offset | When it entered this library. |
 | `copied_from` | string (`id`) | Set on a copy that received a new `id`. |
 | `sources` | list of maps | One entry per import (§3.4). |
 
 Dates and times use ISO 8601. Datetimes must carry a UTC offset.
+
+`rating` is an integer 0–5. A value outside that range, or one that is not an
+integer, is read as no rating rather than as a number that would sort above
+five.
+
+A note may begin with a UTF-8 byte-order mark. Tools must read such a note and
+must keep the mark when they write one.
 
 Write strings that YAML could misread (`no`, `yes`, `on`, `off`, values
 starting with `@`, `*`, `&`, `!`, `%`, or containing `: `) in quotes.
@@ -279,3 +288,6 @@ cannot keep that promise will describe a migration.
 | --- | --- | --- |
 | 0.1 | 2026-10-04 | First draft. |
 | 0.1 | 2026-10-04 | Draft revision: image notes end with a self-embed (§3.2); file names avoid `[ ] # ^ \|` (§2.1). |
+| 0.1 | 2026-10-05 | Additive optional property `added` (§3.1): when the image first entered the collection, possibly in another tool. |
+| 0.1 | 2026-10-06 | A leading UTF-8 BOM in an image note is read and preserved (§3.1). |
+| 0.1 | 2026-10-06 | An out-of-range or non-integer `rating` reads as no rating (§3.1). |

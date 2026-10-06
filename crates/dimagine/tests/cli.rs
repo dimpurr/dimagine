@@ -237,6 +237,11 @@ fn collect(root: &Path) -> Vec<(PathBuf, u64)> {
         for entry in std::fs::read_dir(&dir).unwrap().flatten() {
             let path = entry.path();
             if path.is_dir() {
+                // `.dimagine/` is the tool's own derived cache (index,
+                // previews); scan is allowed to write there.
+                if path.file_name().is_some_and(|name| name == ".dimagine") {
+                    continue;
+                }
                 stack.push(path);
             } else {
                 let len = std::fs::metadata(&path).unwrap().len();

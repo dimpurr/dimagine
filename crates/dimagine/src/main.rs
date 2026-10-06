@@ -149,12 +149,30 @@ fn run_scan(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }
     };
     let report = scan::run_with_limit(&library, max_note_bytes);
+    // Refresh the index (HLD: "walk the library, refresh the index, print a
+    // summary"). A rebuild-required index is reported through the same message
+    // as any other failure. The summary is still printed and the exit code is
+    // still the summary's, but a stale index is never left unmentioned: the
+    // viewer would otherwise serve pre-truncation results with no hint.
+    if let Err(error) = refresh_index(&library) {
+        eprintln!("dimagine: index not refreshed: {error}");
+    }
     if json {
         print_scan_json(&report);
     } else {
         print_scan_human(&report);
     }
     ExitCode::from(report.exit_code().try_into().unwrap_or(1))
+}
+
+fn refresh_index(library: &Library) -> Result<(), dimagine_index::IndexError> {
+    let mut index = dimagine_index::Index::open(&library.root)?;
+    if index.rebuild_required() {
+        return Err(dimagine_index::IndexError::RebuildRequired(
+            "delete .dimagine/cache/index.sqlite and rescan".into(),
+        ));
+    }
+    dimagine_core::sync_index(library, &mut index)
 }
 
 fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {

@@ -1,3 +1,4 @@
+use chrono::Datelike;
 use dimagine_eagle::{import, ImportError, ImportOptions, SkipReasonCode};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde_json::json;
@@ -122,6 +123,132 @@ fn imports_folder_tree_skips_and_preserves_raw_bytes() {
     assert!(note.contains("rating: 4"));
     assert!(note.contains("width: 3\nheight: 2"));
     assert!(note.ends_with("![[Same.png]]\n"));
+}
+
+#[test]
+fn added_comes_from_btime_in_local_offset_and_omitted_when_absent() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("Btime.library");
+    let dst = temp.path().join("dest");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    let btime = 1_689_200_000_000i64;
+    item(
+        &src,
+        "with",
+        json!({"name":"With","ext":"png","btime":btime}),
+        Some(("With.png", b"a")),
+    );
+    item(
+        &src,
+        "without",
+        json!({"name":"Without","ext":"png"}),
+        Some(("Without.png", b"b")),
+    );
+    item(
+        &src,
+        "invalid",
+        json!({"name":"Invalid","ext":"png","btime":"not-a-number"}),
+        Some(("Invalid.png", b"c")),
+    );
+    let report = import(&src, &dst, ImportOptions::default()).unwrap();
+    assert_eq!(report.imported.len(), 3);
+    let expected = chrono::DateTime::from_timestamp_millis(btime)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%dT%H:%M:%S%:z")
+                .to_string()
+        })
+        .unwrap();
+    let with = fs::read_to_string(dst.join("inbox/With.png.md")).unwrap();
+    assert!(with.contains(&format!("added: {expected}")), "note: {with}");
+    assert!(with.contains("imported: "));
+    let without = fs::read_to_string(dst.join("inbox/Without.png.md")).unwrap();
+    assert!(!without.contains("added:"));
+    let invalid = fs::read_to_string(dst.join("inbox/Invalid.png.md")).unwrap();
+    assert!(!invalid.contains("added:"));
+}
+
+/// RW26 M-3: the same fixture rows the Python prototype's `--selftest` reads,
+/// imported for real. The rows whose expected `added` is `null` must produce a
+/// note with no `added` at all, and every value that is written must name the
+/// instant the row names, in a four-digit year. What the fixture cannot say is
+/// the one row a timezone decides: `253402300799000` is the last representable
+/// instant, and east of UTC it renders as year 10000, which is no ISO 8601
+/// year, so both importers omit it there. That per-offset answer is pinned by
+/// `added_matches_the_python_prototype_at_every_offset`; the local zone of the
+/// machine running this test never enters it.
+#[test]
+fn added_matches_the_python_prototype_on_the_shared_btime_fixture() {
+    let fixture_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/added-btime.json");
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&fixture_path).unwrap()).unwrap();
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("BtimeFixture.library");
+    let dst = temp.path().join("dest");
+    fs::create_dir_all(src.join("images")).unwrap();
+    fs::write(src.join("metadata.json"), br#"{"folders":[]}"#).unwrap();
+    for (index, row) in rows.iter().enumerate() {
+        let mut metadata = row["metadata"].clone();
+        metadata["name"] = json!(format!("btime{index}"));
+        metadata["ext"] = json!("png");
+        let file_name = format!("btime{index}.png");
+        item(
+            &src,
+            &format!("i{index}"),
+            metadata,
+            Some((file_name.as_str(), b"png-bytes")),
+        );
+    }
+    import(&src, &dst, ImportOptions::default()).unwrap();
+
+    let mut written = 0;
+    for (index, row) in rows.iter().enumerate() {
+        let note = fs::read_to_string(dst.join(format!("inbox/btime{index}.png.md"))).unwrap();
+        let value = note.lines().find_map(|line| line.strip_prefix("added: "));
+        let expected = row["utc"].as_str();
+        let what = || row["note"].as_str().unwrap_or("fixture row").to_owned();
+        match (expected, value) {
+            (None, None) => {}
+            (None, Some(value)) => {
+                panic!(
+                    "{}: the note carries added: {value}, which names no valid instant",
+                    what()
+                )
+            }
+            (Some(_), None) => assert!(
+                expected.unwrap().starts_with("9999-"),
+                "{}: added is missing for {}",
+                what(),
+                expected.unwrap()
+            ),
+            (Some(instant), Some(value)) => {
+                written += 1;
+                let parsed = chrono::DateTime::parse_from_rfc3339(value).unwrap_or_else(|error| {
+                    panic!("{}: added: {value} is not RFC 3339: {error}", what())
+                });
+                assert_eq!(
+                    parsed.year().to_string().len(),
+                    4,
+                    "{}: added: {value} is not a four-digit year",
+                    what()
+                );
+                assert_eq!(
+                    parsed
+                        .with_timezone(&chrono::Utc)
+                        .format("%Y-%m-%dT%H:%M:%SZ")
+                        .to_string(),
+                    instant,
+                    "{}",
+                    what()
+                );
+            }
+        }
+    }
+    // Rows the epoch names are inside the range in every timezone, so a run
+    // that wrote nothing at all cannot pass.
+    assert!(written > 0, "no fixture row produced an added value");
 }
 
 #[test]

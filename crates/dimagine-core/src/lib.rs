@@ -20,6 +20,7 @@
 
 pub mod check;
 pub mod format;
+pub mod index;
 pub mod library;
 pub mod links;
 pub mod note;
@@ -27,5 +28,6 @@ pub mod scan;
 pub mod sniff;
 
 pub use check::{CheckReport, Finding, Severity};
+pub use index::sync_index;
 pub use library::{FileClass, FileEntry, Library, NotAFolder};
 pub use scan::ScanReport;

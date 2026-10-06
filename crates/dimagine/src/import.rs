@@ -5,8 +5,10 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Arg, ArgMatches, Command};
-use dimagine_eagle::{import, ImportError, ImportOptions, ImportReport, SkipReasonCode};
+use clap::{Arg, ArgAction, ArgMatches, Command};
+use dimagine_eagle::{
+    backfill_added, import, ImportError, ImportOptions, ImportReport, SkipReasonCode,
+};
 
 use crate::emit_failure;
 
@@ -25,7 +27,10 @@ pub fn command() -> Command {
                         .value_name("NAME.LIBRARY")
                         .required(true)
                         .value_parser(clap::value_parser!(PathBuf))
-                        .help("The Eagle .library folder to import (its files never change)."),
+                        .help(
+                            "The Eagle .library folder to import (its files never change), \
+                             or the dimagine library to backfill with --backfill-added.",
+                        ),
                 )
                 .arg(
                     Arg::new("name")
@@ -36,6 +41,21 @@ pub fn command() -> Command {
                             "Display label for the imported library \
                              (default: the source folder name without .library).",
                         ),
+                )
+                .arg(
+                    Arg::new("backfill_added")
+                        .long("backfill-added")
+                        .action(ArgAction::SetTrue)
+                        .help(
+                            "Backfill the added property from sibling .eagle.json raw files \
+                             into this library's notes instead of importing.",
+                        ),
+                )
+                .arg(
+                    Arg::new("apply")
+                        .long("apply")
+                        .action(ArgAction::SetTrue)
+                        .help("Write the backfilled notes (default: dry run, report only)."),
                 ),
         )
 }
@@ -50,6 +70,9 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .get_one::<PathBuf>("source")
         .expect("source is required")
         .clone();
+    if sub.get_flag("backfill_added") {
+        return run_backfill_added(&source, sub);
+    }
     let options = ImportOptions {
         name: sub.get_one::<String>("name").cloned(),
     };
@@ -89,6 +112,42 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
                 emit_failure(false, &message);
             }
             ExitCode::from(1)
+        }
+        Err(error) => {
+            emit_failure(json, &error.to_string());
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_backfill_added(library: &Path, sub: &ArgMatches) -> ExitCode {
+    let json = sub.get_flag("json");
+    let apply = sub.get_flag("apply");
+    match backfill_added(library, apply) {
+        Ok(report) => {
+            if json {
+                let document = serde_json::json!({
+                    "schema": SCHEMA,
+                    "library": library.display().to_string(),
+                    "apply": apply,
+                    "backfill": report,
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&document).unwrap_or_default()
+                );
+            } else {
+                let mode = if apply { "applied" } else { "dry run" };
+                println!("library: {}", library.display());
+                println!("mode: {mode}");
+                println!("scanned: {}", report.scanned);
+                println!("updated: {}", report.updated);
+                println!("already had added: {}", report.already_had);
+                println!("no btime: {}", report.no_btime);
+                println!("no front matter: {}", report.no_front_matter);
+                println!("unreadable: {}", report.unreadable);
+            }
+            ExitCode::from(0)
         }
         Err(error) => {
             emit_failure(json, &error.to_string());

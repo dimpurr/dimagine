@@ -184,6 +184,16 @@ fn split_front_matter(text: &str) -> FmSplit<'_> {
     }
 }
 
+/// The raw YAML text between the `---` fences, or `None` when the note has no
+/// front matter (or an unterminated block). Used by the index sync, which
+/// stores the front matter as JSON for the view queries.
+pub fn front_matter_text(text: &str) -> Option<&str> {
+    match split_front_matter(text) {
+        FmSplit::FrontMatter { yaml, .. } => Some(yaml),
+        _ => None,
+    }
+}
+
 /// The ULID rules from FORMAT §3.3: 26 characters of Crockford base32.
 /// Lowercase spellings are accepted on read; canonical form is uppercase.
 pub const ULID_LEN: usize = 26;

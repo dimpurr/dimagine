@@ -399,9 +399,11 @@ dependencies = [
 name = "dimagine"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "dimagine-core",
  "dimagine-eagle",
+ "dimagine-index",
  "dimagine-preview",
  "dimagine-serve",
  "rpassword",
@@ -414,11 +416,14 @@ dependencies = [
 name = "dimagine-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "dimagine-index",
  "libc",
  "percent-encoding",
  "saphyr",
  "serde",
  "serde_json",
+ "tempfile",
  "unicode-normalization",
 ]
 
@@ -427,6 +432,7 @@ name = "dimagine-eagle"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "dimagine-core",
  "saphyr",
  "serde",
  "serde_json",
@@ -441,6 +447,7 @@ name = "dimagine-index"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "tempfile",
  "unicode-casefold",
  "unicode-normalization",
@@ -474,6 +481,7 @@ dependencies = [
  "axum",
  "chrono",
  "dimagine-core",
+ "dimagine-index",
  "dimagine-preview",
  "httpdate",
  "mime_guess",

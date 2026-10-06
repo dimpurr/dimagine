@@ -3,7 +3,9 @@
 //! The source library is never modified. Imported images retain their original
 //! bytes and raw Eagle metadata; generated notes follow the dimagine format.
 
-use chrono::{DateTime, Local};
+mod backfill;
+
+use chrono::{DateTime, Datelike, FixedOffset, Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,6 +17,8 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
 use unicode_normalization::UnicodeNormalization;
+
+pub use backfill::{backfill_added, BackfillReport};
 
 /// Options controlling the import.
 #[derive(Clone, Debug, Default)]
@@ -707,7 +711,7 @@ fn copy_item_transactionally(source: &Path, image: &Path, raw: &[u8]) -> Result<
     Ok(())
 }
 
-fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().expect("output file has parent");
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -715,8 +719,15 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .as_nanos();
     let temporary = parent.join(format!(".dimagine-tmp-{nonce}.note"));
     let result = (|| {
-        fs::write(&temporary, bytes)?;
-        fs::rename(&temporary, path)
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        // Durable before the rename: a crash after the rename must not leave
+        // the note empty or half-written.
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        // The rename itself has to reach the disk, or a crash can undo it.
+        sync_directory(parent)
     })();
     let clean = match fs::remove_file(&temporary) {
         Ok(()) => Ok(()),
@@ -737,6 +748,24 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
             }
             Err(err)
         }
+    }
+}
+
+/// Flush a directory entry so a rename survives a crash. Not every platform
+/// lets a directory be opened for this (Windows refuses), and there the rename
+/// is still atomic; only an unexpected failure is reported.
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    match fs::File::open(directory) {
+        Ok(handle) => handle.sync_all(),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -1251,6 +1280,59 @@ fn yaml_string(value: &str) -> String {
     yaml_quote(&Value::String(value.to_owned()))
 }
 
+/// Render an Eagle `btime` (epoch milliseconds) as ISO 8601 with the local
+/// UTC offset, the same formatting `imported` uses. `None` when `btime` is
+/// missing or invalid, so the note simply omits `added` (FORMAT §3.1).
+pub(crate) fn btime_text(metadata: &Value) -> Option<String> {
+    let instant = DateTime::from_timestamp_millis(btime_millis(metadata)?)?;
+    let offset = *instant.with_timezone(&Local).offset();
+    added_text(instant, offset)
+}
+
+/// The same value as [`btime_text`], rendered at a chosen UTC offset. Only the
+/// tests need a fixed offset: the local zone is resolved once per process, so
+/// a test cannot walk a matrix of zones inside one process.
+#[cfg(test)]
+pub(crate) fn btime_text_at(metadata: &Value, offset_seconds: i32) -> Option<String> {
+    let instant = DateTime::from_timestamp_millis(btime_millis(metadata)?)?;
+    added_text(instant, FixedOffset::east_opt(offset_seconds)?)
+}
+
+/// The `added:` value for an instant rendered at `offset`.
+///
+/// ISO 8601 has four-digit years, so a year outside 0..=9999 is not a value any
+/// reader accepts: year 10000 formats, but as an unreadable five-digit year, so
+/// the note would carry an `added` nothing can parse back. The range is decided
+/// on the UTC instant, which is the same decision in every timezone, and the
+/// rendering is checked as well, because a zone off UTC turns an instant inside
+/// the range into year 10000 or year 0 on the clock it writes.
+fn added_text(instant: DateTime<Utc>, offset: FixedOffset) -> Option<String> {
+    if !(0..=9999).contains(&instant.year()) {
+        return None;
+    }
+    let local = instant.with_timezone(&offset);
+    if !(0..=9999).contains(&local.year()) {
+        return None;
+    }
+    Some(local.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
+}
+
+/// Eagle's `btime` in epoch milliseconds. A JSON number is either an integer
+/// or a float, and Eagle writes floats (`1689200000000.0`), so an integral
+/// float is a valid btime. A fractional or non-numeric value is not.
+fn btime_millis(metadata: &Value) -> Option<i64> {
+    let value = metadata.get("btime")?;
+    if let Some(millis) = value.as_i64() {
+        return Some(millis);
+    }
+    let millis = value.as_f64()?;
+    if millis.is_finite() && millis.fract() == 0.0 && millis.abs() <= i64::MAX as f64 {
+        Some(millis as i64)
+    } else {
+        None
+    }
+}
+
 fn make_note(
     metadata: &Value,
     library: &str,
@@ -1294,8 +1376,11 @@ fn make_note(
         lines.push(format!("width: {}", width));
         lines.push(format!("height: {}", height));
     }
+    lines.push(format!("imported: {now}"));
+    if let Some(added) = btime_text(metadata) {
+        lines.push(format!("added: {added}"));
+    }
     lines.extend([
-        format!("imported: {now}"),
         "sources:".to_owned(),
         "  - type: eagle".to_owned(),
         format!("    library: {}", yaml_string(library)),
@@ -1495,11 +1580,43 @@ fn write_obsidian_gallery(root: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_item_transactionally, is_generic, is_windows_reserved, CopyItemError};
+    use super::{
+        btime_text_at, copy_item_transactionally, is_generic, is_windows_reserved,
+        write_atomically, CopyItemError,
+    };
+    use chrono::{DateTime, Utc};
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
     use tempfile::TempDir;
+
+    /// RW26 L-8: the write is now fsynced before the rename, so the exact bytes
+    /// still land and no temporary file is left behind.
+    #[test]
+    fn atomic_note_write_publishes_the_exact_bytes_and_no_temporary() {
+        let temp = TempDir::new().unwrap();
+        let note = temp.path().join("girl-underwater.jpg.md");
+        let bytes = b"---\ntitle: Girl\n---\n\nBody.\n\n![[girl-underwater.jpg]]\n";
+        write_atomically(&note, bytes).unwrap();
+        assert_eq!(fs::read(&note).unwrap(), bytes);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+
+        // Overwriting an existing note replaces it whole.
+        write_atomically(&note, b"second\n").unwrap();
+        assert_eq!(fs::read(&note).unwrap(), b"second\n");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    /// A failed write reports the error and leaves nothing behind, so a
+    /// library never collects `.dimagine-tmp-` litter from a failed import.
+    #[test]
+    fn atomic_note_write_reports_failure_without_litter() {
+        let temp = TempDir::new().unwrap();
+        let missing = temp.path().join("absent/note.md");
+        assert!(write_atomically(&missing, b"content").is_err());
+        assert!(!missing.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
 
     fn shared_rows(fixture: &str) -> Vec<(String, bool)> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1534,6 +1651,81 @@ mod tests {
         for (name, expected) in shared_rows("reserved-names.json") {
             assert_eq!(is_windows_reserved(&name), expected, "name: {name:?}");
         }
+    }
+
+    /// The offsets the two importers have to agree on, with the zones whose
+    /// local time they are: UTC, both offsets `America/New_York` uses,
+    /// `Asia/Kolkata`'s half hour, `America/Santiago` and the two offsets
+    /// `Pacific/Chatham` uses, plus the last zone west of UTC.
+    const OFFSET_MATRIX: [(&str, i32); 7] = [
+        ("UTC", 0),
+        ("America/New_York in winter", -5 * 3600),
+        ("America/New_York in summer", -4 * 3600),
+        ("America/Santiago in summer", -4 * 3600),
+        ("Pacific/Midway", -11 * 3600),
+        ("Asia/Kolkata", 5 * 3600 + 1800),
+        ("Pacific/Chatham in summer", 13 * 3600 + 2700),
+    ];
+
+    /// The instant a written `added:` names, in UTC, so one fixture row is
+    /// compared the same way from every offset. Mirrors Python `utc_of`.
+    fn utc_of(text: &str) -> String {
+        let moment = DateTime::parse_from_rfc3339(text)
+            .expect("a written value is RFC 3339")
+            .with_timezone(&Utc);
+        moment.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    /// RW26 M-3: the same fixture rows the Python prototype's `--selftest`
+    /// reads, rendered at every offset in the matrix instead of at whatever
+    /// zone the machine happens to be in, so the check cannot depend on the
+    /// timezone it runs under.
+    #[test]
+    fn added_matches_the_python_prototype_at_every_offset() {
+        let rows: Value = serde_json::from_slice(
+            &fs::read(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/added-btime.json"),
+            )
+            .unwrap(),
+        )
+        .expect("fixture is JSON");
+        for row in rows.as_array().expect("fixture is an array") {
+            let note = row["note"].as_str().unwrap_or("fixture row");
+            let expected = row["utc"].as_str();
+            for (zone, offset) in OFFSET_MATRIX {
+                let written = btime_text_at(&row["metadata"], offset).map(|text| utc_of(&text));
+                // The last representable instant is the one row an offset can
+                // change the answer for: rendered east of UTC it is year 10000,
+                // which is not ISO 8601, so both importers omit it there.
+                let expected_here = match (expected, offset) {
+                    (Some(instant), offset) if offset > 0 && instant.starts_with("9999-") => None,
+                    (expected, _) => expected,
+                };
+                assert_eq!(written.as_deref(), expected_here, "{note} at {zone}");
+            }
+        }
+    }
+
+    /// The row the boundary rule exists for: `10000-01-01T00:00:00Z` is outside
+    /// the four-digit years in every timezone, and a zone west of UTC used to
+    /// write the local year 9999 of an instant no reader can name.
+    #[test]
+    fn the_year_10000_btime_is_omitted_at_every_offset() {
+        let metadata: Value = serde_json::from_str(r#"{"btime":253402300800000}"#).unwrap();
+        for (zone, offset) in OFFSET_MATRIX {
+            assert_eq!(
+                btime_text_at(&metadata, offset),
+                None,
+                "year 10000 at {zone}"
+            );
+        }
+        // The instant just inside the range is still written where it fits.
+        let last: Value = serde_json::from_str(r#"{"btime":253402300799000}"#).unwrap();
+        assert_eq!(
+            btime_text_at(&last, 0).as_deref(),
+            Some("9999-12-31T23:59:59+00:00")
+        );
+        assert_eq!(btime_text_at(&last, 5 * 3600 + 1800), None);
     }
 
     #[test]

@@ -28,6 +28,17 @@ All notable changes to this project are documented here. The format follows
   every page with "No login: anyone who can reach this address can see this
   library", warns once when the bind address is not loopback — and starts
   anyway — and needs no account store at all.
+- Note property `added` (FORMAT §3.1): when the image first entered
+  the collection, possibly in another tool (e.g. Eagle's add time);
+  "newest added" sorts by `added`, else `imported`.
+- Eagle import: `added` written from the item's `btime` (ISO 8601,
+  local UTC offset); `dimagine import eagle --backfill-added` inserts
+  it into already-imported notes (dry run by default, `--apply`
+  atomic and byte-preserving, idempotent).
+- Index view API: read-only `view` (folder, recursive, collection,
+  tags, text, sort, paging), `folder_counts`, `tag_counts`,
+  `collections` and `appears_in`; `dimagine scan` populates the new
+  `first_seen_ns` and `added_ns` columns (schema v3).
 - Viewer hardening: login attempts are throttled before comparison, bounded
   in flight and charged against per-client and global budgets; expensive
   requests are admission-bounded (503 + Retry-After); ETags come from the
@@ -69,3 +80,51 @@ All notable changes to this project are documented here. The format follows
 ### Removed
 - The 2019 prototype (an Express/Pug Pinterest for illustrators). Its code is
   kept at tag `v0-2019`.
+
+### Changed
+- Index view queries answer from SQLite: folder, tags, text, sort and paging
+  are pushed into SQL over derived columns (`folder`, `name_key`, `rating`,
+  `added_ns`) and a normalised `note_tags` table, and the counts are grouped
+  in SQL (schema v6). On a 20 000-image synthetic library a folder view is
+  ~16x faster, a short-text view ~14x, `collections()` ~2x, and no query reads
+  and parses every note any more.
+
+### Fixed
+- Eagle import: note writes are fsynced before the rename and the directory is
+  fsynced after it, so an imported or backfilled note survives a crash.
+- Index: a `rating` outside 0-5, or one that is not an integer, reads as no
+  rating instead of sorting above five (FORMAT §3.1).
+- Index: `tag_counts` no longer counts a note whose image is gone, so the
+  sidebar count matches the list.
+- CLI: `dimagine scan` always says when the index could not be refreshed,
+  including when the library read was incomplete, instead of leaving a stale
+  index unmentioned.
+- Index: the module documentation says where the `first_seen` fallback is
+  applied (in SQL, by the index) and the unused `Index::first_seen` accessor is
+  gone, instead of claiming the scan reads the column back.
+- Index: removing the `added` (or `imported`) property from a note clears the
+  derived added position again instead of keeping the old value until the index
+  is rebuilt (schema v5).
+- Eagle import: `--backfill-added` reports `unreadable` for a note or raw file
+  it could not read, separately from `no btime`.
+- Eagle import: `--backfill-added` reports `no front matter` for a note it
+  cannot insert into, instead of counting it as "already had added" and
+  claiming the library is up to date.
+- Index and viewer: a collection is a note that embeds images or carries
+  `kind: collection`, decided by one shared rule that `dimagine serve` also
+  uses; an image note's self-embed is no longer counted as a membership.
+- Eagle import: an integral float `btime` (which Eagle writes) becomes `added`
+  again, and a `btime` whose year falls outside 0-9999 is omitted instead of
+  writing an unreadable five-digit year. The year is decided on the UTC
+  instant, so `10000-01-01T00:00:00Z` is left out in every timezone, and both
+  importers are now checked at fixed UTC offsets rather than at whatever
+  timezone the machine running the tests is in.
+- Eagle import: `--backfill-added` keeps a note's leading UTF-8 BOM (FORMAT
+  §3.1), which it used to delete while claiming byte preservation.
+- Index: an `added` property that does not parse falls through to `imported`
+  instead of ending the "newest added" chain.
+- Index: a move keeps the image's `first_seen_ns` in the real `dimagine scan`
+  path, paired only when the match between the vanished and the appeared rows is
+  unambiguous 1:1 (by note `id`, else by size and mtime) and the appeared image
+  is one this scan brought in, so a duplicate copy in the same scan as a move is
+  dated as the new file it is.

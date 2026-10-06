@@ -18,6 +18,7 @@ use axum::{
 };
 use dimagine_core::library::{FileClass, FileEntry, Library};
 use dimagine_core::links::{extract_markdown_links, Outcome, Resolver};
+use dimagine_index::{note_is_collection, CollectionEvidence};
 use percent_encoding::percent_decode_str;
 use pulldown_cmark::{html, Event, Options, Parser};
 use saphyr::{LoadableYamlNode, Yaml};
@@ -2046,14 +2047,19 @@ fn yaml_string(value: &serde_json::Value, key: &str) -> Option<String> {
 /// an embed is reported as ambiguous or missing, or when it carries
 /// `kind: collection`, which exists so tools list it (FORMAT §5). An image
 /// note's self-embed never counts (FORMAT §3.2).
+///
+/// This is the rule the index view queries use too, so a viewer and the
+/// renderer never disagree about what a collection is.
 fn is_collection(
     parsed: &ParsedNote,
     members: &[CollectionMember],
     diagnostics: &[CollectionDiagnostic],
 ) -> bool {
-    !members.is_empty()
-        || !diagnostics.is_empty()
-        || yaml_string(&parsed.properties, "kind").as_deref() == Some("collection")
+    note_is_collection(&CollectionEvidence {
+        kind: yaml_string(&parsed.properties, "kind").as_deref(),
+        members: members.len(),
+        unresolved: diagnostics.len(),
+    })
 }
 
 /// Extract the image members of one note with the shared core parser and

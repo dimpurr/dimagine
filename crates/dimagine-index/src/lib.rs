@@ -3,6 +3,8 @@
 //! Library files remain the source of truth. This crate stores derived metadata
 //! under `.dimagine/cache/index.sqlite` and never modifies library content.
 
+mod view;
+
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::fmt;
@@ -11,8 +13,81 @@ use std::sync::{Mutex, OnceLock};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
-const SCHEMA_VERSION: i64 = 2;
+pub use view::{
+    note_is_collection, note_rating, CollectionEvidence, CollectionInfo, SortKey, ViewItem,
+    ViewPage, ViewQuery,
+};
+
+const SCHEMA_VERSION: i64 = 6;
 static OPEN_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+/// The move pairings [`Index::finish_scan`] tries, strongest key first. Each
+/// statement inserts `(new_path, old_path, first_seen_ns)` for an image that
+/// appeared this scan and took over the `first_seen_ns` of a vanished image.
+///
+/// A key only pairs when it names exactly one vanished image and exactly one
+/// appeared image. A key that two rows on either side share pairs nothing, so a
+/// copy made in the same scan as a move is dated like the new file it is. An
+/// image the index already held before this scan never appears on the right of
+/// a pair, and a row a stronger key already paired is out of reach of the keys
+/// that run after it.
+const MOVE_PAIR_SQL: [&str; 2] = [
+    // The paired note kept its id, so the image moved with it (FORMAT §3.3).
+    // The id is unique per note, so one vanished and one appeared note share an
+    // id exactly when that image moved; a copy of a note duplicates its id and
+    // leaves both sides ambiguous, which pairs nothing at all.
+    "WITH vanished AS ( \
+       SELECT n.id AS id, n.image_path AS old_path, old.first_seen_ns AS first_seen_ns \
+       FROM notes n \
+       JOIN moved_from m ON m.kind='note' AND m.path=n.path \
+       JOIN moved_from g ON g.kind='image' AND g.path=n.image_path \
+       JOIN files old ON old.kind='image' AND old.path=n.image_path \
+       WHERE n.id IS NOT NULL AND n.id<>'' \
+     ), \
+     appeared AS ( \
+       SELECT n.id AS id, n.image_path AS new_path \
+       FROM notes n \
+       JOIN files f ON f.kind='image' AND f.path=n.image_path \
+       WHERE n.id IS NOT NULL AND n.id<>'' \
+         AND n.path IN (SELECT path FROM scan_seen) \
+         AND f.path IN (SELECT path FROM temp.appeared_images) \
+     ), \
+     pairs AS ( \
+       SELECT sole_vanished.old_path AS old_path, \
+              sole_vanished.first_seen_ns AS first_seen_ns, \
+              sole_appeared.new_path AS new_path \
+       FROM (SELECT id, old_path, first_seen_ns FROM vanished GROUP BY id HAVING COUNT(*)=1) sole_vanished \
+       JOIN (SELECT id, new_path FROM appeared GROUP BY id HAVING COUNT(*)=1) sole_appeared \
+         ON sole_appeared.id=sole_vanished.id \
+     ) \
+     INSERT OR IGNORE INTO temp.move_pair(new_path,old_path,first_seen_ns) \
+     SELECT new_path, old_path, first_seen_ns FROM pairs \
+     WHERE new_path NOT IN (SELECT new_path FROM pairs GROUP BY new_path HAVING COUNT(*)>1) \
+       AND old_path NOT IN (SELECT old_path FROM pairs GROUP BY old_path HAVING COUNT(*)>1)",
+    // The same size and nanosecond mtime: moving a file keeps both, so this is
+    // the key for what the id above did not pair — an image without a note, a
+    // note without an id, and an id a copy made ambiguous. `HAVING COUNT(*)=1`
+    // leaves one row per size and mtime on either side, which makes the join
+    // below a pairing and not a cross product.
+    "WITH sole_vanished AS ( \
+       SELECT old.size AS size, old.mtime_ns AS mtime_ns, old.path AS old_path, \
+              old.first_seen_ns AS first_seen_ns \
+       FROM moved_from m JOIN files old ON old.path=m.path \
+       WHERE m.kind='image' AND old.path NOT IN (SELECT old_path FROM temp.move_pair) \
+       GROUP BY old.size, old.mtime_ns HAVING COUNT(*)=1 \
+     ), \
+     sole_appeared AS ( \
+       SELECT f.size AS size, f.mtime_ns AS mtime_ns, f.path AS new_path \
+       FROM files f \
+       WHERE f.path IN (SELECT path FROM temp.appeared_images) \
+         AND f.path NOT IN (SELECT new_path FROM temp.move_pair) \
+       GROUP BY f.size, f.mtime_ns HAVING COUNT(*)=1 \
+     ) \
+     INSERT OR IGNORE INTO temp.move_pair(new_path,old_path,first_seen_ns) \
+     SELECT sole_appeared.new_path, sole_vanished.old_path, sole_vanished.first_seen_ns \
+     FROM sole_vanished JOIN sole_appeared \
+     ON sole_appeared.size=sole_vanished.size AND sole_appeared.mtime_ns=sole_vanished.mtime_ns",
+];
 
 /// File classification recorded by a scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -44,6 +119,16 @@ pub struct FileRecord {
     pub mtime_ns: i64,
     pub sha256: Option<String>,
     pub kind: FileKind,
+    /// The image note's own "added" time in ns since the Unix epoch: the note
+    /// property `added`, else its `imported`. `None` means the note has no
+    /// datetime, which is not "keep the stored value": the index then derives
+    /// `added_ns` from `first_seen_ns` again, so removing the property clears
+    /// it.
+    pub note_added_ns: Option<i64>,
+    /// The image note's `rating`, or `None` when it has none or an invalid one
+    /// (FORMAT §3.1). Stored on the image row so sorting and filtering never
+    /// have to read the note's properties.
+    pub rating: Option<u8>,
 }
 
 /// Parsed note fields. Body text is supplied separately with [`Index::set_note_body`].
@@ -72,6 +157,31 @@ pub enum MoveBasis {
     Sha256,
 }
 
+/// How a link was written. Only a strong image embed makes a note a collection
+/// (FORMAT §5), so the syntax has to survive into the index.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LinkSyntax {
+    /// `![[target]]`
+    WikiEmbed,
+    /// `[[target]]`
+    WikiLink,
+    /// `![alt](target)`
+    MarkdownImage,
+    /// A JSON Canvas `file` node.
+    CanvasFileNode,
+}
+
+impl LinkSyntax {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::WikiEmbed => "wiki_embed",
+            Self::WikiLink => "wiki_link",
+            Self::MarkdownImage => "markdown_image",
+            Self::CanvasFileNode => "canvas_file_node",
+        }
+    }
+}
+
 /// A possible move, with paths kept as independent values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MoveCandidate {
@@ -98,6 +208,8 @@ pub struct LinkRecord {
     pub raw: String,
     pub target: Option<String>,
     pub state: LinkState,
+    /// How the link was written (FORMAT §5).
+    pub syntax: LinkSyntax,
 }
 
 /// Errors returned by index operations.
@@ -226,8 +338,13 @@ impl Index {
             self.abort_scan();
             return Err(IndexError::Sqlite(rusqlite::Error::InvalidQuery));
         }
-        self.conn()?
-            .execute_batch("BEGIN IMMEDIATE; DELETE FROM scan_seen;")?;
+        self.conn()?.execute_batch(
+            "BEGIN IMMEDIATE; \
+             DELETE FROM scan_seen; \
+             DROP TABLE IF EXISTS temp.pre_scan_images; \
+             CREATE TEMP TABLE pre_scan_images(path TEXT PRIMARY KEY); \
+             INSERT INTO temp.pre_scan_images(path) SELECT path FROM files WHERE kind='image';",
+        )?;
         self.scan_active = true;
         self.scan_aborted = false;
         Ok(())
@@ -245,21 +362,38 @@ impl Index {
     }
 
     /// Inserts or updates a file row and marks its path as seen in this scan.
+    ///
+    /// `first_seen_ns` is set when the path is first inserted and never
+    /// changed by an update; `added_ns` is the note's own "added" time (note
+    /// `added`, else `imported`) with `first_seen_ns` as the fallback, kept in
+    /// step with it by [`Index::finish_scan`] after a move is applied.
     pub fn upsert_file(&mut self, record: &FileRecord) -> Result<(), IndexError> {
         self.ensure_scan_active()?;
         let result = (|| {
+            let first_seen_ns = now_ns();
+            let folder = folder_of(&record.path);
+            let name_key = name_key(&record.path);
             self.conn()?.execute(
-                "INSERT INTO files(path,size,mtime_ns,sha256,kind) VALUES(?1,?2,?3,?4,?5) \
+                "INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?7,?6),?8,?9,?10) \
                  ON CONFLICT(path) DO UPDATE SET \
                  sha256=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns \
                    THEN COALESCE(excluded.sha256,files.sha256) ELSE excluded.sha256 END, \
-                 size=excluded.size,mtime_ns=excluded.mtime_ns,kind=excluded.kind",
+                 size=excluded.size,mtime_ns=excluded.mtime_ns,kind=excluded.kind, \
+                 note_added_ns=excluded.note_added_ns, \
+                 added_ns=COALESCE(excluded.note_added_ns,files.first_seen_ns), \
+                 folder=excluded.folder,name_key=excluded.name_key,rating=excluded.rating",
                 params![
                     record.path,
                     record.size,
                     record.mtime_ns,
                     record.sha256,
-                    record.kind.as_str()
+                    record.kind.as_str(),
+                    first_seen_ns,
+                    record.note_added_ns,
+                    folder,
+                    name_key,
+                    record.rating.map(i64::from),
                 ],
             )?;
             self.conn()?.execute(
@@ -272,17 +406,39 @@ impl Index {
     }
 
     /// Inserts or updates parsed note metadata and marks the note path seen.
+    ///
+    /// The note's tags also go into `note_tags`, one row per case-folded tag
+    /// of an image note, so a tag filter and the tag counts are index lookups
+    /// instead of a scan over every note's properties.
     pub fn upsert_note(&mut self, record: &NoteRecord) -> Result<(), IndexError> {
         self.ensure_scan_active()?;
         let result = (|| {
             let title = searchable(&record.title);
             let tags = searchable(&record.tags.join(" "));
+            // Tags belong to the image, not to the note: a note that stopped
+            // being an image note must not leave its tags behind, and a note
+            // that became one must not inherit them. Both the stored image and
+            // the incoming one are cleared, before the note row is updated.
+            self.conn()?.execute(
+                "DELETE FROM note_tags WHERE image_path IN ( \
+                   COALESCE((SELECT image_path FROM notes WHERE path=?1),''), COALESCE(?2,''))",
+                params![record.path, record.image_path],
+            )?;
             self.conn()?.execute(
                 "INSERT INTO notes(path,image_path,id,title,tags,props_json,body) VALUES(?1,?2,?3,?4,?5,?6,'') \
              ON CONFLICT(path) DO UPDATE SET image_path=excluded.image_path,id=excluded.id, \
              title=excluded.title,tags=excluded.tags,props_json=excluded.props_json",
                 params![record.path, record.image_path, record.id, title, tags, record.props_json],
             )?;
+            if let Some(image_path) = &record.image_path {
+                for tag in &record.tags {
+                    let tag = searchable(tag);
+                    self.conn()?.execute(
+                        "INSERT OR IGNORE INTO note_tags(image_path,tag) VALUES(?1,?2)",
+                        params![image_path, tag],
+                    )?;
+                }
+            }
             self.conn()?.execute(
                 "INSERT OR IGNORE INTO scan_seen(path) VALUES(?1)",
                 [&record.path],
@@ -331,10 +487,21 @@ impl Index {
                 .execute("DELETE FROM links WHERE src=?1", [src])?;
             let mut unique = HashSet::new();
             for link in links {
-                if unique.insert((link.raw.as_str(), link.target.as_deref(), link.state)) {
+                if unique.insert((
+                    link.raw.as_str(),
+                    link.target.as_deref(),
+                    link.state,
+                    link.syntax,
+                )) {
                     self.conn()?.execute(
-                        "INSERT INTO links(src,raw,target,state) VALUES(?1,?2,?3,?4)",
-                        params![src, link.raw, link.target, link.state.as_str()],
+                        "INSERT INTO links(src,raw,target,state,syntax) VALUES(?1,?2,?3,?4,?5)",
+                        params![
+                            src,
+                            link.raw,
+                            link.target,
+                            link.state.as_str(),
+                            link.syntax.as_str()
+                        ],
                     )?;
                 }
             }
@@ -349,6 +516,15 @@ impl Index {
     /// returns [`IndexError::ScanNotActive`] (or [`IndexError::ScanAborted`] after
     /// [`Index::abort_scan`]) and prunes nothing, so a caller that lost its `begin_scan`
     /// can never empty the index.
+    ///
+    /// The row that appeared at a new path inherits the `first_seen_ns` of the
+    /// row that vanished, so a move never resets "time in the index". The
+    /// pairing keys are the paired note's `id` (FORMAT §3.3) and an identical
+    /// size plus nanosecond mtime, and a key is used only when it names one
+    /// vanished and one appeared image: an ambiguous match hands `first_seen_ns`
+    /// to none of them, so a copy made in the same scan as a move keeps its own.
+    /// Both keys are facts the scan already has, so [`Index::needs_hash`]
+    /// hashing is never required.
     pub fn finish_scan(&mut self, seen_paths: &[String]) -> Result<(), IndexError> {
         self.ensure_scan_active()?;
         let result = (|| {
@@ -369,12 +545,52 @@ impl Index {
                  AND f.path NOT IN (SELECT path FROM scan_seen)",
                 [],
             )?;
+            // A detected move keeps the old first_seen: the file at its new
+            // path inherits the first_seen of the vanished row, so "time in
+            // the index" survives a move. Only images the index did not hold
+            // before this scan can be on the receiving end of such a pair.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS temp.appeared_images; \
+                 CREATE TEMP TABLE appeared_images(path TEXT PRIMARY KEY); \
+                 INSERT INTO temp.appeared_images(path) SELECT path FROM files \
+                 WHERE kind='image' AND path IN (SELECT path FROM scan_seen) \
+                 AND path NOT IN (SELECT path FROM temp.pre_scan_images); \
+                 DROP TABLE IF EXISTS temp.move_pair; \
+                 CREATE TEMP TABLE move_pair(new_path TEXT PRIMARY KEY, old_path TEXT UNIQUE, first_seen_ns INTEGER NOT NULL);",
+            )?;
+            for statement in MOVE_PAIR_SQL {
+                conn.execute(statement, [])?;
+            }
+            conn.execute(
+                "UPDATE files SET first_seen_ns=COALESCE(( \
+                   SELECT p.first_seen_ns FROM move_pair p WHERE p.new_path=files.path \
+                 ), first_seen_ns) \
+                 WHERE kind='image' AND path IN (SELECT new_path FROM move_pair)",
+                [],
+            )?;
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS temp.move_pair; \
+                 DROP TABLE IF EXISTS temp.appeared_images;",
+            )?;
+            // The inherited first_seen is also the added position of an image
+            // whose note has no datetime, so derive added_ns from the two
+            // columns again (FORMAT §3.1: added, else imported, else
+            // first_seen).
+            conn.execute(
+                "UPDATE files SET added_ns=COALESCE(note_added_ns,first_seen_ns) WHERE kind='image'",
+                [],
+            )?;
             conn.execute(
                 "DELETE FROM files WHERE path NOT IN (SELECT path FROM scan_seen)",
                 [],
             )?;
             conn.execute(
                 "DELETE FROM notes WHERE path NOT IN (SELECT path FROM scan_seen)",
+                [],
+            )?;
+            conn.execute(
+                "DELETE FROM note_tags WHERE image_path NOT IN ( \
+                   SELECT image_path FROM notes WHERE image_path IS NOT NULL)",
                 [],
             )?;
             conn.execute(
@@ -443,8 +659,13 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Searches note title, tags, and body. Terms shorter than three Unicode
-    /// characters use substring matching because the trigram tokenizer needs 3.
+    /// Searches note title, tags, and body, and returns the matching note
+    /// paths. Terms shorter than three Unicode characters use substring
+    /// matching because the trigram tokenizer needs 3.
+    ///
+    /// This is the standalone search; the `text` filter of
+    /// [`crate::ViewQuery`] applies the same two rules inside the view's own
+    /// SQL, so a filtered page and a search always agree.
     pub fn search_text(&self, query: &str) -> Result<Vec<String>, IndexError> {
         let query = searchable(query);
         if query.chars().count() < 3 {
@@ -507,13 +728,22 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
     if version.is_none() {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER);
              CREATE TABLE IF NOT EXISTS notes(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,image_path TEXT,id TEXT,title TEXT NOT NULL,tags TEXT NOT NULL,props_json TEXT NOT NULL,body TEXT NOT NULL DEFAULT '');
-             CREATE TABLE IF NOT EXISTS links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,PRIMARY KEY(src,raw));
+             CREATE TABLE IF NOT EXISTS links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,syntax TEXT NOT NULL DEFAULT 'wiki_link',PRIMARY KEY(src,raw));
+             CREATE TABLE IF NOT EXISTS note_tags(image_path TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(image_path,tag));
              CREATE TABLE IF NOT EXISTS scan_seen(path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS moved_from(path TEXT PRIMARY KEY,id TEXT,sha256 TEXT,kind TEXT NOT NULL);
              CREATE INDEX IF NOT EXISTS files_sha256_idx ON files(sha256);
+             CREATE INDEX IF NOT EXISTS files_added_ns_idx ON files(added_ns);
+             CREATE INDEX IF NOT EXISTS files_size_idx ON files(size);
+             CREATE INDEX IF NOT EXISTS files_mtime_ns_idx ON files(mtime_ns);
+             CREATE INDEX IF NOT EXISTS files_folder_idx ON files(folder);
+             CREATE INDEX IF NOT EXISTS files_kind_path_idx ON files(kind,path);
+             CREATE INDEX IF NOT EXISTS files_rating_idx ON files(rating);
              CREATE INDEX IF NOT EXISTS notes_id_idx ON notes(id);
+             CREATE INDEX IF NOT EXISTS notes_image_path_idx ON notes(image_path);
+             CREATE INDEX IF NOT EXISTS note_tags_tag_idx ON note_tags(tag);
              CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(title,tags,body,content='notes',content_rowid='note_id',tokenize='trigram');
              CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
                INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
@@ -526,7 +756,7 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
                INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
              END;
              DELETE FROM schema_version;
-             INSERT INTO schema_version(version) VALUES(2);
+             INSERT INTO schema_version(version) VALUES(6);
              COMMIT;",
         )?;
     }
@@ -539,6 +769,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         "files",
         "notes",
         "links",
+        "note_tags",
         "scan_seen",
         "moved_from",
         "notes_fts",
@@ -556,7 +787,22 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         }
     }
     for (table, expected_columns) in [
-        ("files", &["path", "size", "mtime_ns", "sha256", "kind"][..]),
+        (
+            "files",
+            &[
+                "path",
+                "size",
+                "mtime_ns",
+                "sha256",
+                "kind",
+                "first_seen_ns",
+                "note_added_ns",
+                "added_ns",
+                "folder",
+                "name_key",
+                "rating",
+            ][..],
+        ),
         (
             "notes",
             &[
@@ -570,7 +816,8 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
                 "body",
             ][..],
         ),
-        ("links", &["src", "raw", "target", "state"][..]),
+        ("links", &["src", "raw", "target", "state", "syntax"][..]),
+        ("note_tags", &["image_path", "tag"][..]),
         ("scan_seen", &["path"][..]),
         ("moved_from", &["path", "id", "sha256", "kind"][..]),
     ] {
@@ -593,6 +840,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         ("files", vec!["path"]),
         ("notes", vec!["note_id"]),
         ("links", vec!["src", "raw"]),
+        ("note_tags", vec!["image_path", "tag"]),
         ("scan_seen", vec!["path"]),
         ("moved_from", vec!["path"]),
     ] {
@@ -701,8 +949,27 @@ fn normalize_sql(sql: &str) -> String {
         .collect()
 }
 
+/// The folder a library-relative path sits in: `""` for the library root.
+fn folder_of(path: &str) -> &str {
+    path.rfind('/').map_or("", |index| &path[..index])
+}
+
+/// The file name of a library-relative path, case-folded for a name sort that
+/// does not depend on SQLite's ASCII-only `lower()`.
+fn name_key(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.case_fold().collect()
+}
+
 fn searchable(text: &str) -> String {
     text.case_fold().nfc().collect()
+}
+
+fn now_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 fn valid_sha256(hash: &str) -> bool {
@@ -721,6 +988,8 @@ mod tests {
             mtime_ns,
             sha256: sha256.map(str::to_owned),
             kind: FileKind::Image,
+            note_added_ns: None,
+            rating: None,
         }
     }
 
@@ -802,6 +1071,478 @@ mod tests {
             index.needs_hash("x", 1, 1),
             Err(IndexError::RebuildRequired(_))
         ));
+    }
+
+    #[test]
+    fn first_seen_survives_rescans_and_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("a.jpg", 10, 20, Some(&"a".repeat(64))))
+            .unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        let first_seen: i64 = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT first_seen_ns FROM files WHERE path='a.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(first_seen > 0);
+
+        index.begin_scan().unwrap();
+        let mut record = file("a.jpg", 10, 20, Some(&"a".repeat(64)));
+        record.note_added_ns = Some(123);
+        index.upsert_file(&record).unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        let (after_rescan, added): (i64, i64) = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT first_seen_ns, added_ns FROM files WHERE path='a.jpg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(after_rescan, first_seen, "a rescan keeps first_seen");
+        assert_eq!(added, 123);
+
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("b.jpg", 10, 20, Some(&"a".repeat(64))))
+            .unwrap();
+        index.finish_scan(&["b.jpg".into()]).unwrap();
+        let moved: i64 = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT first_seen_ns FROM files WHERE path='b.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            moved, first_seen,
+            "a detected move keeps the old first_seen"
+        );
+    }
+
+    fn first_seen_of(index: &Index, path: &str) -> i64 {
+        index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT first_seen_ns FROM files WHERE path=?1",
+                [path],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A production scan never hashes (`sync_index` sends no `sha256`), so a
+    /// move has to be recognised from the facts it does have.
+    #[test]
+    fn first_seen_follows_a_move_without_a_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/a.jpg", 10, 20, None))
+            .unwrap();
+        index
+            .upsert_note(&note("refs/a.jpg.md", None, "moved", &[]))
+            .unwrap();
+        index
+            .finish_scan(&["refs/a.jpg".into(), "refs/a.jpg.md".into()])
+            .unwrap();
+        let first_seen = first_seen_of(&index, "refs/a.jpg");
+        assert!(first_seen > 0);
+
+        index.begin_scan().unwrap();
+        // The same bytes at a new path, with the same size and mtime, which is
+        // what moving a file within a library leaves behind.
+        index
+            .upsert_file(&file("refs/b.jpg", 10, 20, None))
+            .unwrap();
+        index
+            .upsert_note(&note("refs/b.jpg.md", None, "moved", &[]))
+            .unwrap();
+        index
+            .finish_scan(&["refs/b.jpg".into(), "refs/b.jpg.md".into()])
+            .unwrap();
+        assert_eq!(
+            first_seen_of(&index, "refs/b.jpg"),
+            first_seen,
+            "size and mtime pair a move, so first_seen survives it"
+        );
+    }
+
+    #[test]
+    fn first_seen_follows_the_paired_note_id_across_a_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("a.jpg", 10, 20, None)).unwrap();
+        let mut paired = note("a.jpg.md", Some("stable-id"), "moved", &[]);
+        paired.image_path = Some("a.jpg".into());
+        index.upsert_note(&paired).unwrap();
+        index
+            .finish_scan(&["a.jpg".into(), "a.jpg.md".into()])
+            .unwrap();
+        let first_seen = first_seen_of(&index, "a.jpg");
+
+        // The image moved and was edited, so size and mtime no longer match;
+        // the note kept its id, which is the key that survives.
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("b.jpg", 99, 20, None)).unwrap();
+        let mut paired = note("b.jpg.md", Some("stable-id"), "moved", &[]);
+        paired.image_path = Some("b.jpg".into());
+        index.upsert_note(&paired).unwrap();
+        index
+            .finish_scan(&["b.jpg".into(), "b.jpg.md".into()])
+            .unwrap();
+        assert_eq!(
+            first_seen_of(&index, "b.jpg"),
+            first_seen,
+            "the paired note's id pairs a move even when the bytes changed"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_new_image_keeps_its_own_first_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("gone.jpg", 10, 20, None)).unwrap();
+        index.finish_scan(&["gone.jpg".into()]).unwrap();
+        let vanished_first_seen = first_seen_of(&index, "gone.jpg");
+
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("new.jpg", 77, 88, None)).unwrap();
+        index.finish_scan(&["new.jpg".into()]).unwrap();
+        assert_ne!(
+            first_seen_of(&index, "new.jpg"),
+            vanished_first_seen,
+            "different size and mtime is not a move"
+        );
+    }
+
+    /// RW26 H-1: Reviewer workflow (a) - copy image+note, then rename the
+    /// original pair in the same scan. Note id pairing is ambiguous (1 vanished
+    /// note id matches 2 appeared notes), so neither note inherits by id.
+    /// The renamed original inherits via unambiguous 1:1 size+mtime, while the
+    /// copy (new mtime) receives its own fresh first_seen_ns.
+    #[test]
+    fn copy_image_and_note_then_rename_original_does_not_transfer_to_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/a.png", 10, 20, None))
+            .unwrap();
+        let mut note_a = note("refs/a.png.md", Some("stable-0001"), "original", &[]);
+        note_a.image_path = Some("refs/a.png".into());
+        index.upsert_note(&note_a).unwrap();
+        index
+            .finish_scan(&["refs/a.png".into(), "refs/a.png.md".into()])
+            .unwrap();
+        let first_seen_a = first_seen_of(&index, "refs/a.png");
+        assert!(first_seen_a > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        // Renamed original: keeps size 10 and mtime 20, note retains id: stable-0001
+        index
+            .upsert_file(&file("refs/b.png", 10, 20, None))
+            .unwrap();
+        let mut note_b = note("refs/b.png.md", Some("stable-0001"), "renamed", &[]);
+        note_b.image_path = Some("refs/b.png".into());
+        index.upsert_note(&note_b).unwrap();
+        // Duplicate copy: size 10, new mtime 30 (from cp), duplicate note id: stable-0001
+        index
+            .upsert_file(&file("refs/c.png", 10, 30, None))
+            .unwrap();
+        let mut note_c = note("refs/c.png.md", Some("stable-0001"), "copy", &[]);
+        note_c.image_path = Some("refs/c.png".into());
+        index.upsert_note(&note_c).unwrap();
+
+        index
+            .finish_scan(&[
+                "refs/b.png".into(),
+                "refs/b.png.md".into(),
+                "refs/c.png".into(),
+                "refs/c.png.md".into(),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            first_seen_of(&index, "refs/b.png"),
+            first_seen_a,
+            "renamed original inherits first_seen via 1:1 size+mtime"
+        );
+        assert_ne!(
+            first_seen_of(&index, "refs/c.png"),
+            first_seen_a,
+            "the copy must not inherit first_seen"
+        );
+    }
+
+    /// RW26 H-1: Reviewer workflow (b) - `cp -p` beside a move in one scan.
+    /// One vanished row matches 2 appeared rows on size+mtime; because the
+    /// pairing is ambiguous, first_seen_ns is transferred to neither.
+    #[test]
+    fn preserving_copy_beside_a_move_transfers_to_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/x.png", 50, 60, None))
+            .unwrap();
+        index.finish_scan(&["refs/x.png".into()]).unwrap();
+        let first_seen_x = first_seen_of(&index, "refs/x.png");
+        assert!(first_seen_x > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/xcopy.png", 50, 60, None))
+            .unwrap();
+        index
+            .upsert_file(&file("refs/y.png", 50, 60, None))
+            .unwrap();
+        index
+            .finish_scan(&["refs/xcopy.png".into(), "refs/y.png".into()])
+            .unwrap();
+
+        assert_ne!(
+            first_seen_of(&index, "refs/xcopy.png"),
+            first_seen_x,
+            "preserving copy does not inherit when ambiguous"
+        );
+        assert_ne!(
+            first_seen_of(&index, "refs/y.png"),
+            first_seen_x,
+            "moved file does not inherit when copy creates ambiguous size+mtime"
+        );
+    }
+
+    /// Several vanished rows matching one appeared row must transfer to none.
+    #[test]
+    fn several_vanished_rows_matching_one_appeared_transfers_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/v1.png", 40, 50, None))
+            .unwrap();
+        index
+            .upsert_file(&file("refs/v2.png", 40, 50, None))
+            .unwrap();
+        index
+            .finish_scan(&["refs/v1.png".into(), "refs/v2.png".into()])
+            .unwrap();
+        let first_seen_v1 = first_seen_of(&index, "refs/v1.png");
+        let first_seen_v2 = first_seen_of(&index, "refs/v2.png");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/a1.png", 40, 50, None))
+            .unwrap();
+        index.finish_scan(&["refs/a1.png".into()]).unwrap();
+
+        let first_seen_a1 = first_seen_of(&index, "refs/a1.png");
+        assert_ne!(first_seen_a1, first_seen_v1);
+        assert_ne!(first_seen_a1, first_seen_v2);
+    }
+
+    /// Plain move without a note still inherits first_seen via 1:1 size+mtime.
+    #[test]
+    fn plain_move_without_note_still_inherits_first_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/plain.png", 100, 200, None))
+            .unwrap();
+        index.finish_scan(&["refs/plain.png".into()]).unwrap();
+        let first_seen = first_seen_of(&index, "refs/plain.png");
+        assert!(first_seen > 0);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/moved.png", 100, 200, None))
+            .unwrap();
+        index.finish_scan(&["refs/moved.png".into()]).unwrap();
+
+        assert_eq!(
+            first_seen_of(&index, "refs/moved.png"),
+            first_seen,
+            "plain move with 1:1 size+mtime inherits first_seen"
+        );
+    }
+
+    /// An image the index already held is not new, so it never receives a
+    /// vanished row's first_seen_ns even when its size and mtime match one.
+    #[test]
+    fn an_image_the_index_already_held_never_takes_over_a_vanished_first_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/gone.png", 10, 20, None))
+            .unwrap();
+        index
+            .upsert_file(&file("refs/kept.png", 10, 20, None))
+            .unwrap();
+        index
+            .finish_scan(&["refs/gone.png".into(), "refs/kept.png".into()])
+            .unwrap();
+        let first_seen_gone = first_seen_of(&index, "refs/gone.png");
+        let first_seen_kept = first_seen_of(&index, "refs/kept.png");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        // refs/gone.png is deleted, refs/kept.png stays and something else is
+        // added: only the added image is a candidate for the vanished row.
+        index
+            .upsert_file(&file("refs/new.png", 99, 88, None))
+            .unwrap();
+        index
+            .finish_scan(&["refs/kept.png".into(), "refs/new.png".into()])
+            .unwrap();
+
+        assert_ne!(
+            first_seen_of(&index, "refs/kept.png"),
+            first_seen_gone,
+            "an image that was already in the index keeps its own first_seen_ns"
+        );
+        assert_ne!(
+            first_seen_of(&index, "refs/new.png"),
+            first_seen_gone,
+            "a different size and mtime is not a move"
+        );
+        assert_eq!(
+            first_seen_of(&index, "refs/kept.png"),
+            first_seen_kept,
+            "an untouched row is not rewritten by the move pairing"
+        );
+    }
+
+    /// A note that vanished while its image stayed is not a move: the image did
+    /// not vanish, so nothing can hand its first_seen_ns to a new row.
+    #[test]
+    fn a_vanished_note_beside_a_staying_image_pairs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/kept.png", 10, 20, None))
+            .unwrap();
+        let mut paired = note("refs/kept.png.md", Some("stable-0001"), "original", &[]);
+        paired.image_path = Some("refs/kept.png".into());
+        index.upsert_note(&paired).unwrap();
+        index
+            .finish_scan(&["refs/kept.png".into(), "refs/kept.png.md".into()])
+            .unwrap();
+        let first_seen_kept = first_seen_of(&index, "refs/kept.png");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        index.begin_scan().unwrap();
+        // The note moved to a new image and the note id moved with it, but the
+        // image it described never left refs/kept.png.
+        index
+            .upsert_file(&file("refs/other.png", 77, 88, None))
+            .unwrap();
+        let mut paired = note("refs/other.png.md", Some("stable-0001"), "moved", &[]);
+        paired.image_path = Some("refs/other.png".into());
+        index.upsert_note(&paired).unwrap();
+        index
+            .finish_scan(&[
+                "refs/kept.png".into(),
+                "refs/other.png".into(),
+                "refs/other.png.md".into(),
+            ])
+            .unwrap();
+
+        assert_ne!(
+            first_seen_of(&index, "refs/other.png"),
+            first_seen_kept,
+            "an image that never vanished cannot donate its first_seen_ns"
+        );
+    }
+
+    fn added_ns_of(index: &Index, path: &str) -> i64 {
+        index
+            .conn()
+            .unwrap()
+            .query_row("SELECT added_ns FROM files WHERE path=?1", [path], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// RW26 L-3: `added_ns=COALESCE(excluded.added_ns,files.added_ns)` meant a
+    /// derived `added_ns` could never be cleared: delete the `added:` line from
+    /// a note and the index kept the value forever, so only a rebuild fixed it.
+    #[test]
+    fn removing_the_note_datetime_clears_the_derived_added_ns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("a.jpg", 1, 1, None)).unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        let first_seen = first_seen_of(&index, "a.jpg");
+        assert_eq!(
+            added_ns_of(&index, "a.jpg"),
+            first_seen,
+            "an image with no note datetime falls back to first_seen"
+        );
+
+        index.begin_scan().unwrap();
+        let mut record = file("a.jpg", 1, 1, None);
+        record.note_added_ns = Some(42);
+        index.upsert_file(&record).unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        assert_eq!(added_ns_of(&index, "a.jpg"), 42, "the note's added wins");
+
+        index.begin_scan().unwrap();
+        index.upsert_file(&file("a.jpg", 1, 1, None)).unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        assert_eq!(
+            added_ns_of(&index, "a.jpg"),
+            first_seen,
+            "a removed property falls back to first_seen again"
+        );
+        let stored: Option<i64> = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT note_added_ns FROM files WHERE path='a.jpg'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None, "the note value itself is cleared too");
+    }
+
+    #[test]
+    fn old_schema_version_requires_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute("CREATE TABLE schema_version(version INTEGER NOT NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO schema_version(version) VALUES(2)", [])
+            .unwrap();
+        drop(conn);
+        let index = Index::open(dir.path()).unwrap();
+        assert!(index.rebuild_required());
     }
 
     #[test]
@@ -923,6 +1664,7 @@ mod tests {
             raw: "same".into(),
             target: None,
             state: LinkState::Missing,
+            syntax: LinkSyntax::WikiEmbed,
         };
         let conflict = LinkRecord {
             state: LinkState::Resolved,
@@ -980,6 +1722,7 @@ mod tests {
             raw: "a.jpg".into(),
             target: Some("a.jpg".into()),
             state: LinkState::Resolved,
+            syntax: LinkSyntax::WikiEmbed,
         };
         index
             .replace_links("album.md", &[link.clone(), link])
@@ -1209,6 +1952,7 @@ mod tests {
                     raw: "[[second.jpg]]".into(),
                     target: Some("second.jpg".into()),
                     state: LinkState::Resolved,
+                    syntax: LinkSyntax::WikiEmbed,
                 }],
             )
             .unwrap();

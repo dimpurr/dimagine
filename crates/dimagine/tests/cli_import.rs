@@ -361,3 +361,116 @@ fn import_eagle_lists_in_help_and_subcommand_help() {
     assert!(stdout.contains("NAME.LIBRARY"), "{stdout}");
     assert!(stdout.contains("--name"), "{stdout}");
 }
+
+fn backfill_library(root: &Path) {
+    std::fs::create_dir_all(root).unwrap();
+    std::fs::write(root.join("girl-underwater.jpg"), b"jpeg-bytes").unwrap();
+    std::fs::write(
+        root.join("girl-underwater.jpg.md"),
+        b"---\ntitle: Girl sinking into deep water\nimported: 2026-10-04T14:30:12+01:00\n---\n\nBody.\n\n![[girl-underwater.jpg]]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("girl-underwater.jpg.eagle.json"),
+        br#"{"id":"L8X2Q4M7Z1A9B","name":"girl-underwater","ext":"jpg","btime":1689200047000}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn backfill_added_dry_run_reports_and_writes_nothing() {
+    let tmp = tmp("backfill-dry");
+    let library = tmp.0.join("library");
+    backfill_library(&library);
+    let note = library.join("girl-underwater.jpg.md");
+    let before = std::fs::read(&note).unwrap();
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        "--backfill-added",
+        library.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("dry run"), "{stdout}");
+    assert!(stdout.contains("updated: 1"), "{stdout}");
+    assert_eq!(
+        std::fs::read(&note).unwrap(),
+        before,
+        "dry run writes nothing"
+    );
+}
+
+#[test]
+fn backfill_added_apply_inserts_property_and_is_idempotent() {
+    let tmp = tmp("backfill-apply");
+    let library = tmp.0.join("library");
+    backfill_library(&library);
+    let note = library.join("girl-underwater.jpg.md");
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        "--backfill-added",
+        "--apply",
+        library.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("applied"), "{stdout}");
+    let updated = std::fs::read_to_string(&note).unwrap();
+    assert!(updated.contains("added: "), "{updated}");
+    assert!(
+        updated.contains("imported: 2026-10-04T14:30:12+01:00\nadded: "),
+        "{updated}"
+    );
+    assert!(updated.ends_with("![[girl-underwater.jpg]]\n"), "{updated}");
+
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        "--backfill-added",
+        "--apply",
+        library.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("updated: 0"), "{stdout}");
+    assert!(stdout.contains("already had added: 1"), "{stdout}");
+    assert_eq!(std::fs::read_to_string(&note).unwrap(), updated);
+}
+
+#[test]
+fn backfill_added_json_report() {
+    let tmp = tmp("backfill-json");
+    let library = tmp.0.join("library");
+    backfill_library(&library);
+    let (code, stdout, stderr) = dimagine(&[
+        "--json",
+        "import",
+        "eagle",
+        "--backfill-added",
+        "--apply",
+        library.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["schema"], "dimagine.import/0.1");
+    assert_eq!(report["apply"], true);
+    assert_eq!(report["backfill"]["scanned"], 1);
+    assert_eq!(report["backfill"]["updated"], 1);
+    assert_eq!(report["backfill"]["already_had"], 0);
+    assert_eq!(report["backfill"]["no_btime"], 0);
+    assert_eq!(report["backfill"]["no_front_matter"], 0);
+    assert_eq!(report["backfill"]["unreadable"], 0);
+}
+
+#[test]
+fn backfill_added_rejects_missing_library() {
+    let tmp = tmp("backfill-missing");
+    let missing = tmp.0.join("absent");
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        "--backfill-added",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 1, "stdout: {stdout}");
+    assert!(stderr.contains("not a dimagine library"), "{stderr}");
+}

@@ -1,0 +1,47 @@
+[
+  {
+    "note": "an integer btime",
+    "metadata": {"btime": 1689200000000},
+    "utc": "2023-07-12T22:13:20Z"
+  },
+  {
+    "note": "an integral float btime, which Eagle writes and serde_json keeps as f64",
+    "metadata": {"btime": 1689200000000.0},
+    "utc": "2023-07-12T22:13:20Z"
+  },
+  {
+    "note": "the epoch",
+    "metadata": {"btime": 0},
+    "utc": "1970-01-01T00:00:00Z"
+  },
+  {
+    "note": "before the epoch",
+    "metadata": {"btime": -1000},
+    "utc": "1969-12-31T23:59:59Z"
+  },
+  {
+    "note": "the last representable year",
+    "metadata": {"btime": 253402300799000},
+    "utc": "9999-12-31T23:59:59Z"
+  },
+  {
+    "note": "year 10000 is not an ISO 8601 year, so added is omitted in every timezone",
+    "metadata": {"btime": 253402300800000},
+    "utc": null
+  },
+  {
+    "note": "a fractional millisecond is not a btime",
+    "metadata": {"btime": 1689200000000.5},
+    "utc": null
+  },
+  {
+    "note": "a numeric string is not a btime",
+    "metadata": {"btime": "1689200000000"},
+    "utc": null
+  },
+  {
+    "note": "a missing btime",
+    "metadata": {},
+    "utc": null
+  }
+]

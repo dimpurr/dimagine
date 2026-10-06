@@ -65,6 +65,7 @@ tags: [underwater, sketch, monochrome]
 rating: 4
 source: https://example.com/artwork/12345
 author: Example Artist
+added: 2023-07-12T20:54:07+01:00
 imported: 2026-10-04T14:30:12+01:00
 ---
 
@@ -76,10 +77,12 @@ Why this image is here, what to notice, related ideas.
 - End the note with an embed of its own image, so the picture shows when the
   note is opened. Use the bare file name if it is unique in the library,
   otherwise the path. This preview does not make the note a collection.
-- Tags are a YAML list without `#`.
+- Tags are a YAML list without `#`. `rating` is an integer 0-5; anything
+  else reads as no rating.
 - Datetimes are ISO 8601 with a UTC offset.
 - Quote strings YAML could misread: `"no"`, `"on"`, `"Note: draft"`.
-- Preserve properties you do not recognise.
+- Preserve properties you do not recognise, and a byte-order mark if the note
+  has one.
 - Do not edit `*.<source>.json` files; they are verbatim records of an import.
 
 ## Make a collection

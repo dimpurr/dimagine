@@ -21,9 +21,14 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 dimagine-core = { path = "../dimagine-core" }
+dimagine-index = { path = "../dimagine-index" }
 dimagine-eagle = { path = "../dimagine-eagle", optional = true }
 dimagine-preview = { path = "../dimagine-preview", optional = true }
 dimagine-serve = { path = "../dimagine-serve", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+dimagine-index = { path = "../dimagine-index" }

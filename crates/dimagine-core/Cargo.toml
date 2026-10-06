@@ -6,9 +6,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+dimagine-index = { path = "../dimagine-index" }
 percent-encoding = "2.3"
 saphyr = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-normalization = "0.1"
 libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
