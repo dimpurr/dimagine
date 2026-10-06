@@ -183,6 +183,206 @@ fn html_paths(html: &str) -> Vec<String> {
     paths
 }
 
+/// A library for the note-body renderer (FORMAT §5.1): a
+/// note that links to and embeds other images, with the
+/// tricky targets — spaces, unicode, brackets — a note
+/// link, and the XSS shapes.
+fn link_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    write("refs/landscape.png", PNG_BYTES);
+    write("refs/ui/button.png", PNG_BYTES);
+    write("refs/my photo.png", PNG_BYTES);
+    write("refs/猫.png", PNG_BYTES);
+    write("refs/a[b].png", PNG_BYTES);
+    write("guide.md", "---\ntitle: Guide\n---\nA guide.\n");
+    write(
+        "refs/landscape.png.md",
+        "---\ntitle: Landscape\ntags:\n  - nature\nrating: 4\nsource: https://example.com/landscape\nauthor: Example Artist\nlicense: unknown\ncreated: 2021-10-15\nimported: 2026-10-04T14:30:12+01:00\nadded: 2023-07-12T20:54:07+01:00\nid: 01JA8X3Q7K2M9V4T6R1B5N0C3Q\nheight: 3429\n---\n\
+         A wide shot.\n\
+         See [[refs/ui/button.png]] and [[refs/ui/button.png|the button]].\n\
+         ![[refs/my photo.png]]\n\
+         ![[landscape.png]]\n\
+         [[missing.png]] and [[refs/猫.png]] and [[refs/a[b].png]].\n\
+         [[guide]] and [[evil.png|<script>alert(1)</script>]]\n",
+    );
+    write(
+        "refs/ui/button.png.md",
+        "---\ntitle: Button\n---\nA button.\n",
+    );
+    dir
+}
+
+/// The rendered note body of an image page, without
+/// the markup around it.
+fn note_body(html: &str) -> &str {
+    let start = html
+        .find("<article class=\"note-body\">")
+        .expect("a note body")
+        + "<article class=\"note-body\">".len();
+    let end = html[start..]
+        .find("</article>")
+        .expect("a closed note body");
+    &html[start..start + end]
+}
+
+#[tokio::test]
+async fn the_note_body_renders_links_and_embeds_per_format_5_1() {
+    let dir = link_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/image/refs/landscape.png", &cookie).await;
+    let body = note_body(&html);
+
+    // A resolved link to another image: its page, with the
+    // file name as the label.
+    assert!(
+        body.contains(
+            "<a href=\"/image/refs/ui/button.png\" rel=\"noopener noreferrer\">button.png</a>"
+        ),
+        "{body}"
+    );
+    // An aliased link uses the alias.
+    assert!(
+        body.contains(
+            "<a href=\"/image/refs/ui/button.png\" rel=\"noopener noreferrer\">the button</a>"
+        ),
+        "{body}"
+    );
+    // An embed of another image: its view rendition, linked
+    // to its page.
+    assert!(
+        body.contains(
+            "<a href=\"/image/refs/my%20photo.png\" rel=\"noopener noreferrer\"><img src=\"/media/refs/my%20photo.png\" alt=\"my photo.png\"></a>"
+        ),
+        "{body}"
+    );
+    // A link to a note: the note view.
+    assert!(
+        body.contains("<a href=\"/?c=guide.md\" rel=\"noopener noreferrer\">guide</a>"),
+        "{body}"
+    );
+    // Unicode and brackets in a target are encoded.
+    assert!(
+        body.contains("<a href=\"/image/refs/%E7%8C%AB.png\" rel=\"noopener noreferrer\">"),
+        "{body}"
+    );
+    assert!(
+        body.contains("<a href=\"/image/refs/a%5Bb%5D.png\" rel=\"noopener noreferrer\">"),
+        "{body}"
+    );
+    // A link that resolves to nothing stays plain text,
+    // marked as missing.
+    assert!(
+        body.contains("<span class=\"missing-link\">[[missing.png]]</span>"),
+        "{body}"
+    );
+    // The note's own embed (FORMAT §3.2) is not repeated:
+    // the page already shows the image.
+    assert!(!body.contains("landscape.png</a>"), "{body}");
+    assert!(
+        !body.contains("<img src=\"/media/refs/landscape.png\""),
+        "{body}"
+    );
+    // XSS shapes stay escaped text, never markup.
+    assert!(!body.contains("<script>"), "{body}");
+    assert!(
+        body.contains("<span class=\"missing-link\">[[evil.png|&lt;script&gt;alert(1)&lt;/script&gt;]]</span>"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn the_image_page_properties_are_a_definition_list() {
+    let dir = link_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/image/refs/landscape.png", &cookie).await;
+
+    // Known FORMAT §3.1 properties, in show order.
+    assert!(html.contains("<dl class=\"property-list\">"), "{html}");
+    assert!(html.contains("<dt>Title</dt><dd>Landscape</dd>"), "{html}");
+    assert!(
+        html.contains(
+            "<dt>Tags</dt><dd><a class=\"inspector-tag\" href=\"/?tag=nature\">nature</a></dd>"
+        ),
+        "{html}"
+    );
+    assert!(html.contains("<dt>Rating</dt><dd>4</dd>"), "{html}");
+    assert!(
+        html.contains(
+            "<dt>Source</dt><dd><a class=\"source-link\" href=\"https://example.com/landscape\" rel=\"noreferrer noopener\">https://example.com/landscape</a></dd>"
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>Author</dt><dd>Example Artist</dd>"),
+        "{html}"
+    );
+    assert!(html.contains("<dt>License</dt><dd>unknown</dd>"), "{html}");
+    assert!(
+        html.contains("<dt>Created</dt><dd><span title=\"2021-10-15\">15 Oct 2021</span></dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>Imported</dt><dd><span title=\"2026-10-04T14:30:12+01:00\">04 Oct 2026, 14:30 (+01:00)</span></dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>Added</dt><dd><span title=\"2023-07-12T20:54:07+01:00\">12 Jul 2023, 20:54 (+01:00)</span></dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<dt>ID</dt><dd><code>01JA8X3Q7K2M9V4T6R1B5N0C3Q</code></dd>"),
+        "{html}"
+    );
+    // An unknown property follows the known ones.
+    assert!(html.contains("<dt>height</dt><dd>3429</dd>"), "{html}");
+    let title_at = html.find("<dt>Title</dt>").unwrap();
+    let height_at = html.find("<dt>height</dt>").unwrap();
+    assert!(title_at < height_at, "{html}");
+    // The raw front matter stays reachable, collapsed.
+    assert!(
+        html.contains("<details class=\"properties-raw\"><summary>Raw properties</summary>"),
+        "{html}"
+    );
+    assert!(html.contains("<pre class=\"properties\">"), "{html}");
+}
+
+#[tokio::test]
+async fn the_image_api_returns_the_rendered_note() {
+    let dir = link_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let detail = json(&app, "/api/image/refs/landscape.png", &cookie).await;
+
+    // The raw body and the rendered body are both there.
+    let body = detail["body"].as_str().unwrap();
+    assert!(body.contains("[[refs/ui/button.png]]"), "{body}");
+    let body_html = detail["body_html"].as_str().unwrap();
+    assert!(
+        body_html.contains(
+            "<a href=\"/image/refs/ui/button.png\" rel=\"noopener noreferrer\">button.png</a>"
+        ),
+        "{body_html}"
+    );
+    assert!(
+        body_html.contains("<img src=\"/media/refs/my%20photo.png\""),
+        "{body_html}"
+    );
+    // The self-embed is not repeated in the rendered note.
+    assert!(
+        !body_html.contains("<img src=\"/media/refs/landscape.png\""),
+        "{body_html}"
+    );
+    // An image without a note has no rendered body.
+    let plain = json(&app, "/api/image/refs/%E7%8C%AB.png", &cookie).await;
+    assert!(plain["body_html"].is_null(), "{plain}");
+}
+
 #[tokio::test]
 async fn the_library_is_all_images_newest_added_first() {
     let dir = library();

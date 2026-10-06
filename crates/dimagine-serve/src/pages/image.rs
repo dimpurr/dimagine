@@ -10,7 +10,10 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use percent_encoding::percent_decode_str;
+use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::catalog::ImageDetail;
 use crate::ui::shell::Frame;
@@ -123,11 +126,18 @@ fn image_body(detail: &ImageDetail, appears_in: &[String], back: String) -> Stri
     }
     out.push_str(&appears_in_html(appears_in));
     if let Some(note) = detail.note_path.as_deref() {
+        // The catalog renders the body with its links
+        // resolved (FORMAT §5.1); a detail without the
+        // rendered HTML still shows the note, unlinked.
+        let body_html = detail
+            .body_html
+            .clone()
+            .unwrap_or_else(|| markdown_html(&detail.body, None));
         out.push_str(&format!(
             "<section class=\"image-section\"><h2>Note</h2><p class=\"note-path\">{}</p>\
              <article class=\"note-body\">{}</article></section>",
             escape_html(note),
-            markdown_html(&detail.body)
+            body_html
         ));
     }
     if let Some(error) = &detail.front_matter_error {
@@ -149,16 +159,206 @@ fn image_body(detail: &ImageDetail, appears_in: &[String], back: String) -> Stri
     out
 }
 
-/// The whole front matter, so every property an import recorded stays visible
-/// even when no field above claims it.
+/// The properties as a definition list: the known FORMAT
+/// §3.1 properties first, in show order, then any property
+/// an import added, by name. The whole front matter stays
+/// reachable, collapsed, as the raw JSON.
 fn properties_section(detail: &ImageDetail) -> String {
     if detail.properties.is_null() {
         return String::new();
     }
-    format!(
-        "<section class=\"image-section\"><h2>Properties</h2><pre class=\"properties\">{}</pre></section>",
+    let mut out = String::from("<section class=\"image-section\"><h2>Properties</h2>");
+    let rows = property_rows(&detail.properties);
+    if !rows.is_empty() {
+        out.push_str("<dl class=\"property-list\">");
+        for (term, definition) in rows {
+            out.push_str(&format!(
+                "<div class=\"property\"><dt>{term}</dt><dd>{definition}</dd></div>"
+            ));
+        }
+        out.push_str("</dl>");
+    }
+    out.push_str(&format!(
+        "<details class=\"properties-raw\"><summary>Raw properties</summary>\
+         <pre class=\"properties\">{}</pre></details></section>",
         escape_html(&crate::catalog::yaml_json_string(&detail.properties))
+    ));
+    out
+}
+
+/// The FORMAT §3.1 properties, in the order they are shown.
+const PROPERTY_ORDER: &[&str] = &[
+    "title",
+    "tags",
+    "rating",
+    "source",
+    "author",
+    "license",
+    "created",
+    "imported",
+    "added",
+    "id",
+    "copied_from",
+    "sources",
+];
+
+/// The property rows: `(label, rendered value)` pairs,
+/// known properties first, then the unknown ones by name.
+fn property_rows(properties: &Value) -> Vec<(String, String)> {
+    let Some(object) = properties.as_object() else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let mut shown = HashSet::new();
+    for key in PROPERTY_ORDER {
+        let Some(value) = object.get(*key) else {
+            continue;
+        };
+        if empty_property(value) {
+            continue;
+        }
+        shown.insert(*key);
+        rows.push((property_label(key), property_value(key, value)));
+    }
+    let mut unknown: Vec<&str> = object
+        .keys()
+        .filter(|key| !shown.contains(key.as_str()))
+        .map(String::as_str)
+        .collect();
+    unknown.sort_unstable();
+    for key in unknown {
+        let Some(value) = object.get(key) else {
+            continue;
+        };
+        if empty_property(value) {
+            continue;
+        }
+        rows.push((escape_html(key), property_value(key, value)));
+    }
+    rows
+}
+
+/// Whether a property has nothing to show: a `null`, or
+/// an empty list or object.
+fn empty_property(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::Array(items) => items.is_empty(),
+        Value::Object(fields) => fields.is_empty(),
+        _ => false,
+    }
+}
+
+/// The human label of a known property.
+fn property_label(key: &str) -> String {
+    let label = match key {
+        "title" => "Title",
+        "tags" => "Tags",
+        "rating" => "Rating",
+        "source" => "Source",
+        "author" => "Author",
+        "license" => "License",
+        "created" => "Created",
+        "imported" => "Imported",
+        "added" => "Added",
+        "id" => "ID",
+        "copied_from" => "Copied from",
+        "sources" => "Sources",
+        _ => key,
+    };
+    escape_html(label)
+}
+
+/// One property value, rendered for the definition list.
+fn property_value(key: &str, value: &Value) -> String {
+    match key {
+        "tags" => tags_value(value),
+        "source" => source_value(value),
+        "created" | "imported" | "added" => date_value(value),
+        "id" | "copied_from" => format!("<code>{}</code>", scalar_value(value)),
+        _ => scalar_value(value),
+    }
+}
+
+/// A property value as text: scalars as themselves, lists
+/// and maps as the JSON they are.
+fn scalar_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => escape_html(text),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => number.to_string(),
+        other => escape_html(&other.to_string()),
+    }
+}
+
+/// `tags` as links to the tagged view.
+fn tags_value(value: &Value) -> String {
+    let Some(tags) = value.as_array() else {
+        return scalar_value(value);
+    };
+    tags.iter()
+        .filter_map(|tag| tag.as_str())
+        .map(|tag| {
+            format!(
+                "<a class=\"inspector-tag\" href=\"/?tag={}\">{}</a>",
+                escape_html(&query_value(tag)),
+                escape_html(tag)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// `source` as a link when it is a URL, as text otherwise.
+fn source_value(value: &Value) -> String {
+    let Some(source) = value.as_str() else {
+        return scalar_value(value);
+    };
+    if source.starts_with("http://") || source.starts_with("https://") {
+        format!(
+            "<a class=\"source-link\" href=\"{}\" rel=\"noreferrer noopener\">{}</a>",
+            escape_html(source),
+            escape_html(source)
+        )
+    } else {
+        escape_html(source)
+    }
+}
+
+/// A date or datetime property: human-readable, with the
+/// original value in the `title` attribute.
+fn date_value(value: &Value) -> String {
+    let Some(text) = value.as_str() else {
+        return scalar_value(value);
+    };
+    format!(
+        "<span title=\"{}\">{}</span>",
+        escape_html(text),
+        escape_html(&human_date(text))
     )
+}
+
+/// An ISO 8601 date or datetime (FORMAT §3.1), in a form
+/// a person reads at a glance. Anything else is shown as
+/// it was written.
+fn human_date(value: &str) -> String {
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return datetime.format("%d %b %Y, %H:%M (%:z)").to_string();
+    }
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return date.format("%d %b %Y").to_string();
+    }
+    for format in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(datetime) = NaiveDateTime::parse_from_str(value, format) {
+            return datetime.format("%d %b %Y, %H:%M").to_string();
+        }
+    }
+    value.to_owned()
 }
 
 /// The path, with a button that copies it. Without JavaScript the button does
@@ -266,6 +466,7 @@ mod tests {
             }),
             front_matter_error: None,
             body: "A **quiet** cat.\n<script>alert(1)</script>\n".into(),
+            body_html: None,
             raw_files: vec!["猫.png.eagle.json".into()],
             note_path: Some("refs/猫.png.md".into()),
         }
@@ -343,6 +544,7 @@ mod tests {
             properties: json!({}),
             front_matter_error: None,
             body: String::new(),
+            body_html: None,
             raw_files: Vec::new(),
             note_path: None,
         };
@@ -367,5 +569,116 @@ mod tests {
         detail.front_matter_error = Some("expected a list".into());
         let html = image_body(&detail, &[], "/".into());
         assert!(html.contains("Front matter error: expected a list"));
+    }
+
+    #[test]
+    fn known_properties_render_as_a_definition_list_in_order() {
+        let mut detail = detail();
+        detail.properties = json!({
+            "title": "A title",
+            "tags": ["one", "two"],
+            "rating": 4,
+            "source": "https://example.com/pic/1",
+            "author": "Example Artist",
+            "license": "unknown",
+            "created": "2021-10-15",
+            "imported": "2026-10-04T14:30:12+01:00",
+            "added": "2023-07-12T20:54:07+01:00",
+            "id": "01JA8X3Q7K2M9V4T6R1B5N0C3Q",
+            "height": 3429,
+        });
+        let html = image_body(&detail, &[], "/".into());
+
+        // A definition list, not raw JSON.
+        assert!(html.contains("<dl class=\"property-list\">"), "{html}");
+        assert!(html.contains("<dt>Title</dt><dd>A title</dd>"), "{html}");
+        assert!(html.contains("<dt>Rating</dt><dd>4</dd>"), "{html}");
+        assert!(
+            html.contains("<dt>Author</dt><dd>Example Artist</dd>"),
+            "{html}"
+        );
+        assert!(html.contains("<dt>License</dt><dd>unknown</dd>"), "{html}");
+        assert!(
+            html.contains("<dt>ID</dt><dd><code>01JA8X3Q7K2M9V4T6R1B5N0C3Q</code></dd>"),
+            "{html}"
+        );
+        // An unknown property follows the known ones.
+        assert!(html.contains("<dt>height</dt><dd>3429</dd>"), "{html}");
+        // Tags are links to the tagged view.
+        assert!(
+            html.contains("<dt>Tags</dt><dd><a class=\"inspector-tag\" href=\"/?tag=one\">one</a>"),
+            "{html}"
+        );
+        // Source is a link.
+        assert!(html.contains(
+            "<dt>Source</dt><dd><a class=\"source-link\" href=\"https://example.com/pic/1\" rel=\"noreferrer noopener\">https://example.com/pic/1</a></dd>"
+        ), "{html}");
+        // The known properties come before the unknown one.
+        let title_at = html.find("<dt>Title</dt>").unwrap();
+        let height_at = html.find("<dt>height</dt>").unwrap();
+        assert!(title_at < height_at, "{html}");
+    }
+
+    #[test]
+    fn dates_are_human_readable_with_the_original_in_the_title() {
+        let mut detail = detail();
+        detail.properties = json!({
+            "created": "2021-10-15",
+            "imported": "2026-10-04T14:30:12+01:00",
+        });
+        let html = image_body(&detail, &[], "/".into());
+        assert!(
+            html.contains("<dt>Created</dt><dd><span title=\"2021-10-15\">15 Oct 2021</span></dd>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<dt>Imported</dt><dd><span title=\"2026-10-04T14:30:12+01:00\">04 Oct 2026, 14:30 (+01:00)</span></dd>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn a_date_that_is_not_iso_8601_is_shown_as_written() {
+        let mut detail = detail();
+        detail.properties = json!({ "created": "sometime last year" });
+        let html = image_body(&detail, &[], "/".into());
+        assert!(
+            html.contains("<span title=\"sometime last year\">sometime last year</span>"),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn the_raw_front_matter_stays_in_a_collapsed_details() {
+        let mut detail = detail();
+        detail.properties = json!({"title": "猫", "height": 3429});
+        let html = image_body(&detail, &[], "/".into());
+        assert!(
+            html.contains("<details class=\"properties-raw\"><summary>Raw properties</summary>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<pre class=\"properties\">{\n  &quot;height&quot;: 3429,\n  &quot;title&quot;: &quot;猫&quot;\n}</pre>"),
+            "{html}"
+        );
+        // The raw JSON is escaped, never live markup.
+        assert!(
+            !html.contains("<pre class=\"properties\">{\n  \"height\""),
+            "{html}"
+        );
+    }
+
+    #[test]
+    fn properties_without_a_value_are_not_listed() {
+        let mut detail = detail();
+        detail.properties = json!({
+            "title": "Shown",
+            "tags": [],
+            "height": null,
+        });
+        let html = image_body(&detail, &[], "/".into());
+        assert!(html.contains("<dt>Title</dt>"), "{html}");
+        assert!(!html.contains("<dt>Tags</dt>"), "{html}");
+        assert!(!html.contains("<dt>height</dt>"), "{html}");
     }
 }

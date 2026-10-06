@@ -1,7 +1,8 @@
 //! Read-only library catalog and preview provider contracts and implementations.
 
+use dimagine_core::format::file_extension;
 use dimagine_core::library::{FileClass, FileEntry, Library};
-use dimagine_core::links::{extract_markdown_links, Outcome, Resolver};
+use dimagine_core::links::{extract_markdown_links, key, LinkSyntax, Outcome, Resolver};
 use dimagine_index::{note_is_collection, CollectionEvidence};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde::Serialize;
@@ -12,6 +13,8 @@ use std::{
     sync::{Arc, Condvar, Mutex},
 };
 use unicode_normalization::UnicodeNormalization;
+
+use crate::ui::{markdown_html, LinkOutcome, LinkResolver};
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp",
@@ -80,8 +83,13 @@ pub struct ImageDetail {
     pub properties: serde_json::Value,
     /// Front matter parsing error, if the note has malformed YAML.
     pub front_matter_error: Option<String>,
-    /// Markdown note body rendered to safe HTML by the page handler.
+    /// Markdown note body, as written.
     pub body: String,
+    /// The note body rendered to safe HTML, its wikilinks and
+    /// embeds resolved against the library (FORMAT §5.1), when
+    /// the image has a note. `None` is different from an empty
+    /// note: it means there is no note to render.
+    pub body_html: Option<String>,
     /// Adjacent raw metadata filenames.
     pub raw_files: Vec<String>,
     /// Library-relative path of the image's note, when it has one. `None` is
@@ -218,6 +226,26 @@ impl FsCatalog {
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
     }
+
+    /// The note body rendered to safe HTML, its wikilinks and
+    /// embeds resolved against the library (FORMAT §5.1).
+    ///
+    /// `note_path` grounds note-relative links and identifies
+    /// the note's own image, whose embed (FORMAT §3.2) the
+    /// image page already shows.
+    fn render_note_body(&self, note_path: &str, body: &str) -> String {
+        let note = self
+            .library
+            .files
+            .iter()
+            .find(|entry| entry.rel == note_path);
+        let links = NoteLinks {
+            files: &self.library.files,
+            resolver: &self.resolver,
+            note,
+        };
+        markdown_html(body, Some(&links))
+    }
 }
 
 impl Catalog for FsCatalog {
@@ -306,30 +334,37 @@ impl Catalog for FsCatalog {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(CatalogError::Unreadable),
         };
-        let (properties, body, front_matter_error, note_relative_path) = if let Some(note_meta) =
-            note_meta
-        {
-            if note_meta.file_type().is_symlink() {
-                return Err(CatalogError::Forbidden);
-            }
-            let canonical_note =
-                fs::canonicalize(&note_path).map_err(|_| CatalogError::Unreadable)?;
-            let note_relative = canonical_note
-                .strip_prefix(&self.root)
-                .map_err(|_| CatalogError::Forbidden)?;
-            if note_relative
-                .components()
-                .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
-            {
-                return Err(CatalogError::Forbidden);
-            }
-            let text = fs::read_to_string(&canonical_note).map_err(|_| CatalogError::Unreadable)?;
-            let parsed = parse_note(&text);
-            let relative = note_relative.to_string_lossy().replace('\\', "/");
-            (parsed.properties, parsed.body, parsed.error, Some(relative))
-        } else {
-            (serde_json::Value::Null, String::new(), None, None)
-        };
+        let (properties, body, front_matter_error, note_relative_path, body_html) =
+            if let Some(note_meta) = note_meta {
+                if note_meta.file_type().is_symlink() {
+                    return Err(CatalogError::Forbidden);
+                }
+                let canonical_note =
+                    fs::canonicalize(&note_path).map_err(|_| CatalogError::Unreadable)?;
+                let note_relative = canonical_note
+                    .strip_prefix(&self.root)
+                    .map_err(|_| CatalogError::Forbidden)?;
+                if note_relative
+                    .components()
+                    .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
+                {
+                    return Err(CatalogError::Forbidden);
+                }
+                let text =
+                    fs::read_to_string(&canonical_note).map_err(|_| CatalogError::Unreadable)?;
+                let parsed = parse_note(&text);
+                let relative = note_relative.to_string_lossy().replace('\\', "/");
+                let body_html = self.render_note_body(&relative, &parsed.body);
+                (
+                    parsed.properties,
+                    parsed.body,
+                    parsed.error,
+                    Some(relative),
+                    Some(body_html),
+                )
+            } else {
+                (serde_json::Value::Null, String::new(), None, None, None)
+            };
         let parent = image.parent().ok_or(CatalogError::NotFound)?;
         let base = image.file_name().unwrap_or_default().to_string_lossy();
         let mut raw_files = Vec::new();
@@ -351,6 +386,7 @@ impl Catalog for FsCatalog {
             path: path.to_owned(),
             properties,
             body,
+            body_html,
             front_matter_error,
             raw_files,
             note_path: note_relative_path,
@@ -779,4 +815,101 @@ fn caption_after(lines: &[&str], link_line: usize) -> String {
         return String::new();
     }
     next.to_string()
+}
+
+/// Link resolution for one note body (FORMAT §5.1).
+///
+/// The image resolver of the library walk answers path and
+/// bare-name links; [`NoteLinks`] adds what a note renderer
+/// needs on top: a link to a note (not only to an image),
+/// and the note's own image, whose embed the image page
+/// already shows (FORMAT §3.2).
+struct NoteLinks<'a> {
+    files: &'a [FileEntry],
+    resolver: &'a Resolver,
+    /// The note the links are written in, when the walk found it.
+    note: Option<&'a FileEntry>,
+}
+
+impl LinkResolver for NoteLinks<'_> {
+    fn resolve_link(&self, target: &str) -> LinkOutcome {
+        let Some(note) = self.note else {
+            return LinkOutcome::Unresolved;
+        };
+        match self.resolver.resolve(target, note, LinkSyntax::WikiLink) {
+            Outcome::Resolved(idx) => self.classify(&self.files[idx], note),
+            // An extensionless name may still name a note: the
+            // image resolver leaves `[[browse]]` alone on
+            // purpose, while a note renderer resolves it to
+            // `browse.md`, the way Obsidian does.
+            Outcome::NotImageTarget | Outcome::NotFound => {
+                self.note_by_stem(target).unwrap_or(LinkOutcome::Unresolved)
+            }
+            // Several files match: the viewer must not guess
+            // (FORMAT §5.1 rule 3).
+            Outcome::Ambiguous(_) => LinkOutcome::Unresolved,
+        }
+    }
+}
+
+impl<'a> NoteLinks<'a> {
+    /// What a resolved library file means for a link.
+    fn classify(&self, entry: &FileEntry, note: &FileEntry) -> LinkOutcome {
+        match entry.class {
+            FileClass::Image => {
+                if is_self_embed(note, entry) {
+                    LinkOutcome::SelfImage(entry.rel.clone())
+                } else {
+                    LinkOutcome::Image(entry.rel.clone())
+                }
+            }
+            FileClass::ImageNote | FileClass::Note => LinkOutcome::Note(entry.rel.clone()),
+            // Raw metadata, boards and anything else have no
+            // page of their own in this viewer.
+            _ => LinkOutcome::Unresolved,
+        }
+    }
+
+    /// The one note whose name without `.md` is `target`,
+    /// when exactly one exists (FORMAT §5.1 rules 2 and 3).
+    fn note_by_stem(&self, target: &str) -> Option<LinkOutcome> {
+        // Only an extensionless target can name a note by
+        // its stem; a target with an extension was already
+        // matched by its full name.
+        if file_extension(target).is_some() {
+            return None;
+        }
+        let wanted = key(target);
+        let mut hits = Vec::new();
+        for entry in self.files {
+            if !matches!(entry.class, FileClass::Note | FileClass::ImageNote) {
+                continue;
+            }
+            // A bare name matches the file name; a path
+            // matches the whole library-relative path.
+            let full = if target.contains('/') {
+                &entry.rel
+            } else {
+                &entry.name
+            };
+            let Some(stem) = without_md(full) else {
+                continue;
+            };
+            if key(stem) == wanted {
+                hits.push(entry);
+            }
+        }
+        match hits.len() {
+            1 => Some(LinkOutcome::Note(hits[0].rel.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// The file name or path without its `.md`, matched
+/// case-insensitively the way the file classes are.
+fn without_md(name: &str) -> Option<&str> {
+    let start = name.len().checked_sub(3)?;
+    let tail = name.get(start..)?;
+    tail.eq_ignore_ascii_case(".md").then_some(&name[..start])
 }

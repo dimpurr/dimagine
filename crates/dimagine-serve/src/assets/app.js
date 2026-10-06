@@ -203,9 +203,19 @@
           '</div></div>'
       );
     }
-    if (detail.body) {
-      // The note body arrives as Markdown text, so it is shown as text: the
-      // server renders it as HTML on the image page, where it is sanitised.
+    if (detail.body_html) {
+      // The server renders the note to sanitised HTML with
+      // its wikilinks and embeds resolved (FORMAT §5.1),
+      // so the inspector shows the rendered note, not the
+      // raw Markdown.
+      parts.push(
+        '<div class="inspector-section"><h4>Note</h4><div class="note-body">' +
+          detail.body_html +
+          '</div></div>'
+      );
+    } else if (detail.body) {
+      // A detail without rendered HTML still shows the
+      // note, as escaped text.
       parts.push(
         '<div class="inspector-section"><h4>Note</h4><div class="note-body">' +
           escapeText(detail.body.slice(0, 400)) +
