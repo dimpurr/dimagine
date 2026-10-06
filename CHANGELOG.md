@@ -8,13 +8,26 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - Accounts: the viewer has a single owner account (email + password, argon2id)
-  created on first visit with a one-time setup code printed at startup;
-  `dimagine user` creates, lists and changes passwords; the account store lives
-  outside the library (`--data-dir`), refuses to start when it is unreadable or
-  malformed, and keeps unknown fields. Passcode mode still works until an account
-  exists. `--trusted-proxy` takes the client address from `X-Forwarded-For`
-  only from listed proxies; session cookies get `Secure` behind an HTTPS proxy
-  or with `--secure-cookies`; passwords need at least 12 characters.
+  that the first visitor creates on `/setup` — there is no setup code to copy,
+  and while no account exists the server says so at startup and every 10
+  minutes, because until then the first visitor can claim it. Setup is
+  serialised, so a second concurrent request is sent to the login page instead
+  of becoming a second owner. `dimagine user` creates, lists, changes passwords
+  and deletes accounts: `user delete <email>` asks first (`--yes` skips the
+  prompt), and deleting the last account puts the next `serve` start back into
+  setup. Any non-empty password is accepted; one shorter than 8 characters is
+  only used after the setup form's "Use this weak password anyway" checkbox or
+  the CLI's `--allow-weak`. The account store lives outside the library
+  (`--data-dir`), refuses to start when it is unreadable or malformed, and keeps
+  unknown fields. Passcode mode still works until an account exists.
+  `--trusted-proxy` takes the client address from `X-Forwarded-For` only from
+  listed proxies; session cookies get `Secure` behind an HTTPS proxy or with
+  `--secure-cookies`.
+- Viewer without login: `dimagine serve --auth none` (default is `--auth
+  account`) serves the library to anyone who can reach the address, banners
+  every page with "No login: anyone who can reach this address can see this
+  library", warns once when the bind address is not loopback — and starts
+  anyway — and needs no account store at all.
 - Viewer hardening: login attempts are throttled before comparison, bounded
   in flight and charged against per-client and global budgets; expensive
   requests are admission-bounded (503 + Retry-After); ETags come from the

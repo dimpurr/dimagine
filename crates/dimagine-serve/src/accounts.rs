@@ -22,8 +22,21 @@ use serde::{Deserialize, Serialize};
 /// Default schema version for accounts.json.
 pub const CURRENT_SCHEMA: u32 = 1;
 
-/// Minimum password length enforced by the setup form and the user CLI.
-pub const MIN_PASSWORD_LENGTH: usize = 12;
+/// Passwords shorter than this are *weak*: too short to resist guessing.
+///
+/// There is no minimum length any more — any non-empty password is accepted —
+/// but a weak one must be confirmed explicitly, both on the setup form
+/// (the "Use this weak password anyway" checkbox) and by the user CLI
+/// (`--allow-weak`).
+pub const WEAK_PASSWORD_LENGTH: usize = 8;
+
+/// Whether a password is weak: shorter than [`WEAK_PASSWORD_LENGTH`].
+///
+/// Counted in characters, not bytes, so a non-ASCII password is not judged
+/// weak because it happens to be multibyte.
+pub fn is_weak_password(password: &str) -> bool {
+    password.chars().count() < WEAK_PASSWORD_LENGTH
+}
 
 /// In-memory representation of `accounts.json`.
 ///
@@ -73,6 +86,10 @@ pub enum AccountsError {
     Schema {
         found: u32,
     },
+    /// No account has that email address.
+    NotFound {
+        email: String,
+    },
 }
 
 impl fmt::Display for AccountsError {
@@ -85,6 +102,9 @@ impl fmt::Display for AccountsError {
                 f,
                 "unsupported accounts.json schema {found}; expected {CURRENT_SCHEMA}"
             ),
+            AccountsError::NotFound { email } => {
+                write!(f, "no account with email '{email}'")
+            }
         }
     }
 }
@@ -95,6 +115,7 @@ impl std::error::Error for AccountsError {
             AccountsError::Io(err) => Some(err),
             AccountsError::Json(err) => Some(err),
             AccountsError::Hash(_) | AccountsError::Schema { .. } => None,
+            AccountsError::NotFound { .. } => None,
         }
     }
 }
@@ -359,16 +380,34 @@ impl AccountsStore {
             .users
             .iter_mut()
             .find(|u| u.email.eq_ignore_ascii_case(trimmed_email))
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("user with email '{trimmed_email}' not found"),
-                )
+            .ok_or_else(|| AccountsError::NotFound {
+                email: trimmed_email.to_string(),
             })?;
 
         user.password_hash = hash_password(new_password)?;
         self.save(&doc)?;
         Ok(())
+    }
+
+    /// Remove an account by email, returning the record that was removed.
+    ///
+    /// The write is the same atomic [`AccountsStore::save`] every other
+    /// mutation uses, and unknown fields survive it. Deleting the last
+    /// account leaves a store with no users, which is what puts the next
+    /// `serve` start back into first-run setup.
+    pub fn delete_user(&self, email: &str) -> Result<UserRecord, AccountsError> {
+        let mut doc = self.load()?;
+        let trimmed_email = email.trim();
+        let index = doc
+            .users
+            .iter()
+            .position(|u| u.email.eq_ignore_ascii_case(trimmed_email))
+            .ok_or_else(|| AccountsError::NotFound {
+                email: trimmed_email.to_string(),
+            })?;
+        let removed = doc.users.remove(index);
+        self.save(&doc)?;
+        Ok(removed)
     }
 }
 
@@ -474,6 +513,74 @@ mod tests {
         let first_run = AccountsStore::new(empty.path());
         assert!(!first_run.has_users().unwrap());
         assert!(first_run.load().unwrap().users.is_empty());
+    }
+
+    #[test]
+    fn weak_passwords_are_judged_by_characters() {
+        // There is no minimum any more: only a warning threshold.
+        assert!(is_weak_password(""));
+        assert!(is_weak_password("short"));
+        assert!(is_weak_password("1234567"));
+        assert!(!is_weak_password("12345678"));
+        assert!(!is_weak_password("a-very-long-password"));
+        // Eight multibyte characters are eight characters, not eight bytes.
+        assert!(!is_weak_password("パスワード八个字符です"));
+        assert!(is_weak_password("パスワード7"));
+    }
+
+    #[test]
+    fn delete_user_removes_the_account_and_can_empty_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountsStore::new(dir.path());
+
+        let owner = store
+            .create_user("Owner@example.com", "secret123456", "owner")
+            .unwrap();
+        store
+            .create_user("second@example.com", "secret123456", "user")
+            .unwrap();
+
+        // Unknown addresses are an error, not a silent no-op.
+        let err = store.delete_user("nobody@example.com").unwrap_err();
+        assert!(err.to_string().contains("nobody@example.com"), "{err}");
+        assert_eq!(store.load().unwrap().users.len(), 2);
+
+        // Case-insensitive, like every other lookup.
+        let removed = store.delete_user("OWNER@EXAMPLE.COM").unwrap();
+        assert_eq!(removed.id, owner.id);
+        assert_eq!(removed.role, "owner");
+        let doc = store.load().unwrap();
+        assert_eq!(doc.users.len(), 1);
+        assert_eq!(doc.users[0].email, "second@example.com");
+
+        // Deleting the last account leaves a readable, empty store: that is
+        // the shape that puts the next start back into setup.
+        store.delete_user("second@example.com").unwrap();
+        assert!(!store.has_users().unwrap());
+        assert!(store.load().unwrap().users.is_empty());
+        assert!(store.file_path().exists(), "the store file itself stays");
+
+        // Unknown fields survive a delete, like any other write.
+        let dir = tempfile::tempdir().unwrap();
+        let store = AccountsStore::new(dir.path());
+        std::fs::write(
+            store.file_path(),
+            r#"{"schema":1,"server_note":"keep me","users":[{"id":"01J9XEXAMPLEULID0000000000","email":"owner@example.com","password_hash":"$argon2id$v=19$dummy","role":"owner","created":"2026-10-05T12:00:00Z","user_note":"do_not_drop"}]}"#,
+        )
+        .unwrap();
+        store.delete_user("owner@example.com").unwrap();
+        let raw = std::fs::read_to_string(store.file_path()).unwrap();
+        assert!(raw.contains("server_note"), "{raw}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.file_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "delete must write 0600, got {mode:o}");
+        }
     }
 
     #[test]

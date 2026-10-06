@@ -1,11 +1,12 @@
-//! Read-only web viewer for a dimagine library, protected either by a shared
-//! passcode (legacy mode) or by a single owner account (ADR-014). Accounts
-//! live outside the library in a state directory; first run walks through a
-//! one-time setup flow.
+//! Read-only web viewer for a dimagine library. Clients are either signed in
+//! with a single owner account (ADR-014), with the legacy shared passcode
+//! until an account exists, or not authenticated at all (`AuthMode::None`).
+//! Accounts live outside the library in a state directory; the first visitor
+//! creates the owner account on `/setup`, with no code to copy.
 
 pub mod accounts;
 
-use crate::accounts::MIN_PASSWORD_LENGTH;
+use crate::accounts::{is_weak_password, WEAK_PASSWORD_LENGTH};
 use axum::{
     body::Body,
     extract::{Form, Path, State},
@@ -28,7 +29,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Component, Path as FsPath, PathBuf},
     sync::{Arc, Condvar, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
 use unicode_normalization::UnicodeNormalization;
@@ -588,6 +589,55 @@ impl std::fmt::Display for CatalogError {
 }
 impl std::error::Error for CatalogError {}
 
+/// How the viewer authenticates its clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AuthMode {
+    /// A login is required: the owner account, or the legacy shared passcode
+    /// while no account exists. This is the default.
+    #[default]
+    Account,
+    /// No login at all. Every page is reachable without a session and carries
+    /// [`NO_LOGIN_BANNER`]; the accounts store is not read at all.
+    None,
+}
+
+impl AuthMode {
+    /// Whether HTML pages must carry the "no login" banner.
+    pub fn shows_banner(self) -> bool {
+        self == AuthMode::None
+    }
+
+    /// The `--auth` spelling of this mode, as it appears in the startup
+    /// document and in help text.
+    pub fn name(self) -> &'static str {
+        match self {
+            AuthMode::Account => "account",
+            AuthMode::None => "none",
+        }
+    }
+
+    /// Parse a mode from its `--auth` spelling.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "account" => Some(AuthMode::Account),
+            "none" => Some(AuthMode::None),
+            _ => None,
+        }
+    }
+}
+
+/// Banner shown at the top of every page when no login is required.
+pub const NO_LOGIN_BANNER: &str =
+    "No login: anyone who can reach this address can see this library.";
+
+/// Reminder logged while no owner account exists yet. It names the setup page
+/// and the claim risk, and carries no secret: there is no code to leak.
+pub const NO_OWNER_REMINDER: &str = "No owner account yet: open /setup to create it. \
+     Until then the first visitor can claim this server.";
+
+/// How long the no-owner reminder waits before repeating itself.
+pub const NO_OWNER_REMINDER_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
 /// Viewer configuration.
 #[derive(Clone, Debug)]
 pub struct ServeConfig {
@@ -601,8 +651,8 @@ pub struct ServeConfig {
     pub trusted_proxies: Vec<std::net::IpAddr>,
     /// State directory for accounts.json.
     pub data_dir: PathBuf,
-    /// Pre-configured setup code (if None and setup mode is active, generated automatically).
-    pub setup_code: Option<String>,
+    /// Whether clients must sign in at all.
+    pub auth: AuthMode,
 }
 impl Default for ServeConfig {
     fn default() -> Self {
@@ -612,22 +662,32 @@ impl Default for ServeConfig {
             https: false,
             trusted_proxies: Vec::new(),
             data_dir: accounts::default_data_dir(),
-            setup_code: None,
+            auth: AuthMode::Account,
         }
     }
 }
 
-/// Generate a random setup code with at least 12 characters.
-pub fn generate_setup_code() -> String {
-    use rand::Rng;
-    let mut rng = rand::rng();
-    const CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    (0..16)
-        .map(|_| {
-            let idx = rng.random_range(0..CHARS.len());
-            CHARS[idx] as char
-        })
-        .collect()
+/// Log [`NO_OWNER_REMINDER`] now and every `interval` after that, until an
+/// owner account exists or the store stops being readable.
+///
+/// A broken store stops the loop rather than repeating the reminder: the
+/// caller is expected to have refused to start in that case, and an
+/// unreadable store is not "no owner yet".
+pub async fn remind_until_owner_exists<F>(
+    accounts: accounts::AccountsStore,
+    interval: Duration,
+    log: F,
+) where
+    F: Fn(&str),
+{
+    loop {
+        match accounts.has_users() {
+            Ok(true) | Err(_) => return,
+            Ok(false) => {}
+        }
+        log(NO_OWNER_REMINDER);
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Resolve client IP for rate limiting and logging.
@@ -662,11 +722,22 @@ struct AppState {
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
     accounts: accounts::AccountsStore,
-    setup_code: Arc<Mutex<Option<String>>>,
+    /// Serialises owner creation: one critical section from the re-check to
+    /// the write, so two concurrent setup requests cannot both create an
+    /// owner.
+    setup_lock: Arc<Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, u64>>>,
     throttles: Arc<Mutex<ThrottleState>>,
     admission: Arc<tokio::sync::Semaphore>,
     login_slots: Arc<tokio::sync::Semaphore>,
+}
+
+impl AppState {
+    /// Render one HTML page, with the no-login banner when the mode calls
+    /// for it.
+    fn page(&self, title: &str, body: &str) -> String {
+        layout(self.config.auth, title, body)
+    }
 }
 
 /// At most this many login attempts may be in flight at once, across all
@@ -866,30 +937,24 @@ pub fn router<C: Catalog, P: PreviewProvider>(
 ///
 /// Fails when `accounts.json` is unreadable, malformed, or written by an
 /// unknown schema version: the caller must exit non-zero rather than start a
-/// viewer that would silently fall back to first-run setup.
+/// viewer that would silently fall back to first-run setup. With
+/// [`AuthMode::None`] the store is never read, so a missing or broken one does
+/// not stop a no-login server.
 pub fn router_from(
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
 ) -> Result<Router, accounts::AccountsError> {
     let accounts = accounts::AccountsStore::new(&config.data_dir);
-    let has_users = accounts.has_users()?;
-    let setup_code = if !has_users && config.passcode.is_none() {
-        Some(
-            config
-                .setup_code
-                .clone()
-                .unwrap_or_else(generate_setup_code),
-        )
-    } else {
-        None
-    };
+    if config.auth == AuthMode::Account {
+        accounts.has_users()?;
+    }
     let state = AppState {
         catalog,
         previews,
         config,
         accounts,
-        setup_code: Arc::new(Mutex::new(setup_code)),
+        setup_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
@@ -914,19 +979,56 @@ pub fn router_from(
         .with_state(state))
 }
 
+/// What a request has to satisfy before it reaches a page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Gate {
+    /// `--auth none`: every page is public and there are no accounts at all.
+    Open,
+    /// No account and no passcode: every page belongs to `/setup`, which
+    /// creates the owner.
+    Setup,
+    /// Accounts exist (or a passcode does): a session is required.
+    Login,
+}
+
+/// Decide the gate for this request.
+///
+/// A store that fails to load never opens setup: it is treated as "accounts
+/// exist", so the request goes to `/login` and is refused there instead of
+/// reaching the account-creation form.
+fn gate(state: &AppState) -> Gate {
+    if state.config.auth == AuthMode::None {
+        return Gate::Open;
+    }
+    let has_users = state.accounts.has_users().unwrap_or(false);
+    if !has_users && state.config.passcode.is_none() {
+        Gate::Setup
+    } else {
+        Gate::Login
+    }
+}
+
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
-    // A store that fails to load must never reopen setup: fail closed by
-    // treating it as "users exist", so the request goes to /login and is
-    // refused there instead of reaching the account-creation form.
-    let has_users = state.accounts.has_users().unwrap_or(false);
-    let is_setup_mode = !has_users && state.config.passcode.is_none();
-
-    if is_setup_mode {
-        if path == "/setup" {
+    match gate(&state) {
+        Gate::Open => {
+            // Nothing to sign in to: `/login` and `/logout` land on the
+            // library, and owner creation is not offered here at all.
+            if path == "/setup" {
+                return (StatusCode::NOT_FOUND, "Not Found").into_response();
+            }
+            if path == "/login" || path == "/logout" {
+                return Redirect::to("/").into_response();
+            }
             return next.run(request).await;
         }
-        return Redirect::to("/setup").into_response();
+        Gate::Setup => {
+            if path == "/setup" {
+                return next.run(request).await;
+            }
+            return Redirect::to("/setup").into_response();
+        }
+        Gate::Login => {}
     }
 
     if path == "/setup" {
@@ -971,8 +1073,8 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
 }
 
 /// The setup form, optionally preceded by an error paragraph. This is the
-/// single place that knows the form's fields, so the password `minlength`
-/// lives here and not in every error page.
+/// single place that knows the form's fields, so the weak-password warning
+/// and its checkbox live here and not in every error page.
 fn setup_form_html(error: Option<&str>) -> String {
     let error = error
         .map(|message| format!("<p>{message}</p>"))
@@ -981,13 +1083,40 @@ fn setup_form_html(error: Option<&str>) -> String {
         "{error}<form method=\"post\">\
          <h2>Welcome to dimagine</h2>\
          <p>Create the owner account to finish server setup.</p>\
+         <p>Until this account exists, the first visitor can claim this server.</p>\
          <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-         <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
-         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
-         <label>One-time setup code <input name=\"setup_code\" type=\"text\" required autocomplete=\"off\"></label>\
-         <button type=\"submit\">Complete Setup</button>\
+         <label>Password <input name=\"password\" type=\"password\" required></label>\
+         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+         <label>Use this weak password anyway <input name=\"allow_weak\" type=\"checkbox\" value=\"yes\"></label>\
+         <p>Any password is accepted, but fewer than {WEAK_PASSWORD_LENGTH} characters is easy to guess:\
+         tick the box to use one anyway.</p>\
+         <button type=\"submit\">Create the owner account</button>\
          </form>"
     )
+}
+
+/// A setup error page, so every refusal renders the same form again.
+fn setup_error(status: StatusCode, error: &str) -> Response {
+    let html = layout(
+        AuthMode::Account,
+        "Initial Setup",
+        &setup_form_html(Some(error)),
+    );
+    let mut response = (status, Html(html)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+/// A setup response that is not an error page: 404s and redirects, both with
+/// `no-store` like every other credential-bearing response.
+fn setup_response(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
+    response
 }
 
 async fn setup_page(State(state): State<AppState>) -> Response {
@@ -996,9 +1125,9 @@ async fn setup_page(State(state): State<AppState>) -> Response {
         Err(err) => return store_error(err),
     };
     if has_users || state.config.passcode.is_some() {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
     }
-    let html = layout("Initial Setup", &setup_form_html(None));
+    let html = state.page("Initial Setup", &setup_form_html(None));
     let mut response = Html(html).into_response();
     response
         .headers_mut()
@@ -1014,8 +1143,11 @@ struct SetupForm {
     password: String,
     #[serde(default)]
     confirm_password: String,
+    /// The "Use this weak password anyway" checkbox. A checkbox posts its
+    /// `value` when ticked and nothing when not, so any non-empty value here
+    /// is an explicit confirmation.
     #[serde(default)]
-    setup_code: String,
+    allow_weak: String,
 }
 
 async fn setup(
@@ -1029,98 +1161,68 @@ async fn setup(
         Err(err) => return store_error(err),
     };
     if has_users || state.config.passcode.is_some() {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+        return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
     }
 
     // Refuse everything that can be refused without waiting on the lock, so a
     // request that is going to fail never queues behind a slow argon2 hash.
     let trimmed_email = form.email.trim();
     if trimmed_email.is_empty() || !trimmed_email.contains('@') {
-        let error_html = layout(
-            "Initial Setup",
-            &setup_form_html(Some("Please enter a valid email address.")),
+        return setup_error(
+            StatusCode::BAD_REQUEST,
+            "Please enter a valid email address.",
         );
-        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return response;
     }
 
     if form.password != form.confirm_password {
-        let error_html = layout(
-            "Initial Setup",
-            &setup_form_html(Some("Passwords do not match.")),
-        );
-        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return response;
+        return setup_error(StatusCode::BAD_REQUEST, "Passwords do not match.");
     }
 
-    if form.password.len() < MIN_PASSWORD_LENGTH {
-        let error_html = layout(
-            "Initial Setup",
-            &setup_form_html(Some(&format!(
-                "Password must be at least {MIN_PASSWORD_LENGTH} characters."
-            ))),
-        );
-        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return response;
+    if form.password.is_empty() {
+        return setup_error(StatusCode::BAD_REQUEST, "Password cannot be empty.");
     }
 
-    // One critical section spans the code check, the account creation, and the
-    // code invalidation. A second concurrent request blocks on this lock and
-    // then finds the code gone, instead of consuming it a second time and
-    // overwriting the first account.
-    let mut active_code = state.setup_code.lock().unwrap();
-    let Some(expected_code) = active_code.clone() else {
-        return (StatusCode::NOT_FOUND, "Not Found").into_response();
-    };
-
-    let code_input = form.setup_code.trim();
-    if code_input.is_empty()
-        || code_input
-            .as_bytes()
-            .ct_eq(expected_code.as_bytes())
-            .unwrap_u8()
-            != 1
-    {
-        let error_html = layout(
-            "Initial Setup",
-            &setup_form_html(Some("Invalid setup code.")),
+    // No length minimum: a short password is accepted, but only when the
+    // operator ticked the box saying they know it is weak.
+    if is_weak_password(&form.password) && form.allow_weak.trim().is_empty() {
+        return setup_error(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "This password is fewer than {WEAK_PASSWORD_LENGTH} characters and is easy to guess. \
+                 Tick \"Use this weak password anyway\" to use it."
+            ),
         );
-        let mut response = (StatusCode::BAD_REQUEST, Html(error_html)).into_response();
-        response
-            .headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        return response;
+    }
+
+    // One critical section spans the re-check and the account creation. A
+    // second concurrent request blocks on this lock and then finds an owner
+    // already exists, so it is sent to the login page instead of creating a
+    // second account (RW25 F-2).
+    let setup_guard = state.setup_lock.lock().unwrap();
+    match state.accounts.has_users() {
+        Ok(true) => return setup_response(Redirect::to("/login").into_response()),
+        Ok(false) => {}
+        Err(err) => return store_error(err),
     }
 
     if let Err(err) = state
         .accounts
         .create_user(trimmed_email, &form.password, "owner")
     {
-        // The code stays valid: a transient store failure must not burn the
-        // one-time code, or the operator would have to restart the server.
-        let error_html = layout(
+        // Setup stays open: a transient store failure must not close it, or
+        // the operator would have to restart the server.
+        let html = layout(
+            AuthMode::Account,
             "Initial Setup",
             &format!("<p>Failed to create account: {err}</p>"),
         );
-        let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(error_html)).into_response();
+        let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response();
         response
             .headers_mut()
             .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return response;
     }
-
-    // Invalidate setup code so it cannot be used again.
-    *active_code = None;
-    drop(active_code);
+    drop(setup_guard);
 
     let token = uuid::Uuid::new_v4().to_string();
     store_session(
@@ -1150,22 +1252,24 @@ async fn setup(
 }
 
 async fn login_page(State(state): State<AppState>) -> Response {
-    // Fail closed: an unreadable store shows the login form, never a redirect
-    // back to /setup.
-    let has_users = state.accounts.has_users().unwrap_or(false);
-    let is_setup_mode = !has_users && state.config.passcode.is_none();
-    if is_setup_mode {
-        return Redirect::to("/setup").into_response();
+    let gate = gate(&state);
+    match gate {
+        // No login exists in this mode: send the visitor to the library.
+        Gate::Open => return Redirect::to("/").into_response(),
+        // Fail closed: an unreadable store shows the login form, never a
+        // redirect back to /setup.
+        Gate::Setup => return Redirect::to("/setup").into_response(),
+        Gate::Login => {}
     }
+    let has_users = state.accounts.has_users().unwrap_or(false);
 
     let form_html = if has_users {
-        format!(
-            "<form method=\"post\">\
-             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-             <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
-             <button>Sign in</button>\
-             </form>"
-        )
+        "<form method=\"post\">\
+         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" required></label>\
+         <button>Sign in</button>\
+         </form>"
+            .to_string()
     } else {
         "<form method=\"post\">\
          <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
@@ -1174,7 +1278,7 @@ async fn login_page(State(state): State<AppState>) -> Response {
             .to_string()
     };
 
-    let mut response = Html(layout("Sign in", &form_html)).into_response();
+    let mut response = Html(state.page("Sign in", &form_html)).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1200,11 +1304,11 @@ async fn login(
     // Fail closed, as in the auth middleware: an unreadable store is treated
     // as "users exist", so the login attempt is refused instead of reopening
     // setup.
-    let has_users = state.accounts.has_users().unwrap_or(false);
-    let is_setup_mode = !has_users && state.config.passcode.is_none();
-    if is_setup_mode {
-        return Redirect::to("/setup").into_response();
-    }
+    let has_users = match gate(&state) {
+        Gate::Open => return Redirect::to("/").into_response(),
+        Gate::Setup => return Redirect::to("/setup").into_response(),
+        Gate::Login => state.accounts.has_users().unwrap_or(false),
+    };
 
     let client_key =
         resolve_client_ip(client.map(|c| c.0), &headers, &state.config.trusted_proxies);
@@ -1254,14 +1358,13 @@ async fn login(
 
     if !authenticated {
         let error_body = if has_users {
-            format!(
-                "<p>Incorrect email or password.</p>\
-                 <form method=\"post\">\
-                 <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-                 <label>Password <input name=\"password\" type=\"password\" required minlength=\"{MIN_PASSWORD_LENGTH}\"></label>\
-                 <button>Sign in</button>\
-                 </form>"
-            )
+            "<p>Incorrect email or password.</p>\
+             <form method=\"post\">\
+             <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
+             <label>Password <input name=\"password\" type=\"password\" required></label>\
+             <button>Sign in</button>\
+             </form>"
+                .to_string()
         } else {
             "<p>Incorrect passcode.</p>\
              <form method=\"post\">\
@@ -1272,7 +1375,7 @@ async fn login(
         };
         let mut response = (
             StatusCode::UNAUTHORIZED,
-            Html(layout("Sign in", &error_body)),
+            Html(state.page("Sign in", &error_body)),
         )
             .into_response();
         response
@@ -1383,12 +1486,13 @@ async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Res
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
     let catalog = state.catalog.clone();
+    let auth = state.config.auth;
     match tokio::task::spawn_blocking(move || {
         render_folder_data(&AppState { catalog, ..state }, &folder)
     })
     .await
     {
-        Ok(Ok(data)) => render_folder_data_html(data),
+        Ok(Ok(data)) => render_folder_data_html(auth, data),
         Ok(Err(error)) => error_response(error),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1413,8 +1517,9 @@ async fn collection_page(State(state): State<AppState>, Path(path): Path<String>
         None => return admission_denied(),
     };
     let catalog = state.catalog.clone();
+    let auth = state.config.auth;
     match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
-        Ok(Ok(c)) => Html(layout(&c.title, &collection_html(&c))).into_response(),
+        Ok(Ok(c)) => Html(layout(auth, &c.title, &collection_html(&c))).into_response(),
         Ok(Err(e)) => error_response(e),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -1432,6 +1537,7 @@ async fn collection_json(State(state): State<AppState>, Path(path): Path<String>
 }
 async fn image_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
     let catalog = state.catalog.clone();
+    let auth = state.config.auth;
     match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
         Ok(Ok(detail)) => {
             let props = escape_html(&yaml_json_string(&detail.properties));
@@ -1452,7 +1558,7 @@ async fn image_page(State(state): State<AppState>, Path(path): Path<String>) -> 
                 })
                 .unwrap_or_default();
             let content = format!("<p><a class=\"original-link\" href=\"/raw/{}\">View original</a></p><img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre>{diagnostic}<h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), encode_path(&detail.path), escape_html(&detail.path));
-            Html(layout(&detail.path, &content)).into_response()
+            Html(layout(auth, &detail.path, &content)).into_response()
         }
         Ok(Err(e)) => error_response(e),
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1702,7 +1808,7 @@ async fn folder_data_blocking(state: AppState, folder: String) -> Response {
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
-fn render_folder_data_html(data: FolderData) -> Response {
+fn render_folder_data_html(auth: AuthMode, data: FolderData) -> Response {
     let crumbs = data
         .breadcrumbs
         .iter()
@@ -1744,6 +1850,7 @@ fn render_folder_data_html(data: FolderData) -> Response {
         })
         .collect::<String>();
     Html(layout(
+        auth,
         if data.folder.is_empty() {
             "Library"
         } else {
@@ -1789,8 +1896,17 @@ fn error_response(e: CatalogError) -> Response {
         CatalogError::Unreadable => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
-fn layout(title: &str, body: &str) -> String {
-    format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>:root{{color-scheme:light dark;font:16px system-ui}}body{{max-width:1100px;margin:auto;padding:1rem}}a{{color:inherit}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}}.tile{{display:flex;flex-direction:column;text-decoration:none}}.tile img{{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px}}.tile span{{margin-top:4px;font-size:0.85rem;overflow-wrap:break-word}}.tile.folder{{aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:rgba(128,128,128,0.15);border-radius:8px;padding:0.5rem;text-align:center;box-sizing:border-box}}.detail{{max-width:100%;height:auto}}figure{{margin:0 0 1.4rem}}figure img{{max-width:100%;height:auto;border-radius:8px}}pre{{overflow:auto}}@media(max-width:420px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}</style><h1>{}</h1>{}</html>", escape_html(title), escape_html(title), body)
+/// One HTML page: the shared chrome, the title, and the body.
+///
+/// With [`AuthMode::None`] a banner goes above the title, so no page can be
+/// mistaken for a login-protected one.
+fn layout(auth: AuthMode, title: &str, body: &str) -> String {
+    let banner = if auth.shows_banner() {
+        format!("<p class=\"banner\">{}</p>", escape_html(NO_LOGIN_BANNER))
+    } else {
+        String::new()
+    };
+    format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>:root{{color-scheme:light dark;font:16px system-ui}}body{{max-width:1100px;margin:auto;padding:1rem}}a{{color:inherit}}.banner{{margin:0 0 1rem;padding:0.6rem 0.8rem;border:1px solid;border-radius:8px;font-weight:600}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}}.tile{{display:flex;flex-direction:column;text-decoration:none}}.tile img{{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px}}.tile span{{margin-top:4px;font-size:0.85rem;overflow-wrap:break-word}}.tile.folder{{aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:rgba(128,128,128,0.15);border-radius:8px;padding:0.5rem;text-align:center;box-sizing:border-box}}.detail{{max-width:100%;height:auto}}figure{{margin:0 0 1.4rem}}figure img{{max-width:100%;height:auto;border-radius:8px}}pre{{overflow:auto}}@media(max-width:420px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}</style>{banner}<h1>{}</h1>{}</html>", escape_html(title), escape_html(title), body)
 }
 fn markdown_html(markdown: &str) -> String {
     let mut out = String::new();

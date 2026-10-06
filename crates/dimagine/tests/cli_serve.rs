@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use dimagine_serve::NO_LOGIN_BANNER;
+
 const BIN: &str = env!("CARGO_BIN_EXE_dimagine");
 
 const PNG: &[u8] = include_bytes!("../../../tests/fixtures/pixel.png");
@@ -86,7 +88,7 @@ fn state_dir() -> DirGuard {
 struct Server {
     child: Option<Child>,
     address: String,
-    setup_code: Option<String>,
+    auth: String,
     state: Option<DirGuard>,
     stdout: std::process::ChildStdout,
 }
@@ -165,7 +167,7 @@ impl Server {
             }
         };
         assert_eq!(document["schema"], "dimagine.serve/0.1", "{document}");
-        let setup_code = document["setup_code"].as_str().map(ToString::to_string);
+        let auth = document["auth"].as_str().expect("auth field").to_string();
         let address = document["address"]
             .as_str()
             .expect("address field")
@@ -176,7 +178,7 @@ impl Server {
         Server {
             child: Some(child),
             address,
-            setup_code,
+            auth,
             state: None,
             stdout,
         }
@@ -186,8 +188,8 @@ impl Server {
         &self.address
     }
 
-    fn setup_code(&self) -> Option<&str> {
-        self.setup_code.as_deref()
+    fn auth(&self) -> &str {
+        &self.auth
     }
 
     /// Kill the server and hand back its stderr; the tests assert on the
@@ -717,8 +719,8 @@ fn serve_refuses_to_start_with_unreadable_accounts_file() {
     let error = serve_error_text(&output);
     assert!(error.contains("account storage I/O error"), "{error}");
     assert!(error.contains("Permission denied"), "{error}");
-    // Never falls back to setup: no startup document, no setup code.
-    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+    // No startup document: the process must not reach the serving stage.
+    assert!(!output.stdout.windows(5).any(|w| w == b"serving"));
 }
 
 #[test]
@@ -735,7 +737,8 @@ fn serve_refuses_to_start_with_truncated_accounts_file() {
     let output = run_serve(&dir.root, &state.0);
     let error = serve_error_text(&output);
     assert!(error.contains("malformed accounts.json"), "{error}");
-    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+    // No startup document: the process must not reach the serving stage.
+    assert!(!output.stdout.windows(5).any(|w| w == b"serving"));
 }
 
 #[test]
@@ -748,7 +751,8 @@ fn serve_refuses_to_start_with_empty_accounts_file() {
     let output = run_serve(&dir.root, &state.0);
     let error = serve_error_text(&output);
     assert!(error.contains("malformed accounts.json"), "{error}");
-    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+    // No startup document: the process must not reach the serving stage.
+    assert!(!output.stdout.windows(5).any(|w| w == b"serving"));
 }
 
 #[test]
@@ -765,7 +769,8 @@ fn serve_refuses_to_start_with_unknown_schema() {
     let output = run_serve(&dir.root, &state.0);
     let error = serve_error_text(&output);
     assert!(error.contains("schema 999"), "{error}");
-    assert!(!output.stdout.windows(12).any(|w| w == b"setup_code"));
+    // No startup document: the process must not reach the serving stage.
+    assert!(!output.stdout.windows(5).any(|w| w == b"serving"));
 }
 
 #[test]
@@ -788,8 +793,8 @@ fn serve_refuses_to_start_when_the_users_key_is_missing() {
             error.contains("users"),
             "the error must name the key: {error}"
         );
-        // Never falls back to setup: no startup document, no setup code.
-        assert!(!output.stdout.windows(10).any(|w| w == b"setup_code"));
+        // Never falls back to setup: the process must not reach serving.
+        assert!(!output.stdout.windows(5).any(|w| w == b"serving"));
         assert!(
             std::fs::read_to_string(state.0.join("accounts.json")).unwrap() == contents,
             "a refused start must not rewrite the store"
@@ -807,10 +812,7 @@ fn serve_first_run_without_an_accounts_file_opens_setup() {
     // No store at all is the one shape that still means first run.
     let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
     let address = server.url().to_string();
-    assert!(
-        server.setup_code().is_some(),
-        "a first run prints a one-time setup code"
-    );
+    assert_eq!(server.auth(), "account");
     let redirect = http_get(&address, "/", None);
     assert_eq!(status_of(&redirect), "303");
     assert!(header_of(&redirect, "location")
@@ -820,7 +822,22 @@ fn serve_first_run_without_an_accounts_file_opens_setup() {
     // Merely serving setup creates no store.
     assert!(!state.0.join("accounts.json").exists());
 
-    server.kill();
+    // There is no code to hand out, and the reminder says so instead.
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("setup code") && !stderr.contains("One-time"),
+        "no setup code is printed any more: {stderr}"
+    );
+    assert!(
+        stderr.contains("No owner account yet") && stderr.contains("/setup"),
+        "the operator is reminded to create the owner: {stderr}"
+    );
+    // The reminder names the risk and carries nothing secret.
+    assert!(stderr.contains("first visitor can claim"), "{stderr}");
+    assert!(
+        !state.0.join("accounts.json").exists(),
+        "the reminder must not create an account"
+    );
 }
 
 #[test]
@@ -1211,11 +1228,92 @@ fn user_cli_warns_about_world_readable_store_and_repairs_it_on_write() {
 }
 
 #[test]
-fn user_cli_refuses_passwords_below_the_minimum() {
+fn user_cli_asks_before_using_a_weak_password() {
     let state = state_dir();
     let data_dir = state.0.to_string_lossy().into_owned();
+    let create = |extra: &[&str], stdin_data: &str| {
+        let mut args = vec!["user", "create", "--data-dir", &data_dir];
+        args.extend_from_slice(extra);
+        run_user(&args, stdin_data)
+    };
 
-    // create refuses a short password with a clear message.
+    // With --password-stdin, standard input is carrying the password, so
+    // there is nobody to ask: the flag is the confirmation.
+    let output = create(
+        &["--email", "owner@example.com", "--password-stdin"],
+        "short\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--allow-weak"), "{stderr}");
+    assert!(stderr.contains("8 characters"), "{stderr}");
+    assert!(!state.0.join("accounts.json").exists());
+
+    // --allow-weak accepts it.
+    let output = create(
+        &[
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+            "--allow-weak",
+        ],
+        "short\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(state.0.join("accounts.json").exists());
+
+    // Without --password-stdin the answer comes from standard input: a
+    // refusal changes nothing.
+    let output = run_user(
+        &[
+            "user",
+            "passwd",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+        ],
+        "tiny\nn\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fewer than 8 characters") && stderr.contains("[y/N]"),
+        "the question must be asked: {stderr}"
+    );
+    assert!(stderr.contains("refused"), "{stderr}");
+
+    // Saying yes goes through.
+    let output = run_user(
+        &[
+            "user",
+            "passwd",
+            "--data-dir",
+            &data_dir,
+            "--email",
+            "owner@example.com",
+        ],
+        "tiny\ny\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed =
+        String::from_utf8_lossy(&run_user(&["user", "list", "--data-dir", &data_dir], "").stdout)
+            .into_owned();
+    assert!(listed.contains("owner@example.com"), "{listed}");
+
+    // A long-enough password is never questioned.
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
     let output = run_user(
         &[
             "user",
@@ -1226,31 +1324,329 @@ fn user_cli_refuses_passwords_below_the_minimum() {
             "owner@example.com",
             "--password-stdin",
         ],
-        "short\n",
+        "12345678\n",
     );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("8 characters"));
+}
+
+#[test]
+fn user_cli_delete_removes_accounts_and_reopens_setup_after_the_last_one() {
+    let dir = library("user-delete");
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+    for email in ["owner@example.com", "second@example.com"] {
+        let output = run_user(
+            &[
+                "user",
+                "create",
+                "--data-dir",
+                &data_dir,
+                "--email",
+                email,
+                "--password-stdin",
+            ],
+            "secret123456\n",
+        );
+        assert_eq!(output.status.code(), Some(0));
+    }
+
+    // An unknown address is an error and deletes nothing.
+    let output = run_user(&["user", "delete", "nobody@example.com", "--yes"], "");
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+    assert!(stderr.contains("nobody@example.com"), "{stderr}");
+    assert!(String::from_utf8_lossy(
+        &run_user(&["user", "list", "--data-dir", &data_dir], "").stdout
+    )
+    .contains("owner@example.com"));
 
-    // passwd refuses a short password too.
+    // Without --yes the answer is asked for, and "n" deletes nothing.
     let output = run_user(
         &[
             "user",
-            "passwd",
+            "delete",
+            "--data-dir",
+            &data_dir,
+            "second@example.com",
+        ],
+        "n\n",
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(
+        &run_user(&["user", "list", "--data-dir", &data_dir], "").stdout
+    )
+    .contains("second@example.com"));
+
+    // Answering yes removes that account only.
+    let output = run_user(
+        &[
+            "user",
+            "delete",
+            "--data-dir",
+            &data_dir,
+            "second@example.com",
+        ],
+        "y\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("deleted user second@example.com"),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(stderr.contains("second@example.com"), "prompt: {stderr}");
+    let listed =
+        String::from_utf8_lossy(&run_user(&["user", "list", "--data-dir", &data_dir], "").stdout)
+            .into_owned();
+    assert!(listed.contains("owner@example.com"), "{listed}");
+    assert!(!listed.contains("second@example.com"), "{listed}");
+
+    // A viewer started now still has an owner and asks for a login.
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+    server.kill();
+
+    // Deleting the last owner puts the next start back into setup.
+    let output = run_user(
+        &[
+            "user",
+            "delete",
+            "--yes",
+            "--data-dir",
+            &data_dir,
+            "owner@example.com",
+        ],
+        "",
+    );
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        stdout.contains("deleted user owner@example.com"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("/setup"), "{stdout}");
+
+    let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
+    let address = server.url().to_string();
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/setup"));
+    // The first visitor can set up again, and the weak-password rule still
+    // applies to the new owner.
+    let (status, cookie) = post_form(
+        &address,
+        "/setup",
+        "email=newowner%40example.com&password=brandnew&confirm_password=brandnew&allow_weak=yes",
+    );
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("the new owner is signed in");
+    assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
+    server.kill();
+}
+
+#[test]
+fn user_cli_delete_needs_a_confirmation_or_yes() {
+    let state = state_dir();
+    let data_dir = state.0.to_string_lossy().into_owned();
+    let output = run_user(
+        &[
+            "user",
+            "create",
             "--data-dir",
             &data_dir,
             "--email",
             "owner@example.com",
             "--password-stdin",
         ],
-        "short\n",
+        "secret123456\n",
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    // No answer at all (standard input closed) is a no.
+    let output = run_user(
+        &[
+            "user",
+            "delete",
+            "--data-dir",
+            &data_dir,
+            "owner@example.com",
+        ],
+        "",
     );
     assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("at least 12 characters"), "{stderr}");
+    assert!(String::from_utf8_lossy(
+        &run_user(&["user", "list", "--data-dir", &data_dir], "").stdout
+    )
+    .contains("owner@example.com"));
 
-    // Neither attempt created an account.
-    assert!(!state.0.join("accounts.json").exists());
+    // --yes skips the question and deletes, in JSON too.
+    let output = run_user(
+        &[
+            "--json",
+            "user",
+            "delete",
+            "--data-dir",
+            &data_dir,
+            "owner@example.com",
+            "--yes",
+        ],
+        "",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).expect("delete JSON");
+    assert_eq!(document["schema"], "dimagine.user/0.1");
+    assert_eq!(document["deleted"]["email"], "owner@example.com");
+    assert_eq!(document["accounts_left"], 0);
+}
+
+#[test]
+fn serve_auth_none_serves_the_library_without_a_login() {
+    let dir = library("auth-none");
+    // A passcode in the environment does not bring a login back.
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--auth", "none"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    assert_eq!(server.auth(), "none");
+
+    // No login, no cookie, no redirect: the library answers straight away.
+    let page = http_get(&address, "/", None);
+    assert_eq!(status_of(&page), "200");
+    assert!(page.contains("girl.jpg"), "{page}");
+    assert!(page.contains(NO_LOGIN_BANNER), "{page}");
+    assert_eq!(status_of(&http_get(&address, "/api/folder", None)), "200");
+
+    // Every page carries the banner, not just the first one.
+    let sub = http_get(&address, "/folder/sub", None);
+    assert_eq!(status_of(&sub), "200");
+    assert!(sub.contains(NO_LOGIN_BANNER), "{sub}");
+
+    // /login leads to the library, /setup does not exist, and no account is
+    // needed at all.
+    let login = http_get(&address, "/login", None);
+    assert_eq!(status_of(&login), "303");
+    assert!(header_of(&login, "location").unwrap().starts_with('/'));
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+    assert!(!server.state_dir().join("accounts.json").exists());
+
+    // Loopback is the common case, so it stays quiet.
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("--auth none is serving"),
+        "a loopback bind must not warn: {stderr}"
+    );
+}
+
+#[test]
+fn serve_auth_none_warns_once_on_a_non_loopback_bind() {
+    let dir = library("auth-none-bind");
+    // Binding to all local IPv4 interfaces while reaching it on loopback.
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--auth", "none", "--bind", "0.0.0.0"],
+        &[],
+    );
+    let address = server.url().to_string();
+
+    // The warning is not a refusal: the server serves anyway.
+    assert_eq!(status_of(&http_get(&address, "/", None)), "200");
+    let stderr = server.kill();
+    let warnings = stderr
+        .lines()
+        .filter(|line| line.contains("--auth none"))
+        .count();
+    assert_eq!(warnings, 1, "exactly one warning: {stderr}");
+    assert!(stderr.contains("0.0.0.0"), "{stderr}");
+}
+
+#[test]
+fn serve_auth_none_starts_on_a_broken_accounts_store() {
+    let dir = library("auth-none-store");
+    let state = state_dir();
+    // A store that account mode must refuse.
+    std::fs::write(state.0.join("accounts.json"), r#"{"schema":1}"#).unwrap();
+
+    let server =
+        Server::start_with_data_dir(&dir.root, &["--port", "0", "--auth", "none"], &[], &state.0);
+    let address = server.url().to_string();
+    assert_eq!(status_of(&http_get(&address, "/", None)), "200");
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("malformed accounts.json"),
+        "the store is not read at all: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(state.0.join("accounts.json")).unwrap(),
+        r#"{"schema":1}"#,
+        "a no-login server must not rewrite the store"
+    );
+}
+
+#[test]
+fn serve_auth_account_is_the_default_and_keeps_passcode_mode() {
+    let dir = library("auth-account");
+    // No --auth: account mode, with the passcode protecting it as before.
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "open-sesame")],
+    );
+    let address = server.url().to_string();
+    assert_eq!(server.auth(), "account");
+
+    let redirect = http_get(&address, "/", None);
+    assert_eq!(status_of(&redirect), "303");
+    assert!(header_of(&redirect, "location")
+        .unwrap()
+        .starts_with("/login"));
+    let login_page = http_get(&address, "/login", None);
+    assert!(login_page.contains("Passcode"), "{login_page}");
+    assert!(!login_page.contains("No login:"), "{login_page}");
+    // Passcode mode still wins over setup while no account exists.
+    assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
+    let (status, cookie) = post_login(&address, "open-sesame");
+    assert_eq!(status, "303");
+    let page = http_get(&address, "/", Some(&cookie.unwrap()));
+    assert_eq!(status_of(&page), "200");
+    assert!(!page.contains("No login:"), "{page}");
+    let stderr = server.kill();
+    assert!(!stderr.contains("No owner account yet"), "{stderr}");
+
+    // An unknown mode is a usage error.
+    let output = Command::new(BIN)
+        .args([
+            "serve",
+            "--library",
+            dir.root.to_str().unwrap(),
+            "--auth",
+            "sometimes",
+        ])
+        .env_remove("DIMAGINE_PASSCODE")
+        .output()
+        .expect("run dimagine serve");
+    assert_eq!(output.status.code(), Some(2));
 }
 
 #[test]
@@ -1259,34 +1655,37 @@ fn setup_flow_over_http_and_restart() {
     let state = state_dir();
     let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
     let address = server.url().to_string();
-    let code = server
-        .setup_code()
-        .expect("first run prints a one-time setup code")
-        .to_string();
 
     let redirect = http_get(&address, "/", None);
     assert_eq!(status_of(&redirect), "303");
     assert!(header_of(&redirect, "location")
         .unwrap()
         .starts_with("/setup"));
-    assert!(http_get(&address, "/setup", None).contains("Initial Setup"));
+    let setup_page = http_get(&address, "/setup", None);
+    assert!(setup_page.contains("Initial Setup"), "{setup_page}");
+    assert!(
+        setup_page.contains("Use this weak password anyway"),
+        "{setup_page}"
+    );
 
-    // A wrong one-time code is refused and creates nothing.
+    // A weak password without the checkbox is refused and creates nothing.
     let (status, _) = post_form(
         &address,
         "/setup",
-        "email=owner%40example.com&password=secret123&confirm_password=secret123&setup_code=wrong",
+        "email=owner%40example.com&password=tiny&confirm_password=tiny",
     );
     assert_eq!(status, "400");
     assert!(!state.0.join("accounts.json").exists());
 
-    // The right code creates the owner and signs in.
-    let body = format!(
-        "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code={code}"
+    // With the checkbox it is accepted, creating the owner and signing them in.
+    let (status, cookie) = post_form(
+        &address,
+        "/setup",
+        "email=owner%40example.com&password=tiny&confirm_password=tiny&allow_weak=yes",
     );
-    let (status, cookie) = post_form(&address, "/setup", &body);
     assert_eq!(status, "303");
     let cookie = cookie.expect("setup signs the owner in");
+    assert!(!cookie.contains("setup_code"), "{cookie}");
     assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
     assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
 
@@ -1299,11 +1698,13 @@ fn setup_flow_over_http_and_restart() {
         assert_eq!(mode, 0o600, "accounts.json must be 0600, got {mode:o}");
     }
 
-    server.kill();
+    let stderr = server.kill();
+    // This server started with no account, so it said so at startup; it stops
+    // saying so once it next looks and finds the owner.
+    assert!(stderr.contains("No owner account yet"), "{stderr}");
 
-    // Restart on the same state: no code is printed and /setup is a 404.
+    // Restart on the same state: /setup is a 404 and login is required again.
     let server = Server::start_with_data_dir(&dir.root, &["--port", "0"], &[], &state.0);
-    assert!(server.setup_code().is_none());
     let address = server.url().to_string();
     assert_eq!(status_of(&http_get(&address, "/setup", None)), "404");
     let redirect = http_get(&address, "/", None);
@@ -1311,5 +1712,13 @@ fn setup_flow_over_http_and_restart() {
     assert!(header_of(&redirect, "location")
         .unwrap()
         .starts_with("/login"));
-    server.kill();
+    let (status, cookie) = post_form(
+        &address,
+        "/login",
+        "email=owner%40example.com&password=tiny",
+    );
+    assert_eq!(status, "303");
+    let cookie = cookie.expect("the owner signs in with the short password");
+    assert_eq!(status_of(&http_get(&address, "/", Some(&cookie))), "200");
+    assert!(!server.kill().contains("No owner account yet"));
 }

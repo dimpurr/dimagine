@@ -1,14 +1,16 @@
-//! `dimagine serve`: read-only, passcode-protected web viewer for a dimagine
-//! library (HLD module `serve`), built on the `dimagine-serve` public API:
-//! `FsCatalog`, `CachedPreview`, `ServeConfig`, `router` and `serve`.
-//! Compiled when the `serve` feature is on and not switched off at runtime
-//! (ADR-013).
+//! `dimagine serve`: read-only web viewer for a dimagine library (HLD module
+//! `serve`), built on the `dimagine-serve` public API: `FsCatalog`,
+//! `CachedPreview`, `ServeConfig`, `router` and `serve`. Compiled when the
+//! `serve` feature is on and not switched off at runtime (ADR-013).
 //!
 //! Accounts live outside the library in the state directory selected by
-//! `--data-dir`. On first run (no accounts yet) the viewer redirects every
-//! page to `/setup`, which needs the one-time setup code printed at startup;
-//! `DIMAGINE_PASSCODE` keeps the legacy shared-passcode mode only while no
-//! account exists. Binding defaults to loopback: other devices need an
+//! `--data-dir`. With the default `--auth account` the viewer sends every page
+//! to `/setup` until an owner account exists; there is no setup code — the
+//! first visitor creates the owner, and the server keeps reminding the
+//! operator to do so itself. `DIMAGINE_PASSCODE` keeps the legacy
+//! shared-passcode mode while no account exists. `--auth none` removes login
+//! altogether (every page is public and carries a banner, and the accounts
+//! store is not needed). Binding defaults to loopback: other devices need an
 //! explicit `--bind`, and a default passcode on a non-loopback bind earns a
 //! warning from the serve crate itself.
 
@@ -18,7 +20,10 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use clap::{Arg, ArgMatches, Command};
-use dimagine_serve::{router_from, serve, CachedPreview, FsCatalog, ServeConfig};
+use dimagine_serve::{
+    accounts::AccountsStore, remind_until_owner_exists, router_from, serve, AuthMode,
+    CachedPreview, FsCatalog, ServeConfig, NO_OWNER_REMINDER_INTERVAL,
+};
 use std::sync::Arc;
 
 use crate::emit_failure;
@@ -64,6 +69,14 @@ pub fn command() -> Command {
                 .help("Always set the Secure attribute on the session cookie (when serving directly over HTTPS)."),
         )
         .arg(
+            Arg::new("auth")
+                .long("auth")
+                .value_name("MODE")
+                .value_parser(["account", "none"])
+                .default_value("account")
+                .help("Who may look at the library: 'account' (owner account, or DIMAGINE_PASSCODE until one exists, default) or 'none' (no login at all)."),
+        )
+        .arg(
             Arg::new("data_dir")
                 .long("data-dir")
                 .value_name("DIR")
@@ -72,7 +85,8 @@ pub fn command() -> Command {
         )
         .after_help(format!(
             "If no users exist and {PASSCODE_ENV} is set, passcode mode is active. \
-             Otherwise, first-run setup requires the one-time code printed at startup."
+             Otherwise /setup creates the owner account: create it right after the first \
+             start, before sharing the address, or the first visitor can claim the server."
         ))
 }
 
@@ -98,27 +112,51 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .get_one::<std::path::PathBuf>("data_dir")
         .cloned()
         .unwrap_or_else(dimagine_serve::accounts::default_data_dir);
-    let passcode = passcode_from_env();
-    let accounts = dimagine_serve::accounts::AccountsStore::new(&data_dir);
-    // An unreadable, malformed, or version-skewed accounts.json must stop the
-    // server: falling back to "no users" would reopen public first-run setup.
-    let has_users = match accounts.has_users() {
-        Ok(has_users) => has_users,
-        Err(err) => {
-            emit_failure(json, &err.to_string());
-            return ExitCode::from(1);
-        }
+    let auth = match sub.get_one::<String>("auth").map(String::as_str) {
+        None => AuthMode::Account,
+        Some(name) => match AuthMode::from_name(name) {
+            Some(mode) => mode,
+            None => {
+                emit_failure(json, &format!("unknown --auth mode: {name}"));
+                return ExitCode::from(2);
+            }
+        },
     };
-    let setup_code = if !has_users && passcode.is_none() {
-        Some(dimagine_serve::generate_setup_code())
+    // `--auth none` is no login at all, so the passcode has nothing to guard.
+    let passcode = if auth == AuthMode::Account {
+        passcode_from_env()
     } else {
         None
     };
+    // A store is only needed when clients must sign in. An unreadable,
+    // malformed, or version-skewed accounts.json must stop such a server:
+    // falling back to "no users" would reopen public first-run setup. In
+    // `--auth none` mode the store is never read, so a broken one is no
+    // obstacle.
+    let accounts = AccountsStore::new(&data_dir);
+    let mut setup_pending = false;
+    if auth == AuthMode::Account {
+        match accounts.has_users() {
+            Ok(has_users) => setup_pending = !has_users && passcode.is_none(),
+            Err(err) => {
+                emit_failure(json, &err.to_string());
+                return ExitCode::from(1);
+            }
+        }
+    }
     let port = sub.get_one::<u16>("port").copied().unwrap_or(DEFAULT_PORT);
     let bind = sub
         .get_one::<IpAddr>("bind")
         .copied()
         .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    if auth == AuthMode::None && !bind.is_loopback() {
+        // Start anyway: reaching the address from elsewhere is the point of
+        // --auth none, and the risk is the user's own to take.
+        eprintln!(
+            "WARNING: --auth none is serving the library without a login on {bind}, \
+             so anyone who can reach this address can see it"
+        );
+    }
     // A proxy whose address family can never equal a connecting peer's
     // address would silently disable per-client limiting (every client
     // collapses onto the peer address), so say so at startup.
@@ -135,7 +173,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         passcode,
         trusted_proxies,
         data_dir,
-        setup_code: setup_code.clone(),
+        auth,
         https: sub.get_flag("secure_cookies"),
         ..ServeConfig::default()
     };
@@ -170,24 +208,29 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
             .map(|addr| format!("http://{addr}"))
             .unwrap_or_else(|_| format!("http://{address}"));
         if json {
-            let mut document = serde_json::json!({
+            let document = serde_json::json!({
                 "schema": SCHEMA,
                 "library": library_dir.display().to_string(),
                 "address": local,
+                "auth": auth.name(),
             });
-            if let Some(ref code) = setup_code {
-                document["setup_code"] = serde_json::Value::String(code.clone());
-            }
             // One compact line: long-running processes emit protocol lines,
             // read one line at a time by tools.
             println!("{}", serde_json::to_string(&document).unwrap_or_default());
         } else {
             println!("serving {} at {local}", library_dir.display());
-            if let Some(ref code) = setup_code {
-                println!("One-time setup code: {code}");
-            }
         }
         let _ = std::io::stdout().flush();
+        // While no owner account exists, keep saying so on stderr: the setup
+        // page has no code, so nothing else would tell the operator that the
+        // server is still claimable.
+        if setup_pending {
+            tokio::spawn(remind_until_owner_exists(
+                accounts,
+                NO_OWNER_REMINDER_INTERVAL,
+                |message| eprintln!("{message}"),
+            ));
+        }
         match serve(listener, app, &config).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

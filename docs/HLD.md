@@ -39,7 +39,7 @@ Every command takes `--library <path>` (default: current directory) and
 | `index` | `.dimagine/cache/index.sqlite`: paths, sizes, mtimes, SHA-256, notes, links. Rebuildable. Incremental: compare mtime and size, then hash. |
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
-| `serve` | axum server: grid, folder and collection views, image detail, previews; single passcode. |
+| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. |
 
 ## `check` findings (0.1)
 

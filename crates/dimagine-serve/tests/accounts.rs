@@ -10,19 +10,21 @@ use axum::{
     http::{HeaderMap, Request, StatusCode},
 };
 use dimagine_serve::{
-    accounts::AccountsStore, router, router_from, FsCatalog, OriginalPreview, ServeConfig,
-    LOGIN_FAILURE_BUDGET,
+    accounts::AccountsStore, remind_until_owner_exists, router, router_from, AuthMode, FsCatalog,
+    OriginalPreview, ServeConfig, LOGIN_FAILURE_BUDGET, NO_LOGIN_BANNER, NO_OWNER_REMINDER,
+    NO_OWNER_REMINDER_INTERVAL,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn app_with(root: &TempDir, setup_code: Option<&str>, passcode: Option<&str>) -> axum::Router {
+fn app_for(root: &TempDir, passcode: Option<&str>, auth: AuthMode) -> axum::Router {
     let config = ServeConfig {
         passcode: passcode.map(str::to_owned),
         data_dir: root.path().join("state"),
-        setup_code: setup_code.map(str::to_owned),
+        auth,
         ..ServeConfig::default()
     };
     router(
@@ -30,6 +32,12 @@ fn app_with(root: &TempDir, setup_code: Option<&str>, passcode: Option<&str>) ->
         OriginalPreview,
         config,
     )
+}
+
+/// The default `--auth account` router: a login exists unless a passcode or an
+/// account says otherwise.
+fn app_with(root: &TempDir, passcode: Option<&str>) -> axum::Router {
+    app_for(root, passcode, AuthMode::Account)
 }
 
 fn get(uri: &str, cookie: Option<&str>) -> Request<Body> {
@@ -83,9 +91,9 @@ fn create_owner(root: &TempDir, email: &str, password: &str) {
 }
 
 #[tokio::test]
-async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
+async fn first_run_setup_needs_no_code_and_is_gone_afterwards() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    let app = app_with(&root, None);
 
     // Every page redirects to /setup while no account exists.
     let (status, headers, _) = send(&app, get("/", None)).await;
@@ -97,36 +105,28 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
     let (status, html) = body_text(&app, get("/setup", None)).await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Initial Setup"), "{html}");
+    // There is no code any more: nothing to print, copy or paste.
+    assert!(!html.contains("setup_code"), "{html}");
+    assert!(!html.contains("one-time"), "{html}");
 
-    // A wrong one-time code is refused and creates nothing.
+    // Mismatched passwords are refused, and nothing is written.
     let (status, _) = body_text(
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=wrong-code",
+            "email=owner%40example.com&password=secret123456&confirm_password=other-password",
         ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!root.path().join("state/accounts.json").exists());
 
-    // Mismatched passwords are refused even with the right code.
-    let (status, _) = body_text(
-        &app,
-        post(
-            "/setup",
-            "email=owner%40example.com&password=secret123456&confirm_password=other-password&setup_code=setup-code-abcdef",
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-
-    // The right code creates the owner and signs them in.
+    // Email + password + confirmation is all the form asks for.
     let (status, headers, _) = send(
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456",
         ),
     )
     .await;
@@ -137,7 +137,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
     let (status, _) = body_text(&app, get("/", Some(&cookie))).await;
     assert_eq!(status, StatusCode::OK);
 
-    // The setup page is gone for good, and the code is dead.
+    // The setup page is gone for good, and a second POST cannot add an owner.
     assert_eq!(
         send(&app, get("/setup", None)).await.0,
         StatusCode::NOT_FOUND
@@ -147,7 +147,7 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
             &app,
             post(
                 "/setup",
-                "email=second%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+                "email=second%40example.com&password=secret123456&confirm_password=secret123456",
             )
         )
         .await
@@ -174,47 +174,82 @@ async fn first_run_setup_flow_wrong_code_refused_and_code_single_use() {
 }
 
 #[tokio::test]
-async fn setup_refuses_short_and_empty_passwords() {
+async fn setup_needs_the_checkbox_for_a_weak_password() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    let app = app_with(&root, None);
 
-    // The form tells the operator about the minimum up front.
+    // The form warns about a short password and offers the checkbox.
     let (status, html) = body_text(&app, get("/setup", None)).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains("minlength=\"12\""), "{html}");
+    assert!(html.contains("Use this weak password anyway"), "{html}");
+    assert!(html.contains("fewer than 8 characters"), "{html}");
+    assert!(!html.contains("minlength"), "no length minimum: {html}");
 
-    // A password below the minimum is refused with a clear message, even
-    // when both fields match and the setup code is valid.
+    // A weak password without the box is refused, and nothing is written.
     let (status, html) = body_text(
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=short&confirm_password=short&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=short&confirm_password=short",
         ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(html.contains("at least 12 characters"), "{html}");
+    assert!(html.contains("Use this weak password anyway"), "{html}");
     assert!(!root.path().join("state/accounts.json").exists());
 
-    // An empty password is refused too (the two empty fields match).
+    // The server enforces it: an empty value for the box is not a yes.
     let (status, _) = body_text(
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=&confirm_password=&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=short&confirm_password=short&allow_weak=",
         ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(!root.path().join("state/accounts.json").exists());
 
-    // A password of exactly 12 characters is accepted.
+    // An empty password is refused even with the box ticked.
+    let (status, html) = body_text(
+        &app,
+        post(
+            "/setup",
+            "email=owner%40example.com&password=&confirm_password=&allow_weak=yes",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(html.contains("cannot be empty"), "{html}");
+    assert!(!root.path().join("state/accounts.json").exists());
+
+    // With the box ticked, the same weak password is accepted.
     let (status, headers, _) = send(
         &app,
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=short&confirm_password=short&allow_weak=yes",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/");
+    let store = AccountsStore::new(&root.path().join("state"));
+    assert_eq!(store.load().unwrap().users.len(), 1);
+}
+
+#[tokio::test]
+async fn setup_accepts_a_password_of_eight_characters_without_the_box() {
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, None);
+
+    // Eight characters is the weak threshold, not a minimum length: this is
+    // accepted with no confirmation at all.
+    let (status, headers, _) = send(
+        &app,
+        post(
+            "/setup",
+            "email=owner%40example.com&password=12345678&confirm_password=12345678",
         ),
     )
     .await;
@@ -227,9 +262,8 @@ async fn setup_is_gone_after_restart_and_once_a_user_exists() {
     let root = tempfile::tempdir().unwrap();
     create_owner(&root, "owner@example.com", "secret123");
 
-    // A fresh process (a new router) with the same data dir: no setup code is
-    // generated and /setup is a 404.
-    let app = app_with(&root, Some("would-be-code"), None);
+    // A fresh process (a new router) with the same data dir: /setup is a 404.
+    let app = app_with(&root, None);
     assert_eq!(
         send(&app, get("/setup", None)).await.0,
         StatusCode::NOT_FOUND
@@ -239,7 +273,7 @@ async fn setup_is_gone_after_restart_and_once_a_user_exists() {
             &app,
             post(
                 "/setup",
-                "email=evil%40example.com&password=secret123&confirm_password=secret123&setup_code=would-be-code",
+                "email=evil%40example.com&password=secret123&confirm_password=secret123",
             )
         )
         .await
@@ -256,7 +290,7 @@ async fn setup_is_gone_after_restart_and_once_a_user_exists() {
 async fn account_login_success_failure_and_logout() {
     let root = tempfile::tempdir().unwrap();
     create_owner(&root, "owner@example.com", "secret123");
-    let app = app_with(&root, None, None);
+    let app = app_with(&root, None);
 
     let (status, html) = body_text(&app, get("/login", None)).await;
     assert_eq!(status, StatusCode::OK);
@@ -302,7 +336,7 @@ async fn account_login_success_failure_and_logout() {
 async fn account_login_throttling_still_applies() {
     let root = tempfile::tempdir().unwrap();
     create_owner(&root, "owner@example.com", "secret123");
-    let app = app_with(&root, None, None);
+    let app = app_with(&root, None);
     let peer: SocketAddr = "203.0.113.7:40000".parse().unwrap();
 
     let wrong = || {
@@ -327,7 +361,7 @@ async fn account_login_throttling_still_applies() {
 #[tokio::test]
 async fn passcode_compat_mode_when_no_user_and_passcode_set() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("ignored-setup-code"), Some("open-sesame"));
+    let app = app_with(&root, Some("open-sesame"));
 
     // Passcode mode wins: no setup page, and the login form asks for a passcode.
     assert_eq!(
@@ -353,7 +387,7 @@ async fn passcode_compat_mode_when_no_user_and_passcode_set() {
 async fn untrusted_peer_ignores_spoofed_forwarded_for() {
     let root = tempfile::tempdir().unwrap();
     // No trusted proxies configured: the TCP peer is the only key.
-    let app = app_with(&root, None, Some("open-sesame"));
+    let app = app_with(&root, Some("open-sesame"));
     let peer: SocketAddr = "127.0.0.1:40000".parse().unwrap();
 
     for i in 0..LOGIN_FAILURE_BUDGET {
@@ -477,8 +511,7 @@ async fn a_store_without_the_users_key_is_an_error_not_a_first_run() {
         "the error must name the key: {text}"
     );
 
-    // Building the viewer refuses outright: no router, so no setup page and no
-    // one-time code.
+    // Building the viewer refuses outright: no router, so no setup page.
     let err = try_router(&root).unwrap_err();
     assert!(err.to_string().contains("users"), "{err}");
 }
@@ -486,7 +519,7 @@ async fn a_store_without_the_users_key_is_an_error_not_a_first_run() {
 #[tokio::test]
 async fn a_store_that_loses_its_users_key_while_running_fails_closed() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    let app = app_with(&root, None);
     assert_eq!(
         send(&app, get("/setup", None)).await.0,
         StatusCode::OK,
@@ -498,12 +531,12 @@ async fn a_store_that_loses_its_users_key_while_running_fails_closed() {
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("accounts.json"), r#"{"schema":1}"#).unwrap();
 
-    // The setup form is never rendered and the code never creates an account.
+    // The setup form is never rendered and the POST never creates an account.
     for request in [
         get("/setup", None),
         post(
             "/setup",
-            "email=owner%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+            "email=owner%40example.com&password=secret123456&confirm_password=secret123456",
         ),
     ] {
         let (status, html) = body_text(&app, request).await;
@@ -565,7 +598,7 @@ fn an_absent_accounts_file_is_a_first_run_and_opens_setup() {
 #[tokio::test]
 async fn a_first_run_without_an_accounts_file_opens_the_setup_page() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    let app = app_with(&root, None);
     assert!(!root.path().join("state/accounts.json").exists());
 
     let (status, headers, _) = send(&app, get("/", None)).await;
@@ -622,20 +655,18 @@ fn permissions_warning_reports_group_or_world_readable_store() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_setup_requests_consume_the_code_only_once() {
+async fn concurrent_setup_requests_still_create_exactly_one_owner() {
     let root = tempfile::tempdir().unwrap();
-    let app = app_with(&root, Some("setup-code-abcdef"), None);
+    let app = app_with(&root, None);
 
     let request = |email: &str| {
         post(
             "/setup",
-            &format!(
-                "email={email}&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef"
-            ),
+            &format!("email={email}&password=secret123456&confirm_password=secret123456"),
         )
     };
 
-    // Two requests race the one-time code; exactly one may complete setup.
+    // Two requests race for the owner; exactly one may complete setup.
     let app_a = app.clone();
     let app_b = app.clone();
     let task_a =
@@ -659,18 +690,17 @@ async fn concurrent_setup_requests_consume_the_code_only_once() {
     assert_eq!(
         winners.len(),
         1,
-        "exactly one request may complete setup: {outcomes:?}"
+        "exactly one request may create the owner: {outcomes:?}"
     );
     for (status, headers) in &outcomes {
         if *status == StatusCode::SEE_OTHER && headers["location"] == "/" {
             continue;
         }
-        // The loser is refused: 404 because the code is gone (or setup is
-        // unreachable now that a user exists).
-        assert_eq!(
-            *status,
-            StatusCode::NOT_FOUND,
-            "the losing request must be refused: {status} {headers:?}"
+        // The loser is sent to the login page: it finds an owner already
+        // exists, so its account is not created.
+        assert!(
+            *status == StatusCode::SEE_OTHER && headers["location"] == "/login",
+            "the losing request must be redirected to login: {status} {headers:?}"
         );
     }
 
@@ -684,19 +714,194 @@ async fn concurrent_setup_requests_consume_the_code_only_once() {
     });
     assert_eq!(doc.users[0].role, "owner");
 
-    // The code is dead: a follow-up request with the same code is refused.
+    // Setup stays closed: a follow-up request finds the owner and is a 404.
     assert_eq!(
         send(
             &app,
             post(
                 "/setup",
-                "email=third%40example.com&password=secret123456&confirm_password=secret123456&setup_code=setup-code-abcdef",
+                "email=third%40example.com&password=secret123456&confirm_password=secret123456",
             )
         )
         .await
         .0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn no_auth_mode_serves_every_page_without_a_login() {
+    let root = tempfile::tempdir().unwrap();
+    // A library with something on it, so the pages below exist.
+    std::fs::create_dir_all(root.path().join("sub")).unwrap();
+    std::fs::write(
+        root.path().join("girl.jpg"),
+        b"\xff\xd8\xff\xe0not-a-real-jpeg",
+    )
+    .unwrap();
+    // Even with an account in the store, `--auth none` asks for nothing.
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, Some("open-sesame"), AuthMode::None);
+
+    // The library is reachable anonymously, with no cookie and no redirect.
+    for path in ["/", "/folder/sub", "/image/girl.jpg"] {
+        let (status, _headers, body) = send(&app, get(path, None)).await;
+        assert_eq!(status, StatusCode::OK, "{path} must be public");
+        let html = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            html.contains(NO_LOGIN_BANNER),
+            "{path} must carry the banner: {html}"
+        );
+    }
+
+    // The API answers too, with no session at all.
+    assert_eq!(send(&app, get("/api/folder", None)).await.0, StatusCode::OK);
+
+    // No login exists: /login and /logout lead to the library, and owner
+    // creation is not offered here.
+    let (status, headers, _) = send(&app, get("/login", None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/");
+    assert_eq!(
+        send(&app, get("/setup", None)).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        send(
+            &app,
+            post(
+                "/setup",
+                "email=intruder%40example.com&password=secret123456&confirm_password=secret123456",
+            )
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    // Posting a login is a no-op, not a way in or a way to see a form.
+    let (status, headers, _) = send(&app, post("/login", "passcode=open-sesame")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/");
+}
+
+#[tokio::test]
+async fn no_auth_mode_does_not_need_the_accounts_store() {
+    let root = tempfile::tempdir().unwrap();
+    let state = root.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // A store a login would have to refuse: no `users` key at all.
+    std::fs::write(state.join("accounts.json"), r#"{"schema":1}"#).unwrap();
+
+    // Account mode still refuses to build a router from it (RW25 F-1).
+    assert!(try_router(&root).is_err());
+
+    // No-login mode never reads it, so the same store is not an obstacle.
+    let app = router_from(
+        Arc::new(FsCatalog::new(root.path()).unwrap()),
+        Arc::new(OriginalPreview),
+        ServeConfig {
+            data_dir: state.clone(),
+            auth: AuthMode::None,
+            ..ServeConfig::default()
+        },
+    )
+    .expect("--auth none does not read the accounts store");
+    let (status, _, body) = send(&app, get("/", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains(NO_LOGIN_BANNER));
+    // The refused store is left exactly as it was.
+    assert_eq!(
+        std::fs::read_to_string(state.join("accounts.json")).unwrap(),
+        r#"{"schema":1}"#
+    );
+}
+
+#[tokio::test]
+async fn the_account_mode_never_shows_the_no_login_banner() {
+    let root = tempfile::tempdir().unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_with(&root, None);
+
+    // The login page is the one page an anonymous client can reach, and it
+    // must not claim that there is no login.
+    let (status, _, body) = send(&app, get("/login", None)).await;
+    assert_eq!(status, StatusCode::OK);
+    let html = String::from_utf8_lossy(&body).into_owned();
+    assert!(!html.contains("No login:"), "{html}");
+    assert!(!html.contains("anyone who can reach"), "{html}");
+
+    // And an anonymous library request is still a redirect to the login page.
+    let (status, headers, _) = send(&app, get("/", None)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(headers["location"], "/login");
+}
+
+#[tokio::test]
+async fn the_owner_reminder_repeats_until_an_account_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AccountsStore::new(&root.path().join("state"));
+
+    let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let logged = Arc::clone(&logged);
+        move |message: &str| logged.lock().unwrap().push(message.to_string())
+    };
+    // A short interval stands in for the ten production minutes.
+    let reminder = tokio::spawn(remind_until_owner_exists(
+        store.clone(),
+        Duration::from_millis(20),
+        sink,
+    ));
+
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    assert!(
+        logged.lock().unwrap().len() >= 2,
+        "the reminder must repeat, not fire once"
+    );
+
+    // Creating the owner stops it, once it next looks.
+    store
+        .create_user("owner@example.com", "secret123456", "owner")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), reminder)
+        .await
+        .expect("the reminder must stop once an owner exists")
+        .unwrap();
+
+    let logged = logged.lock().unwrap();
+    assert!(logged.len() >= 2);
+    assert!(
+        logged.iter().all(|message| message == NO_OWNER_REMINDER),
+        "only the reminder message is logged: {logged:?}"
+    );
+    // It names the setup page and the claim risk, and carries no secret:
+    // there is no code to leak any more.
+    assert_eq!(
+        NO_OWNER_REMINDER,
+        "No owner account yet: open /setup to create it. \
+         Until then the first visitor can claim this server."
+    );
+    assert_eq!(NO_OWNER_REMINDER_INTERVAL, Duration::from_secs(600));
+}
+
+#[tokio::test]
+async fn the_owner_reminder_is_silent_when_an_account_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let store = AccountsStore::new(&root.path().join("state"));
+    create_owner(&root, "owner@example.com", "secret123");
+
+    let logged = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let logged = Arc::clone(&logged);
+        move |message: &str| logged.lock().unwrap().push(message.to_string())
+    };
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        remind_until_owner_exists(store, Duration::from_millis(10), sink),
+    )
+    .await
+    .expect("an existing owner must end the reminder at once");
+    assert!(logged.lock().unwrap().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
