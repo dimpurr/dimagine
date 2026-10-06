@@ -653,7 +653,7 @@ fn setup_form_html(error: Option<&str>) -> String {
          <label>Password <input name=\"password\" type=\"password\" autocomplete=\"new-password\" required></label>\
          <label>Confirm password <input name=\"confirm_password\" type=\"password\" autocomplete=\"new-password\" required></label>\
          <label>Use this weak password anyway <input name=\"allow_weak\" type=\"checkbox\" value=\"yes\"></label>\
-         <p>Any password is accepted, but fewer than {WEAK_PASSWORD_LENGTH} characters is easy to guess:\
+         <p>Any password is accepted, but fewer than {WEAK_PASSWORD_LENGTH} characters is easy to guess: \
          tick the box to use one anyway.</p>\
          <button type=\"submit\">Create the owner account</button>\
          </form>"
@@ -1326,5 +1326,14 @@ mod regression_unit_tests {
 
         // No peer addr returns "unknown"
         assert_eq!(resolve_client_ip(None, &headers, &[trusted_ip]), "unknown");
+    }
+
+    /// W27f copy nit: the weak-password hint reads "guess: tick", with the
+    /// space a Rust line continuation would otherwise swallow.
+    #[test]
+    fn the_setup_hint_spells_guess_tick_with_a_space() {
+        let html = setup_form_html(None);
+        assert!(html.contains("easy to guess: tick the box"), "{html}");
+        assert!(!html.contains("guess:tick"), "{html}");
     }
 }

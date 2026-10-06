@@ -123,6 +123,8 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: the setup form's weak-password hint reads "easy to guess: tick the
+  box"; the space was missing.
 - Viewer: the `--auth none` banner is one full-width bar above the whole shell
   at every width, instead of becoming a column beside the rail or sidebar on
   tablet and desktop. The stylesheet and script are served without a session,
