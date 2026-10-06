@@ -78,13 +78,16 @@ async fn html_pages_and_json_routes_render_unicode_notes_and_collection_order() 
     let (app, cookie) = login(app).await;
     for route in [
         "/",
-        "/folder/art",
-        "/collection/set.md",
+        "/folders",
+        "/collections",
+        "/search",
         "/image/art/%E7%8C%AB.png",
         "/api/folder",
         "/api/folder/art",
         "/api/collection/set.md",
         "/api/image/art/%E7%8C%AB.png",
+        "/api/view",
+        "/api/sidebar",
     ] {
         let response = app
             .clone()
@@ -111,7 +114,10 @@ async fn html_pages_and_json_routes_render_unicode_notes_and_collection_order() 
         .await
         .unwrap();
     assert!(body(root_page).await.contains("folder"));
-    let page = app
+
+    // A collection is a view now: `/collection/<path>` answers 301, and the
+    // members come back in the note's own embed order (FORMAT §5).
+    let redirect = app
         .clone()
         .oneshot(
             Request::builder()
@@ -122,9 +128,27 @@ async fn html_pages_and_json_routes_render_unicode_notes_and_collection_order() 
         )
         .await
         .unwrap();
+    assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(redirect.headers()["location"], "/?c=set.md");
+    let page = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/?c=set.md")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     let html = body(page).await;
-    assert!(html.find("Second caption").unwrap() < html.find("First cat.").unwrap());
-    assert!(html.contains("art/second.jpg"));
+    let second = html
+        .find("art/second.jpg")
+        .expect("the second image is listed");
+    let first = html
+        .find("/image/art/%E7%8C%AB.png")
+        .expect("the cat is listed");
+    assert!(second < first, "the collection's own order wins: {html}");
     let detail = app
         .clone()
         .oneshot(
@@ -304,19 +328,20 @@ async fn special_character_and_unicode_urls_round_trip() {
     assert_eq!(root_page.status(), StatusCode::OK);
     let root_html = body(root_page).await;
 
-    // Verify phone tile layout styles
-    assert!(root_html.contains("aspect-ratio:1"));
-    assert!(root_html.contains("object-fit:cover"));
-    assert!(root_html
-        .contains("@media(max-width:420px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}"));
+    // 1. The library links to the folder and collection views, with the
+    // characters that need encoding encoded (spec §2).
+    assert!(root_html.contains("href=\"/?in=pixiv%20%26%20twitter\""));
+    assert!(
+        root_html.contains("href=\"/?in=a%2Bb\""),
+        "a literal + is encoded, so it cannot be read back as a space"
+    );
+    assert!(root_html.contains("href=\"/?c=pixiv%20%26%20twitter.md\""));
+    assert!(root_html.contains("href=\"/?c=%E9%9B%A8%E3%81%AE%E6%97%A5%20%E2%98%94.md\""));
 
-    // Verify folder links in root
-    assert!(root_html.contains("/folder/pixiv%20%26%20twitter"));
-    assert!(root_html.contains("/folder/a%2Bb"));
-    assert!(root_html.contains("/collection/pixiv%20%26%20twitter.md"));
-    assert!(root_html.contains("/collection/%E9%9B%A8%E3%81%AE%E6%97%A5%20%E2%98%94.md"));
+    // The tile CSS moved into the stylesheet, which the page links by hash.
+    assert!(root_html.contains("<link rel=\"stylesheet\" href=\"/assets/app-"));
 
-    // 2. Request folder via generated link
+    // 2. `/folder/<path>` redirects to the view it now means.
     let folder_resp = app
         .clone()
         .oneshot(
@@ -328,29 +353,31 @@ async fn special_character_and_unicode_urls_round_trip() {
         )
         .await
         .unwrap();
-    assert_eq!(folder_resp.status(), StatusCode::OK);
-    let folder_html = body(folder_resp).await;
+    assert_eq!(folder_resp.status(), StatusCode::PERMANENT_REDIRECT);
+    let location = folder_resp.headers()["location"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(location, "/?in=pixiv%20%26%20twitter");
 
-    // Check breadcrumbs and image links inside folder
-    assert!(
-        folder_html.contains("<a href=\"/folder/pixiv%20%26%20twitter\">pixiv &amp; twitter</a>")
-    );
+    let folder_html = body(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&location)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    // Check the breadcrumb and the image links inside the folder
+    assert!(folder_html.contains(">pixiv &amp; twitter</a>"));
     assert!(folder_html.contains("/image/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png"));
     assert!(folder_html.contains("/thumb/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png"));
-
-    // Request breadcrumb link
-    let crumb_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/folder/pixiv%20%26%20twitter")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(crumb_resp.status(), StatusCode::OK);
 
     // Request image page via generated link
     let image_resp = app
@@ -393,7 +420,7 @@ async fn special_character_and_unicode_urls_round_trip() {
         .unwrap();
     assert_eq!(media_resp.status(), StatusCode::OK);
 
-    // Request collection via generated link
+    // Request collection via the link the root page generated
     let coll_resp = app
         .clone()
         .oneshot(
@@ -405,7 +432,11 @@ async fn special_character_and_unicode_urls_round_trip() {
         )
         .await
         .unwrap();
-    assert_eq!(coll_resp.status(), StatusCode::OK);
+    assert_eq!(coll_resp.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        coll_resp.headers()["location"],
+        "/?c=pixiv%20%26%20twitter.md"
+    );
 
     // Folder and image with a+b and emoji
     let ab_resp = app
@@ -419,7 +450,8 @@ async fn special_character_and_unicode_urls_round_trip() {
         )
         .await
         .unwrap();
-    assert_eq!(ab_resp.status(), StatusCode::OK);
+    assert_eq!(ab_resp.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(ab_resp.headers()["location"], "/?in=a%2Bb");
 
     let emoji_img_resp = app
         .clone()

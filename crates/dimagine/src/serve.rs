@@ -55,6 +55,14 @@ pub fn command() -> Command {
                 .help("IP address to listen on (default: 127.0.0.1, reachable only from this machine)."),
         )
         .arg(
+            Arg::new("rescan_interval")
+                .long("rescan-interval")
+                .value_name("SECS")
+                .value_parser(clap::value_parser!(u64))
+                .default_value("300")
+                .help("Interval in seconds between background library rescans (default: 300, 0 disables)."),
+        )
+        .arg(
             Arg::new("trusted_proxy")
                 .long("trusted-proxy")
                 .value_name("IP")
@@ -104,6 +112,10 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }
     };
     let previews = CachedPreview::new(library_dir);
+    let rescan_interval = sub
+        .get_one::<u64>("rescan_interval")
+        .copied()
+        .unwrap_or(300);
     let trusted_proxies: Vec<IpAddr> = sub
         .get_many::<IpAddr>("trusted_proxy")
         .map(|vals| vals.copied().collect())
@@ -174,6 +186,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         trusted_proxies,
         data_dir,
         auth,
+        rescan_interval,
         https: sub.get_flag("secure_cookies"),
         ..ServeConfig::default()
     };

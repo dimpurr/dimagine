@@ -173,6 +173,37 @@ async fn first_run_setup_needs_no_code_and_is_gone_afterwards() {
     }
 }
 
+/// The sign-in and setup pages link the stylesheet and script. Those carry no
+/// library data, so they are served before the auth gate; gating them would
+/// redirect the sign-in page's own stylesheet back to the sign-in page, which
+/// then renders unstyled.
+#[tokio::test]
+async fn auth_pages_load_the_stylesheet_without_a_session() {
+    let routes = [
+        dimagine_serve::assets::css_route(),
+        dimagine_serve::assets::js_route(),
+    ];
+
+    // Setup gate: no owner exists yet.
+    let root = tempfile::tempdir().unwrap();
+    let app = app_with(&root, None);
+    for route in &routes {
+        let (status, _, body) = send(&app, get(route, None)).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        assert!(!body.is_empty(), "{route}");
+    }
+
+    // Login gate: an owner exists but this client has no session.
+    let root = tempfile::tempdir().unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_with(&root, None);
+    for route in &routes {
+        let (status, _, body) = send(&app, get(route, None)).await;
+        assert_eq!(status, StatusCode::OK, "{route}");
+        assert!(!body.is_empty(), "{route}");
+    }
+}
+
 #[tokio::test]
 async fn setup_needs_the_checkbox_for_a_weak_password() {
     let root = tempfile::tempdir().unwrap();
@@ -744,7 +775,7 @@ async fn no_auth_mode_serves_every_page_without_a_login() {
     let app = app_for(&root, Some("open-sesame"), AuthMode::None);
 
     // The library is reachable anonymously, with no cookie and no redirect.
-    for path in ["/", "/folder/sub", "/image/girl.jpg"] {
+    for path in ["/", "/?in=sub", "/image/girl.jpg"] {
         let (status, _headers, body) = send(&app, get(path, None)).await;
         assert_eq!(status, StatusCode::OK, "{path} must be public");
         let html = String::from_utf8_lossy(&body).into_owned();

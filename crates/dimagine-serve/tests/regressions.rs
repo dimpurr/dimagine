@@ -382,7 +382,21 @@ async fn login_budget_is_keyed_on_the_peer_ip_and_ignores_forwarded_for() {
     assert!(response.headers().get("set-cookie").is_none());
 }
 
-struct SlowListingCatalog;
+/// A catalog whose listing is slow, so the admission bound has something to
+/// bound. Its root is a real temporary library because the viewer builds its
+/// index there when the router is created.
+struct SlowListingCatalog {
+    #[allow(dead_code)]
+    root: TempDir,
+}
+
+impl SlowListingCatalog {
+    fn new() -> Self {
+        Self {
+            root: tempfile::tempdir().unwrap(),
+        }
+    }
+}
 
 impl Catalog for SlowListingCatalog {
     fn list_folder(&self, _folder: &str) -> Result<Vec<ImageEntry>, CatalogError> {
@@ -405,10 +419,13 @@ impl Catalog for SlowListingCatalog {
         Err(CatalogError::Forbidden)
     }
     fn root(&self) -> &Path {
-        Path::new(".")
+        self.root.path()
     }
 }
 
+/// The bound is exercised on the folder listing, which walks the library and
+/// is the expensive kind of request the limit exists for. The library grid now
+/// reads the index, so it is fast enough not to need bounding.
 #[tokio::test]
 async fn over_bound_requests_get_503_with_retry_after() {
     let state = tempfile::tempdir().unwrap();
@@ -416,7 +433,7 @@ async fn over_bound_requests_get_503_with_retry_after() {
         data_dir: state.path().join("state"),
         ..ServeConfig::default()
     };
-    let app = router(SlowListingCatalog, OriginalPreview, config);
+    let app = router(SlowListingCatalog::new(), OriginalPreview, config);
     let cookie = login(&app, "2333").await;
     let mut tasks = Vec::new();
     for _ in 0..12 {
@@ -426,7 +443,7 @@ async fn over_bound_requests_get_503_with_retry_after() {
             let response = app
                 .oneshot(
                     Request::builder()
-                        .uri("/")
+                        .uri("/api/folder")
                         .header("cookie", cookie)
                         .body(Body::empty())
                         .unwrap(),

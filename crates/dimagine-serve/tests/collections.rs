@@ -186,8 +186,11 @@ fn unicode_embed_resolves_and_round_trips() {
     assert_eq!(collection.members[0].path, "uni/雨.png");
 }
 
+/// FORMAT §5.1: an embed that matches no image, or matches several, is
+/// reported on the page that shows the collection. `/collection/<path>` is a
+/// 301 now (spec §2), so the words appear on the collection's library view.
 #[tokio::test]
-async fn collection_page_shows_ambiguous_and_missing_diagnostics() {
+async fn a_collection_view_shows_ambiguous_and_missing_diagnostics() {
     let root = library();
     let config = ServeConfig {
         data_dir: root.path().join("state"),
@@ -195,9 +198,19 @@ async fn collection_page_shows_ambiguous_and_missing_diagnostics() {
     };
     let app = router(catalog(&root), OriginalPreview, config);
     let cookie = login(&app).await;
-    let ambiguous = app
+
+    // The old link still works.
+    let redirect = app
         .clone()
         .oneshot(request("/collection/ambiguous.md", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(redirect.headers()["location"], "/?c=ambiguous.md");
+
+    let ambiguous = app
+        .clone()
+        .oneshot(request("/?c=ambiguous.md", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(ambiguous.status(), StatusCode::OK);
@@ -205,8 +218,9 @@ async fn collection_page_shows_ambiguous_and_missing_diagnostics() {
     assert!(html.contains("matches several files"), "{html}");
     assert!(html.contains("dup_a/photo.png"));
     assert!(html.contains("dup_b/photo.png"));
+
     let missing = app
-        .oneshot(request("/collection/missing.md", Some(&cookie)))
+        .oneshot(request("/?c=missing.md", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(missing.status(), StatusCode::OK);

@@ -1,19 +1,30 @@
 #!/usr/bin/env bash
 # scripts/dev/screenshots.sh <out-dir> [base-url]
 #
-# Capture headless Chrome/Chromium screenshots across viewports, themes, and routes.
+# Capture headless Chrome screenshots across viewports, themes, and routes, and
+# assert that no page overflows horizontally at the phone width.
+#
+# The capture goes through scripts/dev/capture.mjs, which drives Chrome over
+# the DevTools Protocol and calls Emulation.setDeviceMetricsOverride. Plain
+# `--window-size=390,844` does not work: headless Chrome lays a window smaller
+# than 500px out at 500 and clips the screenshot to 390, so the picture is a
+# cropped desktop layout, not a phone layout.
 #
 # If [base-url] is provided:
-#   Skips build and server startup; shoots against that base URL directly.
+#   Skips build and server startup; shoots the library and auth routes against
+#   that base URL directly (the auth routes may not exist there).
 # If [base-url] is omitted:
 #   1. Builds the release binary (cargo build --release -p dimagine).
 #   2. Checks if binary supports '--auth none' (exits 3 if missing).
 #   3. Generates the demo library in a temp dir.
 #   4. Runs dimagine scan on the library.
-#   5. Starts dimagine serve --auth none on 127.0.0.1:<free port>.
-#   6. Waits for server readiness.
-#   7. Captures screenshots to <out-dir>.
-#   8. Cleans up server and temp dir on exit.
+#   5. Starts dimagine serve --auth none on 127.0.0.1:<free port> for the
+#      library routes.
+#   6. Starts a second dimagine serve --auth account with an empty --data-dir:
+#      /setup is shot there, then an account is created with
+#      `dimagine user create --password-stdin`, and /login is shot there.
+#   7. Captures screenshots to <out-dir> and checks the 390px layout.
+#   8. Cleans up both servers and temp dirs on exit.
 
 set -euo pipefail
 
@@ -68,6 +79,17 @@ if [ -z "$CHROME_BIN" ]; then
     exit 1
 fi
 
+# capture.mjs needs Node 22+ for the built-in global WebSocket and fetch.
+if ! command -v node >/dev/null 2>&1; then
+    echo "ERROR: node is required to drive Chrome over the DevTools Protocol." >&2
+    exit 1
+fi
+NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+if [ "${NODE_MAJOR:-0}" -lt 22 ]; then
+    echo "ERROR: node 22 or newer is required (found $(node --version 2>/dev/null || echo none))." >&2
+    exit 1
+fi
+
 locate_binary() {
     local target_dir=""
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
@@ -82,7 +104,9 @@ locate_binary() {
 }
 
 TEMP_DIR=""
+DATA_DIR=""
 SERVER_PID=""
+AUTH_SERVER_PID=""
 
 cleanup() {
     local exit_code=$?
@@ -91,9 +115,18 @@ cleanup() {
         wait "$SERVER_PID" 2>/dev/null || true
         SERVER_PID=""
     fi
+    if [ -n "$AUTH_SERVER_PID" ]; then
+        kill "$AUTH_SERVER_PID" 2>/dev/null || true
+        wait "$AUTH_SERVER_PID" 2>/dev/null || true
+        AUTH_SERVER_PID=""
+    fi
     if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
         rm -rf "$TEMP_DIR"
         TEMP_DIR=""
+    fi
+    if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR" ]; then
+        rm -rf "$DATA_DIR"
+        DATA_DIR=""
     fi
     exit "$exit_code"
 }
@@ -101,8 +134,11 @@ trap cleanup EXIT INT TERM HUP
 
 BASE_URL=""
 SAMPLE_IMAGE_PATH="refs/ui/alpine-glow-001.png"
+EXTERNAL=0
+BINARY=""
 
 if [ -n "$BASE_URL_ARG" ]; then
+    EXTERNAL=1
     BASE_URL="${BASE_URL_ARG%/}"
 else
     echo "==> Building release binary: cargo build --release -p dimagine"
@@ -134,90 +170,146 @@ else
         SAMPLE_IMAGE_PATH="${first_img#"$TEMP_DIR"/}"
     fi
 
-    # Find free port on 127.0.0.1
+    # Find free ports on 127.0.0.1
     PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
     echo "==> Starting dimagine serve --auth none on 127.0.0.1:$PORT..."
-    "$BINARY" serve --auth none --bind 127.0.0.1 --port "$PORT" --library "$TEMP_DIR" &
+    "$BINARY" serve --auth none --bind 127.0.0.1 --port "$PORT" --library "$TEMP_DIR" \
+        >"$TEMP_DIR/library-server.log" 2>&1 &
     SERVER_PID=$!
 
-    # Wait for server readiness
+    # A second server in account mode with an empty state directory: it opens
+    # on /setup until an owner exists, and on /login afterwards.
+    DATA_DIR="$(mktemp -d -t dimagine-accounts-XXXXXX)"
+    AUTH_PORT="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+    echo "==> Starting dimagine serve --auth account on 127.0.0.1:$AUTH_PORT..."
+    "$BINARY" serve --auth account --bind 127.0.0.1 --port "$AUTH_PORT" \
+        --library "$TEMP_DIR" --data-dir "$DATA_DIR" \
+        >"$DATA_DIR/account-server.log" 2>&1 &
+    AUTH_SERVER_PID=$!
+
+    # Wait for both servers
     echo "==> Waiting for server readiness..."
-    ready=0
-    for _ in $(seq 1 40); do
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "ERROR: Server process exited unexpectedly." >&2
+    for pair in "$SERVER_PID:$PORT:127.0.0.1" "$AUTH_SERVER_PID:$AUTH_PORT:127.0.0.1"; do
+        pid="${pair%%:*}"
+        rest="${pair#*:}"
+        check_port="${rest%%:*}"
+        ready=0
+        for _ in $(seq 1 60); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+                echo "ERROR: Server process $pid exited unexpectedly." >&2
+                exit 1
+            fi
+            if curl -s -f "http://127.0.0.1:$check_port/setup" >/dev/null 2>&1 \
+                || curl -s "http://127.0.0.1:$check_port/login" >/dev/null 2>&1 \
+                || curl -s "http://127.0.0.1:$check_port/" >/dev/null 2>&1; then
+                ready=1
+                break
+            fi
+            sleep 0.25
+        done
+        if [ "$ready" -ne 1 ]; then
+            echo "ERROR: Timed out waiting for dimagine serve on port $check_port." >&2
             exit 1
         fi
-        if curl -s -f "http://127.0.0.1:$PORT/" >/dev/null 2>&1 || curl -s "http://127.0.0.1:$PORT/login" >/dev/null 2>&1; then
-            ready=1
-            break
-        fi
-        sleep 0.25
     done
 
-    if [ "$ready" -ne 1 ]; then
-        echo "ERROR: Timed out waiting for dimagine serve to become ready." >&2
-        exit 1
-    fi
-
     BASE_URL="http://127.0.0.1:$PORT"
+    AUTH_BASE_URL="http://127.0.0.1:$AUTH_PORT"
 fi
 
-echo "==> Shooting screenshots against $BASE_URL using $CHROME_BIN"
+echo "==> Shooting screenshots against ${BASE_URL} using $CHROME_BIN"
 
 # Resolutions: WxH
 RESOLUTIONS=("390x844" "834x1194" "1440x900")
 
-# Themes: name and Chrome flags
-# dark: --force-dark-mode + --blink-settings=preferredColorScheme=0
-# light: --blink-settings=preferredColorScheme=1
+# Themes: name
 THEMES=("dark" "light")
 
-# Paths and slugs:
-# / , /?in=<a nested folder> , /folders , /collections , /search , one /image/<path> , /login , /setup
-declare -a ROUTES=(
+# Routes against the no-login library server, and against the account server.
+declare -a LIBRARY_ROUTES=(
     "/|library"
     "/?in=refs/ui|folder-in"
     "/folders|folders"
     "/collections|collections"
     "/search|search"
-    "/image/$SAMPLE_IMAGE_PATH|image"
-    "/login|login"
+    "/image/$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$SAMPLE_IMAGE_PATH")|image"
+)
+declare -a AUTH_ROUTES=(
     "/setup|setup"
+    "/login|login"
 )
 
-total_shots=0
-for res in "${RESOLUTIONS[@]}"; do
-    width="${res%x*}"
-    height="${res#*x}"
+JOBS_FILE="$(mktemp "${TMPDIR:-/tmp}/dimagine-jobs-XXXXXX.json")"
+JOBS_FIRST=1
 
-    for theme in "${THEMES[@]}"; do
-        theme_flags=()
-        if [ "$theme" = "dark" ]; then
-            theme_flags=("--force-dark-mode" "--blink-settings=preferredColorScheme=0")
-        else
-            theme_flags=("--blink-settings=preferredColorScheme=1")
-        fi
+begin_jobs() {
+    printf '{"chrome":"%s","jobs":[' "$CHROME_BIN" > "$JOBS_FILE"
+    JOBS_FIRST=1
+}
 
-        for route_spec in "${ROUTES[@]}"; do
-            path="${route_spec%|*}"
-            slug="${route_spec#*|}"
-            out_file="$OUT_DIR/${width}-${theme}-${slug}.png"
-            target_url="$BASE_URL$path"
+add_job() {
+    # url width height theme out check
+    local url="$1" width="$2" height="$3" theme="$4" out="$5" check="$6"
+    if [ "$JOBS_FIRST" = 1 ]; then
+        JOBS_FIRST=0
+    else
+        printf ',' >> "$JOBS_FILE"
+    fi
+    printf '{"url":"%s","width":%s,"height":%s,"theme":"%s"' \
+        "$url" "$width" "$height" "$theme" >> "$JOBS_FILE"
+    if [ -n "$out" ]; then
+        printf ',"out":"%s"' "$out" >> "$JOBS_FILE"
+    fi
+    if [ "$check" = "true" ]; then
+        printf ',"check":true' >> "$JOBS_FILE"
+    fi
+    printf '}' >> "$JOBS_FILE"
+}
 
-            echo "  [$width | $theme] $path -> ${width}-${theme}-${slug}.png"
-            "$CHROME_BIN" \
-                --headless=new \
-                --screenshot="$out_file" \
-                --window-size="$width,$height" \
-                --hide-scrollbars \
-                --disable-gpu \
-                "${theme_flags[@]}" \
-                "$target_url" >/dev/null 2>&1 || true
+end_jobs() {
+    printf ']}' >> "$JOBS_FILE"
+}
 
-            total_shots=$((total_shots + 1))
+# Shoot one base URL across every route in the remaining arguments.
+shoot_routes() {
+    local base_url="$1"
+    shift
+    local -a specs=("$@")
+    begin_jobs
+    for res in "${RESOLUTIONS[@]}"; do
+        width="${res%x*}"
+        height="${res#*x}"
+        for theme in "${THEMES[@]}"; do
+            for route_spec in "${specs[@]}"; do
+                path="${route_spec%|*}"
+                slug="${route_spec#*|}"
+                out_file="$OUT_DIR/${width}-${theme}-${slug}.png"
+                check="false"
+                if [ "$width" = "390" ]; then
+                    check="true"
+                fi
+                echo "  [$width | $theme] $path -> ${width}-${theme}-${slug}.png"
+                add_job "${base_url}${path}" "$width" "$height" "$theme" "$out_file" "$check"
+            done
         done
     done
-done
+    end_jobs
+    node "$SCRIPT_DIR/capture.mjs" "$JOBS_FILE"
+}
 
-echo "==> Completed $total_shots screenshots in $OUT_DIR"
+shoot_routes "$BASE_URL" "${LIBRARY_ROUTES[@]}"
+
+if [ "$EXTERNAL" = 1 ]; then
+    shoot_routes "$BASE_URL" "${AUTH_ROUTES[@]}"
+else
+    # /setup exists only until the owner account is created.
+    shoot_routes "$AUTH_BASE_URL" "/setup|setup"
+    echo "==> Creating the owner account for /login..."
+    printf '%s\n' "dimagine-demo-password" | \
+        "$BINARY" user create --email demo@example.com --password-stdin --data-dir "$DATA_DIR" >/dev/null
+    # The store now has an owner, so the same server serves the login form.
+    shoot_routes "$AUTH_BASE_URL" "/login|login"
+fi
+
+rm -f "$JOBS_FILE"
+echo "==> Done: screenshots in $OUT_DIR"

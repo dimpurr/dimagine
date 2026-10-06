@@ -106,6 +106,12 @@ pub struct ViewQuery {
     /// Full-text filter over the image's note, reusing [`Index::search_text`]
     /// semantics (trigram FTS for 3+ chars, substring for shorter).
     pub text: Option<String>,
+    /// Only images whose note carries no tag at all. The viewer's "Untagged"
+    /// lens; a tag filter cannot express it, because "no tags" is not a tag.
+    pub untagged: bool,
+    /// Only images added at or after this instant, in ns since the Unix
+    /// epoch. The viewer's "Recent" lens.
+    pub added_after_ns: Option<i64>,
     pub sort: SortKey,
     pub descending: bool,
     pub offset: u32,
@@ -120,6 +126,8 @@ impl Default for ViewQuery {
             collection: None,
             tags: Vec::new(),
             text: None,
+            untagged: false,
+            added_after_ns: None,
             sort: SortKey::Added,
             descending: true,
             offset: 0,
@@ -279,6 +287,15 @@ fn view_sql(q: &ViewQuery) -> ViewSql {
              WHERE note_tags.image_path=f.path AND note_tags.tag=?)",
         );
         sql.bind(crate::searchable(tag));
+    }
+    if q.untagged {
+        // "No tags" is not a tag, so it cannot be a `note_tags` lookup: it is
+        // the absence of a row, which is what NOT EXISTS states.
+        sql.and("NOT EXISTS(SELECT 1 FROM note_tags WHERE note_tags.image_path=f.path)");
+    }
+    if let Some(after) = q.added_after_ns {
+        sql.and("f.added_ns>=?");
+        sql.bind(after);
     }
     if let Some(text) = &q.text {
         // The same two rules as `Index::search_text`: the trigram tokenizer
@@ -747,6 +764,20 @@ mod tests {
                 "text",
                 ViewQuery {
                     text: Some("synthetic".into()),
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "untagged",
+                ViewQuery {
+                    untagged: true,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "added after an instant",
+                ViewQuery {
+                    added_after_ns: Some(1_700_000_000_000_000_000),
                     ..ViewQuery::default()
                 },
             ),

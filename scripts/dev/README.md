@@ -45,25 +45,33 @@ python3 scripts/dev/demo-library.py --selftest
 
 ---
 
-## 2. Screenshot Automation (`screenshots.sh`)
+## 2. Screenshot Automation (`screenshots.sh` + `capture.mjs`)
 
-`scripts/dev/screenshots.sh` automates capturing screenshots across all required viewports, themes, and application routes using headless Chrome/Chromium.
+`scripts/dev/screenshots.sh` automates capturing screenshots across all required viewports, themes, and application routes. It builds a job list and hands it to `scripts/dev/capture.mjs`, which drives Chrome over the DevTools Protocol.
+
+`capture.mjs` uses `Emulation.setDeviceMetricsOverride` rather than `--window-size`: headless Chrome will not lay a window out below 500 CSS pixels wide, so `--window-size=390,844` produces a 500px layout cropped to 390, not a phone layout. The override sets the viewport the page actually uses, and the same page is then measured — every 390px job fails the run when `document.documentElement.scrollWidth` exceeds `window.innerWidth`, so a horizontal overflow is caught without looking at the images.
 
 ### Usage
 
 ```bash
 # Standard mode: builds release binary, creates temp demo library,
-# runs dimagine scan, starts dimagine serve --auth none, and captures screenshots.
+# runs dimagine scan, starts two servers (--auth none for the library
+# routes, --auth account with an empty --data-dir for /setup and /login),
+# and captures screenshots.
 ./scripts/dev/screenshots.sh /path/to/screenshots
 
 # External URL mode: shoot against an existing server (skips build and serve)
 ./scripts/dev/screenshots.sh /path/to/screenshots http://127.0.0.1:8917
 ```
 
+`/setup` is shot on the account server while no owner exists; the script then creates an owner with `dimagine user create --password-stdin`, which turns that same server into the `/login` form. Both state directories are temporary and removed on exit. In external-URL mode there is no second server, so the auth routes are shot against the given URL (where they may not exist).
+
+`capture.mjs` needs Node 22 or newer (for the built-in global `WebSocket`).
+
 ### Behavior & Exit Codes
 
-- **Exit 0**: All screenshots captured successfully.
-- **Exit 1**: Missing Chrome/Chromium executable, or server failed to start.
+- **Exit 0**: All screenshots captured, and no page overflowed at 390px.
+- **Exit 1**: Missing Chrome/Chromium or Node 22+, a server failed to start, or a 390px page overflowed horizontally.
 - **Exit 2**: Command-line usage error (missing `<out-dir>`).
 - **Exit 3**: The binary lacks the `--auth none` flag (which is being added in parallel). When this flag is missing, the script prints an explanatory message and exits with status 3.
 

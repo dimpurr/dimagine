@@ -375,8 +375,12 @@ fn serve_login_with_default_passcode_shows_the_library() {
     let page = http_get(&address, "/", Some(&cookie));
     assert_eq!(status_of(&page), "200");
     assert!(page.contains("girl.jpg"), "{page}");
-    assert!(page.contains("/folder/sub"), "{page}");
+    assert!(page.contains("/?in=sub"), "{page}");
+    // An old folder link still lands on the view it means (spec §2).
     let sub = http_get(&address, "/folder/sub", Some(&cookie));
+    assert_eq!(status_of(&sub), "308", "{sub}");
+    assert_eq!(header_of(&sub, "location"), Some("/?in=sub"));
+    let sub = http_get(&address, "/?in=sub", Some(&cookie));
     assert_eq!(status_of(&sub), "200");
     assert!(sub.contains("cat.png"), "{sub}");
 
@@ -1539,9 +1543,15 @@ fn serve_auth_none_serves_the_library_without_a_login() {
     assert_eq!(status_of(&http_get(&address, "/api/folder", None)), "200");
 
     // Every page carries the banner, not just the first one.
-    let sub = http_get(&address, "/folder/sub", None);
+    let sub = http_get(&address, "/?in=sub", None);
     assert_eq!(status_of(&sub), "200");
     assert!(sub.contains(NO_LOGIN_BANNER), "{sub}");
+
+    // The old folder URL still names the same images: it answers a
+    // permanent redirect to the library view it now means.
+    let moved = http_get(&address, "/folder/sub", None);
+    assert_eq!(status_of(&moved), "308");
+    assert_eq!(header_of(&moved, "location").unwrap(), "/?in=sub");
 
     // /login leads to the library, /setup does not exist, and no account is
     // needed at all.

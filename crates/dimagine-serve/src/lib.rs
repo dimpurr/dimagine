@@ -1,604 +1,69 @@
-//! Read-only web viewer for a dimagine library. Clients are either signed in
-//! with a single owner account (ADR-014), with the legacy shared passcode
-//! until an account exists, or not authenticated at all (`AuthMode::None`).
-//! Accounts live outside the library in a state directory; the first visitor
-//! creates the owner account on `/setup`, with no code to copy.
+//! Read-only web viewer for a dimagine library. Clients are either
+//! signed in with a single owner account (ADR-014), with the legacy
+//! shared passcode until an account exists, or not authenticated at
+//! all (`AuthMode::None`). Accounts live outside the library in a
+//! state directory; the first visitor creates the owner account on
+//! `/setup`, with no code to copy.
+//!
+//! The library pages are split into `pages`, `ui`, `assets`,
+//! `view_query`, `catalog`, `media` and `index_sync`; this module is
+//! the router, the application state and the auth middleware.
 
 pub mod accounts;
+pub mod assets;
+pub mod catalog;
+pub mod index_sync;
+pub(crate) mod media;
+pub mod pages;
+pub mod ui;
+pub mod view_query;
 
-use crate::accounts::{is_weak_password, WEAK_PASSWORD_LENGTH};
+pub use ui::shell::Frame;
+
+pub use catalog::*;
+pub use index_sync::*;
+pub use view_query::*;
+
 use axum::{
     body::Body,
-    extract::{Form, Path, State},
+    extract::{Form, State},
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::get,
     Json, Router,
 };
-use dimagine_core::library::{FileClass, FileEntry, Library};
-use dimagine_core::links::{extract_markdown_links, Outcome, Resolver};
-use dimagine_index::{note_is_collection, CollectionEvidence};
-use percent_encoding::percent_decode_str;
-use pulldown_cmark::{html, Event, Options, Parser};
-use saphyr::{LoadableYamlNode, Yaml};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    io::{Read, Seek, SeekFrom},
-    path::{Component, Path as FsPath, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use unicode_normalization::UnicodeNormalization;
 
-const IMAGE_EXTENSIONS: &[&str] = &[
-    "jpg", "jpeg", "png", "gif", "webp", "avif", "heic", "heif", "tif", "tiff", "bmp",
-];
+use crate::accounts::{is_weak_password, WEAK_PASSWORD_LENGTH};
+use crate::pages::{
+    collections::collection_json, collections::collection_redirect, collections::collections_page,
+    folders::folder_json, folders::folder_redirect, folders::folder_root_json,
+    folders::folders_page, image::image_json, image::image_page, library::library_page,
+    library::sidebar_json, library::view_json, search::search_page,
+};
+use crate::ui::layout;
+
 const SESSION_SECONDS: u64 = 60 * 60 * 24 * 30;
-
-/// A library item shown by the folder view.
-#[derive(Clone, Debug, Serialize)]
-pub struct ImageEntry {
-    /// Path relative to the library root, using forward slashes.
-    pub path: String,
-    /// Display name.
-    pub name: String,
-}
-
-/// A collection note and its image members in document order.
-#[derive(Clone, Debug, Serialize)]
-pub struct Collection {
-    /// Collection note path relative to the library root.
-    pub path: String,
-    /// Display title.
-    pub title: String,
-    /// Ordered image paths.
-    pub members: Vec<CollectionMember>,
-    /// Embeds that did not resolve to exactly one image, shown on the
-    /// collection page instead of being silently dropped (FORMAT §5.1).
-    pub diagnostics: Vec<CollectionDiagnostic>,
-}
-
-/// Why one embed is not a member.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub enum DiagnosticKind {
-    /// The bare name matched several files; the viewer must not guess
-    /// (FORMAT §5.1 rule 3).
-    Ambiguous,
-    /// The target claims an image but matches nothing (FORMAT §5.1).
-    Missing,
-}
-
-/// One embed that resolved to no single image.
-#[derive(Clone, Debug, Serialize)]
-pub struct CollectionDiagnostic {
-    /// The embed target as written between the brackets.
-    pub target: String,
-    /// 1-based line of the embed in the note file.
-    pub line: usize,
-    pub kind: DiagnosticKind,
-    /// Candidate paths when [`DiagnosticKind::Ambiguous`].
-    pub candidates: Vec<String>,
-}
-
-/// One image and its adjacent caption in a collection.
-#[derive(Clone, Debug, Serialize)]
-pub struct CollectionMember {
-    /// Image path relative to the library root.
-    pub path: String,
-    /// Caption line following its embed, when present.
-    pub caption: String,
-}
-
-/// Parsed image note details.
-#[derive(Clone, Debug, Serialize)]
-pub struct ImageDetail {
-    /// Image path relative to the library root.
-    pub path: String,
-    /// YAML front matter properties.
-    pub properties: serde_json::Value,
-    /// Front matter parsing error, if the note has malformed YAML.
-    pub front_matter_error: Option<String>,
-    /// Markdown note body rendered to safe HTML by the page handler.
-    pub body: String,
-    /// Adjacent raw metadata filenames.
-    pub raw_files: Vec<String>,
-}
-
-/// Read-only library catalog contract.
-pub trait Catalog: Send + Sync + 'static {
-    /// List images in a folder, with an empty path meaning the library root.
-    fn list_folder(&self, folder: &str) -> Result<Vec<ImageEntry>, CatalogError>;
-    /// List visible child folders beneath a folder.
-    fn list_subfolders(&self, folder: &str) -> Result<Vec<String>, CatalogError>;
-    /// List collection notes in a folder.
-    fn list_collections(&self, folder: &str) -> Result<Vec<Collection>, CatalogError>;
-    /// Return a collection by note path.
-    fn collection(&self, path: &str) -> Result<Collection, CatalogError>;
-    /// Return image detail by image path.
-    fn image_detail(&self, path: &str) -> Result<ImageDetail, CatalogError>;
-    /// Resolve and validate a path beneath the library root.
-    fn resolve_path(&self, path: &str) -> Result<PathBuf, CatalogError>;
-    /// Return the library root.
-    fn root(&self) -> &FsPath;
-}
-
-/// Preview path provider contract. The fallback uses the original image.
-pub trait PreviewProvider: Send + Sync + 'static {
-    /// Find a rendition for an image, or return `None` to use the original.
-    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf>;
-}
-
-/// Requested image rendition.
-#[derive(Clone, Copy, Debug)]
-pub enum PreviewKind {
-    /// Grid thumbnail.
-    Thumb,
-    /// Detail view image.
-    View,
-}
-
-/// Filesystem catalog that follows FORMAT §2.2 while scanning.
-///
-/// The library is walked once with `dimagine-core` at construction; the walk
-/// feeds the link resolver and the collection listing. Note contents are read
-/// live on every request, so edits to a note are visible without a restart.
-#[derive(Clone, Debug)]
-pub struct FsCatalog {
-    root: PathBuf,
-    library: Library,
-    resolver: Arc<Resolver>,
-}
-
-impl FsCatalog {
-    /// Open a catalog rooted at an existing directory.
-    pub fn new(root: impl AsRef<FsPath>) -> Result<Self, CatalogError> {
-        let root = fs::canonicalize(root).map_err(|_| CatalogError::NotFound)?;
-        if !root.is_dir() {
-            return Err(CatalogError::NotFound);
-        }
-        let library = Library::open(&root).map_err(|_| CatalogError::NotFound)?;
-        let resolver = Arc::new(Resolver::new(&library.files));
-        Ok(Self {
-            root,
-            library,
-            resolver,
-        })
-    }
-
-    fn scan_images(&self, directory: &FsPath) -> Result<Vec<ImageEntry>, CatalogError> {
-        let mut out = Vec::new();
-        for entry in fs::read_dir(directory).map_err(|_| CatalogError::NotFound)? {
-            let entry = entry.map_err(|_| CatalogError::Unreadable)?;
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if ignored_name(&name)
-                || entry
-                    .file_type()
-                    .map_err(|_| CatalogError::Unreadable)?
-                    .is_symlink()
-            {
-                continue;
-            }
-            let ty = entry.file_type().map_err(|_| CatalogError::Unreadable)?;
-            if ty.is_file() && is_image(&path) {
-                let relative = path
-                    .strip_prefix(&self.root)
-                    .map_err(|_| CatalogError::Forbidden)?;
-                out.push(ImageEntry {
-                    path: relative.to_string_lossy().replace('\\', "/"),
-                    name,
-                });
-            }
-        }
-        out.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(out)
-    }
-
-    fn collections_in(&self, folder: &str) -> Result<Vec<Collection>, CatalogError> {
-        let folder_path = self.resolve_path(folder)?;
-        if !folder_path.is_dir() {
-            return Err(CatalogError::NotFound);
-        }
-        let folder_rel = folder_path
-            .strip_prefix(&self.root)
-            .unwrap_or(&folder_path)
-            .to_path_buf();
-        let mut items = Vec::new();
-        for entry in self.library.files.iter().filter(|entry| {
-            matches!(entry.class, FileClass::Note | FileClass::ImageNote)
-                && entry.path.parent() == Some(folder_rel.as_path())
-        }) {
-            let text = fs::read_to_string(self.root.join(&entry.path))
-                .map_err(|_| CatalogError::Unreadable)?;
-            let parsed = parse_note(&text);
-            let (members, diagnostics) =
-                collect_collection(&self.resolver, &self.library.files, entry, &parsed, &text);
-            if !is_collection(&parsed, &members, &diagnostics) {
-                continue;
-            }
-            let title = yaml_string(&parsed.properties, "title")
-                .unwrap_or_else(|| entry.name.trim_end_matches(".md").to_string());
-            items.push(Collection {
-                path: entry.rel.clone(),
-                title,
-                members,
-                diagnostics,
-            });
-        }
-        items.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(items)
-    }
-}
-
-impl Catalog for FsCatalog {
-    fn list_folder(&self, folder: &str) -> Result<Vec<ImageEntry>, CatalogError> {
-        let directory = self.resolve_path(folder)?;
-        if !directory.is_dir() {
-            return Err(CatalogError::NotFound);
-        }
-        self.scan_images(&directory)
-    }
-
-    fn list_subfolders(&self, folder: &str) -> Result<Vec<String>, CatalogError> {
-        let directory = self.resolve_path(folder)?;
-        let mut folders = Vec::new();
-        for entry in fs::read_dir(directory).map_err(|_| CatalogError::NotFound)? {
-            let entry = entry.map_err(|_| CatalogError::Unreadable)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let kind = entry.file_type().map_err(|_| CatalogError::Unreadable)?;
-            if kind.is_dir() && !kind.is_symlink() && !ignored_name(&name) {
-                folders.push(if folder.is_empty() {
-                    name
-                } else {
-                    format!("{}/{name}", folder.trim_end_matches('/'))
-                });
-            }
-        }
-        folders.sort();
-        Ok(folders)
-    }
-
-    fn list_collections(&self, folder: &str) -> Result<Vec<Collection>, CatalogError> {
-        self.collections_in(folder)
-    }
-
-    fn collection(&self, path: &str) -> Result<Collection, CatalogError> {
-        let safe = self.resolve_path(path)?;
-        if !safe.is_file() {
-            return Err(CatalogError::NotFound);
-        }
-        let native_name = safe.file_name().unwrap_or_default().to_os_string();
-        let name = native_name.to_string_lossy().into_owned();
-        let class = dimagine_core::library::classify(&name);
-        if !matches!(class, FileClass::Note | FileClass::ImageNote) {
-            return Err(CatalogError::NotFound);
-        }
-        let rel = safe
-            .strip_prefix(&self.root)
-            .map_err(|_| CatalogError::Forbidden)?
-            .to_path_buf();
-        let text = fs::read_to_string(&safe).map_err(|_| CatalogError::Unreadable)?;
-        let parsed = parse_note(&text);
-        let note = FileEntry {
-            rel: rel.to_string_lossy().into_owned(),
-            name: name.clone(),
-            path: rel,
-            native_name,
-            class,
-        };
-        let (members, diagnostics) =
-            collect_collection(&self.resolver, &self.library.files, &note, &parsed, &text);
-        if !is_collection(&parsed, &members, &diagnostics) {
-            return Err(CatalogError::NotFound);
-        }
-        Ok(Collection {
-            path: path.to_owned(),
-            title: yaml_string(&parsed.properties, "title")
-                .unwrap_or_else(|| name.trim_end_matches(".md").to_string()),
-            members,
-            diagnostics,
-        })
-    }
-
-    fn image_detail(&self, path: &str) -> Result<ImageDetail, CatalogError> {
-        let image = self.resolve_path(path)?;
-        if !image.is_file() || !is_image(&image) {
-            return Err(CatalogError::NotFound);
-        }
-        let note_path = PathBuf::from(format!("{}.md", image.to_string_lossy()));
-        let note_meta = match fs::symlink_metadata(&note_path) {
-            Ok(metadata) => Some(metadata),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return Err(CatalogError::Unreadable),
-        };
-        let (properties, body, front_matter_error) = if let Some(note_meta) = note_meta {
-            if note_meta.file_type().is_symlink() {
-                return Err(CatalogError::Forbidden);
-            }
-            let canonical_note =
-                fs::canonicalize(&note_path).map_err(|_| CatalogError::Unreadable)?;
-            let note_relative = canonical_note
-                .strip_prefix(&self.root)
-                .map_err(|_| CatalogError::Forbidden)?;
-            if note_relative
-                .components()
-                .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
-            {
-                return Err(CatalogError::Forbidden);
-            }
-            let text = fs::read_to_string(canonical_note).map_err(|_| CatalogError::Unreadable)?;
-            let parsed = parse_note(&text);
-            (parsed.properties, parsed.body, parsed.error)
-        } else {
-            (serde_json::Value::Null, String::new(), None)
-        };
-        let parent = image.parent().ok_or(CatalogError::NotFound)?;
-        let base = image.file_name().unwrap_or_default().to_string_lossy();
-        let mut raw_files = Vec::new();
-        for entry in fs::read_dir(parent).map_err(|_| CatalogError::Unreadable)? {
-            let entry = entry.map_err(|_| CatalogError::Unreadable)?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with(&format!("{base}."))
-                && name.ends_with(".json")
-                && !entry
-                    .file_type()
-                    .map_err(|_| CatalogError::Unreadable)?
-                    .is_symlink()
-            {
-                raw_files.push(name);
-            }
-        }
-        raw_files.sort();
-        Ok(ImageDetail {
-            path: path.to_owned(),
-            properties,
-            body,
-            front_matter_error,
-            raw_files,
-        })
-    }
-
-    fn resolve_path(&self, path: &str) -> Result<PathBuf, CatalogError> {
-        let relative = FsPath::new(path);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        {
-            return Err(CatalogError::Forbidden);
-        }
-        let mut candidate = self.root.clone();
-        for component in relative.components() {
-            if let Component::Normal(part) = component {
-                let name = part.to_string_lossy();
-                if ignored_name(&name) {
-                    return Err(CatalogError::Forbidden);
-                }
-                candidate.push(part);
-                let metadata = match fs::symlink_metadata(&candidate) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        let parent = candidate.parent().ok_or(CatalogError::NotFound)?;
-                        let mut matched = None;
-                        if let Ok(entries) = fs::read_dir(parent) {
-                            let part_str = part.to_string_lossy();
-                            let part_nfc: String = part_str.nfc().collect();
-                            for entry in entries.flatten() {
-                                let ename = entry.file_name();
-                                let ename_str = ename.to_string_lossy();
-                                if ename_str.nfc().eq(part_nfc.chars()) {
-                                    candidate.pop();
-                                    candidate.push(&ename);
-                                    if let Ok(m) = fs::symlink_metadata(&candidate) {
-                                        matched = Some(m);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        matched.ok_or(CatalogError::NotFound)?
-                    }
-                };
-                if metadata.file_type().is_symlink() {
-                    return Err(CatalogError::Forbidden);
-                }
-            }
-        }
-        let canonical = fs::canonicalize(&candidate).map_err(|_| CatalogError::NotFound)?;
-        let relative = canonical
-            .strip_prefix(&self.root)
-            .map_err(|_| CatalogError::Forbidden)?;
-        if relative
-            .components()
-            .any(|c| ignored_name(&c.as_os_str().to_string_lossy()))
-        {
-            return Err(CatalogError::Forbidden);
-        }
-        Ok(canonical)
-    }
-
-    fn root(&self) -> &FsPath {
-        &self.root
-    }
-}
-
-/// Original-image preview fallback.
-#[derive(Clone, Debug, Default)]
-pub struct OriginalPreview;
-impl PreviewProvider for OriginalPreview {
-    fn preview_path(&self, image: &str, _kind: PreviewKind) -> Option<PathBuf> {
-        Some(PathBuf::from(image))
-    }
-}
-
-/// Bounded concurrency limiter for CPU-intensive preview generation.
-struct ConcurrencyLimiter {
-    active: Mutex<usize>,
-    cvar: Condvar,
-    max: usize,
-}
-
-impl ConcurrencyLimiter {
-    fn new(max: usize) -> Self {
-        Self {
-            active: Mutex::new(0),
-            cvar: Condvar::new(),
-            max,
-        }
-    }
-
-    fn acquire(&self) -> ConcurrencyGuard<'_> {
-        let mut count = self.active.lock().unwrap();
-        while *count >= self.max {
-            count = self.cvar.wait(count).unwrap();
-        }
-        *count += 1;
-        ConcurrencyGuard { limiter: self }
-    }
-}
-
-struct ConcurrencyGuard<'a> {
-    limiter: &'a ConcurrencyLimiter,
-}
-
-impl<'a> Drop for ConcurrencyGuard<'a> {
-    fn drop(&mut self) {
-        let mut count = self.limiter.active.lock().unwrap();
-        *count -= 1;
-        self.limiter.cvar.notify_one();
-    }
-}
-
-/// Real preview provider backed by `dimagine_preview::ensure`.
-pub struct CachedPreview {
-    root: PathBuf,
-    concurrency: Arc<ConcurrencyLimiter>,
-    logged: Arc<Mutex<HashSet<String>>>,
-}
-
-impl CachedPreview {
-    /// Create a new preview provider for a library root with bounded concurrency (default 4).
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self::with_concurrency(root, 4)
-    }
-
-    /// Create a new preview provider with a custom concurrency limit.
-    pub fn with_concurrency(root: impl Into<PathBuf>, max_concurrency: usize) -> Self {
-        let root = root.into();
-        let root = fs::canonicalize(&root).unwrap_or(root);
-        Self {
-            root,
-            concurrency: Arc::new(ConcurrencyLimiter::new(max_concurrency.max(1))),
-            logged: Arc::new(Mutex::new(HashSet::new())),
-        }
-    }
-}
-
-impl PreviewProvider for CachedPreview {
-    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
-        let relative = FsPath::new(image);
-        if relative.is_absolute()
-            || relative
-                .components()
-                .any(|c| !matches!(c, Component::Normal(_) | Component::CurDir))
-        {
-            return None;
-        }
-        let candidate = self.root.join(relative);
-        let source = match fs::canonicalize(&candidate) {
-            Ok(c) if c.starts_with(&self.root) && c.is_file() => c,
-            _ => {
-                // Try resolving with NFC/NFD normalization if exact byte match failed
-                let mut matched = self.root.clone();
-                for component in relative.components() {
-                    if let Component::Normal(part) = component {
-                        matched.push(part);
-                        if fs::symlink_metadata(&matched).is_err() {
-                            let parent = matched.parent()?;
-                            let mut resolved = None;
-                            if let Ok(entries) = fs::read_dir(parent) {
-                                let part_str = part.to_string_lossy();
-                                let part_nfc: String = part_str.nfc().collect();
-                                for entry in entries.flatten() {
-                                    let ename = entry.file_name();
-                                    let ename_str = ename.to_string_lossy();
-                                    if ename_str.nfc().eq(part_nfc.chars()) {
-                                        matched.pop();
-                                        matched.push(&ename);
-                                        if fs::symlink_metadata(&matched).is_ok() {
-                                            resolved = Some(());
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            resolved?;
-                        }
-                    }
-                }
-                let Ok(c) = fs::canonicalize(&matched) else {
-                    return None;
-                };
-                if c.starts_with(&self.root) && c.is_file() {
-                    c
-                } else {
-                    return None;
-                }
-            }
-        };
-        let preview_kind = match kind {
-            PreviewKind::Thumb => dimagine_preview::Kind::Thumb,
-            PreviewKind::View => dimagine_preview::Kind::View,
-        };
-        let _guard = self.concurrency.acquire();
-        match dimagine_preview::ensure(&self.root, &source, &[preview_kind]) {
-            Ok(renditions) => renditions
-                .into_iter()
-                .find(|r| r.kind == preview_kind)
-                .map(|r| r.path),
-            Err(err) => {
-                let mut logged = self.logged.lock().unwrap();
-                if logged.insert(image.to_string()) {
-                    eprintln!("preview generation failed for {image}: {err}");
-                }
-                None
-            }
-        }
-    }
-}
-
-/// Catalog lookup error.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CatalogError {
-    NotFound,
-    Forbidden,
-    Unreadable,
-}
-impl std::fmt::Display for CatalogError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::NotFound => "path not found",
-            Self::Forbidden => "path is outside the library or invalid",
-            Self::Unreadable => "path could not be read",
-        })
-    }
-}
-impl std::error::Error for CatalogError {}
 
 /// How the viewer authenticates its clients.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum AuthMode {
-    /// A login is required: the owner account, or the legacy shared passcode
-    /// while no account exists. This is the default.
+    /// A login is required: the owner account, or the legacy shared
+    /// passcode while no account exists. This is the default.
     #[default]
     Account,
-    /// No login at all. Every page is reachable without a session and carries
-    /// [`NO_LOGIN_BANNER`]; the accounts store is not read at all.
+    /// No login at all. Every page is reachable without a session and
+    /// carries [`NO_LOGIN_BANNER`]; the accounts store is not read at
+    /// all.
     None,
 }
 
@@ -608,8 +73,8 @@ impl AuthMode {
         self == AuthMode::None
     }
 
-    /// The `--auth` spelling of this mode, as it appears in the startup
-    /// document and in help text.
+    /// The `--auth` spelling of this mode, as it appears in the
+    /// startup document and in help text.
     pub fn name(self) -> &'static str {
         match self {
             AuthMode::Account => "account",
@@ -631,8 +96,9 @@ impl AuthMode {
 pub const NO_LOGIN_BANNER: &str =
     "No login: anyone who can reach this address can see this library.";
 
-/// Reminder logged while no owner account exists yet. It names the setup page
-/// and the claim risk, and carries no secret: there is no code to leak.
+/// Reminder logged while no owner account exists yet. It names the
+/// setup page and the claim risk, and carries no secret: there is no
+/// code to leak.
 pub const NO_OWNER_REMINDER: &str = "No owner account yet: open /setup to create it. \
      Until then the first visitor can claim this server.";
 
@@ -654,7 +120,11 @@ pub struct ServeConfig {
     pub data_dir: PathBuf,
     /// Whether clients must sign in at all.
     pub auth: AuthMode,
+    /// Seconds between background library rescans (default: 300, 0
+    /// disables).
+    pub rescan_interval: u64,
 }
+
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
@@ -664,16 +134,17 @@ impl Default for ServeConfig {
             trusted_proxies: Vec::new(),
             data_dir: accounts::default_data_dir(),
             auth: AuthMode::Account,
+            rescan_interval: 300,
         }
     }
 }
 
-/// Log [`NO_OWNER_REMINDER`] now and every `interval` after that, until an
-/// owner account exists or the store stops being readable.
+/// Log [`NO_OWNER_REMINDER`] now and every `interval` after that,
+/// until an owner account exists or the store stops being readable.
 ///
-/// A broken store stops the loop rather than repeating the reminder: the
-/// caller is expected to have refused to start in that case, and an
-/// unreadable store is not "no owner yet".
+/// A broken store stops the loop rather than repeating the reminder:
+/// the caller is expected to have refused to start in that case, and
+/// an unreadable store is not "no owner yet".
 pub async fn remind_until_owner_exists<F>(
     accounts: accounts::AccountsStore,
     interval: Duration,
@@ -693,9 +164,10 @@ pub async fn remind_until_owner_exists<F>(
 
 /// Resolve client IP for rate limiting and logging.
 ///
-/// When the direct TCP peer is a trusted reverse proxy, the client IP is extracted
-/// from the LAST hop of the `X-Forwarded-For` header. For untrusted peers (or if the
-/// header is absent/malformed), the TCP peer IP is used directly, ignoring the header.
+/// When the direct TCP peer is a trusted reverse proxy, the client IP
+/// is extracted from the LAST hop of the `X-Forwarded-For` header.
+/// For untrusted peers (or if the header is absent/malformed), the
+/// TCP peer IP is used directly, ignoring the header.
 pub fn resolve_client_ip(
     peer_addr: Option<std::net::SocketAddr>,
     headers: &HeaderMap,
@@ -718,51 +190,56 @@ pub fn resolve_client_ip(
 }
 
 #[derive(Clone)]
-struct AppState {
-    catalog: Arc<dyn Catalog>,
-    previews: Arc<dyn PreviewProvider>,
-    config: ServeConfig,
-    accounts: accounts::AccountsStore,
-    /// Serialises owner creation: one critical section from the re-check to
-    /// the write, so two concurrent setup requests cannot both create an
-    /// owner.
-    setup_lock: Arc<Mutex<()>>,
-    sessions: Arc<Mutex<HashMap<String, u64>>>,
-    throttles: Arc<Mutex<ThrottleState>>,
-    admission: Arc<tokio::sync::Semaphore>,
-    login_slots: Arc<tokio::sync::Semaphore>,
+pub(crate) struct AppState {
+    pub(crate) catalog: Arc<dyn Catalog>,
+    pub(crate) previews: Arc<dyn PreviewProvider>,
+    pub(crate) config: ServeConfig,
+    pub(crate) accounts: accounts::AccountsStore,
+    /// Serialises owner creation: one critical section from the
+    /// re-check to the write, so two concurrent setup requests cannot
+    /// both create an owner.
+    pub(crate) setup_lock: Arc<Mutex<()>>,
+    pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
+    pub(crate) throttles: Arc<Mutex<ThrottleState>>,
+    pub(crate) admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) login_slots: Arc<tokio::sync::Semaphore>,
+    pub(crate) index: Arc<IndexHandle>,
 }
 
 impl AppState {
-    /// Render one HTML page, with the no-login banner when the mode calls
-    /// for it.
-    fn page(&self, title: &str, body: &str) -> String {
-        layout(self.config.auth, title, body)
+    /// The no-login banner text, when the mode calls for it. Every
+    /// page frame carries it, so no page can be mistaken for a
+    /// login-protected one.
+    pub(crate) fn banner(&self) -> Option<&'static str> {
+        self.config.auth.shows_banner().then_some(NO_LOGIN_BANNER)
     }
 }
 
-/// At most this many login attempts may be in flight at once, across all
-/// clients. Guesses are refused here — before the passcode is looked at — so
-/// a brute-force wave cannot test many passcodes at the same time.
+/// At most this many login attempts may be in flight at once, across
+/// all clients. Guesses are refused here — before the passcode is
+/// looked at — so a brute-force wave cannot test many passcodes at
+/// the same time.
 pub const LOGIN_CONCURRENCY_LIMIT: usize = 2;
 
-/// Attempts one client may spend inside `LOGIN_BUDGET_WINDOW_SECS` before the
-/// server stops comparing its guesses. Charged before the comparison, so the
-/// passcode is never even looked at once the budget is gone.
+/// Attempts one client may spend inside `LOGIN_BUDGET_WINDOW_SECS`
+/// before the server stops comparing its guesses. Charged before the
+/// comparison, so the passcode is never even looked at once the
+/// budget is gone.
 pub const LOGIN_FAILURE_BUDGET: u32 = 10;
 
-/// Attempts all clients together may spend inside `LOGIN_BUDGET_WINDOW_SECS`.
-/// This is the backstop that keeps the per-client budget from being farmed out
-/// across many source addresses, and it is not affected by client eviction.
+/// Attempts all clients together may spend inside
+/// `LOGIN_BUDGET_WINDOW_SECS`. This is the backstop that keeps the
+/// per-client budget from being farmed out across many source
+/// addresses, and it is not affected by client eviction.
 pub const LOGIN_GLOBAL_FAILURE_BUDGET: u32 = 100;
 
-/// Length of the login attempt budget window. Budgets are restored, never
-/// permanently withdrawn, so there is no lockout.
+/// Length of the login attempt budget window. Budgets are restored,
+/// never permanently withdrawn, so there is no lockout.
 pub const LOGIN_BUDGET_WINDOW_SECS: u64 = 15 * 60;
 
-/// Clients kept in memory. Past this the least recently seen one is dropped;
-/// forgetting a client only restores that client's own budget, never the
-/// global one.
+/// Clients kept in memory. Past this the least recently seen one is
+/// dropped; forgetting a client only restores that client's own
+/// budget, never the global one.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
 /// Bound on concurrently expensive requests: directory listings and
@@ -770,11 +247,11 @@ const MAX_TRACKED_CLIENTS: usize = 1024;
 /// a 503 with Retry-After instead of queueing without limit.
 const ADMISSION_LIMIT: usize = 8;
 
-fn acquire_admission(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+pub(crate) fn acquire_admission(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
     state.admission.clone().try_acquire_owned().ok()
 }
 
-fn admission_denied() -> Response {
+pub(crate) fn admission_denied() -> Response {
     let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
     response
         .headers_mut()
@@ -782,8 +259,50 @@ fn admission_denied() -> Response {
     response
 }
 
-/// Attempts spent by one client (or by every client together) inside the
-/// current budget window.
+pub(crate) fn json_result<T: Serialize>(result: Result<T, CatalogError>) -> Response {
+    match result {
+        Ok(value) => Json(value).into_response(),
+        Err(e) => error_response(e),
+    }
+}
+
+/// The answer when the index cannot answer a request.
+///
+/// A list page must never fall back to "there is nothing here": the
+/// library is not empty, the index is unusable, and those are
+/// different facts. So this is 503 with the reason, shaped to match
+/// what the caller would have returned.
+pub(crate) fn index_failure(state: &AppState, as_json: bool) -> Response {
+    let reason = index_reason(state);
+    if as_json {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": reason })),
+        )
+            .into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, reason).into_response()
+    }
+}
+
+/// Why the index is unusable, in words a person can act on.
+fn index_reason(state: &AppState) -> String {
+    match state.index.sidebar_data() {
+        Ok(_) => "the library index could not answer this query".to_owned(),
+        Err(error) => format!("the library index is unavailable: {error}"),
+    }
+}
+
+pub(crate) fn error_response(e: CatalogError) -> Response {
+    match e {
+        CatalogError::NotFound => StatusCode::NOT_FOUND.into_response(),
+        CatalogError::Forbidden => StatusCode::FORBIDDEN.into_response(),
+        CatalogError::Unreadable => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Attempts spent by one client (or by every client together) inside
+/// the current budget window.
 #[derive(Clone, Copy, Default)]
 struct LoginBudget {
     spent: u32,
@@ -792,9 +311,10 @@ struct LoginBudget {
 }
 
 impl LoginBudget {
-    /// Attempts spent in the window containing `now`, starting a fresh window
-    /// first if the previous one has passed. A clock that steps backwards keeps
-    /// the current window rather than handing out a second budget.
+    /// Attempts spent in the window containing `now`, starting a
+    /// fresh window first if the previous one has passed. A clock
+    /// that steps backwards keeps the current window rather than
+    /// handing out a second budget.
     fn spent_in_window(&mut self, now: u64) -> u32 {
         if now.saturating_sub(self.window_start) >= LOGIN_BUDGET_WINDOW_SECS {
             self.window_start = now;
@@ -809,7 +329,8 @@ impl LoginBudget {
         self.last_seen = now;
     }
 
-    /// Seconds until this window rolls over and the budget is restored.
+    /// Seconds until this window rolls over and the budget is
+    /// restored.
     fn retry_after(&self, now: u64) -> u64 {
         LOGIN_BUDGET_WINDOW_SECS
             .saturating_sub(now.saturating_sub(self.window_start))
@@ -818,7 +339,7 @@ impl LoginBudget {
 }
 
 #[derive(Default)]
-struct ThrottleState {
+pub(crate) struct ThrottleState {
     clients: HashMap<String, LoginBudget>,
     global: LoginBudget,
 }
@@ -829,16 +350,16 @@ enum LoginGate {
     /// The attempt may be compared against the passcode. Carries the
     /// escalating delay step.
     Compare(u32),
-    /// Refused without comparing; `retry_after` seconds until the budget is
-    /// restored.
+    /// Refused without comparing; `retry_after` seconds until the
+    /// budget is restored.
     Refused { retry_after: u64 },
 }
 
 impl ThrottleState {
-    /// Decide whether one login attempt may be compared, charging it to both
-    /// the per-client and the global budget when it may. Runs before the
-    /// passcode is read, so a refused attempt costs the caller nothing and
-    /// reveals nothing about the guess.
+    /// Decide whether one login attempt may be compared, charging it
+    /// to both the per-client and the global budget when it may.
+    /// Runs before the passcode is read, so a refused attempt costs
+    /// the caller nothing and reveals nothing about the guess.
     fn admit(&mut self, client_key: &str, now: u64) -> LoginGate {
         let global = self.global.spent_in_window(now);
         let global_retry = self.global.retry_after(now);
@@ -864,8 +385,8 @@ impl ThrottleState {
         LoginGate::Compare(spent.saturating_add(1).max(global.saturating_add(1)))
     }
 
-    /// Charge an admitted attempt, keeping the client map bounded by evicting
-    /// the least recently seen client.
+    /// Charge an admitted attempt, keeping the client map bounded by
+    /// evicting the least recently seen client.
     fn charge_client(&mut self, client_key: &str, now: u64) {
         if self.clients.len() >= MAX_TRACKED_CLIENTS && !self.clients.contains_key(client_key) {
             if let Some(oldest) = self
@@ -877,9 +398,10 @@ impl ThrottleState {
                 self.clients.remove(&oldest);
             }
         }
-        // A first attempt starts its window now, not at zero: an entry left
-        // with a zeroed window start would look long expired and its next
-        // attempt would be admitted as a free budget.
+        // A first attempt starts its window now, not at zero: an
+        // entry left with a zeroed window start would look long
+        // expired and its next attempt would be admitted as a free
+        // budget.
         self.clients
             .entry(client_key.to_owned())
             .or_insert(LoginBudget {
@@ -889,17 +411,18 @@ impl ThrottleState {
             .charge(now);
     }
 
-    /// A successful login restores that client's budget. The global budget is
-    /// deliberately left alone: a success must not be able to hand an attacker
-    /// a fresh global allowance.
+    /// A successful login restores that client's budget. The global
+    /// budget is deliberately left alone: a success must not be able
+    /// to hand an attacker a fresh global allowance.
     fn record_success(&mut self, client_key: &str) {
         self.clients.remove(client_key);
     }
 }
 
-/// Report an accounts-store failure to the client: 500 with the error text.
-/// The store was validated at startup, so this only fires when it breaks
-/// while the server runs; the error never contains a password or hash.
+/// Report an accounts-store failure to the client: 500 with the error
+/// text. The store was validated at startup, so this only fires when
+/// it breaks while the server runs; the error never contains a
+/// password or hash.
 fn store_error(err: accounts::AccountsError) -> Response {
     let mut response = (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
     response
@@ -908,8 +431,9 @@ fn store_error(err: accounts::AccountsError) -> Response {
     response
 }
 
-/// Refuse a login attempt without comparing it: 429 with `Retry-After` and an
-/// empty body, so a refused attempt is indistinguishable from any other.
+/// Refuse a login attempt without comparing it: 429 with `Retry-After`
+/// and an empty body, so a refused attempt is indistinguishable from
+/// any other.
 fn login_refused(retry_after: u64) -> Response {
     let mut response = StatusCode::TOO_MANY_REQUESTS.into_response();
     if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
@@ -923,8 +447,9 @@ fn login_refused(retry_after: u64) -> Response {
 
 /// Build the read-only viewer router.
 ///
-/// The accounts store is opened here; a store that cannot be read is a panic
-/// because every caller that can report an error uses [`router_from`] instead.
+/// The accounts store is opened here; a store that cannot be read is
+/// a panic because every caller that can report an error uses
+/// [`router_from`] instead.
 pub fn router<C: Catalog, P: PreviewProvider>(
     catalog: C,
     previews: P,
@@ -936,11 +461,11 @@ pub fn router<C: Catalog, P: PreviewProvider>(
 
 /// Build a router from trait objects for later CLI integration.
 ///
-/// Fails when `accounts.json` is unreadable, malformed, or written by an
-/// unknown schema version: the caller must exit non-zero rather than start a
-/// viewer that would silently fall back to first-run setup. With
-/// [`AuthMode::None`] the store is never read, so a missing or broken one does
-/// not stop a no-login server.
+/// Fails when `accounts.json` is unreadable, malformed, or written by
+/// an unknown schema version: the caller must exit non-zero rather
+/// than start a viewer that would silently fall back to first-run
+/// setup. With [`AuthMode::None`] the store is never read, so a
+/// missing or broken one does not stop a no-login server.
 pub fn router_from(
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
@@ -950,6 +475,21 @@ pub fn router_from(
     if config.auth == AuthMode::Account {
         accounts.has_users()?;
     }
+    let index_handle = match IndexHandle::open(catalog.root()) {
+        Ok(handle) => handle,
+        // A library whose index cannot be built is still worth
+        // serving: sign-in, media and notes work, and every list page
+        // says why it is empty rather than showing a library that
+        // looks fine.
+        Err(error) => {
+            eprintln!(
+                "WARNING: the library index is unavailable ({error}); list pages will report it"
+            );
+            IndexHandle::unavailable(catalog.root().to_path_buf(), error)
+        }
+    };
+    let index = Arc::new(index_handle);
+    index.ensure_background_rescan(config.rescan_interval);
     let state = AppState {
         catalog,
         previews,
@@ -960,18 +500,33 @@ pub fn router_from(
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
+        index,
     };
     Ok(Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout).post(logout))
         .route("/setup", get(setup_page).post(setup))
-        .route("/", get(folder_page))
-        .route("/folder/*path", get(folder_page))
-        .route("/collection/*path", get(collection_page))
+        // The library and its three siblings (spec §2).
+        .route("/", get(library_page))
+        .route("/folders", get(folders_page))
+        .route("/collections", get(collections_page))
+        .route("/search", get(search_page))
         .route("/image/*path", get(image_page))
-        .route("/media/*path", get(media))
-        .route("/thumb/*path", get(media))
-        .route("/raw/*path", get(media))
+        // Old links keep working, pointing at the new form (spec §2).
+        .route("/folder/*path", get(folder_redirect))
+        .route("/collection/*path", get(collection_redirect))
+        .route("/media/*path", get(media::media))
+        .route("/thumb/*path", get(media::media))
+        .route("/raw/*path", get(media::media))
+        // The hashed stylesheet and script (spec §0). Only the current
+        // hash resolves: a stale URL is a 404, which a cached page
+        // cannot hit.
+        .route(&assets::css_route(), get(css_asset))
+        .route(&assets::js_route(), get(js_asset))
+        // The JSON the HTML pages read from.
+        .route("/api/view", get(view_json))
+        .route("/api/sidebar", get(sidebar_json))
+        // The JSON agents read, unchanged.
         .route("/api/folder", get(folder_root_json))
         .route("/api/folder/*path", get(folder_json))
         .route("/api/collection/*path", get(collection_json))
@@ -983,10 +538,11 @@ pub fn router_from(
 /// What a request has to satisfy before it reaches a page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Gate {
-    /// `--auth none`: every page is public and there are no accounts at all.
+    /// `--auth none`: every page is public and there are no accounts
+    /// at all.
     Open,
-    /// No account and no passcode: every page belongs to `/setup`, which
-    /// creates the owner.
+    /// No account and no passcode: every page belongs to `/setup`,
+    /// which creates the owner.
     Setup,
     /// Accounts exist (or a passcode does): a session is required.
     Login,
@@ -994,9 +550,9 @@ enum Gate {
 
 /// Decide the gate for this request.
 ///
-/// A store that fails to load never opens setup: it is treated as "accounts
-/// exist", so the request goes to `/login` and is refused there instead of
-/// reaching the account-creation form.
+/// A store that fails to load never opens setup: it is treated as
+/// "accounts exist", so the request goes to `/login` and is refused
+/// there instead of reaching the account-creation form.
 fn gate(state: &AppState) -> Gate {
     if state.config.auth == AuthMode::None {
         return Gate::Open;
@@ -1011,10 +567,18 @@ fn gate(state: &AppState) -> Gate {
 
 async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
+    // The stylesheet and script carry no library data and the sign-in and
+    // setup pages need them to render, so they are served before the gate.
+    // Gating them would redirect the sign-in page's own stylesheet back to
+    // the sign-in page, which then renders unstyled.
+    if path.starts_with("/assets/") {
+        return next.run(request).await;
+    }
     match gate(&state) {
         Gate::Open => {
-            // Nothing to sign in to: `/login` and `/logout` land on the
-            // library, and owner creation is not offered here at all.
+            // Nothing to sign in to: `/login` and `/logout` land on
+            // the library, and owner creation is not offered here at
+            // all.
             if path == "/setup" {
                 return (StatusCode::NOT_FOUND, "Not Found").into_response();
             }
@@ -1073,9 +637,9 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     Redirect::to("/login").into_response()
 }
 
-/// The setup form, optionally preceded by an error paragraph. This is the
-/// single place that knows the form's fields, so the weak-password warning
-/// and its checkbox live here and not in every error page.
+/// The setup form, optionally preceded by an error paragraph. This is
+/// the single place that knows the form's fields, so the weak-password
+/// warning and its checkbox live here and not in every error page.
 fn setup_form_html(error: Option<&str>) -> String {
     let error = error
         .map(|message| format!("<p>{message}</p>"))
@@ -1085,9 +649,9 @@ fn setup_form_html(error: Option<&str>) -> String {
          <h2>Welcome to dimagine</h2>\
          <p>Create the owner account to finish server setup.</p>\
          <p>Until this account exists, the first visitor can claim this server.</p>\
-         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-         <label>Password <input name=\"password\" type=\"password\" required></label>\
-         <label>Confirm password <input name=\"confirm_password\" type=\"password\" required></label>\
+         <label>Email <input name=\"email\" type=\"email\" autocomplete=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" autocomplete=\"new-password\" required></label>\
+         <label>Confirm password <input name=\"confirm_password\" type=\"password\" autocomplete=\"new-password\" required></label>\
          <label>Use this weak password anyway <input name=\"allow_weak\" type=\"checkbox\" value=\"yes\"></label>\
          <p>Any password is accepted, but fewer than {WEAK_PASSWORD_LENGTH} characters is easy to guess:\
          tick the box to use one anyway.</p>\
@@ -1098,11 +662,7 @@ fn setup_form_html(error: Option<&str>) -> String {
 
 /// A setup error page, so every refusal renders the same form again.
 fn setup_error(status: StatusCode, error: &str) -> Response {
-    let html = layout(
-        AuthMode::Account,
-        "Initial Setup",
-        &setup_form_html(Some(error)),
-    );
+    let html = layout("Initial Setup", &setup_form_html(Some(error)));
     let mut response = (status, Html(html)).into_response();
     response
         .headers_mut()
@@ -1110,8 +670,8 @@ fn setup_error(status: StatusCode, error: &str) -> Response {
     response
 }
 
-/// A setup response that is not an error page: 404s and redirects, both with
-/// `no-store` like every other credential-bearing response.
+/// A setup response that is not an error page: 404s and redirects,
+/// both with `no-store` like every other credential-bearing response.
 fn setup_response(mut response: Response) -> Response {
     response
         .headers_mut()
@@ -1128,7 +688,7 @@ async fn setup_page(State(state): State<AppState>) -> Response {
     if has_users || state.config.passcode.is_some() {
         return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
     }
-    let html = state.page("Initial Setup", &setup_form_html(None));
+    let html = layout("Initial Setup", &setup_form_html(None));
     let mut response = Html(html).into_response();
     response
         .headers_mut()
@@ -1144,16 +704,16 @@ struct SetupForm {
     password: String,
     #[serde(default)]
     confirm_password: String,
-    /// The "Use this weak password anyway" checkbox. A checkbox posts its
-    /// `value` when ticked and nothing when not, so any non-empty value here
-    /// is an explicit confirmation.
+    /// The "Use this weak password anyway" checkbox. A checkbox posts
+    /// its `value` when ticked and nothing when not, so any non-empty
+    /// value here is an explicit confirmation.
     #[serde(default)]
     allow_weak: String,
 }
 
 async fn setup(
     State(state): State<AppState>,
-    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    client: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Form(form): Form<SetupForm>,
 ) -> Response {
@@ -1165,8 +725,9 @@ async fn setup(
         return setup_response((StatusCode::NOT_FOUND, "Not Found").into_response());
     }
 
-    // Refuse everything that can be refused without waiting on the lock, so a
-    // request that is going to fail never queues behind a slow argon2 hash.
+    // Refuse everything that can be refused without waiting on the
+    // lock, so a request that is going to fail never queues behind a
+    // slow argon2 hash.
     let trimmed_email = form.email.trim();
     if trimmed_email.is_empty() || !trimmed_email.contains('@') {
         return setup_error(
@@ -1183,8 +744,8 @@ async fn setup(
         return setup_error(StatusCode::BAD_REQUEST, "Password cannot be empty.");
     }
 
-    // No length minimum: a short password is accepted, but only when the
-    // operator ticked the box saying they know it is weak.
+    // No length minimum: a short password is accepted, but only when
+    // the operator ticked the box saying they know it is weak.
     if is_weak_password(&form.password) && form.allow_weak.trim().is_empty() {
         return setup_error(
             StatusCode::BAD_REQUEST,
@@ -1195,10 +756,10 @@ async fn setup(
         );
     }
 
-    // One critical section spans the re-check and the account creation. A
-    // second concurrent request blocks on this lock and then finds an owner
-    // already exists, so it is sent to the login page instead of creating a
-    // second account (RW25 F-2).
+    // One critical section spans the re-check and the account creation.
+    // A second concurrent request blocks on this lock and then finds
+    // an owner already exists, so it is sent to the login page
+    // instead of creating a second account (RW25 F-2).
     let setup_guard = state.setup_lock.lock().unwrap();
     match state.accounts.has_users() {
         Ok(true) => return setup_response(Redirect::to("/login").into_response()),
@@ -1210,10 +771,9 @@ async fn setup(
         .accounts
         .create_user(trimmed_email, &form.password, "owner")
     {
-        // Setup stays open: a transient store failure must not close it, or
-        // the operator would have to restart the server.
+        // Setup stays open: a transient store failure must not close
+        // it, or the operator would have to restart the server.
         let html = layout(
-            AuthMode::Account,
             "Initial Setup",
             &format!("<p>Failed to create account: {err}</p>"),
         );
@@ -1255,10 +815,11 @@ async fn setup(
 async fn login_page(State(state): State<AppState>) -> Response {
     let gate = gate(&state);
     match gate {
-        // No login exists in this mode: send the visitor to the library.
+        // No login exists in this mode: send the visitor to the
+        // library.
         Gate::Open => return Redirect::to("/").into_response(),
-        // Fail closed: an unreadable store shows the login form, never a
-        // redirect back to /setup.
+        // Fail closed: an unreadable store shows the login form, never
+        // a redirect back to /setup.
         Gate::Setup => return Redirect::to("/setup").into_response(),
         Gate::Login => {}
     }
@@ -1266,20 +827,20 @@ async fn login_page(State(state): State<AppState>) -> Response {
 
     let form_html = if has_users {
         "<form method=\"post\">\
-         <label>Email <input name=\"email\" type=\"email\" autofocus required></label>\
-         <label>Password <input name=\"password\" type=\"password\" required></label>\
+         <label>Email <input name=\"email\" type=\"email\" autocomplete=\"email\" autofocus required></label>\
+         <label>Password <input name=\"password\" type=\"password\" autocomplete=\"current-password\" required></label>\
          <button>Sign in</button>\
          </form>"
             .to_string()
     } else {
         "<form method=\"post\">\
-         <label>Passcode <input name=\"passcode\" type=\"password\" autofocus></label>\
+         <label>Passcode <input name=\"passcode\" type=\"password\" autocomplete=\"current-password\" autofocus></label>\
          <button>Sign in</button>\
          </form>"
             .to_string()
     };
 
-    let mut response = Html(state.page("Sign in", &form_html)).into_response();
+    let mut response = Html(layout("Sign in", &form_html)).into_response();
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1298,13 +859,13 @@ struct LoginForm {
 
 async fn login(
     State(state): State<AppState>,
-    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    client: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
     Form(form): Form<LoginForm>,
 ) -> Response {
-    // Fail closed, as in the auth middleware: an unreadable store is treated
-    // as "users exist", so the login attempt is refused instead of reopening
-    // setup.
+    // Fail closed, as in the auth middleware: an unreadable store is
+    // treated as "users exist", so the login attempt is refused instead
+    // of reopening setup.
     let has_users = match gate(&state) {
         Gate::Open => return Redirect::to("/").into_response(),
         Gate::Setup => return Redirect::to("/setup").into_response(),
@@ -1313,16 +874,18 @@ async fn login(
 
     let client_key =
         resolve_client_ip(client.map(|c| c.0), &headers, &state.config.trusted_proxies);
-    // Bound how many guesses are in flight before anything else: a parallel
-    // wave of guesses is refused without the passcode ever being compared.
+    // Bound how many guesses are in flight before anything else: a
+    // parallel wave of guesses is refused without the passcode ever
+    // being compared.
     let _slot = match state.login_slots.clone().try_acquire_owned() {
         Ok(slot) => slot,
         Err(_) => return login_refused(1),
     };
-    // Then charge the attempt to the per-client and the global budget, still
-    // before comparing, so an exhausted budget refuses without comparing and
-    // response timing never reveals whether a guess was correct: every attempt
-    // that is compared pays the same escalating delay.
+    // Then charge the attempt to the per-client and the global budget,
+    // still before comparing, so an exhausted budget refuses without
+    // comparing and response timing never reveals whether a guess was
+    // correct: every attempt that is compared pays the same escalating
+    // delay.
     let delay_step = {
         let mut throttle = state.throttles.lock().unwrap();
         match throttle.admit(&client_key, now_seconds()) {
@@ -1376,7 +939,7 @@ async fn login(
         };
         let mut response = (
             StatusCode::UNAUTHORIZED,
-            Html(state.page("Sign in", &error_body)),
+            Html(layout("Sign in", &error_body)),
         )
             .into_response();
         response
@@ -1418,7 +981,7 @@ async fn login(
 
 async fn logout(
     State(state): State<AppState>,
-    client: Option<axum::extract::ConnectInfo<std::net::SocketAddr>>,
+    client: Option<axum::extract::ConnectInfo<SocketAddr>>,
     headers: HeaderMap,
 ) -> Response {
     let token = headers
@@ -1450,11 +1013,12 @@ async fn logout(
 /// Decide whether a session cookie must carry `Secure`.
 ///
 /// `Secure` is set when the viewer is served directly over HTTPS
-/// (`config.https`, raised by the `--secure-cookies` flag), or when the
-/// request arrived through a trusted reverse proxy that terminated TLS: the
-/// TCP peer is a configured trusted proxy and its `X-Forwarded-Proto` header
-/// says `https`. The header is honoured only from a trusted peer, so a direct
-/// client can never influence the flag.
+/// (`config.https`, raised by the `--secure-cookies` flag), or when
+/// the request arrived through a trusted reverse proxy that terminated
+/// TLS: the TCP peer is a configured trusted proxy and its
+/// `X-Forwarded-Proto` header says `https`. The header is honoured
+/// only from a trusted peer, so a direct client can never influence
+/// the flag.
 fn cookie_secure(
     state: &AppState,
     peer: Option<std::net::SocketAddr>,
@@ -1476,655 +1040,35 @@ fn cookie_secure(
         .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
 }
 
-async fn folder_page(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
-    let _permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
-    let raw = route_tail(uri.path(), "/folder/");
-    let folder = match percent_decode_str(&raw).decode_utf8() {
-        Ok(s) => s.into_owned(),
-        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
-    };
-    let catalog = state.catalog.clone();
-    let auth = state.config.auth;
-    match tokio::task::spawn_blocking(move || {
-        render_folder_data(&AppState { catalog, ..state }, &folder)
-    })
-    .await
-    {
-        Ok(Ok(data)) => render_folder_data_html(auth, data),
-        Ok(Err(error)) => error_response(error),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+/// `GET /assets/app-<hash>.css` — the stylesheet, immutable until it
+/// changes.
+async fn css_asset(uri: axum::http::Uri) -> Response {
+    asset(uri.path(), "text/css; charset=utf-8", assets::css_at)
 }
-async fn folder_root_json(State(state): State<AppState>) -> Response {
-    let _permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
-    folder_data_blocking(state, String::new()).await
+
+/// `GET /assets/app-<hash>.js` — the enhancement script.
+async fn js_asset(uri: axum::http::Uri) -> Response {
+    asset(uri.path(), "text/javascript; charset=utf-8", assets::js_at)
 }
-async fn folder_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let _permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
-    folder_data_blocking(state, path).await
-}
-async fn collection_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let _permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
-    let catalog = state.catalog.clone();
-    let auth = state.config.auth;
-    match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
-        Ok(Ok(c)) => Html(layout(auth, &c.title, &collection_html(&c))).into_response(),
-        Ok(Err(e)) => error_response(e),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-async fn collection_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let _permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
-    let catalog = state.catalog.clone();
-    match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
-        Ok(result) => json_result(result),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-async fn image_page(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let catalog = state.catalog.clone();
-    let auth = state.config.auth;
-    match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
-        Ok(Ok(detail)) => {
-            let props = escape_html(&yaml_json_string(&detail.properties));
-            let body = markdown_html(&detail.body);
-            let raws = detail
-                .raw_files
-                .iter()
-                .map(|f| format!("<li>{}</li>", escape_html(f)))
-                .collect::<String>();
-            let diagnostic = detail
-                .front_matter_error
-                .as_ref()
-                .map(|e| {
-                    format!(
-                        "<p class=\"error\">Front matter error: {}</p>",
-                        escape_html(e)
-                    )
-                })
-                .unwrap_or_default();
-            let content = format!("<p><a class=\"original-link\" href=\"/raw/{}\">View original</a></p><img class=\"detail\" src=\"/media/{}\" alt=\"{}\"><h2>Properties</h2><pre>{props}</pre>{diagnostic}<h2>Note</h2><article>{body}</article><h2>Raw source files</h2><ul>{raws}</ul>", encode_path(&detail.path), encode_path(&detail.path), escape_html(&detail.path));
-            Html(layout(auth, &detail.path, &content)).into_response()
-        }
-        Ok(Err(e)) => error_response(e),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-async fn image_json(State(state): State<AppState>, Path(path): Path<String>) -> Response {
-    let catalog = state.catalog.clone();
-    match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
-        Ok(Ok(d)) => Json(d).into_response(),
-        Ok(Err(e)) => error_response(e),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-async fn media(
-    State(state): State<AppState>,
-    Path(path): Path<String>,
-    uri: axum::http::Uri,
-    headers: HeaderMap,
+
+/// One asset response. The URL carries a hash of the body, so it can
+/// be cached for a year: a different body is a different URL.
+fn asset(
+    path: &str,
+    content_type: &'static str,
+    body: fn(&str) -> Option<&'static str>,
 ) -> Response {
-    let permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
+    let Some(body) = body(path) else {
+        return StatusCode::NOT_FOUND.into_response();
     };
-    let kind = if uri.path().starts_with("/thumb/") {
-        Some(PreviewKind::Thumb)
-    } else if uri.path().starts_with("/raw/") {
-        None
-    } else {
-        Some(PreviewKind::View)
-    };
-    let catalog = state.catalog.clone();
-    let previews = state.previews.clone();
-    let root = state.catalog.root().to_path_buf();
-    let headers = headers.clone();
-    let prepared = tokio::task::spawn_blocking(move || {
-        let original = catalog
-            .resolve_path(&path)
-            .map_err(ServeImageError::Catalog)?;
-        if !is_image(&original) {
-            return Err(ServeImageError::Catalog(CatalogError::NotFound));
-        }
-        let served = match kind {
-            Some(k) => previews
-                .preview_path(&path, k)
-                .and_then(|p| fs::canonicalize(p).ok())
-                .filter(|p| p.starts_with(&root) && p.is_file())
-                .unwrap_or_else(|| original.clone()),
-            None => original.clone(),
-        };
-        open_hashed_image(&served)
-    })
-    .await;
-    match prepared {
-        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
-            stream_image(file, metadata, etag, mime, mismatch, &headers, permit).await
-        }
-        Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
-        Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-
-enum ServeImageError {
-    Catalog(CatalogError),
-    Io,
-}
-fn open_hashed_image(
-    path: &FsPath,
-) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
-    let mut file = fs::File::open(path).map_err(|_| ServeImageError::Io)?;
-    let metadata = file.metadata().map_err(|_| ServeImageError::Io)?;
-    let mut hasher = Sha256::new();
-    let mut signature = [0u8; 32];
-    let mut prefix = Vec::with_capacity(32);
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|_| ServeImageError::Io)?;
-        if read == 0 {
-            break;
-        }
-        if prefix.len() < 32 {
-            prefix.extend_from_slice(&buffer[..read.min(32 - prefix.len())]);
-        }
-        hasher.update(&buffer[..read]);
-    }
-    signature.copy_from_slice(&hasher.finalize());
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| ServeImageError::Io)?;
-    let etag = format!(
-        "\"{}\"",
-        signature
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    );
-    let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
-    let extension_mime = mime_guess::from_path(path)
-        .first_raw()
-        .unwrap_or("application/octet-stream");
-    Ok((file, metadata, etag, mime, mime != extension_mime))
-}
-
-/// A streamed file that keeps its admission permit until the last byte.
-struct AdmittedFile {
-    inner: tokio::fs::File,
-    _admission: tokio::sync::OwnedSemaphorePermit,
-}
-
-impl tokio::io::AsyncRead for AdmittedFile {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
-async fn stream_image(
-    file: fs::File,
-    metadata: fs::Metadata,
-    etag: String,
-    mime: &'static str,
-    mismatch: bool,
-    request_headers: &HeaderMap,
-    admission: tokio::sync::OwnedSemaphorePermit,
-) -> Response {
-    let file = tokio::fs::File::from_std(file);
-    // The admission permit lives for the whole stream, so slow
-    // readers count against the concurrency bound while streaming.
-    let stream = tokio_util::io::ReaderStream::new(AdmittedFile {
-        inner: file,
-        _admission: admission,
-    });
-    let body = Body::from_stream(stream);
-    let modified = metadata
-        .modified()
-        .unwrap_or(UNIX_EPOCH)
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut response = Response::new(body);
-    let h = response.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
-    // Rendition URLs carry no content hash, so they must not be
-    // cached as immutable: the source file or a regenerated
-    // preview can change under the same URL. The ETag is a
-    // SHA-256 of the served bytes, so `no-cache` revalidation is
-    // exact and costs one 304 per reuse.
-    h.insert(
+    let mut response = Response::new(Body::from(body));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-cache"),
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
     );
-    if mismatch {
-        h.insert(
-            "x-dimagine-extension-mismatch",
-            HeaderValue::from_static("true"),
-        );
-    }
-    h.insert(header::ETAG, HeaderValue::from_str(&etag).unwrap());
-    h.insert(
-        header::LAST_MODIFIED,
-        HeaderValue::from_str(&httpdate::fmt_http_date(
-            SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(modified),
-        ))
-        .unwrap(),
-    );
-    if request_headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|value| etag_header_matches(value, &etag))
-    {
-        *response.status_mut() = StatusCode::NOT_MODIFIED;
-        *response.body_mut() = Body::empty();
-    }
     response
-}
-
-fn etag_header_matches(header: &str, etag: &str) -> bool {
-    header.split(',').map(str::trim).any(|candidate| {
-        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == etag
-    })
-}
-
-fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        Some("image/png")
-    } else if bytes.starts_with(b"\xff\xd8\xff") {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.starts_with(b"BM") {
-        Some("image/bmp")
-    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
-        Some("image/tiff")
-    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
-        match &bytes[8..12] {
-            b"avif" | b"avis" => Some("image/avif"),
-            b"heic" | b"heix" | b"hevc" | b"hevx" => Some("image/heic"),
-            b"mif1" => Some("image/heif"),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
-
-#[derive(Serialize)]
-struct FolderData {
-    folder: String,
-    breadcrumbs: Vec<(String, String)>,
-    folders: Vec<String>,
-    images: Vec<ImageEntry>,
-    collections: Vec<Collection>,
-}
-fn render_folder_data(state: &AppState, folder: &str) -> Result<FolderData, CatalogError> {
-    let folders = state.catalog.list_subfolders(folder)?;
-    let images_all = state.catalog.list_folder(folder)?;
-    let prefix = if folder.is_empty() {
-        String::new()
-    } else {
-        format!("{}/", folder.trim_end_matches('/'))
-    };
-    let images = images_all
-        .into_iter()
-        .filter(|i| {
-            i.path
-                .strip_prefix(&prefix)
-                .is_some_and(|tail| !tail.contains('/'))
-        })
-        .collect();
-    let collections = state.catalog.list_collections(folder)?;
-    let breadcrumbs = breadcrumbs(folder);
-    Ok(FolderData {
-        folder: folder.to_owned(),
-        breadcrumbs,
-        folders,
-        images,
-        collections,
-    })
-}
-async fn folder_data_blocking(state: AppState, folder: String) -> Response {
-    match tokio::task::spawn_blocking(move || render_folder_data(&state, &folder)).await {
-        Ok(result) => json_result(result),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-fn render_folder_data_html(auth: AuthMode, data: FolderData) -> Response {
-    let crumbs = data
-        .breadcrumbs
-        .iter()
-        .map(|(label, path)| {
-            if path.is_empty() {
-                format!("<a href=\"/\">{}</a>", escape_html(label))
-            } else {
-                format!(
-                    "<a href=\"/folder/{}\">{}</a>",
-                    encode_path(path),
-                    escape_html(label)
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" / ");
-    let folders = data
-        .folders
-        .iter()
-        .map(|folder| {
-            let name = folder.rsplit('/').next().unwrap_or(folder);
-            format!(
-                "<a class=\"tile folder\" href=\"/folder/{}\">📁 {}</a>",
-                encode_path(folder),
-                escape_html(name)
-            )
-        })
-        .collect::<String>();
-    let images = data.images.iter().map(|i| format!("<a class=\"tile\" href=\"/image/{}\"><img loading=\"lazy\" src=\"/thumb/{}\" alt=\"{}\"><span>{}</span></a>", encode_path(&i.path), encode_path(&i.path), escape_html(&i.name), escape_html(&i.name))).collect::<String>();
-    let cols = data
-        .collections
-        .iter()
-        .map(|c| {
-            format!(
-                "<li><a href=\"/collection/{}\">{}</a></li>",
-                encode_path(&c.path),
-                escape_html(&c.title)
-            )
-        })
-        .collect::<String>();
-    Html(layout(
-        auth,
-        if data.folder.is_empty() {
-            "Library"
-        } else {
-            &data.folder
-        },
-        &format!(
-            "<nav>{crumbs}</nav><ul>{cols}</ul><section class=\"grid\">{folders}{images}</section>"
-        ),
-    ))
-    .into_response()
-}
-fn collection_html(c: &Collection) -> String {
-    let figures: String = c.members.iter().map(|m| format!("<figure><a href=\"/image/{}\"><img loading=\"lazy\" src=\"/media/{}\" alt=\"{}\"></a><figcaption>{}</figcaption></figure>", encode_path(&m.path), encode_path(&m.path), escape_html(&m.path), escape_html(&m.caption))).collect();
-    let diagnostics: String = c.diagnostics.iter().map(|d| match d.kind {
-        DiagnosticKind::Ambiguous => format!(
-            "<p class=\"error\">Line {}: <code>{}</code> matches several files, not guessing: {}</p>",
-            d.line,
-            escape_html(&d.target),
-            d.candidates
-                .iter()
-                .map(|candidate| escape_html(candidate))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        DiagnosticKind::Missing => format!(
-            "<p class=\"error\">Line {}: <code>{}</code> matches no file</p>",
-            d.line,
-            escape_html(&d.target)
-        ),
-    }).collect();
-    format!("{figures}{diagnostics}")
-}
-fn json_result<T: Serialize>(result: Result<T, CatalogError>) -> Response {
-    match result {
-        Ok(value) => Json(value).into_response(),
-        Err(e) => error_response(e),
-    }
-}
-fn error_response(e: CatalogError) -> Response {
-    match e {
-        CatalogError::NotFound => StatusCode::NOT_FOUND.into_response(),
-        CatalogError::Forbidden => StatusCode::FORBIDDEN.into_response(),
-        CatalogError::Unreadable => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
-}
-/// One HTML page: the shared chrome, the title, and the body.
-///
-/// With [`AuthMode::None`] a banner goes above the title, so no page can be
-/// mistaken for a login-protected one.
-fn layout(auth: AuthMode, title: &str, body: &str) -> String {
-    let banner = if auth.shows_banner() {
-        format!("<p class=\"banner\">{}</p>", escape_html(NO_LOGIN_BANNER))
-    } else {
-        String::new()
-    };
-    format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><style>:root{{color-scheme:light dark;font:16px system-ui}}body{{max-width:1100px;margin:auto;padding:1rem}}a{{color:inherit}}.banner{{margin:0 0 1rem;padding:0.6rem 0.8rem;border:1px solid;border-radius:8px;font-weight:600}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(145px,1fr));gap:12px}}.tile{{display:flex;flex-direction:column;text-decoration:none}}.tile img{{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px}}.tile span{{margin-top:4px;font-size:0.85rem;overflow-wrap:break-word}}.tile.folder{{aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:rgba(128,128,128,0.15);border-radius:8px;padding:0.5rem;text-align:center;box-sizing:border-box}}.detail{{max-width:100%;height:auto}}figure{{margin:0 0 1.4rem}}figure img{{max-width:100%;height:auto;border-radius:8px}}pre{{overflow:auto}}@media(max-width:420px){{.grid{{grid-template-columns:repeat(2,minmax(0,1fr))}}}}</style>{banner}<h1>{}</h1>{}</html>", escape_html(title), escape_html(title), body)
-}
-fn markdown_html(markdown: &str) -> String {
-    let mut out = String::new();
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_TABLES);
-    let safe_events = Parser::new_ext(markdown, options).map(|event| match event {
-        Event::Html(raw) | Event::InlineHtml(raw) => Event::Text(raw),
-        other => other,
-    });
-    html::push_html(&mut out, safe_events);
-    let mut sanitizer = ammonia::Builder::default();
-    sanitizer.url_schemes(["http", "https", "mailto"].into_iter().collect());
-    sanitizer.clean(&out).to_string()
-}
-fn escape_html(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-fn ignored_name(s: &str) -> bool {
-    s.starts_with('.')
-        || s.starts_with("._")
-        || s == "Thumbs.db"
-        || s.eq_ignore_ascii_case("desktop.ini")
-}
-fn is_image(path: &FsPath) -> bool {
-    path.extension()
-        .and_then(|x| x.to_str())
-        .is_some_and(|x| IMAGE_EXTENSIONS.contains(&x.to_ascii_lowercase().as_str()))
-}
-struct ParsedNote {
-    properties: serde_json::Value,
-    body: String,
-    body_line: usize,
-    error: Option<String>,
-}
-fn parse_note(text: &str) -> ParsedNote {
-    let mut lines = text.split_inclusive('\n');
-    let Some(first) = lines.next() else {
-        return ParsedNote {
-            properties: serde_json::Value::Null,
-            body: String::new(),
-            body_line: 1,
-            error: None,
-        };
-    };
-    if first.trim_end_matches(['\r', '\n']) != "---" {
-        return ParsedNote {
-            properties: serde_json::Value::Null,
-            body: text.to_owned(),
-            body_line: 1,
-            error: None,
-        };
-    }
-    let mut offset = first.len();
-    let yaml_start = offset;
-    let mut line_no = 1usize;
-    for line in lines {
-        line_no += 1;
-        if line.trim_end_matches(['\r', '\n']) == "---" {
-            let yaml = &text[yaml_start..offset];
-            let body = text[offset + line.len()..].to_owned();
-            let body_line = line_no + 1;
-            return match Yaml::load_from_str(yaml) {
-                Ok(documents) if documents.len() == 1 => ParsedNote {
-                    properties: yaml_to_json(&documents[0]),
-                    body,
-                    body_line,
-                    error: None,
-                },
-                Ok(_) => ParsedNote {
-                    properties: serde_json::Value::Null,
-                    body,
-                    body_line,
-                    error: Some("front matter must contain exactly one YAML document".to_owned()),
-                },
-                Err(error) => ParsedNote {
-                    properties: serde_json::Value::Null,
-                    body,
-                    body_line,
-                    error: Some(error.to_string()),
-                },
-            };
-        }
-        offset += line.len();
-    }
-    ParsedNote {
-        properties: serde_json::Value::Null,
-        body: text.to_owned(),
-        body_line: 2,
-        error: Some("front matter has no closing delimiter".to_owned()),
-    }
-}
-fn yaml_to_json(yaml: &Yaml<'_>) -> serde_json::Value {
-    if let Some(value) = yaml.as_str() {
-        return serde_json::Value::String(value.to_owned());
-    }
-    if let Some(value) = yaml.as_bool() {
-        return serde_json::Value::Bool(value);
-    }
-    if let Some(value) = yaml.as_integer() {
-        return serde_json::Value::Number(value.into());
-    }
-    if let Some(value) = yaml.as_floating_point() {
-        return serde_json::Number::from_f64(value)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null);
-    }
-    if yaml.is_null() {
-        return serde_json::Value::Null;
-    }
-    if let Some(sequence) = yaml.as_vec() {
-        return serde_json::Value::Array(sequence.iter().map(yaml_to_json).collect());
-    }
-    if let Some(mapping) = yaml.as_mapping() {
-        let mut object = serde_json::Map::new();
-        for (key, value) in mapping {
-            let key = key
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{key:?}"));
-            object.insert(key, yaml_to_json(value));
-        }
-        return serde_json::Value::Object(object);
-    }
-    serde_json::Value::Null
-}
-fn yaml_json_string(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned())
-}
-fn yaml_string(value: &serde_json::Value, key: &str) -> Option<String> {
-    value.get(key)?.as_str().map(ToOwned::to_owned)
-}
-/// A note is a collection when it embeds at least one image (FORMAT §5), when
-/// an embed is reported as ambiguous or missing, or when it carries
-/// `kind: collection`, which exists so tools list it (FORMAT §5). An image
-/// note's self-embed never counts (FORMAT §3.2).
-///
-/// This is the rule the index view queries use too, so a viewer and the
-/// renderer never disagree about what a collection is.
-fn is_collection(
-    parsed: &ParsedNote,
-    members: &[CollectionMember],
-    diagnostics: &[CollectionDiagnostic],
-) -> bool {
-    note_is_collection(&CollectionEvidence {
-        kind: yaml_string(&parsed.properties, "kind").as_deref(),
-        members: members.len(),
-        unresolved: diagnostics.len(),
-    })
-}
-
-/// Extract the image members of one note with the shared core parser and
-/// resolver, and collect the embeds that resolved to no single image.
-fn collect_collection(
-    resolver: &Resolver,
-    files: &[FileEntry],
-    note: &FileEntry,
-    parsed: &ParsedNote,
-    text: &str,
-) -> (Vec<CollectionMember>, Vec<CollectionDiagnostic>) {
-    let links = extract_markdown_links(&parsed.body, parsed.body_line);
-    let lines: Vec<&str> = text.lines().collect();
-    let mut members = Vec::new();
-    let mut diagnostics = Vec::new();
-    for link in links.iter().filter(|link| link.syntax.is_strong_image()) {
-        match resolver.resolve(&link.target, note, link.syntax) {
-            Outcome::Resolved(idx) if files[idx].class == FileClass::Image => {
-                let image = &files[idx];
-                if is_self_embed(note, image) {
-                    continue;
-                }
-                members.push(CollectionMember {
-                    path: image.rel.clone(),
-                    caption: caption_after(&lines, link.line),
-                });
-            }
-            Outcome::Ambiguous(hits) => diagnostics.push(CollectionDiagnostic {
-                target: link.target.clone(),
-                line: link.line,
-                kind: DiagnosticKind::Ambiguous,
-                candidates: hits.iter().map(|&idx| files[idx].rel.clone()).collect(),
-            }),
-            Outcome::NotFound => diagnostics.push(CollectionDiagnostic {
-                target: link.target.clone(),
-                line: link.line,
-                kind: DiagnosticKind::Missing,
-                candidates: Vec::new(),
-            }),
-            Outcome::NotImageTarget | Outcome::Resolved(_) => {}
-        }
-    }
-    (members, diagnostics)
-}
-
-/// FORMAT §3.2: an image note's embed of its own image is a preview, not a
-/// membership.
-fn is_self_embed(note: &FileEntry, image: &FileEntry) -> bool {
-    note.class == FileClass::ImageNote
-        && note
-            .paired_image_path()
-            .is_some_and(|paired| paired == image.path)
-}
-
-/// The caption is the line directly after an embed, when it is neither empty
-/// nor itself an embed (FORMAT §5).
-fn caption_after(lines: &[&str], link_line: usize) -> String {
-    let Some(next) = lines.get(link_line) else {
-        return String::new();
-    };
-    let trimmed = next.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with("![") {
-        return String::new();
-    }
-    next.to_string()
 }
 
 fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
@@ -2140,37 +1084,7 @@ fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
     }
     sessions.insert(token, now + SESSION_SECONDS);
 }
-fn breadcrumbs(path: &str) -> Vec<(String, String)> {
-    let mut out = vec![("Library".to_string(), String::new())];
-    let mut acc = String::new();
-    for part in path.split('/').filter(|s| !s.is_empty()) {
-        if !acc.is_empty() {
-            acc.push('/');
-        }
-        acc.push_str(part);
-        out.push((part.to_string(), acc.clone()));
-    }
-    out
-}
-fn route_tail(path: &str, prefix: &str) -> String {
-    path.strip_prefix(prefix).unwrap_or("").to_string()
-}
-fn encode_path(path: &str) -> String {
-    path.split('/')
-        .map(|part| {
-            part.bytes()
-                .map(|b| {
-                    if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
-                        (b as char).to_string()
-                    } else {
-                        format!("%{b:02X}")
-                    }
-                })
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("/")
-}
+
 fn cookie_value(cookies: &str, name: &str) -> Option<String> {
     cookies
         .split(';')
@@ -2178,6 +1092,7 @@ fn cookie_value(cookies: &str, name: &str) -> Option<String> {
         .find(|(k, _)| *k == name)
         .map(|(_, v)| v.to_string())
 }
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2185,7 +1100,8 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
-/// Run the viewer on a pre-bound TCP listener. Callers choose the bind address.
+/// Run the viewer on a pre-bound TCP listener. Callers choose the bind
+/// address.
 pub async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
@@ -2197,12 +1113,12 @@ pub async fn serve(
     }
     axum::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
 }
 
-fn default_passcode_warning(config: &ServeConfig, address: std::net::SocketAddr) -> bool {
+fn default_passcode_warning(config: &ServeConfig, address: SocketAddr) -> bool {
     config.passcode.as_deref() == Some("2333") && !address.ip().is_loopback()
 }
 
@@ -2229,12 +1145,14 @@ mod regression_unit_tests {
 
     #[test]
     fn login_budget_bounds_comparisons_per_client_and_globally() {
-        // One client cannot spend more than its per-window budget, however
-        // many guesses it fires: only the first ones are ever compared.
+        // One client cannot spend more than its per-window budget,
+        // however many guesses it fires: only the first ones are ever
+        // compared.
         let mut throttle = ThrottleState::default();
         let mut compared = 0;
         for attempt in 0..1_000u64 {
-            // Two guesses per second: the whole wave is inside one window.
+            // Two guesses per second: the whole wave is inside one
+            // window.
             if matches!(throttle.admit("one", attempt / 2), LoginGate::Compare(_)) {
                 compared += 1;
             }
@@ -2245,7 +1163,8 @@ mod regression_unit_tests {
             throttle.admit("one", LOGIN_BUDGET_WINDOW_SECS / 2),
             LoginGate::Refused { retry_after } if retry_after > 0
         ));
-        // ...and a window that has passed restores it: no permanent lockout.
+        // ...and a window that has passed restores it: no permanent
+        // lockout.
         let mut compared = 0;
         for attempt in 0..1_000u64 {
             let now = LOGIN_BUDGET_WINDOW_SECS + attempt / 2;
@@ -2255,8 +1174,8 @@ mod regression_unit_tests {
         }
         assert_eq!(compared, LOGIN_FAILURE_BUDGET);
 
-        // Spreading the guesses over many clients cannot beat the global
-        // budget either.
+        // Spreading the guesses over many clients cannot beat the
+        // global budget either.
         let mut throttle = ThrottleState::default();
         let mut compared = 0;
         for attempt in 0..1_000u64 {
@@ -2273,8 +1192,8 @@ mod regression_unit_tests {
             LoginGate::Refused { .. }
         ));
 
-        // A success restores that client's own budget and only that client's:
-        // the global allowance is not handed back.
+        // A success restores that client's own budget and only that
+        // client's: the global allowance is not handed back.
         let mut throttle = ThrottleState::default();
         for attempt in 0..LOGIN_FAILURE_BUDGET as u64 {
             throttle.admit("one", attempt);
@@ -2294,8 +1213,8 @@ mod regression_unit_tests {
 
     #[test]
     fn login_budget_keeps_tracked_clients_bounded_and_saturates() {
-        // One window per global budget's worth of guesses, so the map really
-        // does overflow and the eviction path runs.
+        // One window per global budget's worth of guesses, so the map
+        // really does overflow and the eviction path runs.
         let mut throttle = ThrottleState::default();
         let mut admitted = 0;
         for index in 0..2_000u64 {
@@ -2309,8 +1228,8 @@ mod regression_unit_tests {
         }
         assert_eq!(admitted, 2_000);
         assert!(throttle.clients.len() <= MAX_TRACKED_CLIENTS);
-        // Counters saturate instead of wrapping, and a refused attempt is not
-        // charged at all.
+        // Counters saturate instead of wrapping, and a refused attempt
+        // is not charged at all.
         let mut only = ThrottleState::default();
         only.global.spent = u32::MAX;
         only.admit("one", 0);
@@ -2320,9 +1239,9 @@ mod regression_unit_tests {
 
     #[test]
     fn configured_budget_pushes_a_four_digit_keyspace_past_an_hour() {
-        // Projection, not a wall-clock measurement: at the configured budget
-        // an attacker needs at least this long to try every four-digit
-        // passcode, whichever bound binds first.
+        // Projection, not a wall-clock measurement: at the configured
+        // budget an attacker needs at least this long to try every
+        // four-digit passcode, whichever bound binds first.
         const FOUR_DIGIT_KEYSPACE: u64 = 10_000;
         const ONE_HOUR: u64 = 60 * 60;
         let per_client_windows = FOUR_DIGIT_KEYSPACE.div_ceil(LOGIN_FAILURE_BUDGET as u64);
@@ -2378,7 +1297,8 @@ mod regression_unit_tests {
             "203.0.113.195"
         );
 
-        // Trusted proxy with multi-hop X-Forwarded-For extracts LAST hop
+        // Trusted proxy with multi-hop X-Forwarded-For extracts LAST
+        // hop
         let mut multi_headers = HeaderMap::new();
         multi_headers.insert(
             "x-forwarded-for",

@@ -7,6 +7,20 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer Phase 1: the library is the home. `/` shows every image with the
+  scope in the query string (`in`, `sub`, `c`, `tag`, `q`, `sort`, `dir`,
+  `size`, `p`, and the `untagged` and `recent` lenses), and `/folders`,
+  `/collections` and `/search` are its siblings. Every view is a URL, and the
+  same query drives `/api/view` and `/api/sidebar`.
+- Viewer: one layout at three widths — a bottom tab bar on a phone, an icon
+  rail on a tablet, a pinned sidebar and inspector on a desktop — with the
+  stylesheet and one small script shipped inside the binary and served from a
+  content-hashed URL. The script only enhances; every page works without it.
+- Viewer: the index is opened at startup, built before traffic is accepted
+  when it is missing or unusable, and refreshed every `--rescan-interval`
+  seconds (default 300, `0` disables). Listings and counts come from the index.
+- Index view API: `untagged` and `added_after_ns` filters, for the sidebar's
+  Untagged and Recent lenses.
 - Accounts: the viewer has a single owner account (email + password, argon2id)
   that the first visitor creates on `/setup` — there is no setup code to copy,
   and while no account exists the server says so at startup and every 10
@@ -82,6 +96,14 @@ All notable changes to this project are documented here. The format follows
   kept at tag `v0-2019`.
 
 ### Changed
+- Viewer: `/folder/<path>` and `/collection/<path>` answer 301 to the library
+  view they now mean (`/?in=`, `/?c=`), so a link shared from an older version
+  still lands on the images it meant. A path that is not in the library is not
+  redirected: an empty grid would read as "this is empty" rather than "this is
+  not here".
+- Viewer: the image page carries "Back to view" (the view it was reached
+  from), "Appears in" (the collections that embed it), the path with a copy
+  button, and the note's `source` link.
 - Index view queries answer from SQLite: folder, tags, text, sort and paging
   are pushed into SQL over derived columns (`folder`, `name_key`, `rating`,
   `added_ns`) and a normalised `note_tags` table, and the counts are grouped
@@ -90,6 +112,11 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: the `--auth none` banner is one full-width bar above the whole shell
+  at every width, instead of becoming a column beside the rail or sidebar on
+  tablet and desktop. The stylesheet and script are served without a session,
+  so `/login` and `/setup` render styled instead of having their own assets
+  redirected back to the page that asked for them.
 - Eagle import: note writes are fsynced before the rename and the directory is
   fsynced after it, so an imported or backfilled note survives a crash.
 - Index: a `rating` outside 0-5, or one that is not an integer, reads as no
