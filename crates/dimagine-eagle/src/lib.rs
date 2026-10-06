@@ -1482,7 +1482,7 @@ fn write_collection_and_report(
     create_confined_dirs(root, &collection_dir)?;
     let mut collection = vec![
         "---".to_owned(),
-        format!("kind: collection"),
+        "kind: collection".to_owned(),
         format!(
             "title: {}",
             yaml_string(&format!("{library} (Eagle import)"))

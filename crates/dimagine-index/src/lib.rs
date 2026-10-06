@@ -1592,6 +1592,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock scaling is not stable under parallel load; run on a quiet machine with scripts/dev/bench-index.sh"]
     fn ten_thousand_notes_refresh_fts_roughly_linearly() {
         fn index_notes(count: usize) -> (std::time::Duration, usize) {
             let dir = tempfile::tempdir().unwrap();

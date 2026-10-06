@@ -441,7 +441,9 @@ fn convert_rgb_to_srgb(image: &mut DynamicImage, profile: &Profile) -> Result<()
         image
             .to_rgba8()
             .as_raw()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[1], px[2]])
             .collect::<Vec<u8>>()
     } else {
@@ -464,8 +466,10 @@ fn finish_rgb_or_rgba(
     if let Some(alpha) = alpha {
         let mut rgba = vec![0; converted.len() / 3 * 4];
         for (dest, (alpha, rgb)) in rgba
-            .chunks_exact_mut(4)
-            .zip(alpha.iter().zip(converted.chunks_exact(3)))
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(alpha.iter().zip(converted.as_chunks::<3>().0.iter()))
         {
             dest[..3].copy_from_slice(rgb);
             dest[3] = *alpha;
@@ -1374,11 +1378,10 @@ mod tests {
     }
 
     fn temp_library() -> tempfile::TempDir {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
         Builder::new()
             .prefix("preview-test-")
-            .tempdir_in(target)
-            .expect("target temp dir")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp dir")
     }
 
     /// Grayscale ICC profile with gamma 1.0; conversion to sRGB shifts the
