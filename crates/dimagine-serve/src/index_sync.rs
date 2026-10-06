@@ -40,6 +40,10 @@ pub struct SidebarFolder {
 }
 
 /// A collection row for `/api/sidebar`.
+///
+/// One home for the shape agents read: every item carries `path`, `title`
+/// and `count`, and `count` is always a number, never `null` — an uncountable
+/// member count would be an unknown recorded as absent.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct SidebarCollection {
     /// Library-relative path of the collection note.
@@ -262,6 +266,12 @@ impl IndexHandle {
                 .collect(),
             collections: collections
                 .into_iter()
+                // The collection list carries only the notes that mean to
+                // collect: `kind: collection` always, plus a non-image note
+                // with an image embed (`dimagine_index::collection_is_listed`,
+                // FORMAT §3.2/§5). An image note that embeds its siblings is
+                // still a collection; it is just not listed.
+                .filter(|collection| collection.listed)
                 .map(|collection| SidebarCollection {
                     path: collection.note_path,
                     title: collection.title,
@@ -540,6 +550,54 @@ mod tests {
             vec!["collection.md".to_owned()]
         );
         assert!(handle.appears_in("plain.png").unwrap().is_empty());
+    }
+
+    /// W27f: an image note that embeds its siblings is a valid collection
+    /// (FORMAT §5), but listing one per image buried the deliberate ones, so
+    /// the list — and only the list — drops it
+    /// (`dimagine_index::collection_is_listed`, FORMAT §3.2/§5). "Appears in"
+    /// still names it.
+    #[test]
+    fn the_sidebar_list_drops_image_note_collections_but_appears_in_keeps_them() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("refs")).unwrap();
+        fs::write(root.join("refs/page-01.png"), JPEG).unwrap();
+        fs::write(root.join("refs/page-02.png"), JPEG).unwrap();
+        fs::write(
+            root.join("refs/page-01.png.md"),
+            "---\ntitle: Page one\n---\n\nAn image note embedding a sibling and its preview.\n\n\
+             ![[page-02.png]]\n![[page-01.png]]\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("guide.md"),
+            "---\nkind: collection\ntitle: Guide\n---\nPlanned shots go here.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("roundup.md"),
+            "![[refs/page-01.png]]\nA plain note, so a listed collection.\n",
+        )
+        .unwrap();
+        let handle = IndexHandle::open(root).unwrap();
+
+        let sidebar = handle.sidebar_data().unwrap();
+        let listed: Vec<(&str, u64)> = sidebar
+            .collections
+            .iter()
+            .map(|collection| (collection.path.as_str(), collection.count))
+            .collect();
+        assert_eq!(
+            listed,
+            [("guide.md", 0), ("roundup.md", 1)],
+            "the image note is a collection, but not one the list carries"
+        );
+        assert_eq!(
+            handle.appears_in("refs/page-02.png").unwrap(),
+            vec!["refs/page-01.png.md".to_owned()],
+            "the image page still names the image note in appears in"
+        );
     }
 
     #[test]

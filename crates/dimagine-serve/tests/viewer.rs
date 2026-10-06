@@ -60,6 +60,37 @@ fn app(dir: &TempDir) -> axum::Router {
     )
 }
 
+/// A library shaped like the real one that flooded the collection list
+/// (W27f): a `kind: collection` note, a plain note that embeds images, and an
+/// IMAGE note that embeds a sibling beside its own preview. All three are
+/// valid collections (FORMAT §5); the list carries the first two only.
+fn flood_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    write("refs/page-01.png", PNG_BYTES);
+    write("refs/page-02.png", PNG_BYTES);
+    write(
+        "refs/page-01.png.md",
+        "---\ntitle: Page one\n---\nPreviewing the shot beside a sibling.\n\n\
+         ![[page-02.png]]\n![[page-01.png]]\n",
+    );
+    write(
+        "guide.md",
+        "---\nkind: collection\ntitle: Guide\n---\nPlanned shots go here.\n",
+    );
+    write(
+        "roundup.md",
+        "---\ntitle: Roundup\n---\n![[refs/page-01.png]]\n![[refs/page-02.png]]\n",
+    );
+    dir
+}
+
 async fn login(router: axum::Router) -> (axum::Router, String) {
     let response = router
         .clone()
@@ -271,6 +302,90 @@ async fn a_collection_lists_its_members_in_the_notes_own_order() {
         vec!["refs/landscape.png", "plain.png"],
         "the embed order wins over the added order"
     );
+}
+
+/// W27f: FORMAT §5 lets every note that embeds images be a collection, and
+/// image notes embedding their siblings buried the deliberate ones on a real
+/// library (1,175 collections, 1,170 of them image notes). The list a person
+/// browses — the sidebar section, `/collections`, the `/api/sidebar`
+/// `collections` array — carries a collection only when the note means to
+/// collect: `kind: collection`, or a non-image note with an image embed
+/// (`dimagine_index::collection_is_listed`, FORMAT §3.2/§5).
+#[tokio::test]
+async fn the_collection_list_carries_only_notes_that_mean_to_collect() {
+    let dir = flood_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // The API list: the `kind: collection` note and the plain note, in path
+    // order, every item carrying the same three fields and a numeric count.
+    let sidebar = json(&app, "/api/sidebar", &cookie).await;
+    let collections = sidebar["collections"].as_array().unwrap();
+    let paths: Vec<&str> = collections
+        .iter()
+        .map(|collection| collection["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["guide.md", "roundup.md"],
+        "the image note stays off the list"
+    );
+    for collection in collections {
+        let mut keys: Vec<&str> = collection
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| key.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["count", "path", "title"],
+            "one shape for every item: {collection}"
+        );
+        assert!(
+            collection["count"].is_u64(),
+            "a count is always a number, never null: {collection}"
+        );
+    }
+    assert_eq!(collections[0]["count"], 0, "no embeds yet");
+    assert_eq!(collections[1]["count"], 2);
+
+    // The sidebar section and the /collections page say the same thing.
+    let library_page = text(&app, "/", &cookie).await;
+    assert!(library_page.contains("href=\"/?c=guide.md\""));
+    assert!(library_page.contains("href=\"/?c=roundup.md\""));
+    assert!(
+        !library_page.contains("/?c=refs/page-01.png.md"),
+        "the image note is a collection, but not one the list carries"
+    );
+    let collections_page = text(&app, "/collections", &cookie).await;
+    assert!(collections_page.contains("href=\"/?c=guide.md\""));
+    assert!(collections_page.contains("href=\"/?c=roundup.md\""));
+    assert!(!collections_page.contains("/?c=refs/page-01.png.md"));
+}
+
+/// W27f: leaving the list changes only the list. The image note that embeds
+/// its sibling still works as a collection: `/?c=<image note>` shows its
+/// members, and "appears in" on the image page still names it (FORMAT §5; the
+/// self-embed stays a preview, FORMAT §3.2).
+#[tokio::test]
+async fn an_image_note_off_the_list_is_still_a_collection_for_the_rest() {
+    let dir = flood_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let paths = json_paths(&app, "c=refs/page-01.png.md", &cookie).await;
+    assert_eq!(paths, vec!["refs/page-02.png"], "the sibling, not itself");
+    let page = page_paths(&app, "c=refs/page-01.png.md", &cookie).await;
+    assert_eq!(
+        page,
+        json_paths(&app, "c=refs/page-01.png.md", &cookie).await
+    );
+
+    // The image page names the image note in "appears in", listed or not.
+    let html = text(&app, "/image/refs/page-02.png", &cookie).await;
+    assert!(html.contains("Appears in"));
+    assert!(html.contains("href=\"/?c=refs/page-01.png.md\""));
+    assert!(html.contains("href=\"/?c=roundup.md\""));
 }
 
 #[tokio::test]

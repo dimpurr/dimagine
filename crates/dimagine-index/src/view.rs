@@ -63,6 +63,12 @@ pub struct CollectionInfo {
     pub title: String,
     /// Number of image members (embeds that resolve to images).
     pub member_count: u64,
+    /// Whether the collection list carries this note (the sidebar, the
+    /// `/collections` page and the `/api/sidebar` `collections` array). An
+    /// unlisted collection is still a collection: [`ViewQuery::collection`]
+    /// shows its members and [`Index::appears_in`] names it. See
+    /// [`collection_is_listed`] for the rule.
+    pub listed: bool,
 }
 
 /// What one note offers as evidence of being a collection (FORMAT §5).
@@ -70,6 +76,9 @@ pub struct CollectionInfo {
 pub struct CollectionEvidence<'a> {
     /// The note's `kind` property.
     pub kind: Option<&'a str>,
+    /// The note is the note of one image (`<image>.<ext>.md`, FORMAT §3): its
+    /// self-embed is a preview, not a membership (FORMAT §3.2).
+    pub image_note: bool,
     /// Image embeds that resolve to exactly one image and are not the image
     /// note's own self-embed (FORMAT §3.2).
     pub members: usize,
@@ -87,6 +96,27 @@ pub struct CollectionEvidence<'a> {
 /// viewer and the renderer never disagree about what a collection is.
 pub fn note_is_collection(evidence: &CollectionEvidence<'_>) -> bool {
     evidence.members > 0 || evidence.unresolved > 0 || evidence.kind == Some("collection")
+}
+
+/// CTO decision for the collection *list*, on top of FORMAT §5. The list a
+/// person browses — the sidebar section, the `/collections` page and the
+/// `/api/sidebar` `collections` array — carries a note only when it means to
+/// collect: it says `kind: collection` (FORMAT §5), or it is not the note of
+/// an image (FORMAT §3.2) and embeds at least one image.
+///
+/// Everything else stays as FORMAT §5 defines it: an image note that embeds
+/// other images — Eagle-style notes embed their sibling previews, and on a
+/// real library that buried the deliberate ones among 1,175 collections,
+/// 1,170 of them image notes — is still a collection. It is reachable as
+/// `/?c=<note>`, its members keep their order, and "appears in" on the image
+/// page still names it; the list simply does not carry it.
+///
+/// Like [`note_is_collection`], this is the one rule both the index and
+/// `dimagine-serve` read, so the list never disagrees with the index API:
+/// `Index::collections` reports every collection with a `listed` flag, and
+/// the serve surfaces that show a list filter by it.
+pub fn collection_is_listed(evidence: &CollectionEvidence<'_>) -> bool {
+    note_is_collection(evidence) && (evidence.kind == Some("collection") || !evidence.image_note)
 }
 
 /// The parameters of a [`Index::view`] query.
@@ -345,15 +375,17 @@ fn order_by(q: &ViewQuery) -> String {
 }
 
 /// The columns that decide whether a note is a collection (FORMAT §5): its
-/// path and title source, the number of image members (self-embed excluded,
-/// FORMAT §3.2) and whether a strong image embed failed to resolve.
+/// path and title source, whether it is the note of an image (FORMAT §3.2,
+/// which the list rule reads), the number of image members (self-embed
+/// excluded, FORMAT §3.2) and whether a strong image embed failed to resolve.
 const CANDIDATE_COLUMNS: &str = "notes.path, notes.props_json, \
      (SELECT count(*) FROM links WHERE links.src=notes.path AND links.syntax<>'wiki_link' \
         AND links.target IS NOT NULL \
         AND links.target IN (SELECT path FROM files WHERE kind='image') \
         AND links.target<>COALESCE(notes.image_path,'')) AS members, \
      EXISTS(SELECT 1 FROM links WHERE links.src=notes.path AND links.syntax<>'wiki_link' \
-        AND links.target IS NULL) AS unresolved";
+        AND links.target IS NULL) AS unresolved, \
+     (notes.image_path IS NOT NULL) AS image_note";
 
 /// A cheap superset of [`note_is_collection`], parenthesised because callers
 /// append their own `AND` conditions: the note has a strong image embed that
@@ -369,6 +401,9 @@ const CANDIDATE_WHERE: &str =
 struct CollectionCandidate {
     path: String,
     props: serde_json::Value,
+    /// The note is the note of an image (FORMAT §3.2), which the list rule
+    /// reads.
+    image_note: bool,
     members: usize,
     unresolved: usize,
 }
@@ -377,6 +412,7 @@ impl CollectionCandidate {
     fn evidence(&self) -> CollectionEvidence<'_> {
         CollectionEvidence {
             kind: self.props.get("kind").and_then(serde_json::Value::as_str),
+            image_note: self.image_note,
             members: self.members,
             unresolved: self.unresolved,
         }
@@ -502,7 +538,10 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Notes that are collections (FORMAT §5), with their image member count.
+    /// Notes that are collections (FORMAT §5), with their image member count
+    /// and whether the collection list carries each one
+    /// ([`collection_is_listed`]). Every collection is here, listed or not,
+    /// so the API keeps naming what `/?c=` accepts.
     pub fn collections(&self) -> Result<Vec<CollectionInfo>, IndexError> {
         Ok(self
             .collection_candidates(
@@ -514,15 +553,19 @@ impl Index {
             )?
             .into_iter()
             .filter(|candidate| note_is_collection(&candidate.evidence()))
-            .map(|candidate| CollectionInfo {
-                title: candidate
-                    .props
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                note_path: candidate.path,
-                member_count: candidate.members as u64,
+            .map(|candidate| {
+                let listed = collection_is_listed(&candidate.evidence());
+                CollectionInfo {
+                    title: candidate
+                        .props
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                    note_path: candidate.path,
+                    member_count: candidate.members as u64,
+                    listed,
+                }
             })
             .collect())
     }
@@ -560,6 +603,7 @@ impl Index {
                 props: serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
                 members: row.get::<_, i64>(2)?.max(0) as usize,
                 unresolved: row.get::<_, i64>(3)?.max(0) as usize,
+                image_note: row.get::<_, i64>(4)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -627,18 +671,171 @@ mod tests {
 
     #[test]
     fn a_collection_is_an_embed_or_an_explicit_kind() {
-        let collection = |kind, members, unresolved| {
+        let collection = |kind, image_note, members, unresolved| {
             note_is_collection(&CollectionEvidence {
                 kind,
+                image_note,
                 members,
                 unresolved,
             })
         };
-        assert!(collection(Some("collection"), 0, 0));
-        assert!(collection(None, 1, 0), "an image embed is enough");
-        assert!(collection(None, 0, 1), "a broken image embed is enough");
-        assert!(!collection(None, 0, 0));
-        assert!(!collection(Some("note"), 0, 0));
+        assert!(collection(Some("collection"), true, 0, 0));
+        assert!(collection(None, true, 1, 0), "an image embed is enough");
+        assert!(
+            collection(None, false, 0, 1),
+            "a broken image embed is enough"
+        );
+        assert!(!collection(None, false, 0, 0));
+        assert!(!collection(Some("note"), false, 0, 0));
+    }
+
+    /// W27f: the list rule on top of FORMAT §5. `kind: collection` always
+    /// lists; every other collection lists when it is not the note of an image
+    /// (FORMAT §3.2) — so an image note that embeds its siblings is a
+    /// collection that the list leaves off.
+    #[test]
+    fn the_list_carries_kind_collections_and_plain_notes_not_image_notes() {
+        let listed = |kind, image_note, members, unresolved| {
+            collection_is_listed(&CollectionEvidence {
+                kind,
+                image_note,
+                members,
+                unresolved,
+            })
+        };
+        assert!(listed(Some("collection"), true, 0, 0), "kind always lists");
+        assert!(
+            listed(Some("collection"), false, 0, 0),
+            "with or without an image note"
+        );
+        assert!(
+            listed(None, false, 1, 0),
+            "a plain note with an embed lists"
+        );
+        assert!(
+            listed(None, false, 0, 1),
+            "a broken embed still means to collect"
+        );
+        assert!(
+            !listed(None, true, 1, 0),
+            "an image note embedding its sibling stays off the list"
+        );
+        assert!(
+            !listed(None, false, 0, 0),
+            "a note with nothing to embed is not listed"
+        );
+    }
+
+    /// W27f end to end in the index API: an image note that embeds its
+    /// siblings (and its own preview, FORMAT §3.2) is a collection the list
+    /// leaves off, while membership, order and "appears in" still treat it
+    /// as one (FORMAT §5).
+    #[test]
+    fn image_note_collections_are_off_the_list_but_answer_every_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+        };
+        let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
+            path: path.to_owned(),
+            image_path: image_path.map(str::to_owned),
+            id: None,
+            title: String::new(),
+            tags: Vec::new(),
+            props_json: props.to_owned(),
+        };
+        let embed = |src: &str, target: &str| crate::LinkRecord {
+            src: src.to_owned(),
+            raw: format!("![[{target}]]"),
+            target: Some(target.to_owned()),
+            state: crate::LinkState::Resolved,
+            syntax: crate::LinkSyntax::WikiEmbed,
+        };
+        index.begin_scan().unwrap();
+        index.upsert_file(&image("refs/page-01.png")).unwrap();
+        index.upsert_file(&image("refs/page-02.png")).unwrap();
+        // The image note: a sibling embed and its own preview (§3.2).
+        index
+            .upsert_note(&note(
+                "refs/page-01.png.md",
+                Some("refs/page-01.png"),
+                r#"{"title":"Page one"}"#,
+            ))
+            .unwrap();
+        index
+            .replace_links(
+                "refs/page-01.png.md",
+                &[
+                    embed("refs/page-01.png.md", "refs/page-02.png"),
+                    embed("refs/page-01.png.md", "refs/page-01.png"),
+                ],
+            )
+            .unwrap();
+        // A plain note that embeds an image: a collection, and listed.
+        index
+            .upsert_note(&note("roundup.md", None, r#"{"title":"Roundup"}"#))
+            .unwrap();
+        index
+            .replace_links("roundup.md", &[embed("roundup.md", "refs/page-01.png")])
+            .unwrap();
+        // `kind: collection` with no embeds at all: listed, always.
+        index
+            .upsert_note(&note(
+                "guide.md",
+                None,
+                r#"{"kind":"collection","title":"Guide"}"#,
+            ))
+            .unwrap();
+        index
+            .finish_scan(&[
+                "refs/page-01.png".into(),
+                "refs/page-02.png".into(),
+                "refs/page-01.png.md".into(),
+                "roundup.md".into(),
+                "guide.md".into(),
+            ])
+            .unwrap();
+
+        // Every collection is named, with its place in the list recorded.
+        let seen: Vec<(String, bool)> = index
+            .collections()
+            .unwrap()
+            .into_iter()
+            .map(|info| (info.note_path, info.listed))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("guide.md".to_owned(), true),
+                ("refs/page-01.png.md".to_owned(), false),
+                ("roundup.md".to_owned(), true),
+            ],
+            "the image note is a collection the list leaves off"
+        );
+
+        // "Appears in" still names the image note (FORMAT §5).
+        assert_eq!(
+            index.appears_in("refs/page-02.png").unwrap(),
+            vec!["refs/page-01.png.md".to_owned()]
+        );
+
+        // So does the collection view, in embed order and without the image
+        // note's own image (FORMAT §3.2).
+        let members = index
+            .view(&ViewQuery {
+                collection: Some("refs/page-01.png.md".into()),
+                ..ViewQuery::default()
+            })
+            .unwrap();
+        assert_eq!(members.total, 1);
+        assert_eq!(members.items[0].path, "refs/page-02.png");
     }
 
     /// RW26 M-5: every view query has to be answered from the indexes. The

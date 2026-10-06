@@ -88,6 +88,17 @@ All notable changes to this project are documented here. The format follows
   documentation index.
 
 ### Changed
+- Viewer: the collection list — the sidebar section, the `/collections` page
+  and the `/api/sidebar` `collections` array — carries only the notes that
+  mean to collect: `kind: collection`, or a non-image note that embeds at
+  least one image. FORMAT §5 is unchanged about what a collection IS: an
+  image note that embeds its siblings is still a collection — `/?c=<note>`
+  shows its members and "Appears in" still names it — but it is not listed
+  (on a real library, 1,170 of 1,175 collections were such image notes showing
+  sibling previews). The index API stays backward compatible: `collections()`
+  still names every collection, now with a `listed` flag, and `/api/sidebar`
+  collection items consistently carry `path`, `title` and `count`, with
+  `count` a number.
 - Documented that the account `role` field is stored but not yet enforced
   (reserved for the future multi-user surface); there is no behavior change.
 

@@ -198,7 +198,12 @@ impl FsCatalog {
             let parsed = parse_note(&text);
             let (members, diagnostics) =
                 collect_collection(&self.resolver, &self.library.files, entry, &parsed, &text);
-            if !is_collection(&parsed, &members, &diagnostics) {
+            if !is_collection(
+                entry.class == FileClass::ImageNote,
+                &parsed,
+                &members,
+                &diagnostics,
+            ) {
                 continue;
             }
             let title = yaml_string(&parsed.properties, "title")
@@ -273,7 +278,12 @@ impl Catalog for FsCatalog {
         };
         let (members, diagnostics) =
             collect_collection(&self.resolver, &self.library.files, &note, &parsed, &text);
-        if !is_collection(&parsed, &members, &diagnostics) {
+        if !is_collection(
+            class == FileClass::ImageNote,
+            &parsed,
+            &members,
+            &diagnostics,
+        ) {
             return Err(CatalogError::NotFound);
         }
         Ok(Collection {
@@ -694,13 +704,19 @@ pub(crate) fn yaml_string(value: &serde_json::Value, key: &str) -> Option<String
     value.get(key)?.as_str().map(ToOwned::to_owned)
 }
 
+/// Whether the note is a collection, by the one shared rule
+/// ([`note_is_collection`], FORMAT §5). `image_note` is a fact the caller has
+/// from the file walk: the note is `<image>.<ext>.md` (FORMAT §3.2); it does
+/// not change the verdict, only feeds the evidence.
 fn is_collection(
+    image_note: bool,
     parsed: &ParsedNote,
     members: &[CollectionMember],
     diagnostics: &[CollectionDiagnostic],
 ) -> bool {
     note_is_collection(&CollectionEvidence {
         kind: yaml_string(&parsed.properties, "kind").as_deref(),
+        image_note,
         members: members.len(),
         unresolved: diagnostics.len(),
     })

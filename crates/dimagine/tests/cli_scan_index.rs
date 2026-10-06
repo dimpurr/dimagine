@@ -607,6 +607,72 @@ fn collections_follow_format_section_5_not_just_the_kind_property() {
     );
 }
 
+/// W27f: the index API stays backward compatible — `collections()` still names
+/// every collection, including an image note that embeds its siblings — but
+/// each row now records whether the collection list carries it
+/// (`dimagine_index::collection_is_listed`, FORMAT §3.2/§5), while `appears_in`
+/// and the `collection` view keep answering for the unlisted ones.
+#[test]
+fn scan_keeps_image_note_collections_but_marks_them_off_the_list() {
+    let tmp = tmp("scan-listed-collections");
+    let root = tmp.0.join("library");
+    for image in ["refs/page-01.png", "refs/page-02.png"] {
+        let path = root.join(image);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"png").unwrap();
+    }
+    // The image note: a sibling embed and its own preview (FORMAT §3.2), which
+    // makes it a collection the list leaves off.
+    std::fs::write(
+        root.join("refs/page-01.png.md"),
+        "---\ntitle: Page one\n---\n\n![[page-02.png]]\n\n![[page-01.png]]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("guide.md"),
+        "---\nkind: collection\ntitle: Guide\n---\nPlanned shots go here.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("roundup.md"),
+        "---\ntitle: Roundup\n---\n\n![[refs/page-01.png]]\n",
+    )
+    .unwrap();
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let index = open_index(&root);
+
+    let seen: Vec<(String, bool)> = index
+        .collections()
+        .unwrap()
+        .into_iter()
+        .map(|info| (info.note_path, info.listed))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("guide.md".to_owned(), true),
+            ("refs/page-01.png.md".to_owned(), false),
+            ("roundup.md".to_owned(), true),
+        ],
+        "still a collection, but the list leaves it off"
+    );
+
+    assert_eq!(
+        index.appears_in("refs/page-02.png").unwrap(),
+        ["refs/page-01.png.md"],
+        "appears in still names the image note"
+    );
+    let members = index
+        .view(&ViewQuery {
+            collection: Some("refs/page-01.png.md".into()),
+            limit: 100,
+            ..ViewQuery::default()
+        })
+        .unwrap();
+    assert_eq!(members.total, 1, "the sibling, never its own image");
+}
+
 /// RW26 L-3: a derived `added_ns` could never be cleared, so removing the
 /// `added:` line from a note left the old value in the index and only a
 /// rebuild fixed it. The fallback chain of FORMAT §3.1 says it must return to
