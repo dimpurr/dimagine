@@ -301,7 +301,8 @@ async fn the_note_body_renders_links_and_embeds_per_format_5_1() {
         !body.contains("<img src=\"/media/refs/landscape.png\""),
         "{body}"
     );
-    // XSS shapes stay escaped text, never markup.
+    // XSS shapes stay escaped text, never markup. This is the note fragment,
+    // not the whole page (W43's theme boot is the frame's one script tag).
     assert!(!body.contains("<script>"), "{body}");
     assert!(
         body.contains("<span class=\"missing-link\">[[evil.png|&lt;script&gt;alert(1)&lt;/script&gt;]]</span>"),
@@ -875,16 +876,19 @@ async fn scope_chips_render_with_a_way_to_drop_each_one() {
     let dir = library();
     let (app, cookie) = login(app(&dir)).await;
     let html = text(&app, "/?in=refs&tag=nature&q=landscape", &cookie).await;
+    // W43: the chips live inside the search capsule, on one line, and name
+    // their kind with a glyph — the tooltip carries the word and the value.
     let chips = html
-        .split("<div class=\"scope-chips\">")
+        .split("<span class=\"scope-chips\">")
         .nth(1)
         .expect("chips")
         .split("</div>")
         .next()
         .unwrap();
-    assert!(chips.contains("in: refs"));
-    assert!(chips.contains("tag: nature"));
-    assert!(chips.contains("q: landscape"));
+    assert!(chips.contains("title=\"Folder: refs\""));
+    assert!(chips.contains("title=\"Tag: nature\""));
+    assert!(chips.contains("title=\"Search: landscape\""));
+    assert!(!chips.contains("in: refs") && !chips.contains("tag: nature"));
     assert_eq!(chips.matches("chip-remove").count(), 3);
     // Dropping the tag keeps the folder.
     assert!(chips.contains("href=\"/?in=refs&amp;q=landscape\""));
@@ -1146,9 +1150,11 @@ async fn a_folder_with_no_images_offers_the_way_out() {
     let (app, cookie) = login(app(&dir)).await;
 
     let html = text(&app, "/?in=empty&sub=0", &cookie).await;
-    assert!(html.contains("Show subfolders?"), "{html}");
+    assert!(html.contains("Show subfolders"), "{html}");
     assert!(html.contains("href=\"/?in=empty\""));
-    assert!(html.contains("Clear all filters"));
+    // W43: one way out per state — the chip already offers the way to
+    // drop the folder, so the state itself does not repeat it.
+    assert!(!html.contains("Clear all filters"), "{html}");
 }
 
 /// RW37: the scope chips used to paste the user's own words into the page
@@ -1165,7 +1171,7 @@ async fn hostile_scope_values_reach_the_library_page_only_escaped() {
     )
     .await;
     assert!(
-        html.contains("q: &lt;img src=x onerror=alert(1)&gt;"),
+        html.contains("Search: &lt;img src=x onerror=alert(1)&gt;"),
         "{html}"
     );
     assert!(
@@ -1174,11 +1180,22 @@ async fn hostile_scope_values_reach_the_library_page_only_escaped() {
     );
 
     let html = text(&app, "/?tag=%3Cscript%3E%22x%22", &cookie).await;
-    assert!(html.contains("tag: &lt;script&gt;&quot;x&quot;"), "{html}");
-    assert!(!html.contains("<script>"), "the raw form rendered: {html}");
+    assert!(html.contains("Tag: &lt;script&gt;&quot;x&quot;"), "{html}");
+    // W43: the whole page legitimately ships one bare `<script>` — the theme
+    // boot in <head>, which the frame itself writes. Hostile input pays for
+    // nothing more than escaped text.
+    assert_eq!(
+        html.matches("<script>").count(),
+        1,
+        "only the theme boot: {html}"
+    );
+    assert!(html.contains("<script>try{var t=localStorage.getItem('dimagine.theme')"));
 
     let html = text(&app, "/?in=%22%3E%3Cimg%20onerror%3E", &cookie).await;
-    assert!(html.contains("in: &quot;&gt;&lt;img onerror&gt;"), "{html}");
+    assert!(
+        html.contains("Folder: &quot;&gt;&lt;img onerror&gt;"),
+        "{html}"
+    );
     assert!(
         !html.contains("\"><img onerror"),
         "the raw form rendered: {html}"
@@ -1186,7 +1203,7 @@ async fn hostile_scope_values_reach_the_library_page_only_escaped() {
 
     let html = text(&app, "/?c=%22%3E%3Csvg%3E.md", &cookie).await;
     assert!(
-        html.contains("collection: &quot;&gt;&lt;svg&gt;.md"),
+        html.contains("Collection: &quot;&gt;&lt;svg&gt;.md"),
         "{html}"
     );
     assert!(

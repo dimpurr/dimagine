@@ -175,7 +175,14 @@ async fn html_pages_and_json_routes_render_unicode_notes_and_collection_order() 
         .unwrap();
     let rendered = body(page).await;
     assert!(rendered.contains("&lt;script&gt;"));
-    assert!(!rendered.contains("<script>"));
+    // W43: the one bare `<script>` a page ships is the theme boot in <head>;
+    // user-controlled text stays escaped.
+    assert_eq!(
+        rendered.matches("<script>").count(),
+        1,
+        "only the theme boot: {rendered}"
+    );
+    assert!(rendered.contains("<script>try{var t=localStorage.getItem('dimagine.theme')"));
 }
 
 #[tokio::test]

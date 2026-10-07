@@ -9,6 +9,13 @@ use crate::index_sync::SidebarData;
 use crate::ui::escape_html;
 use crate::view_query::{Direction, SortKey, ViewParams};
 
+/// W43: the theme boot, inlined into `<head>` so a stored choice paints
+/// before the first frame — `app.js` is `defer`red and can arrive after the
+/// browser has already painted the system theme. It sets the same
+/// `data-theme` attribute `app.js` sets, from the same `dimagine.theme` key,
+/// so the two agree without sharing code.
+const THEME_BOOT: &str = "<script>try{var t=localStorage.getItem('dimagine.theme');if(t==='light'||t==='dark')document.documentElement.setAttribute('data-theme',t)}catch(e){}</script>";
+
 /// Where a page sits in the viewer's four destinations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Destination {
@@ -108,12 +115,13 @@ impl<'a> Frame<'a> {
         format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
-             <title>{} · dimagine</title><link rel=\"stylesheet\" href=\"{}\"></head><body>\
+             <title>{} · dimagine</title><link rel=\"stylesheet\" href=\"{}\">{}</head><body>\
              {}\
              <div class=\"app-shell\">{}{}<main class=\"main-column\">{}{}{}</main>{}{}</div>\
              <script src=\"{}\" defer></script></body></html>",
             escape_html(self.title),
             escape_html(&css_url()),
+            THEME_BOOT,
             banner,
             self.rail(),
             self.sidebar(),
@@ -167,9 +175,8 @@ impl<'a> Frame<'a> {
             bar.push_str("</div>");
         }
         bar.push_str("</div>");
-        if let Some(view) = self.view {
-            bar.push_str(&crate::ui::components::scope_chips(view));
-        }
+        // W43: the chips live inside the search capsule (`search_pill`), on
+        // one line — a second row of chips under the bar is no longer drawn.
         bar.push_str("</header>");
         if let Some(view) = self.view {
             bar.push_str(&crate::ui::components::breadcrumbs(view));
@@ -230,6 +237,23 @@ mod tests {
         assert!(html.contains(&format!("src=\"{}\"", js_url())));
         assert!(!html.contains("desktop-sidebar"));
         assert!(html.contains("<p>hi</p>"));
+    }
+
+    /// W43: a stored theme choice must be applied before the first paint, so
+    /// the boot script sits in `<head>` — before `<body>`, before anything a
+    /// browser could paint — and reads the same key `app.js` remembers by.
+    #[test]
+    fn the_theme_boot_script_precedes_the_body() {
+        let html = Frame::new("Sign in", Destination::Library, "<p>hi</p>").render();
+        let boot_at = html
+            .find("localStorage.getItem('dimagine.theme')")
+            .expect("a theme boot");
+        let body_at = html.find("<body>").expect("a body");
+        assert!(boot_at < body_at, "the boot closes the head: {html}");
+        assert!(
+            html[boot_at..].contains("data-theme"),
+            "it sets the same attribute the stylesheet reads"
+        );
     }
 
     /// The search page has the real field already; a pill beside it would only

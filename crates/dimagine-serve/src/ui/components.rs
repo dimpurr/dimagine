@@ -58,15 +58,162 @@ const DESTINATIONS: [Destination; 4] = [
     Destination::Search,
 ];
 
-/// The search pill. On the library it shows the active scope; tapping it goes
-/// to `/search`, where there is a real field (spec §3).
+/// === W43: search field, chips and states ===
+///
+/// The pill, the chips it carries and the empty / error / loading states
+/// follow the refined style tile (`nm/specs/style-tile.html`, DESIGN.md
+/// §4.3, §4.7, §4.8): the kind of a filter is a glyph, not an `in:` / `tag:`
+/// prefix; the chip sits inside the search capsule on one scrolling line;
+/// a state is a small monochrome glyph, a regular-weight title, one
+/// sentence and one text-style action.
+///
+/// A 12px folder: the kind of a `in:` filter, drawn instead of written.
+const CHIP_GLYPH_FOLDER: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M1.5 3.5h4l1.5 2h7.5v7.5a1 1 0 0 1-1 1h-11a1 1 0 0 1-1-1z"/></svg>"##;
+/// A 12px tag.
+const CHIP_GLYPH_TAG: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" aria-hidden="true" focusable="false"><path d="M2 2h5l7 7-5 5-7-7z"/><circle cx="5" cy="5" r="1.1" fill="currentColor" stroke="none"/></svg>"##;
+/// Stacked frames: the kind of a collection filter.
+const CHIP_GLYPH_COLLECTION: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true" focusable="false"><rect x="4" y="2.5" width="9.5" height="11" rx="1"/><path d="M4 2.5H3a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h8"/></svg>"##;
+/// Text lines: a bare search term.
+const CHIP_GLYPH_TEXT: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M3.2 4.6h9.6M3.2 8h9.6M3.2 11.4h5.6"/></svg>"##;
+/// A funnel: a filter that carries no value (`untagged`, `recent`).
+const CHIP_GLYPH_FILTER: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2.4 3.6h11.2l-4.3 4.8v4.2l-2.6-1.5V8.4z"/></svg>"##;
+/// The remove mark inside a chip.
+const CHIP_REMOVE_GLYPH: &str = r##"<svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M1.6 1.6 8.4 8.4M8.4 1.6 1.6 8.4"/></svg>"##;
+/// A magnifier for the leading edge of a search capsule.
+pub const SEARCH_GLYPH: &str = r##"<svg class="search-glyph" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14.5 14.5" stroke-linecap="round"/></svg>"##;
+/// The state glyph (DESIGN.md §4.8): 28px on screen, drawn on a 24-unit
+/// grid with 1.5-unit strokes, monochrome, no container.
+pub const STATE_GLYPH_PHOTO: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="4.5" width="18" height="15" rx="3"/><circle cx="8.6" cy="9.7" r="1.5"/><path d="M3.6 16.6l4.3-3.7 3.2 2.5 3.5-3.1 5.1 4.4"/></svg>"##;
+/// The error variant of the state glyph; `--danger` lands on this glyph and
+/// nowhere else (§4.8).
+pub const STATE_GLYPH_WARN: &str = r##"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 3.7 21.1 19.8H2.9z"/><path d="M12 9.7v4.5"/><path d="M12 17.1h.01" stroke-width="2"/></svg>"##;
+
+/// Which glyph a chip draws. The tooltip names the kind in words, so the
+/// label itself carries only the value.
+#[derive(Clone, Copy)]
+enum ChipKind {
+    Folder,
+    Tag,
+    Collection,
+    Text,
+    Filter,
+}
+
+impl ChipKind {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Folder => CHIP_GLYPH_FOLDER,
+            Self::Tag => CHIP_GLYPH_TAG,
+            Self::Collection => CHIP_GLYPH_COLLECTION,
+            Self::Text => CHIP_GLYPH_TEXT,
+            Self::Filter => CHIP_GLYPH_FILTER,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Folder => "Folder",
+            Self::Tag => "Tag",
+            Self::Collection => "Collection",
+            Self::Text => "Search",
+            Self::Filter => "Filter",
+        }
+    }
+}
+
+/// One removable scope chip, as the tile draws it: a quiet capsule whose
+/// kind is a glyph, whose label truncates at 22ch with the whole value in
+/// the native tooltip, and whose ✕ is a link to the same view without this
+/// one filter — so removal works with scripting off and is a real tab stop.
+/// The label and tooltip quote the user's own words, so they are escaped
+/// here rather than trusting every caller.
+fn chip(kind: ChipKind, label: &str, tooltip_value: &str, remove_url: &str) -> String {
+    let tooltip = format!("{}: {}", kind.name(), tooltip_value);
+    format!(
+        "<span class=\"chip\" title=\"{tooltip}\">{glyph}\
+         <span class=\"chip-label\">{label}</span>\
+         <a class=\"chip-remove\" href=\"{url}\" aria-label=\"{remove}\">{X}</a></span>",
+        tooltip = escape_html(&tooltip),
+        glyph = kind.glyph(),
+        label = escape_html(label),
+        url = escape_html(remove_url),
+        remove = escape_html(&format!("Remove filter {tooltip}")),
+        X = CHIP_REMOVE_GLYPH,
+    )
+}
+
+/// The active scope as chips, each with a link that removes it. The chips
+/// live *inside* the search capsule (`search_pill`), on one line that
+/// scrolls sideways rather than wrapping.
+pub fn scope_chips(params: &ViewParams) -> String {
+    let mut chips = Vec::new();
+    if let Some(folder) = &params.folder {
+        chips.push(chip(
+            ChipKind::Folder,
+            &leaf_name(folder),
+            folder,
+            &view_url(&params.without_folder()),
+        ));
+    }
+    if let Some(collection) = &params.collection {
+        chips.push(chip(
+            ChipKind::Collection,
+            &leaf_name(collection),
+            collection,
+            &view_url(&params.without_collection()),
+        ));
+    }
+    for tag in &params.tags {
+        chips.push(chip(
+            ChipKind::Tag,
+            tag,
+            tag,
+            &view_url(&params.without_tag(tag)),
+        ));
+    }
+    if let Some(text) = &params.q {
+        chips.push(chip(
+            ChipKind::Text,
+            text,
+            text,
+            &view_url(&params.without_q()),
+        ));
+    }
+    if params.untagged {
+        chips.push(chip(ChipKind::Filter, "untagged", "untagged", "/"));
+    }
+    if params.recent {
+        chips.push(chip(ChipKind::Filter, "recent", "recent", "/"));
+    }
+    if chips.is_empty() {
+        return String::new();
+    }
+    format!("<span class=\"scope-chips\">{}</span>", chips.join(""))
+}
+
+/// The search pill: the toolbar's capsule, and where the chips live (§4.3).
+/// On the library it shows the active scope as chips on one line; tapping it
+/// goes to `/search`, where there is a real field (spec §3). The capsule may
+/// be a link rather than a field — there is simply no input. Once chips are
+/// inside, the capsule cannot also be one link around them, so it becomes a
+/// field-shaped container and the trailing label is the link to the page.
 pub fn search_pill(view: Option<&ViewParams>) -> String {
     let label = match view {
         Some(params) if !params.to_query_string().is_empty() => "Refine",
         _ => "Search",
     };
+    let chips = view.map(scope_chips).unwrap_or_default();
+    if chips.is_empty() {
+        return format!(
+            "<a class=\"search-pill-container\" href=\"/search\">{glyph}<span class=\
+             \"search-label\">{label}</span></a>",
+            glyph = SEARCH_GLYPH,
+        );
+    }
     format!(
-        "<a class=\"search-pill-container\" href=\"/search\"><span class=\"search-label\">{label}</span></a>"
+        "<div class=\"search-pill-container pill-scoped\">{glyph}{chips}\
+         <a class=\"search-label\" href=\"/search\">{label}</a></div>",
+        glyph = SEARCH_GLYPH,
     )
 }
 
@@ -156,54 +303,6 @@ pub fn size_toggles(params: &ViewParams) -> String {
     }
     out.push_str("</div>");
     out
-}
-
-/// One removable scope chip. The label quotes the user's own words, so it is
-/// escaped here rather than trusting every caller.
-fn chip(label: &str, remove_url: &str) -> String {
-    format!(
-        "<span class=\"chip\">{label}<a class=\"chip-remove\" href=\"{url}\" \
-         aria-label=\"{remove}\">✕</a></span>",
-        label = escape_html(label),
-        url = escape_html(remove_url),
-        remove = escape_html(&format!("Remove filter {label}")),
-    )
-}
-
-/// The active scope as chips, each with a link that removes it.
-pub fn scope_chips(params: &ViewParams) -> String {
-    let mut chips = Vec::new();
-    if let Some(folder) = &params.folder {
-        chips.push(chip(
-            &format!("in: {}", leaf_name(folder)),
-            &view_url(&params.without_folder()),
-        ));
-    }
-    if let Some(collection) = &params.collection {
-        chips.push(chip(
-            &format!("collection: {}", leaf_name(collection)),
-            &view_url(&params.without_collection()),
-        ));
-    }
-    for tag in &params.tags {
-        chips.push(chip(
-            &format!("tag: {tag}"),
-            &view_url(&params.without_tag(tag)),
-        ));
-    }
-    if let Some(text) = &params.q {
-        chips.push(chip(&format!("q: {text}"), &view_url(&params.without_q())));
-    }
-    if params.untagged {
-        chips.push(chip("untagged", "/"));
-    }
-    if params.recent {
-        chips.push(chip("recent", "/"));
-    }
-    if chips.is_empty() {
-        return String::new();
-    }
-    format!("<div class=\"scope-chips\">{}</div>", chips.join(""))
 }
 
 /// The breadcrumb trail when `in` is set; each segment narrows to its prefix.
@@ -306,50 +405,121 @@ pub fn load_more(params: &ViewParams, total: u64) -> String {
     )
 }
 
-/// What an empty view says, and the way out of it.
+/// What an empty view says, and the way out of it — the §4.8 anatomy: a
+/// small monochrome glyph, a title one step above the sentence, one
+/// sentence, and at most one text-style action. Where there is already a
+/// way out there is no second one; "Clear all filters" appears only when
+/// nothing else is.
 pub fn empty_state(params: &ViewParams) -> String {
-    let mut out = String::from("<div class=\"empty-state\">");
-    if let Some(folder) = &params.folder {
-        out.push_str(&format!(
-            "<h3>No images in {}</h3>",
-            escape_html(&leaf_name(folder))
-        ));
-        if !params.recursive {
-            out.push_str(&format!(
-                "<p>This folder has no images of its own. <a href=\"{}\">Show subfolders?</a></p>",
-                escape_html(&view_url(&params.with_recursive(true)))
-            ));
+    let (title, sentence, action): (String, String, Option<(String, String)>) =
+        if let Some(folder) = &params.folder {
+            if params.recursive {
+                (
+                    format!("No images in {}", leaf_name(folder)),
+                    "This folder and its subfolders have no images.".to_owned(),
+                    None,
+                )
+            } else {
+                (
+                    format!("No images in {}", leaf_name(folder)),
+                    "This folder has no images of its own.".to_owned(),
+                    Some((
+                        "Show subfolders".to_owned(),
+                        view_url(&params.with_recursive(true)),
+                    )),
+                )
+            }
+        } else if let Some(text) = &params.q {
+            (
+                format!("No images matching “{text}”"),
+                "Try a different word, or clear the filters.".to_owned(),
+                None,
+            )
+        } else if let Some(collection) = &params.collection {
+            (
+                format!("{} has no images", leaf_name(collection)),
+                "Its embeds resolve to no image that is still here.".to_owned(),
+                None,
+            )
+        } else if params.untagged {
+            (
+                "Every image has a tag".to_owned(),
+                "Nothing is untagged right now.".to_owned(),
+                None,
+            )
+        } else if params.recent {
+            // W34 audit #10: Recent is "the last 200 added", so an empty lens
+            // means an empty library or filters that match none of it — never a
+            // claim about days.
+            (
+                "Nothing in Recent".to_owned(),
+                "The library is empty, or the filters beside Recent match no image.".to_owned(),
+                None,
+            )
         } else {
-            out.push_str("<p>This folder and its subfolders have no images.</p>");
+            (
+                "The library is empty".to_owned(),
+                "Add images and run a scan to see them.".to_owned(),
+                None,
+            )
+        };
+
+    let mut out = format!(
+        "<div class=\"empty-state\"><span class=\"state-glyph\" aria-hidden=\"true\">\
+         {STATE_GLYPH_PHOTO}</span><h3>{}</h3><p>{}</p>",
+        escape_html(&title),
+        escape_html(&sentence),
+    );
+    let action = match action {
+        Some((label, url)) => Some((label, url)),
+        None if !params.to_query_string().is_empty() => {
+            Some(("Clear all filters".to_owned(), "/".to_owned()))
         }
-    } else if let Some(text) = &params.q {
+        None => None,
+    };
+    if let Some((label, url)) = action {
         out.push_str(&format!(
-            "<h3>No images matching “{}”</h3><p>Try a different word, or clear the filters.</p>",
-            escape_html(text)
+            "<a class=\"state-action\" href=\"{}\">{}</a>",
+            escape_html(&url),
+            escape_html(&label),
         ));
-    } else if let Some(collection) = &params.collection {
-        out.push_str(&format!(
-            "<h3>{} has no images</h3><p>Its embeds resolve to no image that is still here.</p>",
-            escape_html(&leaf_name(collection))
-        ));
-    } else if params.untagged {
-        out.push_str("<h3>Every image has a tag</h3><p>Nothing is untagged right now.</p>");
-    } else if params.recent {
-        // W34 audit #10: Recent is "the last 200 added", so an empty lens
-        // means an empty library or filters that match none of it — never a
-        // claim about days.
-        out.push_str(
-            "<h3>Nothing in Recent</h3><p>The library is empty, or the filters beside \
-             Recent match no image.</p>",
-        );
-    } else {
-        out.push_str("<h3>The library is empty</h3><p>Add images and run a scan to see them.</p>");
-    }
-    if !params.to_query_string().is_empty() {
-        out.push_str("<p><a class=\"back-link\" href=\"/\">Clear all filters</a></p>");
     }
     out.push_str("</div>");
     out
+}
+
+/// The error form of the §4.8 state: a **neutral** surface. `--danger`
+/// lands on the status glyph and nowhere else — not the title, not a fill,
+/// not a border. The sentence names the precise cause; this is never a big
+/// red block and never a raw exception.
+pub fn error_state(title: &str, sentence: &str) -> String {
+    format!(
+        "<div class=\"empty-state state-error\"><span class=\"state-glyph\" aria-hidden=\"true\">\
+         {STATE_GLYPH_WARN}</span><h3>{}</h3><p>{}</p></div>",
+        escape_html(title),
+        escape_html(sentence),
+    )
+}
+
+/// The inline form of §4.8 — the same anatomy one size down, for inside a
+/// panel or a list. Its action is a `<button>` carrying `action_attribute`,
+/// because an inline state such as "No tags match" is client-side and has
+/// no URL to point at; the stylesheet keeps it off screen until the script
+/// reveals it.
+pub fn inline_state(
+    title: &str,
+    sentence: &str,
+    action_label: &str,
+    action_attribute: &str,
+) -> String {
+    format!(
+        "<div class=\"inline-state\" hidden><span class=\"state-glyph\" aria-hidden=\"true\">\
+         {STATE_GLYPH_PHOTO}</span><p class=\"state-title\">{}</p><p class=\"state-sentence\">\
+         {}</p><button class=\"state-action\" type=\"button\" {action_attribute}>{}</button></div>",
+        escape_html(title),
+        escape_html(sentence),
+        escape_html(action_label),
+    )
 }
 
 /// A folder card, for `/folders`.
@@ -679,11 +849,16 @@ mod tests {
     fn chips_name_the_scope_and_offer_a_way_to_drop_it() {
         let params = ViewParams::parse("in=refs/ui&tag=eagle&tag=nature&q=street&c=browse.md");
         let html = scope_chips(&params);
-        assert!(html.contains("in: ui"));
-        assert!(html.contains("tag: eagle"));
-        assert!(html.contains("tag: nature"));
-        assert!(html.contains("q: street"));
-        assert!(html.contains("collection: browse.md"));
+        // The kind is a glyph, not a prefix: no `in:` / `tag:` / `q:` text,
+        // just the value — the whole "kind: value" survives in the tooltip.
+        assert!(html.contains("title=\"Folder: refs/ui\""));
+        assert!(html.contains("title=\"Tag: eagle\""));
+        assert!(html.contains("title=\"Tag: nature\""));
+        assert!(html.contains("title=\"Search: street\""));
+        assert!(html.contains("title=\"Collection: browse.md\""));
+        assert!(!html.contains("in:"), "{html}");
+        assert!(!html.contains("tag:"), "{html}");
+        assert!(!html.contains("q:"), "{html}");
         assert_eq!(html.matches("chip-remove").count(), 5);
         // Dropping a tag keeps the rest of the scope, in the canonical order.
         assert!(html.contains("href=\"/?in=refs/ui&amp;c=browse.md&amp;tag=nature&amp;q=street\""));
@@ -700,7 +875,7 @@ mod tests {
             "q=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E",
         ));
         assert!(
-            html.contains("q: &lt;img src=x onerror=alert(1)&gt;"),
+            html.contains("&lt;img src=x onerror=alert(1)&gt;"),
             "the escaped form is present: {html}"
         );
         assert!(
@@ -712,7 +887,7 @@ mod tests {
     #[test]
     fn a_chip_escapes_a_tag_name_carrying_script_and_quotes() {
         let html = scope_chips(&ViewParams::parse("tag=%3Cscript%3E%22x%22"));
-        assert!(html.contains("tag: &lt;script&gt;&quot;x&quot;"), "{html}");
+        assert!(html.contains("&lt;script&gt;&quot;x&quot;"), "{html}");
         assert!(!html.contains("<script>"), "the raw form rendered: {html}");
         assert!(!html.contains("\"x\""), "a raw quote pair rendered: {html}");
     }
@@ -722,7 +897,7 @@ mod tests {
         let params = ViewParams::parse("in=%22%3E%3Cimg%20onerror%3E");
         let chips = scope_chips(&params);
         assert!(
-            chips.contains("in: &quot;&gt;&lt;img onerror&gt;"),
+            chips.contains("Folder: &quot;&gt;&lt;img onerror&gt;"),
             "{chips}"
         );
         assert!(
@@ -741,10 +916,13 @@ mod tests {
     fn a_chip_escapes_a_collection_name_carrying_markup() {
         let html = scope_chips(&ViewParams::parse("c=%22%3E%3Csvg%3E.md"));
         assert!(
-            html.contains("collection: &quot;&gt;&lt;svg&gt;.md"),
+            html.contains("Collection: &quot;&gt;&lt;svg&gt;.md"),
             "{html}"
         );
-        assert!(!html.contains("\"><svg"), "the raw form rendered: {html}");
+        // The chip's own glyph is an `<svg`; the injected payload is the
+        // whole `"><svg>` pair closing a quoted attribute, which never
+        // appears raw.
+        assert!(!html.contains("\"><svg>"), "the raw form rendered: {html}");
     }
 
     #[test]
@@ -972,15 +1150,39 @@ mod tests {
     #[test]
     fn an_empty_folder_offers_subfolders_and_an_empty_search_offers_a_reset() {
         let shallow = empty_state(&ViewParams::parse("in=refs&sub=0"));
-        assert!(shallow.contains("Show subfolders?"));
+        assert!(shallow.contains("Show subfolders"));
         assert!(shallow.contains("href=\"/?in=refs\""));
 
         let deep = empty_state(&ViewParams::parse("in=refs"));
         assert!(deep.contains("no images"));
-        assert!(!deep.contains("Show subfolders?"));
+        assert!(!deep.contains("Show subfolders"));
 
         let search = empty_state(&ViewParams::parse("q=nothing"));
         assert!(search.contains("Clear all filters"));
+    }
+
+    /// §4.8: the empty state is a glyph, a title, one sentence and at most
+    /// one action — and the two-action case keeps only the way out.
+    #[test]
+    fn an_empty_state_carries_one_glyph_and_at_most_one_action() {
+        let html = empty_state(&ViewParams::parse("in=refs&sub=0&tag=eagle"));
+        assert_eq!(html.matches("state-glyph").count(), 1, "{html}");
+        assert_eq!(html.matches("state-action").count(), 1, "{html}");
+        assert!(!html.contains("Clear all filters"), "{html}");
+        let plain = empty_state(&ViewParams::default());
+        assert!(plain.contains("state-glyph"));
+        assert!(!plain.contains("state-action"), "nothing to do, no action");
+    }
+
+    #[test]
+    fn an_error_state_is_neutral_text_with_a_red_glyph_only() {
+        let html = error_state("Not found", "No image at <that> path.");
+        assert!(html.contains("state-error"), "{html}");
+        assert!(html.contains("No image at &lt;that&gt; path."), "{html}");
+        assert!(!html.contains("<that>"), "the raw form rendered: {html}");
+        // The sentence and title are plain text on a neutral surface; the
+        // red belongs to the glyph alone, and the stylesheet owns that.
+        assert!(!html.contains("danger"), "{html}");
     }
 
     #[test]
@@ -1020,7 +1222,25 @@ mod tests {
     fn the_search_pill_is_a_link_to_the_search_page() {
         assert!(search_pill(None).contains("href=\"/search\""));
         assert!(search_pill(Some(&ViewParams::default())).contains(">Search</span>"));
-        assert!(search_pill(Some(&ViewParams::parse("in=refs"))).contains(">Refine</span>"));
+        // With chips inside, the capsule cannot be one link around them, so
+        // the label is the link and the chips keep their own remove links.
+        let scoped = search_pill(Some(&ViewParams::parse("in=refs")));
+        assert!(scoped.contains(">Refine</a>"), "{scoped}");
+        assert!(scoped.contains("class=\"search-pill-container pill-scoped\""));
+        assert!(scoped.contains("chip-remove"));
+    }
+
+    /// The chips live inside the capsule, on the line the capsule already
+    /// owns — never in a second row of their own (W34 #7, DESIGN.md §4.3).
+    #[test]
+    fn the_chips_live_inside_the_pill_not_beside_it() {
+        let pill = search_pill(Some(&ViewParams::parse("tag=eagle&q=street")));
+        let chips_at = pill.find("scope-chips").expect("a chip row");
+        let capsule_at = pill.find("search-pill-container").expect("the capsule");
+        assert!(
+            capsule_at < chips_at,
+            "the chip row is inside the capsule: {pill}"
+        );
     }
 
     #[test]

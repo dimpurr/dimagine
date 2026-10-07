@@ -9,6 +9,8 @@
 //   * arrows move the selection, Enter opens, Esc clears, / focuses search
 //   * "Load more" fetches the next page from /api/view and appends it
 //   * recent views, kept on this device only
+//   * the theme is a choice on this device: Auto, Light or Dark
+//   * the chips inside the search capsule scroll, and the tag list filters
 //
 // No framework, no build step, no network beyond the viewer's own origin.
 
@@ -18,6 +20,76 @@
   // Marks the document so CSS can hide the no-script affordances (the sort
   // submit button) that only exist for a browser without this file.
   document.documentElement.classList.add('js');
+
+  /* =============================================== W43: theme =========== */
+
+  // W34 audit #11: the palette used to be the operating system's alone. The
+  // choice is 'auto' (follow the system), 'light' or 'dark', kept on this
+  // device. `applyTheme` runs here, before anything else in this file, so a
+  // reload paints the chosen theme rather than flashing the other one.
+  var THEME_KEY = 'dimagine.theme';
+
+  function storedTheme() {
+    try {
+      var value = window.localStorage.getItem(THEME_KEY);
+      return value === 'light' || value === 'dark' ? value : 'auto';
+    } catch (error) {
+      return 'auto';
+    }
+  }
+
+  function applyTheme(choice) {
+    if (choice === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', choice);
+  }
+
+  function rememberTheme(choice) {
+    try {
+      window.localStorage.setItem(THEME_KEY, choice);
+    } catch (error) {
+      // A device that refuses storage keeps the choice for this page only.
+    }
+  }
+
+  var themeChoice = storedTheme();
+  applyTheme(themeChoice);
+
+  // The switch is the toolbar's fifth control, and the toolbar is drawn by
+  // the server for every page; building it here keeps a theme preference a
+  // device-only detail with nothing to ask the server for. Without this
+  // file the pages follow the system, exactly as they did before.
+  (function buildThemeSwitch() {
+    var host =
+      document.querySelector('.toolbar-controls') || document.querySelector('.top-bar-row');
+    if (!host) return;
+    var group = document.createElement('div');
+    group.className = 'theme-switch';
+    group.setAttribute('role', 'group');
+    group.setAttribute('aria-label', 'Theme');
+    ['auto', 'light', 'dark'].forEach(function (choice) {
+      var button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.themeChoice = choice;
+      button.textContent = choice.charAt(0).toUpperCase() + choice.slice(1);
+      button.setAttribute('aria-pressed', String(choice === themeChoice));
+      if (choice === themeChoice) button.classList.add('active');
+      group.appendChild(button);
+    });
+    group.addEventListener('click', function (event) {
+      var button = event.target.closest ? event.target.closest('button') : null;
+      if (!button) return;
+      var choice = button.dataset.themeChoice;
+      if (!choice) return;
+      applyTheme(choice);
+      rememberTheme(choice);
+      Array.prototype.forEach.call(group.querySelectorAll('button'), function (each) {
+        var on = each === button;
+        each.classList.toggle('active', on);
+        each.setAttribute('aria-pressed', String(on));
+      });
+    });
+    host.appendChild(group);
+  })();
 
   var SIZE_KEY = 'dimagine.size';
   var RECENT_KEY = 'dimagine.recent-views';
@@ -443,6 +515,110 @@
     } catch (error) {
       // Storage is optional; the list simply does not persist.
     }
+  })();
+
+  /* =================================== W43: chips, tag filter, loading == */
+
+  // §4.3: the chips of the active scope live inside the search capsule and
+  // scroll sideways on one line. The row says it is overflowing with a fade
+  // at the edge where content is cut off, so the fade appears only when
+  // there is something to fade to.
+  function syncChipScroller(row) {
+    var overflowing = row.scrollWidth > row.clientWidth + 1;
+    row.classList.toggle('scrollable', overflowing);
+    if (!overflowing) {
+      row.classList.remove('at-start', 'at-end');
+      return;
+    }
+    row.classList.toggle('at-start', row.scrollLeft <= 1);
+    row.classList.toggle('at-end', row.scrollLeft + row.clientWidth >= row.scrollWidth - 1);
+  }
+
+  Array.prototype.forEach.call(document.querySelectorAll('.scope-chips'), function (row) {
+    syncChipScroller(row);
+    row.addEventListener('scroll', function () {
+      syncChipScroller(row);
+    });
+  });
+
+  window.addEventListener('resize', function () {
+    Array.prototype.forEach.call(document.querySelectorAll('.scope-chips'), syncChipScroller);
+  });
+
+  // The ✕ is a real link, so dropping a filter works without this file. The
+  // script only plays its 120ms exit first, then follows the same href.
+  // A keyboard activation goes at once: keyboard-initiated actions never
+  // animate (DESIGN.md §2.6).
+  document.addEventListener('click', function (event) {
+    var remove = event.target.closest ? event.target.closest('.chip-remove') : null;
+    if (!remove) return;
+    if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.detail === 0) {
+      return;
+    }
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    var chip = remove.closest('.chip');
+    if (!chip || chip.classList.contains('removing')) return;
+    event.preventDefault();
+    chip.classList.add('removing');
+    window.setTimeout(function () {
+      window.location.href = remove.href;
+    }, 120);
+  });
+
+  // §4.7: the tag list is on the page already — the filter box narrows both
+  // groups by hiding the rows that do not match, and the inline state says
+  // so when nothing does. Matching ignores case and accents, because a
+  // person types "ene" for "écrémeuse".
+  var tagFilter = document.getElementById('tag-filter');
+  if (tagFilter) {
+    var tagGroups = Array.prototype.slice.call(document.querySelectorAll('[data-tag-group]'));
+    var noTagMatch = document.querySelector('.inline-state');
+
+    function folded(value) {
+      return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    }
+
+    function filterTags() {
+      var needle = folded(tagFilter.value.trim());
+      var shown = 0;
+      tagGroups.forEach(function (group) {
+        var inGroup = 0;
+        Array.prototype.forEach.call(group.querySelectorAll('.tag-row'), function (row) {
+          var name = row.querySelector('.tag-name');
+          var hits = !needle || folded(name ? name.textContent : '').indexOf(needle) !== -1;
+          row.hidden = !hits;
+          if (hits) inGroup += 1;
+        });
+        group.hidden = inGroup === 0;
+        shown += inGroup;
+      });
+      if (noTagMatch) noTagMatch.hidden = shown !== 0;
+    }
+
+    tagFilter.addEventListener('input', filterTags);
+    var clearTagFilter = document.querySelector('[data-clear-tag-filter]');
+    if (clearTagFilter) {
+      clearTagFilter.addEventListener('click', function () {
+        tagFilter.value = '';
+        filterTags();
+        tagFilter.focus();
+      });
+    }
+  }
+
+  // §4.8 loading: the request for the next page belongs to "Load more"
+  // above; this keeps a skeleton in the button's place while it is in
+  // flight, and ends it when the tiles arrive. The grid keeps its tiles, so
+  // the columns never jump.
+  (function skeletonWhilePaging() {
+    var button = document.querySelector('.load-more-btn');
+    if (!button || !grid) return;
+    button.addEventListener('click', function () {
+      button.classList.add('is-loading');
+    });
+    new MutationObserver(function () {
+      button.classList.remove('is-loading');
+    }).observe(grid, { childList: true });
   })();
 })();
 

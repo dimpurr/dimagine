@@ -308,11 +308,9 @@ pub(crate) fn error_response(e: CatalogError) -> Response {
 /// mistaken for a login-protected page.
 pub(crate) fn error_page(state: &AppState, status: StatusCode, message: &str) -> Response {
     let title = error_page_title(status);
-    let body = format!(
-        "<div class=\"empty-state\"><h3>{}</h3><p>{}</p></div>",
-        crate::ui::escape_html(title),
-        crate::ui::escape_html(message)
-    );
+    // W43: the §4.8 error anatomy — a neutral surface whose only red thing
+    // is the status glyph, never a big red block.
+    let body = crate::ui::components::error_state(title, message);
     let frame = Frame {
         banner: state.banner(),
         ..Frame::new(title, Destination::Library, body)
