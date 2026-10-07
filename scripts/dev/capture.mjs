@@ -6,7 +6,10 @@
 // Chrome over the DevTools Protocol instead and calls
 // `Emulation.setDeviceMetricsOverride`, which sets the viewport the page
 // actually lays out in. The same page is then measured: a `check` job fails
-// when `document.documentElement.scrollWidth` is wider than `window.innerWidth`.
+// when `document.documentElement.scrollWidth` or `window.innerWidth`
+// exceeds the emulated device width — mobile shrink-to-fit inflates the
+// two together (600px content on a 390px device measures 608/608), so
+// comparing them to each other alone would pass pages wider than the device.
 //
 // Usage: node capture.mjs <jobs.json>
 //
@@ -21,10 +24,11 @@
 //
 // Exit codes: 0 every shot written and every check passed; 1 a shot failed or
 // a check found horizontal overflow; 2 usage error; 130/143/129 the process
-// was killed by SIGINT/SIGTERM/SIGHUP after Chrome was torn down.
+// was killed by SIGINT/SIGTERM/SIGHUP after Chrome and its profile dir were
+// torn down.
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -67,17 +71,50 @@ chrome.stderr.on('data', (chunk) => {
   stderr += chunk.toString();
 });
 
-function stopChrome() {
+function killChrome() {
   try {
     chrome.kill('SIGKILL');
   } catch {
     // already gone
   }
-  try {
-    rmSync(profile, { recursive: true, force: true });
-  } catch {
-    // best effort
+}
+
+const EXIT_WAIT_MS = 2000;
+const PROFILE_QUIET_MS = 500;
+const PROFILE_RETRY_DEADLINE_MS = 5000;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// SIGKILL is asynchronous and Chrome's helpers can outlive the main
+// process briefly: some are still writing under the profile when the
+// first rmSync runs (it fails part-way then) and others recreate files
+// right after a successful removal. So teardown waits for the child's
+// exit event, then keeps removing until the profile not only is gone
+// but stays gone across a quiet interval (bounded, so this never hangs
+// — at worst it is still the old best effort); only after that may the
+// caller exit.
+async function stopChrome() {
+  killChrome();
+  if (chrome.exitCode === null && chrome.signalCode === null) {
+    await Promise.race([
+      new Promise((resolve) => chrome.once('exit', resolve)),
+      sleep(EXIT_WAIT_MS),
+    ]);
   }
+  const deadline = Date.now() + PROFILE_RETRY_DEADLINE_MS;
+  do {
+    try {
+      rmSync(profile, { recursive: true, force: true });
+    } catch {
+      // a not-yet-dead helper is still writing under the profile
+    }
+    await sleep(PROFILE_QUIET_MS);
+    if (!existsSync(profile)) {
+      return; // gone, and nothing recreated it within the quiet interval
+    }
+  } while (Date.now() < deadline);
 }
 
 // A node process killed by a signal (a timeout, Ctrl-C, a closed tmux
@@ -92,8 +129,9 @@ for (const [signal, exitCode] of Object.entries(SIGNAL_EXIT_CODES)) {
       return;
     }
     signalShutdown = true;
-    stopChrome();
-    process.exit(exitCode);
+    // stopChrome() resolves only once the profile is gone (or fully
+    // retried); exiting before that would race the removal.
+    stopChrome().then(() => process.exit(exitCode));
   });
 }
 
@@ -202,7 +240,13 @@ async function main() {
         returnByValue: true,
       });
       const metrics = JSON.parse(result.result.value);
-      const overflow = metrics.scroll > metrics.inner;
+      // Failing either test means the page overflows: scroll wider than
+      // inner catches classic overflow, and inner or scroll wider than the
+      // emulated device width catches mobile shrink-to-fit inflating both.
+      const overflow =
+        metrics.scroll > metrics.inner ||
+        metrics.inner > width ||
+        metrics.scroll > width;
       const label = `${width}px ${job.url}`;
       console.log(
         `CHECK ${label} inner=${metrics.inner} scroll=${metrics.scroll} ` +
@@ -228,13 +272,17 @@ async function main() {
   return 0;
 }
 
-main()
-  .then((code) => {
-    stopChrome();
-    process.exit(code);
-  })
-  .catch((error) => {
+async function run() {
+  let code = 0;
+  try {
+    code = await main();
+  } catch (error) {
     console.error(`capture: ${error.message}`);
-    stopChrome();
-    process.exit(1);
-  });
+    code = 1;
+  }
+  await stopChrome();
+  process.exit(code);
+}
+
+// If the teardown itself ever rejects, still end the process.
+run().catch(() => process.exit(1));

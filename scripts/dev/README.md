@@ -49,7 +49,7 @@ python3 scripts/dev/demo-library.py --selftest
 
 `scripts/dev/screenshots.sh` automates capturing screenshots across all required viewports, themes, and application routes. It builds a job list and hands it to `scripts/dev/capture.mjs`, which drives Chrome over the DevTools Protocol.
 
-`capture.mjs` uses `Emulation.setDeviceMetricsOverride` rather than `--window-size`: headless Chrome will not lay a window out below 500 CSS pixels wide, so `--window-size=390,844` produces a 500px layout cropped to 390, not a phone layout. The override sets the viewport the page actually uses, and the same page is then measured — every 390px job fails the run when `document.documentElement.scrollWidth` exceeds `window.innerWidth`, so a horizontal overflow is caught without looking at the images.
+`capture.mjs` uses `Emulation.setDeviceMetricsOverride` rather than `--window-size`: headless Chrome will not lay a window out below 500 CSS pixels wide, so `--window-size=390,844` produces a 500px layout cropped to 390, not a phone layout. The override sets the viewport the page actually uses, and the same page is then measured — a job fails the run when `document.documentElement.scrollWidth` or `window.innerWidth` exceeds the emulated device width (mobile shrink-to-fit inflates both together — a 600px page on a 390px device measures 608/608 — so comparing the two to each other alone misses pages wider than the device), so a horizontal overflow is caught without looking at the images.
 
 ### Usage
 
@@ -106,4 +106,4 @@ Files are named `<width>-<theme>-<slug>.png` (3 widths × 2 themes × 8 routes =
 
 ## 3. Browsers
 
-Capture screenshots only through `screenshots.sh` / `capture.mjs`: they start Chrome, record its PID, and kill it on every exit path — normal exit, thrown error, and SIGINT/SIGTERM/SIGHUP. Any other headless browser must record its PID at launch and kill that exact PID in a trap/finally on every exit path; never kill browsers by name or command-line pattern.
+Capture screenshots only through `screenshots.sh` / `capture.mjs`: they start Chrome, record its PID, and on every exit path — normal exit, thrown error, and SIGINT/SIGTERM/SIGHUP — kill it and remove its temporary profile dir. Any other headless browser must record its PID at launch and kill that exact PID in a trap/finally on every exit path; never kill browsers by name or command-line pattern.

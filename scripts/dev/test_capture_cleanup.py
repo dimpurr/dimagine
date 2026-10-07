@@ -3,7 +3,9 @@
 A node process killed by a signal (timeout, Ctrl-C, a closed tmux
 pane) must not leave a headless Chrome behind: capture.mjs has to
 kill its Chrome, remove the profile dir, and exit with the
-conventional 128+signal code.
+conventional 128+signal code. The profile dir must also be gone
+when the signal arrives while the page is still loading and
+Chrome's helpers are still writing under it.
 """
 
 import http.server
@@ -59,6 +61,94 @@ class StubHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+def _png_body(fill):
+    """A PNG whose IDAT is pre-compressed at deflate level 0 (stored), so
+    it is a plausible image — Chrome does not reject it from the first
+    bytes — of any size we want."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        body = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 0, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(fill, 0))
+        + chunk(b"IEND", b"")
+    )
+
+
+STREAM_CHUNK = 4096
+# 30 small images whose downloads start staggered and complete in a rolling
+# wave, plus 2 that trickle so slowly the page's load event is still pending
+# throughout the test window — so cache-entry commits keep landing under the
+# profile dir, and capture.mjs stays busy waiting for the page.
+ROLLING_BODY = _png_body(b"\x41" * 40_000)  # ~40 KB
+ETERNAL_BODY = _png_body(b"\x42" * 40_000)  # ~40 KB, trickled below
+N_ROLLING = 30
+ROLL_START_STAGGER = 0.12
+ROLL_CHUNK_DELAY = 0.15
+ETERNAL_CHUNK_DELAY = 1.0
+
+
+class StreamingStubHandler(http.server.BaseHTTPRequestHandler):
+    """A page whose subresource commits keep rolling under the profile
+    dir, so a teardown that kills Chrome and removes the profile without
+    waiting for the deleted processes to die (and without retrying the
+    removal) loses the race and leaves a partial tree behind."""
+
+    def do_GET(self):
+        if self.path == "/busy":
+            body = (
+                b"<html><body>"
+                + b"".join(
+                    b"<img src='/s%d.png'>" % i for i in range(N_ROLLING + 2)
+                )
+                + b"<script>for(i=0;i<100000;i++)document.title=i</script>"
+                + b"</body></html>"
+            )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if self.path.startswith("/s") and self.path.endswith(".png"):
+            idx = int(self.path[2:-4])
+            if idx < N_ROLLING:
+                body = ROLLING_BODY
+                time.sleep(ROLL_START_STAGGER * idx)
+                chunk_delay = ROLL_CHUNK_DELAY
+            else:
+                body = ETERNAL_BODY
+                chunk_delay = ETERNAL_CHUNK_DELAY
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                for i in range(0, len(body), STREAM_CHUNK):
+                    self.wfile.write(body[i : i + STREAM_CHUNK])
+                    self.wfile.flush()
+                    time.sleep(chunk_delay)
+            except OSError:
+                # Chrome died mid-stream; that is the point of this page.
+                pass
+            return
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def log_message(self, *args):
         pass
@@ -124,14 +214,16 @@ class CaptureCleanupTests(unittest.TestCase):
                     f"{proc.returncode}: {''.join(stderr_lines)}"
                 )
             for line in list(stderr_lines):
-                match = re.search(r"chrome pid (\d+)(?: profile (.*))?", line)
+                match = re.search(r"chrome pid (\d+) profile (.+)", line)
                 if match:
-                    return int(match.group(1)), match.group(2)
+                    return int(match.group(1)), match.group(2).strip()
             time.sleep(0.1)
         self.fail("capture.mjs never reported its Chrome pid")
 
-    def _run_signal_case(self, sig, expected_code):
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), StubHandler)
+    def _run_signal_case(
+        self, sig, expected_code, delay=0.0, handler=StubHandler, page="/"
+    ):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
             port = server.server_address[1]
@@ -144,7 +236,7 @@ class CaptureCleanupTests(unittest.TestCase):
                             "chrome": self.chrome,
                             "jobs": [
                                 {
-                                    "url": f"http://127.0.0.1:{port}/",
+                                    "url": f"http://127.0.0.1:{port}{page}",
                                     "width": 800,
                                     "height": 600,
                                     "theme": "light",
@@ -177,16 +269,21 @@ class CaptureCleanupTests(unittest.TestCase):
                         "Chrome was not running when capture.mjs reported its pid",
                     )
                     command = process_command(chrome_pid)
-                    if profile:
-                        self.assertIn(
-                            profile,
-                            command,
-                            "the recorded pid does not look like the spawned Chrome",
-                        )
+                    self.assertIn(
+                        profile,
+                        command,
+                        "the recorded pid does not look like the spawned Chrome",
+                    )
 
+                    # With a delay, the signal lands while the stub page is
+                    # still loading and Chrome's helpers are writing under
+                    # the profile — the timing where removing the profile
+                    # before waiting for Chrome to die loses the race.
+                    if delay:
+                        time.sleep(delay)
                     proc.send_signal(sig)
                     self.assertEqual(
-                        proc.wait(timeout=10),
+                        proc.wait(timeout=15),
                         expected_code,
                         f"capture.mjs did not exit {expected_code} on {sig.name}",
                     )
@@ -198,11 +295,10 @@ class CaptureCleanupTests(unittest.TestCase):
                         pid_alive(chrome_pid),
                         f"Chrome {chrome_pid} survived {sig.name} to capture.mjs",
                     )
-                    if profile:
-                        self.assertFalse(
-                            Path(profile).exists(),
-                            "the Chrome profile dir survived the signal",
-                        )
+                    self.assertFalse(
+                        Path(profile).exists(),
+                        "the Chrome profile dir survived the signal",
+                    )
                 finally:
                     if proc.poll() is None:
                         proc.send_signal(signal.SIGTERM)
@@ -223,6 +319,26 @@ class CaptureCleanupTests(unittest.TestCase):
         ):
             with self.subTest(signal=sig.name):
                 self._run_signal_case(sig, expected_code)
+
+    def test_mid_render_signal_removes_profile(self):
+        # 3 s after the pid line the streaming stub page's subresources are
+        # mid-download and Chrome's cache writers are still writing under
+        # the profile dir, which is when a teardown that kills Chrome and
+        # removes the profile without waiting for Chrome to die leaves a
+        # partial tree behind.
+        for sig, expected_code in (
+            (signal.SIGINT, 130),
+            (signal.SIGTERM, 143),
+            (signal.SIGHUP, 129),
+        ):
+            with self.subTest(signal=sig.name):
+                self._run_signal_case(
+                    sig,
+                    expected_code,
+                    delay=3.0,
+                    handler=StreamingStubHandler,
+                    page="/busy",
+                )
 
 
 if __name__ == "__main__":
