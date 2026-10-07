@@ -64,13 +64,18 @@ fn kind_cache_name(kind: dimagine_preview::Kind) -> &'static str {
 }
 
 /// Whether a rendition for `hash` already sits in the library cache
-/// (`.dimagine/cache/previews/<shard>/<hash>-<kind>.<ext>`).
+/// (`.dimagine/cache/previews/<shard>/<hash>-<kind>-<gen>.<ext>`, where
+/// `<gen>` is dimagine-preview's rendition policy generation).
 fn rendition_exists(root: &Path, hash: &str, kind: dimagine_preview::Kind) -> bool {
     let shard = root.join(".dimagine/cache/previews").join(&hash[..2]);
     let Ok(entries) = fs::read_dir(shard) else {
         return false;
     };
-    let prefix = format!("{hash}-{}.", kind_cache_name(kind));
+    let prefix = format!(
+        "{hash}-{}-{}.",
+        kind_cache_name(kind),
+        dimagine_preview::RENDITION_GENERATION
+    );
     entries
         .flatten()
         .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))

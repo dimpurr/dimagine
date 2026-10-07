@@ -266,13 +266,16 @@ Tools that generate previews should produce:
 
 | Name | Size rule | Use |
 | --- | --- | --- |
-| `thumb` | long edge ≤ 400 px | grids, phones |
+| `thumb` | long edge ≤ 400 px **and** aspect ≤ 5:2 — a more extreme aspect is cropped to 5:2 first, from the top for tall sources and from the left for wide ones; the short edge is ≥ 40 px unless the source's own short edge is smaller (previews never upscale) | grids, phones |
 | `view` | long edge ≤ 1568 px **and** area ≤ 1,150,000 px | detail view, and images sent to vision models |
 
 - Format: JPEG at quality about 88; PNG when the image has transparency. These two
   formats are accepted by every major vision-model API.
 - Never upscale. Apply EXIF orientation. Convert to sRGB. Use the first frame of
   animated images.
+- A rendition is valid only for the rendition policy that produced it. The cache
+  key carries a policy generation, so a tool regenerates an entry written by an
+  older policy instead of reusing it — even when its dimensions would still match.
 - Larger renditions are produced on demand from the original, not stored by
   default.
 
@@ -290,4 +293,6 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-04 | Draft revision: image notes end with a self-embed (§3.2); file names avoid `[ ] # ^ \|` (§2.1). |
 | 0.1 | 2026-10-05 | Additive optional property `added` (§3.1): when the image first entered the collection, possibly in another tool. |
 | 0.1 | 2026-10-06 | A leading UTF-8 BOM in an image note is read and preserved (§3.1). |
+| 0.1 | 2026-10-06 | `thumb` previews keep a readable shape: long edge ≤ 400 px, aspect ≤ 5:2; an extreme-aspect source is cropped to 5:2 from the top (tall) or the left (wide) instead of shrinking to a sliver, and the short edge is ≥ 40 px unless the source itself is smaller (§8.2). |
+| 0.1 | 2026-10-06 | A rendition is valid only for the rendition policy that made it: the cache key carries a policy generation, and older-policy entries are regenerated, not reused (§8.2). |
 | 0.1 | 2026-10-06 | An out-of-range or non-integer `rating` reads as no rating (§3.1). |

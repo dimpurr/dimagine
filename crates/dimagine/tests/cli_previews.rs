@@ -7,6 +7,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use dimagine_preview::RENDITION_GENERATION;
+
 const BIN: &str = env!("CARGO_BIN_EXE_dimagine");
 
 const PNG: &[u8] = include_bytes!("../../../tests/fixtures/pixel.png");
@@ -126,12 +128,14 @@ fn previews_generates_then_caches_without_touching_originals() {
     assert_eq!(files.len(), 4, "thumb+view for each of the two images");
     for path in files.iter().map(|(p, _)| p) {
         let name = path.file_name().unwrap().to_str().unwrap();
+        // Name shape: <hash>-<kind>-<generation>.<ext>, the generation
+        // tag dimagine-preview keys renditions by (FORMAT §8.2).
         assert!(
-            name.ends_with("-thumb.jpg")
-                || name.ends_with("-view.jpg")
-                || name.ends_with("-thumb.png")
-                || name.ends_with("-view.png"),
-            "rendition names are hash-kind.ext: {name}"
+            name.ends_with(&format!("-thumb-{RENDITION_GENERATION}.jpg"))
+                || name.ends_with(&format!("-view-{RENDITION_GENERATION}.jpg"))
+                || name.ends_with(&format!("-thumb-{RENDITION_GENERATION}.png"))
+                || name.ends_with(&format!("-view-{RENDITION_GENERATION}.png")),
+            "rendition names are hash-kind-generation.ext: {name}"
         );
     }
 

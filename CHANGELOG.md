@@ -191,3 +191,11 @@ All notable changes to this project are documented here. The format follows
   unambiguous 1:1 (by note `id`, else by size and mtime) and the appeared image
   is one this scan brought in, so a duplicate copy in the same scan as a move is
   dated as the new file it is.
+- Previews: grid thumbnails render through a crop-then-scale pipeline, so a
+  tall screenshot (e.g. 1440x3000) gets its thumbnail in milliseconds and
+  concurrent `/thumb` requests no longer queue behind the four generation
+  slots.
+- Previews: a thumbnail keeps a readable shape (FORMAT §8.2): long edge ≤ 400
+  px, aspect ≤ 5:2. An extreme-aspect source (e.g. a 780x48000 full-page
+  screenshot) is cropped to 5:2 — from the top for tall sources, from the
+  left for wide ones — a real crop, never a squeeze or a sliver on the grid.
