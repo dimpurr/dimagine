@@ -322,6 +322,10 @@ impl ViewParams {
             }
         }
 
+        // Whether the URL asked for an order at all. A lens that fixes the
+        // order says so only when the reader asked for something else.
+        let asked_for_an_order = raw_sort.is_some() || explicit_dir.is_some();
+
         if let Some(s) = raw_sort {
             match parse_sort_key(&s) {
                 Some(key) => params.sort = key,
@@ -345,6 +349,18 @@ impl ViewParams {
             },
             None => default_direction(params.sort),
         };
+
+        // The Recent lens is newest-first by definition, so a sort asked for
+        // beside it cannot decide the order (W37 review, Medium #1). Say so,
+        // rather than leaving a parameter that looks like it did something.
+        if params.recent
+            && asked_for_an_order
+            && (params.sort != SortKey::Added || params.direction != Direction::Desc)
+        {
+            params.notices.push(format!(
+                "Ignored sort: Recent is always the last {RECENT_LIMIT} added, newest first"
+            ));
+        }
 
         params
     }
@@ -841,9 +857,22 @@ mod tests {
     /// holds, so it cannot decide their order either.
     #[test]
     fn the_recent_lens_keeps_the_added_order_a_sort_cannot_change_its_mind() {
-        let sorted = ViewParams::parse("recent=1&sort=name&dir=asc").to_index_query();
+        let params = ViewParams::parse("recent=1&sort=name&dir=asc");
+        let sorted = params.to_index_query();
         assert_eq!(sorted.sort, SortKey::Added);
         assert!(sorted.descending);
+        // W37 review, Medium #1: and the reader is told, so the sort control
+        // is not the only place the truth appears.
+        assert_eq!(params.notices.len(), 1);
+        assert!(
+            params.notices[0] == "Ignored sort: Recent is always the last 200 added, newest first",
+            "{:?}",
+            params.notices
+        );
+
+        // A lens on its own asked for no order, so there is nothing to ignore.
+        assert!(ViewParams::parse("recent=1").notices.is_empty());
+        assert!(ViewParams::parse("recent=1&dir=desc").notices.is_empty());
 
         // Without the lens, the sort belongs to the reader.
         let plain = ViewParams::parse("sort=name&dir=asc").to_index_query();

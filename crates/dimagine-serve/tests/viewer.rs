@@ -599,6 +599,21 @@ async fn an_image_note_off_the_list_is_still_a_collection_for_the_rest() {
     assert!(html.contains("Appears in"));
     assert!(html.contains("href=\"/?c=refs/page-01.png.md\""));
     assert!(html.contains("href=\"/?c=roundup.md\""));
+
+    // W27f review L-1: the legacy pretty URL resolves too. "Off the list" is
+    // not "not a collection", so `/collection/<note>` must not answer 404 for
+    // the one collection the list leaves off.
+    let response = get(&app, "/collection/refs/page-01.png.md", &cookie).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::PERMANENT_REDIRECT,
+        "an unlisted collection still redirects"
+    );
+    assert_eq!(response.headers()["location"], "/?c=refs/page-01.png.md");
+
+    // A note that is not a collection at all is still not redirected.
+    let response = get(&app, "/collection/refs/page-03.png.md", &cookie).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -681,6 +696,56 @@ async fn recent_is_the_last_two_hundred_not_the_whole_library() {
     assert!(
         !html.contains("load-more-btn"),
         "the 200th image is the last one the lens offers"
+    );
+
+    // W37 review, Medium #1 (W39 review M1/L1): the lens's order is not a
+    // choice, so the toolbar states it — a focusable arrow whose sentence is an
+    // attribute, rather than a sort the grid ignores, a disabled control a
+    // keyboard cannot reach, or a wide hint that overflows the phone toolbar.
+    let html = text(&app, "/?recent=1", &cookie).await;
+    assert!(
+        html.contains("role=\"note\" tabindex=\"0\""),
+        "the Recent order is a focusable label: {html}"
+    );
+    assert!(html.contains(">↓</span>"), "showing the order: {html}");
+    assert!(
+        !html.contains("disabled"),
+        "nothing on the Recent lens is unreachable: {html}"
+    );
+    assert!(
+        !html.contains(">Recent is always"),
+        "and the sentence is not visible text that widens the toolbar: {html}"
+    );
+    assert!(
+        html.contains("title=\"Recent is always the last 200 added, newest first.\""),
+        "and it says why: {html}"
+    );
+    // A URL that asks for a sort the lens cannot honour shows the same label
+    // and says, in the notice box, that the sort was ignored.
+    let html = text(&app, "/?recent=1&sort=name-asc", &cookie).await;
+    assert!(
+        html.contains(">↓</span>"),
+        "the label shows the order in force, not the URL's: {html}"
+    );
+    assert!(
+        html.contains("Ignored sort: Recent is always the last 200 added, newest first"),
+        "{html}"
+    );
+
+    // W37 review, Medium #2: a page past the lens end says so, states the size
+    // it still reports, and offers the way back — it never claims the library
+    // is empty beside a count of 200.
+    let html = text(&app, "/?recent=1&p=3", &cookie).await;
+    assert!(html.contains("Nothing on this page"), "{html}");
+    assert!(!html.contains("The library is empty"), "{html}");
+    assert!(!html.contains("Nothing in Recent"), "{html}");
+    assert!(
+        html.contains("href=\"/?recent=1\">Back to the first page</a>"),
+        "the way back to the images: {html}"
+    );
+    assert!(
+        html.contains("<span class=\"result-count\">200 items</span>"),
+        "the count and the state agree: {html}"
     );
 }
 

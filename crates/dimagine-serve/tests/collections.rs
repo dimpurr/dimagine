@@ -226,3 +226,72 @@ async fn a_collection_view_shows_ambiguous_and_missing_diagnostics() {
     assert_eq!(missing.status(), StatusCode::OK);
     assert!(body(missing).await.contains("matches no file"));
 }
+
+/// W39 review L4: the pretty URL is what names the collection, so a `c` it
+/// carries must not override it. The last `c` wins in a query string, so
+/// `/collection/<one>?c=<two>` used to render `<two>`.
+#[tokio::test]
+async fn a_carried_collection_cannot_override_the_pretty_url() {
+    let root = library();
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog(&root), OriginalPreview, config);
+    let cookie = login(&app).await;
+
+    let redirect = app
+        .clone()
+        .oneshot(request(
+            "/collection/ambiguous.md?c=no_kind.md",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        redirect.headers()["location"],
+        "/?c=ambiguous.md",
+        "the collection the URL named wins over the one it carried"
+    );
+
+    // Everything else the URL carried still travels.
+    let kept = app
+        .oneshot(request("/collection/ambiguous.md?size=l", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(kept.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(kept.headers()["location"], "/?c=ambiguous.md&size=l");
+}
+
+/// W39 review L6: an index that cannot answer is not an answer of "no". The
+/// route used to swallow the error and report the note as "not a collection";
+/// it now gives the 503 with the reason, the shape every other list page gives.
+#[tokio::test]
+async fn an_unusable_index_says_so_instead_of_not_a_collection() {
+    let root = library();
+    // A directory where the index database belongs: it cannot be opened, and it
+    // cannot be removed and rebuilt, so the handle is unavailable.
+    fs::create_dir_all(root.path().join(".dimagine/cache/index.sqlite")).unwrap();
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog(&root), OriginalPreview, config);
+    let cookie = login(&app).await;
+
+    let response = app
+        .oneshot(request("/collection/ambiguous.md", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let html = body(response).await;
+    assert!(
+        html.contains("unavailable"),
+        "the page says why the index cannot answer: {html}"
+    );
+    assert!(
+        !html.contains("is not in this library"),
+        "an unusable index must not read as \"not a collection\": {html}"
+    );
+}

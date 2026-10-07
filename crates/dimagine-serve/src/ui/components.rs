@@ -6,7 +6,7 @@
 use dimagine_index::ViewItem;
 use percent_encoding::utf8_percent_encode;
 
-use crate::index_sync::{recent_label, SidebarData};
+use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
 use crate::view_query::{
@@ -227,7 +227,13 @@ pub fn result_count(total: u64) -> String {
 ///
 /// Only the parameters that are not the sort travel as hidden fields, so
 /// changing the sort keeps the scope and returns to page one.
+///
+/// The Recent lens never gets this menu: its order is not a choice, so it has
+/// [`recent_sort_control`] instead.
 pub fn sort_control(params: &ViewParams) -> String {
+    if params.recent {
+        return recent_sort_control(params);
+    }
     let mut out = String::from("<form class=\"sort-form\" method=\"get\" action=\"/\">");
     for (name, value) in [
         ("in", &params.folder),
@@ -249,9 +255,6 @@ pub fn sort_control(params: &ViewParams) -> String {
     }
     if params.untagged {
         out.push_str("<input type=\"hidden\" name=\"untagged\" value=\"1\">");
-    }
-    if params.recent {
-        out.push_str("<input type=\"hidden\" name=\"recent\" value=\"1\">");
     }
     if let Some(collection) = &params.collection {
         out.push_str(&format!(
@@ -278,6 +281,47 @@ pub fn sort_control(params: &ViewParams) -> String {
     // Without JavaScript the control needs a button to submit the form.
     out.push_str("</select><button class=\"sort-submit\" type=\"submit\">Go</button></form>");
     out
+}
+
+/// The sort control on the Recent lens, where there is nothing to choose.
+///
+/// Recent is "the last [`RECENT_LIMIT`] added, newest first" by definition
+/// (W34 audit #10), so a sort beside it cannot decide the order. Offering the
+/// menu anyway made the control lie: it showed the picked option while the grid
+/// stayed Added-descending, and picking another one changed the URL and nothing
+/// else (W37 review, Medium #1). So it shows the order in force.
+///
+/// It is a focusable label, not a disabled `<select>`: a disabled control is
+/// unfocusable and its `title` never renders, so a keyboard-only reader had no
+/// way to reach the sentence (W39 review L1), the UA dimming was not the
+/// design's disabled state (L2), and the visible hint that carried it was 107px
+/// too wide for the 390px toolbar (M1). A label is in the tab order, draws the
+/// focus ring, and carries the whole sentence in `title` (hover and focus) and
+/// `aria-label` (screen readers).
+///
+/// It is deliberately as narrow as a label can be: one descending arrow beside
+/// the count, in the count's own muted text scale. The bar is one row
+/// (DESIGN.md §4.4) — count, this label, the size segments, the theme switch —
+/// and at 390px the five controls only fit when this one is an arrow: anything
+/// wordier squeezes the size segments until `L` is clipped, which is what the
+/// worded label and the hint it carried did (W39 review M1). The words are not
+/// gone, they are one hover or one Tab away.
+///
+/// Over a collection it renders nothing at all. The grid keeps the collection's
+/// own member order (`ViewQuery::collection`), so there is no order of Recent's
+/// to state, and "newest first" would be false there (W39 review L3) — the
+/// wording is left out rather than shown as a lie, which is also what keeps the
+/// toolbar fitting on `/?c=<note>&recent=1`.
+fn recent_sort_control(params: &ViewParams) -> String {
+    if params.collection.is_some() {
+        return String::new();
+    }
+    let note = format!("Recent is always the last {RECENT_LIMIT} added, newest first.");
+    format!(
+        "<span class=\"sort-form\"><span class=\"search-hint recent-order\" role=\"note\" \
+         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">↓</span></span>",
+        note = escape_html(&note),
+    )
 }
 
 /// The three-step thumbnail size control. `size` is a URL parameter as well as
@@ -495,6 +539,23 @@ pub fn empty_state(params: &ViewParams) -> String {
     }
     out.push_str("</div>");
     out
+}
+
+/// A page past the end of a view (W37 review, Medium #2).
+///
+/// The view is not empty — the count beside it says how many images it holds —
+/// so the empty view's words would contradict it ("the library is empty" on a
+/// library of 205). This says where the page sits and offers the one way back
+/// to the images.
+pub fn past_end_state(params: &ViewParams, total: u64) -> String {
+    let noun = if total == 1 { "item" } else { "items" };
+    format!(
+        "<div class=\"empty-state\"><span class=\"state-glyph\" aria-hidden=\"true\">\
+         {STATE_GLYPH_PHOTO}</span><h3>Nothing on this page</h3>\
+         <p>This view has {total} {noun}; this page is past the end of it.</p>\
+         <a class=\"state-action\" href=\"{}\">Back to the first page</a></div>",
+        escape_html(&view_url(&params.with_page(1))),
+    )
 }
 
 /// The error form of the §4.8 state: a **neutral** surface. `--danger`
@@ -846,11 +907,12 @@ mod tests {
 
     #[test]
     fn the_sort_menu_carries_the_lenses_and_a_non_recursive_folder() {
-        let params = ViewParams::parse("in=refs&sub=0&untagged=1&recent=1&c=set.md");
+        // Not `recent`: that lens has no menu to carry anything (W37 review,
+        // Medium #1) — see `the_recent_order_is_a_focusable_arrow_not_a_wide_hint`.
+        let params = ViewParams::parse("in=refs&sub=0&untagged=1&c=set.md");
         let html = sort_control(&params);
         assert!(html.contains("name=\"sub\" value=\"0\""));
         assert!(html.contains("name=\"untagged\" value=\"1\""));
-        assert!(html.contains("name=\"recent\" value=\"1\""));
         assert!(html.contains("name=\"c\" value=\"set.md\""));
     }
 
@@ -1300,20 +1362,117 @@ mod tests {
         assert!(result_count(0).contains("0 items<"));
         assert!(result_count(2).contains("2 items<"));
     }
-}
-#[cfg(test)]
-mod debug_probe {
+
+    /// W37 review, Medium #1: the Recent lens is newest-first by definition, so
+    /// its sort menu offered choices the grid ignored. W39 review M1/L1/L2: the
+    /// replacement is a focusable label, not a disabled control — a disabled
+    /// control cannot be focused, so its `title` is unreachable, and the 107px
+    /// visible hint it carried overflowed the 390px phone toolbar. The visible
+    /// label is one arrow because the toolbar's five controls only fit at 390px
+    /// when it is; the sentence rides in `title` and `aria-label`.
     #[test]
-    fn probe() {
-        println!(
-            "SIZE: {}",
-            super::size_toggles(&crate::view_query::ViewParams::parse("in=refs&size=l"))
+    fn the_recent_order_is_a_focusable_arrow_not_a_wide_hint() {
+        let html = sort_control(&ViewParams::parse("recent=1"));
+        assert!(
+            html.contains("role=\"note\" tabindex=\"0\""),
+            "the order is a focusable label, not a disabled control: {html}"
         );
-        println!(
-            "CHIP: {}",
-            super::scope_chips(&crate::view_query::ViewParams::parse(
-                "in=refs/ui&tag=eagle&tag=nature&q=street&c=browse.md"
-            ))
+        assert!(
+            html.contains(">↓</span>"),
+            "the order in force is the one shown: {html}"
         );
+        assert!(
+            html.contains("title=\"Recent is always the last 200 added, newest first.\""),
+            "the label carries the whole sentence: {html}"
+        );
+        assert!(
+            html.contains(
+                "aria-label=\"Sort order — Recent is always the last 200 added, newest first.\""
+            ),
+            "and a screen reader hears it: {html}"
+        );
+        // M1: the toolbar must fit a 390px phone, which holds only while the
+        // sentence stays an attribute and never becomes visible text.
+        assert!(
+            !html.contains(">Recent is always"),
+            "the sentence is not a visible hint: {html}"
+        );
+        assert!(
+            !html.contains(">Added ↓</span>"),
+            "and the label is not the wide control it replaced: {html}"
+        );
+        // L1/L2: nothing disabled, so nothing unfocusable or UA-dimmed.
+        assert!(!html.contains("disabled"), "{html}");
+        // Nothing else is offered, so nothing else can be promised.
+        assert!(!html.contains("Name A→Z"), "{html}");
+        assert!(!html.contains("type=\"submit\""), "{html}");
+        assert!(
+            !html.contains("type=\"hidden\""),
+            "and nothing to submit: {html}"
+        );
+    }
+
+    /// W39 review L3: over a collection the grid keeps the collection's own
+    /// member order (`ViewQuery::collection`), so "newest first" would be false
+    /// there. The wording is left out rather than shown as a lie — which also
+    /// keeps the toolbar's five controls fitting at 390px on this combination.
+    #[test]
+    fn the_recent_order_over_a_collection_states_no_order_at_all() {
+        let html = sort_control(&ViewParams::parse(
+            "c=collections/featured-picks.md&recent=1",
+        ));
+        assert!(html.is_empty(), "no claim to make: {html}");
+        assert!(
+            !html.contains("newest first"),
+            "a collection cannot be reordered by Recent: {html}"
+        );
+    }
+
+    #[test]
+    fn the_recent_sort_control_shows_the_forced_order_not_the_url() {
+        let html = sort_control(&ViewParams::parse("recent=1&sort=name-asc"));
+        assert!(
+            html.contains(">↓</span>"),
+            "the grid is Added-descending whatever the URL says: {html}"
+        );
+        assert!(!html.contains(">Name A→Z<"), "{html}");
+    }
+
+    #[test]
+    fn every_other_view_keeps_the_real_sort_menu() {
+        for query in ["", "tag=nature", "in=refs", "c=browse.md", "untagged=1"] {
+            let html = sort_control(&ViewParams::parse(query));
+            assert!(
+                html.contains(
+                    "<select class=\"sort-select\" name=\"sort\" aria-label=\"Sort order\">"
+                ),
+                "'{query}' keeps the menu: {html}"
+            );
+            assert!(!html.contains("disabled"), "'{query}': {html}");
+            assert!(html.contains("Name A→Z"), "'{query}': {html}");
+        }
+    }
+
+    /// W37 review, Medium #2: a page past the end is not an empty view, so it
+    /// must not borrow the empty view's words.
+    #[test]
+    fn a_page_past_the_end_states_the_size_and_the_way_back() {
+        let html = past_end_state(&ViewParams::parse("recent=1&p=3"), 200);
+        assert!(html.contains("<h3>Nothing on this page</h3>"), "{html}");
+        assert!(
+            html.contains("This view has 200 items; this page is past the end of it."),
+            "{html}"
+        );
+        assert!(
+            html.contains("href=\"/?recent=1\">Back to the first page</a>"),
+            "the way back to the images: {html}"
+        );
+        // Never the empty library's words, and never a bare page.
+        assert!(!html.contains("The library is empty"), "{html}");
+    }
+
+    #[test]
+    fn a_page_past_the_end_of_a_one_item_view_says_item() {
+        assert!(past_end_state(&ViewParams::parse("p=2"), 1).contains("This view has 1 item;"));
     }
 }

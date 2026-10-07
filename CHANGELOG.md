@@ -235,3 +235,26 @@ All notable changes to this project are documented here. The format follows
   px, aspect ≤ 5:2. An extreme-aspect source (e.g. a 780x48000 full-page
   screenshot) is cropped to 5:2 — from the top for tall sources, from the
   left for wide ones — a real crop, never a squeeze or a sliver on the grid.
+- Viewer: `/collection/<note>` resolves for every collection the index knows,
+  including the image-note collections the list leaves off. Reading the list
+  there made "unlisted" mean "not a collection", so a legacy link to an image
+  note answered 404 while `/?c=<note>` answered 200.
+- Viewer: the Recent lens's order is stated, not offered — the lens is the last
+  200 added, newest first, so a sort beside it cannot decide the order; before
+  this it showed the picked option while the grid stayed Added-descending. The
+  order is a focusable arrow beside the count, so the sentence that explains it
+  is reachable on hover and focus and by a screen reader, and the phone toolbar
+  at 390px keeps all five controls visible (a disabled control with a wide
+  visible hint did neither). Over a collection the toolbar claims no order at
+  all, because a collection keeps its own member order. A page past the end of
+  a view now says so and offers the way back, instead of claiming the library
+  is empty beside a count of 200.
+- Viewer: `/collection/<note>` answers from that note's own row instead of
+  listing every collection on every request, so a burst of legacy links no
+  longer holds the index lock and slows unrelated pages down.
+- Viewer: a legacy `/collection/<note>` that also carries a `c` keeps the note
+  the pretty URL named — the carried `c` used to win and point the page at a
+  different collection.
+- Viewer: `/collection/<note>` reports an index it cannot read as 503 with the
+  reason, instead of answering 404 "not a collection" for a note that may well
+  be one.

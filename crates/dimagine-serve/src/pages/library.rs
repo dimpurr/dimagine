@@ -183,6 +183,14 @@ fn read(state: &AppState, params: &ViewParams) -> Option<Page> {
 /// The result area: the grid, or what is missing, and the way on.
 fn grid_body(params: &ViewParams, page: &ViewPage) -> String {
     if page.items.is_empty() {
+        // An empty slice with a non-zero total is not an empty view: the page
+        // is past the end, and the empty view's words ("The library is empty")
+        // would contradict the count the toolbar is showing beside it (W37
+        // review, Medium #2). `/?recent=1&p=3` on a 205-image library is how a
+        // hand-typed URL or a stale bookmark gets there.
+        if page.total > 0 {
+            return components::past_end_state(params, page.total);
+        }
         return components::empty_state(params);
     }
     format!(
@@ -347,5 +355,28 @@ mod tests {
             html.contains("<section class=\"search-section\"><h1>Tag: a&lt;b &amp; co</h1>"),
             "{html}"
         );
+    }
+
+    /// W37 review, Medium #2: an empty slice with a non-zero total is a page
+    /// past the end, and saying "the library is empty" beside a count of 200
+    /// is a lie the count itself exposes.
+    #[test]
+    fn an_empty_page_past_the_end_is_not_an_empty_view() {
+        let past = ViewPage {
+            total: 200,
+            items: Vec::new(),
+        };
+        let html = grid_body(&ViewParams::parse("recent=1&p=3"), &past);
+        assert!(html.contains("Nothing on this page"), "{html}");
+        assert!(!html.contains("The library is empty"), "{html}");
+        assert!(!html.contains("Nothing in Recent"), "{html}");
+
+        // A view that really is empty keeps the empty view's words.
+        let empty = ViewPage {
+            total: 0,
+            items: Vec::new(),
+        };
+        let html = grid_body(&ViewParams::default(), &empty);
+        assert!(html.contains("The library is empty"), "{html}");
     }
 }

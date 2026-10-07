@@ -949,6 +949,50 @@ async fn error_pages_carry_the_no_login_banner() {
     }
 }
 
+/// RW32 L-1: the HTML 403 page — `catalog_error_page`'s `Forbidden` arm — had
+/// no test; only the JSON route's bare 403 did.
+///
+/// The rule is "no symlink component", not "outside the root": the fixture's
+/// symlink target (`outside.md`) sits in the same folder, and the image page
+/// still refuses it (W39 review L5 — the comment used to say "outside the
+/// library's own files", which sent the next reader looking for a
+/// canonical-prefix rule that is not there). What the test pins down is the
+/// page: the framed page and the banner, like every other error a browser
+/// renders.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_forbidden_image_page_is_a_framed_403_page() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("girl.jpg"),
+        b"\xff\xd8\xff\xe0not-a-real-jpeg",
+    )
+    .unwrap();
+    std::fs::write(root.path().join("outside.md"), "not this library's note").unwrap();
+    std::os::unix::fs::symlink(
+        root.path().join("outside.md"),
+        root.path().join("girl.jpg.md"),
+    )
+    .unwrap();
+    let app = app_for(&root, Some("open-sesame"), AuthMode::None);
+
+    let (status, headers, body) = send(&app, get("/image/girl.jpg", None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(headers["cache-control"], "no-store");
+    let html = String::from_utf8_lossy(&body).into_owned();
+    assert!(
+        html.starts_with("<!doctype html>"),
+        "the 403 must be an HTML page, not a bare status: {html}"
+    );
+    assert!(html.contains("app-shell"), "the frame: {html}");
+    assert!(html.contains(NO_LOGIN_BANNER), "the banner: {html}");
+    assert!(html.contains("Not viewable"), "the heading: {html}");
+    assert!(
+        html.contains("This address is outside this library and cannot be shown."),
+        "the sentence names the cause: {html}"
+    );
+}
+
 #[tokio::test]
 async fn no_auth_mode_does_not_need_the_accounts_store() {
     let root = tempfile::tempdir().unwrap();

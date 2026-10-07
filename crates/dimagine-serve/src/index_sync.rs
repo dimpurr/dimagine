@@ -214,6 +214,23 @@ impl IndexHandle {
         }
     }
 
+    /// Whether one note is a collection, listed or not.
+    ///
+    /// The list surfaces filter by `collection_is_listed`; a legacy
+    /// `/collection/<path>` asks a different question — *is this a collection*
+    /// — and it is a question about one note, so the index answers it from that
+    /// note's own row (W39 review M2: reading the whole collection list here
+    /// held the index lock on an admission-free route and made unrelated
+    /// requests ~5× slower under a burst). The rule is the index's, so an
+    /// unlisted collection still resolves (W27f review L-1: reading the
+    /// filtered list there turned "unlisted" into 404).
+    pub fn is_collection(&self, path: &str) -> Result<bool, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.is_collection(path),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
     /// Every folder, collection and tag with its count, cached per generation.
     pub fn sidebar_data(&self) -> Result<Arc<SidebarData>, IndexError> {
         let generation = self.generation();

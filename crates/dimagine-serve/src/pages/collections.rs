@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response},
 };
-use dimagine_index::ViewQuery;
+use dimagine_index::{IndexError, ViewQuery};
 
 use crate::catalog::DiagnosticKind;
 use crate::index_sync::SidebarData;
@@ -86,12 +86,16 @@ pub(crate) async fn collection_redirect(
     RawQuery(query): RawQuery,
 ) -> Response {
     match collection_target(&state, &path, query.as_deref()) {
-        Some(target) => Redirect::permanent(&target).into_response(),
-        None => error_page(
+        Ok(Some(target)) => Redirect::permanent(&target).into_response(),
+        Ok(None) => error_page(
             &state,
             StatusCode::NOT_FOUND,
             "This collection is not in this library.",
         ),
+        // An index that cannot answer is not an answer of "no" (W39 review
+        // L6): the note may well be a collection, so this is the 503 that says
+        // why, the shape every other list page gives.
+        Err(_) => index_failure(&state, false),
     }
 }
 
@@ -100,24 +104,54 @@ pub(crate) async fn collection_redirect(
 /// A collection that is not in the index is not redirected: an empty grid would
 /// read as "this collection has no images", which is a different fact from "this
 /// collection is not here".
-fn collection_target(state: &AppState, path: &str, query: Option<&str>) -> Option<String> {
+///
+/// "In the index" is the question, not "in the list": the list leaves off the
+/// image-note collections (`collection_is_listed`, FORMAT §3.2), but an unlisted
+/// collection is still a collection with members, so this URL keeps resolving
+/// for it (W27f review L-1: consulting the list here made an unlisted note a
+/// 404 while `/?c=<note>` answered 200).
+///
+/// `Err` is the index declining to answer at all; the caller turns that into
+/// the 503 that says so rather than a 404 that claims the note is not a
+/// collection.
+fn collection_target(
+    state: &AppState,
+    path: &str,
+    query: Option<&str>,
+) -> Result<Option<String>, IndexError> {
     // The router already decoded this segment, so a `+` in it is a `+`.
-    let collection = normalise_decoded_path(path).ok().flatten()?;
-    let known = state
-        .index
-        .sidebar_data()
-        .ok()?
-        .collections
-        .iter()
-        .any(|entry| entry.path == collection);
-    known.then(|| format!("/?c={}{}", query_value(&collection), carry_query(query)))
+    let Some(collection) = normalise_decoded_path(path).ok().flatten() else {
+        return Ok(None);
+    };
+    if !state.index.is_collection(&collection)? {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "/?c={}{}",
+        query_value(&collection),
+        carry_query(query)
+    )))
 }
 
+/// The query a legacy collection URL carries into its redirect.
+///
+/// Everything the URL carried travels, except its own `c`: the redirect's
+/// target sets `c` to the collection the pretty URL named, and because the last
+/// `c` wins a carried one would silently point the page at a different
+/// collection (W39 review L4: `/collection/set-0001.md?c=set-0002.md` read
+/// "Set 2"). The pretty URL is the one that names the collection, so it wins.
 fn carry_query(query: Option<&str>) -> String {
-    match query.filter(|query| !query.is_empty()) {
-        Some(query) => format!("&{query}"),
-        None => String::new(),
+    let Some(query) = query.filter(|query| !query.is_empty()) else {
+        return String::new();
+    };
+    let carried: Vec<&str> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && pair.split('=').next() != Some("c"))
+        .collect();
+    if carried.is_empty() {
+        return String::new();
     }
+    format!("&{}", carried.join("&"))
 }
 
 /// `GET /api/collection/<path>` — one collection with its members and

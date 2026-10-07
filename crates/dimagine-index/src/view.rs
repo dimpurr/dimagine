@@ -571,6 +571,27 @@ impl Index {
             .collect())
     }
 
+    /// Whether one note is a collection (FORMAT §5), answered from its own row.
+    ///
+    /// The legacy `/collection/<path>` route asks this question once per
+    /// request, so it must not walk the whole list: `WHERE notes.path=?1` is a
+    /// point lookup on the note's unique path, and the candidate predicate is
+    /// the one [`Index::collections`] uses, so the two can never disagree about
+    /// what a collection is or which of them the list carries. A path that is
+    /// not a note at all is simply not a collection, never an error.
+    pub fn is_collection(&self, path: &str) -> Result<bool, IndexError> {
+        Ok(self
+            .collection_candidates(
+                &format!(
+                    "SELECT {CANDIDATE_COLUMNS} FROM notes \
+                     WHERE notes.path=?1 AND {CANDIDATE_WHERE}"
+                ),
+                [path],
+            )?
+            .into_iter()
+            .any(|candidate| note_is_collection(&candidate.evidence())))
+    }
+
     /// Collection note paths that embed `image_path`. An image note's own
     /// self-embed never counts (FORMAT §3.2).
     pub fn appears_in(&self, image_path: &str) -> Result<Vec<String>, IndexError> {
@@ -837,6 +858,110 @@ mod tests {
             .unwrap();
         assert_eq!(members.total, 1);
         assert_eq!(members.items[0].path, "refs/page-02.png");
+    }
+
+    /// W39 review M2: the legacy `/collection/<path>` route asks about one
+    /// note, so the index answers it from that note's own row. The rule is the
+    /// list's (`note_is_collection`), and the lookup is an indexed search on
+    /// the note's unique path rather than a walk over every collection.
+    #[test]
+    fn one_note_is_a_collection_without_listing_them_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+        };
+        let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
+            path: path.to_owned(),
+            image_path: image_path.map(str::to_owned),
+            id: None,
+            title: String::new(),
+            tags: Vec::new(),
+            props_json: props.to_owned(),
+        };
+        let embed = |src: &str, target: &str| crate::LinkRecord {
+            src: src.to_owned(),
+            raw: format!("![[{target}]]"),
+            target: Some(target.to_owned()),
+            state: crate::LinkState::Resolved,
+            syntax: crate::LinkSyntax::WikiEmbed,
+        };
+        index.begin_scan().unwrap();
+        index.upsert_file(&image("refs/page-01.png")).unwrap();
+        index.upsert_file(&image("refs/page-02.png")).unwrap();
+        // A listed collection: a plain note with an embed.
+        index
+            .upsert_note(&note("roundup.md", None, r#"{"title":"Roundup"}"#))
+            .unwrap();
+        index
+            .replace_links("roundup.md", &[embed("roundup.md", "refs/page-01.png")])
+            .unwrap();
+        // An unlisted one: an image note embedding a sibling (FORMAT §3.2).
+        index
+            .upsert_note(&note(
+                "refs/page-01.png.md",
+                Some("refs/page-01.png"),
+                r#"{"title":"Page one"}"#,
+            ))
+            .unwrap();
+        index
+            .replace_links(
+                "refs/page-01.png.md",
+                &[embed("refs/page-01.png.md", "refs/page-02.png")],
+            )
+            .unwrap();
+        // A note that collects nothing at all.
+        index.upsert_note(&note("plain.md", None, r#"{}"#)).unwrap();
+        index
+            .finish_scan(&[
+                "refs/page-01.png".into(),
+                "refs/page-02.png".into(),
+                "refs/page-01.png.md".into(),
+                "roundup.md".into(),
+                "plain.md".into(),
+            ])
+            .unwrap();
+
+        assert!(
+            index.is_collection("roundup.md").unwrap(),
+            "a listed collection"
+        );
+        assert!(
+            index.is_collection("refs/page-01.png.md").unwrap(),
+            "an unlisted collection is still a collection"
+        );
+        assert!(
+            !index.is_collection("plain.md").unwrap(),
+            "a note with no embed"
+        );
+        assert!(
+            !index.is_collection("refs/page-01.png").unwrap(),
+            "an image, not a note"
+        );
+        assert!(
+            !index.is_collection("nope/missing.md").unwrap(),
+            "a path that is not there is not a collection, and not an error"
+        );
+
+        // The question costs one indexed row, not a walk over the collections.
+        let params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new("roundup.md")];
+        let plan = index
+            .explain(
+                &format!(
+                    "SELECT {CANDIDATE_COLUMNS} FROM notes \
+                     WHERE notes.path=?1 AND {CANDIDATE_WHERE}"
+                ),
+                &params,
+            )
+            .join("; ");
+        assert!(plan.contains("SEARCH"), "no point lookup: {plan}");
+        assert!(!plan.contains("SCAN notes"), "a full scan: {plan}");
     }
 
     /// RW26 M-5: every view query has to be answered from the indexes. The
