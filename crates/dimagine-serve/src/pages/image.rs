@@ -24,6 +24,11 @@ use crate::{catalog_error_page, error_page, error_response, AppState};
 /// The destination of "Back to view".
 const DESTINATION: crate::ui::shell::Destination = crate::ui::shell::Destination::Library;
 
+/// The aspect-ratio thresholds that crop a tile or a stage (DESIGN.md §5.4),
+/// the same pair the stylesheet's `data-fit` rules use.
+const TALL_BELOW: f64 = 0.4;
+const WIDE_ABOVE: f64 = 2.5;
+
 /// `GET /image/<path>`.
 pub(crate) async fn image_page(
     State(state): State<AppState>,
@@ -105,9 +110,15 @@ fn image_body(detail: &ImageDetail, appears_in: &[String], back: String) -> Stri
         "<a class=\"original-link\" href=\"/raw/{path}\">View original</a></div></header>"
     ));
 
+    // The stage takes the picture's shape (W34 #2): a tall screenshot fills the
+    // column and scrolls inside the well instead of painting a sliver in a big
+    // empty box. When the note records the dimensions the fit is known here and
+    // the page is right on the first paint; otherwise the script measures the
+    // loaded image, and a shape nobody knows keeps the whole picture.
     out.push_str(&format!(
-        "<div class=\"image-detail-layout\"><figure class=\"image-stage\">\
+        "<div class=\"image-detail-layout\"><figure class=\"image-stage\"{}>\
          <img src=\"/media/{path}\" alt=\"{label}\"></figure>",
+        fit_attribute(known_fit(&detail.properties)),
         label = escape_html(&title_of(detail))
     ));
     out.push_str("<div class=\"image-panel\">");
@@ -157,6 +168,41 @@ fn image_body(detail: &ImageDetail, appears_in: &[String], back: String) -> Stri
     ));
     out.push_str("</div></div></div>");
     out
+}
+
+/// The stage's `data-fit`, when the note's front matter records the picture's
+/// shape. The Eagle import writes `width` and `height`, and a served rendition
+/// keeps the source aspect ratio, so what the note records is what the stage
+/// shows. A missing, non-numeric or zero dimension says nothing about the
+/// shape, and the stage then says nothing — it does not guess (invariant 4).
+fn known_fit(properties: &Value) -> Option<&'static str> {
+    let width = numeric_property(properties, "width")?;
+    let height = numeric_property(properties, "height")?;
+    let ratio = width / height;
+    Some(if ratio < TALL_BELOW {
+        "tall"
+    } else if ratio > WIDE_ABOVE {
+        "wide"
+    } else {
+        "normal"
+    })
+}
+
+/// A property as a usable number: `3429`, `"3429"` and `1.5` all count.
+/// Anything else — absent, a list, a word, a zero — is not a dimension.
+fn numeric_property(properties: &Value, key: &str) -> Option<f64> {
+    let number = match properties.get(key)? {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().parse::<f64>().ok()?,
+        _ => return None,
+    };
+    (number.is_finite() && number > 0.0).then_some(number)
+}
+
+/// The `data-fit="…"` attribute, or nothing when the shape is unknown.
+fn fit_attribute(fit: Option<&str>) -> String {
+    fit.map(|fit| format!(" data-fit=\"{fit}\""))
+        .unwrap_or_default()
 }
 
 /// The properties as a definition list: the known FORMAT
@@ -680,5 +726,70 @@ mod tests {
         assert!(html.contains("<dt>Title</dt>"), "{html}");
         assert!(!html.contains("<dt>Tags</dt>"), "{html}");
         assert!(!html.contains("<dt>height</dt>"), "{html}");
+    }
+
+    /// The stage takes the shape the note records, so a page the index has no
+    /// dimensions for is still right on its first paint (W34 #2).
+    #[test]
+    fn the_stage_takes_the_shape_the_note_records() {
+        let mut detail = detail();
+        // A phone screenshot, and a panorama.
+        detail.properties = json!({"width": 780, "height": 48000});
+        assert!(
+            image_body(&detail, &[], "/".into())
+                .contains("class=\"image-stage\" data-fit=\"tall\""),
+            "a tall picture fills the column and scrolls"
+        );
+        detail.properties = json!({"width": 2400, "height": 800});
+        assert!(image_body(&detail, &[], "/".into())
+            .contains("class=\"image-stage\" data-fit=\"wide\""));
+        // An ordinary picture, including one an importer wrote as text.
+        detail.properties = json!({"width": "1200", "height": "800"});
+        assert!(image_body(&detail, &[], "/".into())
+            .contains("class=\"image-stage\" data-fit=\"normal\""));
+    }
+
+    /// A shape nobody recorded is not invented: the stage keeps the whole
+    /// picture and the script measures it if it can (invariant 4).
+    #[test]
+    fn a_shape_the_note_does_not_record_is_not_guessed() {
+        for properties in [
+            json!({}),
+            json!({"width": 1200}),
+            json!({"height": 800}),
+            json!({"width": 0, "height": 800}),
+            json!({"width": null, "height": 800}),
+            json!({"width": "wide", "height": 800}),
+            json!({"width": [1, 2], "height": 800}),
+        ] {
+            assert_eq!(known_fit(&properties), None, "{properties}");
+        }
+        let mut bare = detail();
+        bare.properties = json!({});
+        let html = image_body(&bare, &[], "/".into());
+        assert!(html.contains("<figure class=\"image-stage\">"), "{html}");
+        assert!(!html.contains("data-fit"), "{html}");
+    }
+
+    /// The thresholds are DESIGN.md §5.4's, and both boundaries are exclusive:
+    /// an aspect ratio of exactly 0.4 or exactly 2.5 is an ordinary picture.
+    #[test]
+    fn the_crop_thresholds_are_the_design_system_ones() {
+        assert_eq!(
+            known_fit(&json!({"width": 4, "height": 10})),
+            Some("normal")
+        );
+        assert_eq!(
+            known_fit(&json!({"width": 4, "height": 10.001})),
+            Some("tall")
+        );
+        assert_eq!(
+            known_fit(&json!({"width": 25, "height": 10})),
+            Some("normal")
+        );
+        assert_eq!(
+            known_fit(&json!({"width": 25.001, "height": 10})),
+            Some("wide")
+        );
     }
 }

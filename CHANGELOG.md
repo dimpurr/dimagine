@@ -100,7 +100,6 @@ All notable changes to this project are documented here. The format follows
   "Folder: path", "Collection: name" (the note's `title`, else the file), or
   "Search: q" — instead of the generic "Search" that never said what was on
   screen (W34 audit #12). The whole library stays quietly "Library".
-||||||| 4517f1e
 - `dimagine serve` stops cleanly: Ctrl-C (SIGINT) and SIGTERM now close the
   listening socket, answer the requests already in flight, and exit with status
   `0`. The wait is bounded at 5 seconds, so a client that has stalled cannot
@@ -128,6 +127,19 @@ All notable changes to this project are documented here. The format follows
   `count` a number.
 - Documented that the account `role` field is stored but not yet enforced
   (reserved for the future multi-user surface); there is no behavior change.
+- Viewer: tiles and the image page follow the design system. A tile is square
+  and shows the whole picture; only an extreme aspect ratio is cropped — a very
+  tall image is top-aligned and carries a "Tall" badge, a very wide one is
+  centre-cropped and carries a "Wide" badge — and the ratio is measured from
+  the loaded thumbnail, so an unmeasured image is never cropped on a guess.
+  Names are visible on a phone and on hover or selection elsewhere, a pending
+  thumbnail holds the grid's shape as a skeleton, and a picture that cannot be
+  loaded names its file and says "Unavailable" instead of rendering an empty
+  square (W34 audit #1 display side and #3). The image page's stage takes the
+  picture's shape: a tall screenshot fills the column and scrolls inside a
+  capped well instead of painting a sliver in an oversized empty box (#2), and
+  the properties and the rendered note are drawn as the design system's field
+  list and its wikilink / embed styles (#8, #9).
 
 ### Removed
 - The 2019 prototype (an Express/Pug Pinterest for illustrators). Its code is

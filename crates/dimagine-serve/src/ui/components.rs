@@ -349,6 +349,15 @@ pub fn notices(notices: &[String]) -> String {
 
 /// One image tile. The tile is a plain link, so the grid works without JS; the
 /// `data-path` attribute is what the inspector fills from.
+///
+/// The tile is square and the picture is whole (`object-fit: contain`). Only an
+/// extreme aspect ratio is cropped, and the aspect ratio cannot be emitted here:
+/// the index stores no dimensions (DESIGN.md §4.5 — "computed from the loaded
+/// image's natural size" until it does). The script therefore measures the
+/// thumbnail once it loads and writes `data-fit` (`tall` / `wide` / `normal`)
+/// plus the measured `data-w` / `data-h` on the tile, which is what the
+/// stylesheet crops by. A size that never arrives leaves the tile in its
+/// default `contain`, so an unknown is never turned into a guess (invariant 4).
 pub fn tile(item: &ViewItem, params: &ViewParams) -> String {
     let label = item
         .title
@@ -356,8 +365,8 @@ pub fn tile(item: &ViewItem, params: &ViewParams) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| leaf_name(&item.path));
     format!(
-        "<a class=\"tile\" data-path=\"{path}\" href=\"/image/{path_encoded}{view}\">\
-         <img loading=\"lazy\" src=\"/thumb/{path_encoded}\" alt=\"{label}\">\
+        "<a class=\"tile\" data-path=\"{path}\" href=\"/image/{path_encoded}{view}\" title=\"{label}\">\
+         <img loading=\"lazy\" decoding=\"async\" src=\"/thumb/{path_encoded}\" alt=\"{label}\">\
          <span class=\"tile-caption\">{label}</span></a>",
         path = escape_html(&item.path),
         path_encoded = escape_html(&crate::ui::encode_path(&item.path)),
@@ -1122,6 +1131,48 @@ mod tests {
             !html.contains("?v="),
             "the whole library needs no back link"
         );
+    }
+
+    /// The tile's own prefix is a contract: `tests/viewer.rs` reads a page's
+    /// image paths back out of it.
+    #[test]
+    fn a_tile_opens_with_the_attributes_the_pages_parse() {
+        let item = ViewItem {
+            path: "refs/a.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        };
+        assert!(tile(&item, &ViewParams::default())
+            .starts_with("<a class=\"tile\" data-path=\"refs/a.png\""));
+    }
+
+    /// W34 audit #3 / DESIGN.md §4.5: the whole name stays reachable while the
+    /// caption is hidden, and the aspect hooks belong to the script — the tile
+    /// never states a crop it has not measured.
+    #[test]
+    fn a_tile_carries_the_whole_name_and_no_guessed_aspect() {
+        let item = ViewItem {
+            path: "refs/猫 & co.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: Some("猫 & co".into()),
+            rating: None,
+            note_path: None,
+        };
+        let html = tile(&item, &ViewParams::default());
+        assert!(html.contains("title=\"猫 &amp; co\""), "{html}");
+        assert!(html.contains("alt=\"猫 &amp; co\""), "{html}");
+        for hook in ["data-fit", "data-w", "data-h"] {
+            assert!(
+                !html.contains(hook),
+                "the aspect is measured in the browser, not assumed: {html}"
+            );
+        }
     }
 
     #[test]

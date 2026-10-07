@@ -8,6 +8,7 @@
 //   * single click selects a tile and fills the inspector (desktop)
 //   * arrows move the selection, Enter opens, Esc clears, / focuses search
 //   * "Load more" fetches the next page from /api/view and appends it
+//   * tiles crop only a measured extreme aspect ratio, and say so with a badge
 //   * recent views, kept on this device only
 //   * the theme is a choice on this device: Auto, Light or Dark
 //   * the chips inside the search capsule scroll, and the tag list filters
@@ -424,6 +425,7 @@
           page.items.forEach(function (item) {
             grid.appendChild(tileElement(item));
           });
+          watchTiles(grid);
           var shown = grid.querySelectorAll('.tile[data-path]').length;
           if (shown >= page.total) {
             loadMore.remove();
@@ -467,6 +469,156 @@
     });
     return tile;
   }
+
+  /* ------------------------------------------ tiles: fit and skeletons */
+
+  // The tile is square and the picture is whole. Only an extreme aspect ratio
+  // is cropped (DESIGN.md §4.5 and §5.4: below 0.4 is tall, above 2.5 is
+  // wide), and the index stores no dimensions, so the ratio is measured from
+  // the thumbnail the browser has loaded. Nothing measured means no crop: the
+  // tile keeps its `contain` default rather than guessing a shape.
+  var TALL_BELOW = 0.4;
+  var WIDE_ABOVE = 2.5;
+  var TILE_BADGE = {
+    tall: {
+      title: 'Tall image — top-aligned crop',
+      glyph:
+        '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">' +
+        '<path d="M6 1v10M3.5 8.5 6 11l2.5-2.5M3.5 3.5 6 1l2.5 2.5"/></svg>'
+    },
+    wide: {
+      title: 'Wide image — centre crop',
+      glyph:
+        '<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">' +
+        '<path d="M1 6h10M3.5 3.5 1 6l2.5 2.5M8.5 3.5 11 6l-2.5 2.5"/></svg>'
+    }
+  };
+  var BROKEN_GLYPH =
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false">' +
+    '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 16l5-4 4 3 3-3 6 5"/>' +
+    '<path d="M8.5 9.5h.01"/></svg>';
+
+  // `tall`, `wide` or `normal`, and null when the shape is not known.
+  function tileFit(width, height) {
+    if (!width || !height) return null;
+    var ratio = width / height;
+    if (ratio < TALL_BELOW) return 'tall';
+    if (ratio > WIDE_ABOVE) return 'wide';
+    return 'normal';
+  }
+
+  function badgeFor(tile, fit) {
+    var badge = tile.querySelector('.tile-badge');
+    if (fit !== 'tall' && fit !== 'wide') {
+      if (badge) badge.parentNode.removeChild(badge);
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'tile-badge';
+      badge.setAttribute('aria-hidden', 'true');
+      tile.appendChild(badge);
+    }
+    badge.innerHTML = TILE_BADGE[fit].glyph;
+    badge.title = TILE_BADGE[fit].title;
+  }
+
+  function markBroken(tile) {
+    tile.classList.remove('loading');
+    tile.classList.add('broken');
+    var badge = tile.querySelector('.tile-badge');
+    if (badge) badge.parentNode.removeChild(badge);
+    var image = tile.querySelector('img');
+    if (image) image.parentNode.removeChild(image);
+    if (tile.querySelector('.tile-broken')) return;
+    var broken = document.createElement('span');
+    broken.className = 'tile-broken';
+    broken.innerHTML =
+      BROKEN_GLYPH +
+      '<span class="tile-broken-name"></span>' +
+      '<span class="tile-broken-note">Unavailable</span>';
+    // The name is a user's file name: set as text, never as markup.
+    broken.querySelector('.tile-broken-name').textContent = String(
+      tile.dataset.path || ''
+    )
+      .split('/')
+      .pop();
+    tile.appendChild(broken);
+  }
+
+  function fitTile(tile) {
+    var image = tile.querySelector('img');
+    if (!image) return;
+    if (!image.complete) return; // still on its way; the skeleton stays
+    if (!image.naturalWidth) {
+      markBroken(tile);
+      return;
+    }
+    tile.classList.remove('loading');
+    var fit = tileFit(image.naturalWidth, image.naturalHeight) || 'normal';
+    tile.dataset.w = String(image.naturalWidth);
+    tile.dataset.h = String(image.naturalHeight);
+    tile.dataset.fit = fit;
+    badgeFor(tile, fit);
+  }
+
+  // Every tile in `scope`, including the ones a later page appends. A tile is
+  // measured once, so the marker is a property on the image rather than an
+  // attribute the page would then serve.
+  function watchTiles(scope) {
+    var images = (scope || document).querySelectorAll('.tile[data-path] img');
+    Array.prototype.forEach.call(images, function (image) {
+      var tile = image.closest ? image.closest('.tile') : null;
+      if (!tile || image.dimagineWatched) return;
+      image.dimagineWatched = true;
+      if (image.complete) {
+        fitTile(tile);
+        return;
+      }
+      // A picture that has not arrived holds the grid's shape.
+      tile.classList.add('loading');
+      image.addEventListener('load', function () {
+        fitTile(tile);
+      });
+      image.addEventListener('error', function () {
+        markBroken(tile);
+      });
+    });
+  }
+
+  // The image page's stage takes the picture's shape as well (W34 #2).
+  function watchStage() {
+    var stage = document.querySelector('.image-stage');
+    if (!stage) return;
+    var image = stage.querySelector('img');
+    if (!image) return;
+    var shape = function () {
+      if (!image.naturalWidth) return;
+      var fit = tileFit(image.naturalWidth, image.naturalHeight);
+      if (fit) stage.dataset.fit = fit;
+    };
+    if (image.complete) shape();
+    else image.addEventListener('load', shape);
+  }
+
+  // An `![[embed]]` is a thumbnail with its caption beneath it. The renderer
+  // writes the link and the image; the alt text is the caption to show.
+  function captionEmbeds() {
+    var embeds = document.querySelectorAll('.note-body a > img');
+    Array.prototype.forEach.call(embeds, function (image) {
+      var link = image.parentNode;
+      var alt = image.getAttribute('alt') || '';
+      if (!alt || link.querySelector('.note-embed-caption')) return;
+      var caption = document.createElement('span');
+      caption.className = 'note-embed-caption';
+      caption.textContent = alt;
+      link.appendChild(caption);
+    });
+  }
+
+  watchTiles(null);
+  watchStage();
+  captionEmbeds();
 
   /* ------------------------------------------------------- recent views */
 
