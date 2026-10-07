@@ -20,7 +20,8 @@
 //   }
 //
 // Exit codes: 0 every shot written and every check passed; 1 a shot failed or
-// a check found horizontal overflow; 2 usage error.
+// a check found horizontal overflow; 2 usage error; 130/143/129 the process
+// was killed by SIGINT/SIGTERM/SIGHUP after Chrome was torn down.
 
 import { spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -41,6 +42,8 @@ if (!chromeBin || !jobs.length) {
 }
 
 const profile = mkdtempSync(join(tmpdir(), 'dimagine-capture-'));
+// No `detached: true`: Chrome stays in node's process group so it dies
+// with node wherever the platform propagates signals to the group.
 const chrome = spawn(
   chromeBin,
   [
@@ -56,6 +59,8 @@ const chrome = spawn(
   ],
   { stdio: ['ignore', 'ignore', 'pipe'] }
 );
+// The pid and profile let callers record which Chrome to expect.
+console.error(`capture: chrome pid ${chrome.pid} profile ${profile}`);
 
 let stderr = '';
 chrome.stderr.on('data', (chunk) => {
@@ -73,6 +78,23 @@ function stopChrome() {
   } catch {
     // best effort
   }
+}
+
+// A node process killed by a signal (a timeout, Ctrl-C, a closed tmux
+// pane) would otherwise leave Chrome running with no parent to clean it
+// up, so every terminating signal tears Chrome and its profile down
+// first and exits with the conventional 128+signal code.
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 };
+let signalShutdown = false;
+for (const [signal, exitCode] of Object.entries(SIGNAL_EXIT_CODES)) {
+  process.on(signal, () => {
+    if (signalShutdown) {
+      return;
+    }
+    signalShutdown = true;
+    stopChrome();
+    process.exit(exitCode);
+  });
 }
 
 async function browserPort() {

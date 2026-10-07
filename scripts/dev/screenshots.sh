@@ -107,9 +107,22 @@ TEMP_DIR=""
 DATA_DIR=""
 SERVER_PID=""
 AUTH_SERVER_PID=""
+CAPTURE_PID=""
+JOBS_FILE=""
 
 cleanup() {
     local exit_code=$?
+    # capture.mjs owns the Chrome process: stop it first so its
+    # own signal handling tears Chrome and its profile down.
+    if [ -n "$CAPTURE_PID" ]; then
+        kill "$CAPTURE_PID" 2>/dev/null || true
+        wait "$CAPTURE_PID" 2>/dev/null || true
+        CAPTURE_PID=""
+    fi
+    if [ -n "$JOBS_FILE" ]; then
+        rm -f "$JOBS_FILE"
+        JOBS_FILE=""
+    fi
     if [ -n "$SERVER_PID" ]; then
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
@@ -239,7 +252,10 @@ declare -a AUTH_ROUTES=(
     "/login|login"
 )
 
-JOBS_FILE="$(mktemp "${TMPDIR:-/tmp}/dimagine-jobs-XXXXXX.json")"
+# The X's must end the template: BSD mktemp (macOS) only
+# randomizes trailing X's, so a ".json" suffix would make every
+# run reuse one literal filename and collide.
+JOBS_FILE="$(mktemp "${TMPDIR:-/tmp}/dimagine-jobs-XXXXXX")"
 JOBS_FIRST=1
 
 begin_jobs() {
@@ -294,7 +310,14 @@ shoot_routes() {
         done
     done
     end_jobs
-    node "$SCRIPT_DIR/capture.mjs" "$JOBS_FILE"
+    # Record capture.mjs's exact PID so the cleanup trap can stop
+    # it on any exit path; capture.mjs then kills its own Chrome.
+    node "$SCRIPT_DIR/capture.mjs" "$JOBS_FILE" &
+    CAPTURE_PID=$!
+    local capture_status=0
+    wait "$CAPTURE_PID" || capture_status=$?
+    CAPTURE_PID=""
+    return "$capture_status"
 }
 
 shoot_routes "$BASE_URL" "${LIBRARY_ROUTES[@]}"

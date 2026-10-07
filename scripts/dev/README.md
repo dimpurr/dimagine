@@ -101,3 +101,9 @@ Files are named `<width>-<theme>-<slug>.png` (3 widths × 2 themes × 8 routes =
 - `390-light-library.png`
 - `834-dark-folders.png`
 - `1440-light-setup.png`
+
+---
+
+## 3. Browsers
+
+Capture screenshots only through `screenshots.sh` / `capture.mjs`: they start Chrome, record its PID, and kill it on every exit path — normal exit, thrown error, and SIGINT/SIGTERM/SIGHUP. Any other headless browser must record its PID at launch and kill that exact PID in a trap/finally on every exit path; never kill browsers by name or command-line pattern.
