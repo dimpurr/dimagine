@@ -498,26 +498,69 @@ fn is_all(params: &ViewParams) -> bool {
 }
 
 /// The folder rows, nested by path depth so the tree reads as a tree.
+///
+/// Every row carries its own path and its parent's, which is all the client
+/// script needs to collapse and expand nodes; the disclosure triangle is a
+/// real `<button>` outside the row link, so both the row and the toggle are
+/// keyboard stops. Without the script the whole tree is simply shown: the
+/// stylesheet hides the triangles until `html.js` is present.
+///
+/// The full path rides in `title` and in a styled tooltip span, because a
+/// truncating label must always have a way to be read whole (W34 audit #6,
+/// DESIGN.md §4.1).
 fn folder_tree(
     folders: &[crate::index_sync::SidebarFolder],
     params: &ViewParams,
     active: &str,
 ) -> String {
-    let mut rows = Vec::new();
+    let parents: std::collections::HashSet<&str> = folders
+        .iter()
+        .filter_map(|folder| folder.path.rsplit_once('/').map(|(parent, _)| parent))
+        .collect();
+    let mut out = String::from("<div class=\"sidebar-tree\">");
     for folder in folders {
         let depth = folder.path.matches('/').count();
+        let parent = folder.path.rsplit_once('/').map_or("", |(head, _)| head);
+        let label = leaf_name(&folder.path);
         let current = folder.path == active;
-        rows.push(format!(
-            "<a class=\"sidebar-row folder-row depth-{depth}{active}\" href=\"/?in={path}{carry}\">\
-             <span class=\"sidebar-row-label\">{label}</span><span class=\"sidebar-row-count\">{count}</span></a>",
+        let has_children = parents.contains(folder.path.as_str());
+        let open_by_default = depth == 0;
+        out.push_str(&format!(
+            "<div class=\"folder-node depth-{depth}\">{triangle}\
+             <a class=\"sidebar-row folder-row{active}\" \
+             data-folder=\"{raw}\" data-parent=\"{raw_parent}\" href=\"/?in={path}{carry}\" \
+             title=\"{full}\"><span class=\"sidebar-row-label\">{label}</span>\
+             <span class=\"sidebar-row-count\">{count}</span>\
+             <span class=\"sidebar-tip\" aria-hidden=\"true\">{full}</span></a></div>",
+            triangle = if has_children {
+                format!(
+                    "<button type=\"button\" class=\"tree-triangle\" data-folder=\"{raw}\" \
+                     aria-expanded=\"{expanded}\" aria-label=\"{verb} {label}\">\
+                     <span class=\"tree-tri\"></span></button>",
+                    raw = escape_html(&folder.path),
+                    expanded = open_by_default,
+                    verb = if open_by_default {
+                        "Collapse"
+                    } else {
+                        "Expand"
+                    },
+                    label = escape_html(&label),
+                )
+            } else {
+                String::new()
+            },
             active = if current { " active" } else { "" },
+            raw = escape_html(&folder.path),
+            raw_parent = escape_html(parent),
             path = escape_html(&query_value(&folder.path)),
             carry = carry_params(params),
-            label = escape_html(&leaf_name(&folder.path)),
+            full = escape_html(&folder.path),
+            label = escape_html(&label),
             count = folder.count,
         ));
     }
-    rows.join("")
+    out.push_str("</div>");
+    out
 }
 
 /// The parameters a sidebar link carries along: everything except the lens the
@@ -542,8 +585,10 @@ fn carry_params(params: &ViewParams) -> String {
 
 fn sidebar_row(href: &str, label: &str, count: u64, active: bool) -> String {
     format!(
-        "<a class=\"sidebar-row{active}\" href=\"{href}\"><span class=\"sidebar-row-label\">{label}</span>\
-         <span class=\"sidebar-row-count\">{count}</span></a>",
+        "<a class=\"sidebar-row{active}\" href=\"{href}\" title=\"{label}\">\
+         <span class=\"sidebar-row-label\">{label}</span>\
+         <span class=\"sidebar-row-count\">{count}</span>\
+         <span class=\"sidebar-tip\" aria-hidden=\"true\">{label}</span></a>",
         active = if active { " active" } else { "" },
         href = escape_html(href),
         label = escape_html(label),
@@ -769,8 +814,56 @@ mod tests {
     #[test]
     fn the_sidebar_marks_the_folder_it_is_inside() {
         let html = sidebar_sections(&sidebar(), &ViewParams::default(), Some("refs/ui"));
-        assert!(html.contains("class=\"sidebar-row folder-row depth-1 active\""));
-        assert!(html.contains("depth-0"));
+        assert!(html.contains("class=\"sidebar-row folder-row active\""));
+        assert!(html.contains("folder-node depth-0"));
+        assert!(html.contains("folder-node depth-1"));
+    }
+
+    /// W34 audit #4: the tree must be collapsible, so every row carries its
+    /// place in the tree and every branch carries a keyboard-reachable toggle.
+    #[test]
+    fn folder_rows_name_their_node_and_parent_and_branches_get_a_triangle() {
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None);
+        assert!(
+            html.contains("data-folder=\"refs\" data-parent=\"\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("data-folder=\"refs/ui\" data-parent=\"refs\""),
+            "{html}"
+        );
+        // "refs" has a child: it gets the disclosure button; "refs/ui" does not.
+        assert_eq!(html.matches("class=\"tree-triangle\"").count(), 1, "{html}");
+        assert!(
+            html.contains("aria-expanded=\"true\" aria-label=\"Collapse refs\""),
+            "the top level opens by default: {html}"
+        );
+    }
+
+    #[test]
+    fn a_deeper_branch_starts_collapsed() {
+        let mut data = sidebar();
+        data.folders.push(crate::index_sync::SidebarFolder {
+            path: "refs/ui/icons".into(),
+            count: 4,
+        });
+        let html = sidebar_sections(&data, &ViewParams::default(), None);
+        assert!(
+            html.contains("aria-expanded=\"false\" aria-label=\"Expand ui\""),
+            "{html}"
+        );
+    }
+
+    /// W34 audit #6: a label that can truncate always has its full string in
+    /// `title` and in the styled tooltip the script reveals.
+    #[test]
+    fn sidebar_rows_carry_their_full_name_for_the_tooltip() {
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None);
+        assert!(html.contains("title=\"refs/ui\""), "{html}");
+        assert!(
+            html.contains("<span class=\"sidebar-tip\" aria-hidden=\"true\">Recent"),
+            "{html}"
+        );
     }
 
     #[test]

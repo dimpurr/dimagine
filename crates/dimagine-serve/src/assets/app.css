@@ -1222,3 +1222,271 @@ a.tile:hover {
     display: none;
   }
 }
+
+/* === sidebar (W42) ============================================ */
+/* W42 styling batch — W34 audit #4/#5/#6/#10, DESIGN.md §2–§4.2:
+   the translucent, resizable sidebar with a collapsible folder tree,
+   section headers on scale, and truncated rows whose full name is always
+   reachable. One block, appended last, so parallel batches merge cleanly
+   and its rules win over the earlier sidebar section they re-style.
+   Light and dark are both defined here; nothing animates that
+   prefers-reduced-motion has not already stopped. */
+
+/* The tokens this block needs, by their DESIGN.md names (values verbatim).
+   Elevation and motion tokens are theme-independent. */
+:root {
+  --separator: rgba(0, 0, 0, 0.09);
+  --material-sidebar: rgba(246, 247, 250, 0.72);
+  --elev-1: 0 1px 2px rgba(0, 0, 0, 0.06), 0 8px 24px rgba(0, 0, 0, 0.1);
+  --dur-fast: 120ms;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  /* DESIGN.md §3: default 248, min 200, max 360 — the script clamps to
+     these and remembers the choice per device. */
+  --sidebar-w: 248px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --separator: rgba(255, 255, 255, 0.1);
+    --material-sidebar: rgba(32, 35, 42, 0.72);
+  }
+}
+
+/* The sidebar as a material (§2.5): translucent fill, saturating blur,
+   hairline on the edge facing content. */
+.desktop-sidebar {
+  position: sticky; /* the resizer and the sticky headers both need it */
+  padding: 8px;
+  background: var(--material-sidebar);
+  border-right: 1px solid var(--separator);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  backdrop-filter: saturate(180%) blur(20px);
+}
+
+/* Solid fallbacks (§2.5): reduced transparency, no backdrop-filter support,
+   and more-contrast all put the material down for a solid surface. The
+   layout is correct with the material off — nothing here is sized by it. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .desktop-sidebar {
+    background: var(--surface);
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .desktop-sidebar {
+    background: var(--surface);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-contrast: more) {
+  .desktop-sidebar {
+    background: var(--surface);
+    border-right-color: var(--border);
+  }
+}
+
+/* Section headers (§4.2): 11px uppercase at weight 500, secondary ink,
+   24px tall, --space-5 (12px) of air above. */
+.sidebar-section-title {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  margin: 12px 0 2px;
+  padding: 6px 8px 2px;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.sidebar-brand + .sidebar-section .sidebar-section-title,
+.sidebar-section:first-of-type .sidebar-section-title {
+  margin-top: 4px;
+}
+
+.sidebar-section {
+  margin-bottom: 0;
+}
+
+/* Sidebar rows (§4.1): 13px on 28px rows for pointers, 44px for touch,
+   pressed feedback, and the selected weight at 500, not 600. */
+.sidebar-row {
+  position: relative;
+  min-height: 28px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+  transition: transform var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+
+.sidebar-row:active {
+  transform: scale(0.98);
+}
+
+.sidebar-row.active {
+  font-weight: 500;
+}
+
+.sidebar-row-label {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+@media (pointer: coarse) {
+  .desktop-sidebar .sidebar-row {
+    min-height: 44px;
+  }
+}
+
+/* The folder tree (§4.1): every row reserves a 16px lane at the front of
+   its depth indent for the disclosure triangle, so leaf rows and branch
+   rows at the same depth align, the triangle sits at `depth × 14px`, and
+   a parent's row is never pushed right of its own children (indent =
+   depth × 14px on the row itself, plus the lane — never in flow, or the
+   ladder inverts). Without the script the whole tree is shown with the
+   original pre-W42 indent and the triangles do not exist on screen. */
+.folder-node {
+  position: relative;
+  min-width: 0;
+  margin-left: calc(var(--depth, 0) * 14px);
+}
+
+html.js .folder-node {
+  margin-left: calc(var(--depth, 0) * 14px + 16px);
+}
+
+.folder-node[hidden] {
+  display: none;
+}
+
+.sidebar-tree .sidebar-row.folder-row {
+  padding-left: 8px;
+}
+
+.tree-triangle {
+  display: none;
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* The node already carries the depth indent plus the 16px lane, so the
+     lane is exactly one step back and needs no depth arithmetic. */
+  left: -16px;
+  width: 16px;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  background: none;
+  border: 0;
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+html.js .tree-triangle {
+  display: inline-flex;
+}
+
+.tree-tri {
+  width: 0;
+  height: 0;
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  border-left: 4px solid currentColor;
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.tree-triangle[aria-expanded="true"] .tree-tri {
+  transform: rotate(90deg);
+}
+
+.tree-triangle:hover {
+  color: var(--text);
+  background: var(--surface-alt);
+}
+
+/* The drag edge (§5 decision 2): a 6px hit area on the inner edge,
+   invisible until hover, drag or keyboard focus, when a 1px hairline
+   turns accent. No persistent handle. */
+.sidebar-resizer {
+  display: none;
+}
+
+@media (min-width: 1200px) {
+  .sidebar-resizer {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: calc(var(--sidebar-w) - 3px);
+    z-index: 25;
+    display: block;
+    width: 6px;
+    cursor: col-resize;
+    background: transparent;
+  }
+
+  .sidebar-resizer::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 2px;
+    width: 1px;
+    background: transparent;
+    transition: background var(--dur-fast) var(--ease-out);
+  }
+
+  .sidebar-resizer:hover::after,
+  .sidebar-resizer:focus-visible::after,
+  .sidebar-resizer.dragging::after {
+    background: var(--accent);
+  }
+}
+
+/* The styled tooltip for truncated rows (§4.1): the full string rides in
+   the native `title` always, and this surface fades in above the row —
+   like the tile — on hover or focus of a row the script measured as
+   truncated (400ms delay, instant once one is already open). Solid
+   `--surface` — never a second translucent surface stacked on the
+   sidebar (§2.5). */
+.sidebar-tip {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 8px;
+  z-index: 30;
+  /* Capped to the row so the sidebar's scrollport never clips the bubble;
+     longer paths wrap (overflow-wrap below) instead. */
+  max-width: min(280px, calc(100% - 8px));
+  padding: 4px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--elev-1);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1.35;
+  text-transform: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.sidebar-tip.shown {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .sidebar-tip {
+    display: none;
+  }
+}

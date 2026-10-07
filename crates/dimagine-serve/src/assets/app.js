@@ -445,3 +445,213 @@
     }
   })();
 })();
+
+/* === SIDEBAR (W42) =========================================== */
+/* W42 styling batch (W34 audit #4/#5/#6): the collapsible folder tree,
+   the resizable sidebar width, and the styled tooltip on truncated rows.
+   All of it is enhancement — without this file the full tree is shown,
+   the sidebar keeps its default width, and `title` still carries every
+   long name. Kept as its own section so parallel batches merge cleanly. */
+
+(function () {
+  'use strict';
+
+  var TREE_KEY = 'dimagine.folder-tree';
+  var WIDTH_KEY = 'dimagine.sidebar-w';
+  var WIDTH_MIN = 200;
+  var WIDTH_MAX = 360;
+  var WIDTH_DEFAULT = 248;
+  var TIP_DELAY = 400;
+
+  var sidebar = document.querySelector('.desktop-sidebar');
+
+  function readStored(key) {
+    try {
+      return window.localStorage.getItem(key);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function writeStored(key, value) {
+    try {
+      window.localStorage.setItem(key, value);
+    } catch (error) {
+      // Storage is optional; the choice simply does not persist.
+    }
+  }
+
+  /* -------------------------------------------------- folder tree */
+
+  var tree = sidebar ? sidebar.querySelector('.sidebar-tree') : null;
+  if (tree) {
+    var parentOf = {};
+    var open;
+    try {
+      open = JSON.parse(readStored(TREE_KEY) || '{}');
+    } catch (error) {
+      open = {};
+    }
+    if (!open || typeof open !== 'object') open = {};
+
+    Array.prototype.forEach.call(tree.querySelectorAll('.folder-row'), function (row) {
+      parentOf[row.dataset.folder] = row.dataset.parent || '';
+    });
+
+    // Top level expanded, deeper levels collapsed, unless the device
+    // remembers a choice.
+    function isOpen(folder) {
+      if (Object.prototype.hasOwnProperty.call(open, folder)) return !!open[folder];
+      return !parentOf[folder];
+    }
+
+    // The selected folder is never hidden behind a remembered closed
+    // ancestor — force the trail open for this view (not persisted until
+    // the next toggle writes the map).
+    var activeRow = tree.querySelector('.folder-row.active');
+    if (activeRow) {
+      var ancestor = parentOf[activeRow.dataset.folder];
+      while (ancestor) {
+        open[ancestor] = true;
+        ancestor = parentOf[ancestor];
+      }
+    }
+
+    function applyTree() {
+      Array.prototype.forEach.call(tree.querySelectorAll('.folder-row'), function (row) {
+        var hidden = false;
+        var parent = parentOf[row.dataset.folder];
+        while (parent) {
+          if (!isOpen(parent)) {
+            hidden = true;
+            break;
+          }
+          parent = parentOf[parent];
+        }
+        row.parentNode.hidden = hidden;
+      });
+      Array.prototype.forEach.call(tree.querySelectorAll('.tree-triangle'), function (button) {
+        var expanded = isOpen(button.dataset.folder);
+        button.setAttribute('aria-expanded', String(expanded));
+        button.setAttribute(
+          'aria-label',
+          (expanded ? 'Collapse ' : 'Expand ') + button.dataset.folder.split('/').pop()
+        );
+      });
+    }
+
+    tree.addEventListener('click', function (event) {
+      var button = event.target.closest ? event.target.closest('.tree-triangle') : null;
+      if (!button) return;
+      event.preventDefault();
+      var folder = button.dataset.folder;
+      open[folder] = !isOpen(folder);
+      writeStored(TREE_KEY, JSON.stringify(open));
+      applyTree();
+    });
+
+    applyTree();
+  }
+
+  /* -------------------------------------------------- width resizing */
+
+  if (sidebar) {
+    var resizer = document.createElement('div');
+    var dragging = false;
+
+    function setWidth(w, persist) {
+      var value = Math.min(WIDTH_MAX, Math.max(WIDTH_MIN, Math.round(w)));
+      document.documentElement.style.setProperty('--sidebar-w', value + 'px');
+      resizer.setAttribute('aria-valuenow', String(value));
+      if (persist) writeStored(WIDTH_KEY, String(value));
+    }
+
+    resizer.className = 'sidebar-resizer';
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.setAttribute('aria-label', 'Resize sidebar');
+    resizer.setAttribute('aria-valuemin', String(WIDTH_MIN));
+    resizer.setAttribute('aria-valuemax', String(WIDTH_MAX));
+    resizer.tabIndex = 0;
+    document.body.appendChild(resizer);
+
+    var remembered = parseInt(readStored(WIDTH_KEY) || '', 10);
+    setWidth(isNaN(remembered) ? sidebar.getBoundingClientRect().width : remembered, false);
+
+    resizer.addEventListener('pointerdown', function (event) {
+      dragging = true;
+      resizer.classList.add('dragging');
+      resizer.setPointerCapture(event.pointerId);
+      event.preventDefault();
+    });
+    resizer.addEventListener('pointermove', function (event) {
+      if (!dragging) return;
+      // The sidebar sits flush with the left edge, so the pointer's x is
+      // the width — no measurement, no reflow per move.
+      setWidth(event.clientX, false);
+    });
+    function endDrag() {
+      if (!dragging) return;
+      dragging = false;
+      resizer.classList.remove('dragging');
+      setWidth(sidebar.getBoundingClientRect().width, true);
+    }
+    resizer.addEventListener('pointerup', endDrag);
+    resizer.addEventListener('pointercancel', endDrag);
+    resizer.addEventListener('dblclick', function () {
+      setWidth(WIDTH_DEFAULT, true);
+    });
+    resizer.addEventListener('keydown', function (event) {
+      var current = sidebar.getBoundingClientRect().width;
+      if (event.key === 'ArrowLeft') setWidth(current - 8, true);
+      else if (event.key === 'ArrowRight') setWidth(current + 8, true);
+      else if (event.key === 'Home') setWidth(WIDTH_DEFAULT, true);
+      else return;
+      event.preventDefault();
+    });
+  }
+
+  /* -------------------------------------------------- row tooltips */
+
+  // The server gives every row its full name in `title`; this adds the
+  // styled tooltip for the rows that actually truncate — 400ms after
+  // hover starts, instant on keyboard focus, and instant once another
+  // tooltip is already open (DESIGN.md §4.1).
+  Array.prototype.forEach.call(
+    document.querySelectorAll('.desktop-sidebar .sidebar-row'),
+    function (row) {
+      var label = row.querySelector('.sidebar-row-label');
+      var tip = row.querySelector('.sidebar-tip');
+      if (!label || !tip || label.scrollWidth <= label.clientWidth) return;
+      var timer = null;
+
+      function show() {
+        timer = null;
+        tip.classList.add('shown');
+      }
+
+      function enter(instant) {
+        if (timer || tip.classList.contains('shown')) return;
+        if (instant || document.querySelector('.sidebar-tip.shown')) show();
+        else timer = window.setTimeout(show, TIP_DELAY);
+      }
+
+      function leave() {
+        if (timer) {
+          window.clearTimeout(timer);
+          timer = null;
+        }
+        tip.classList.remove('shown');
+      }
+
+      row.addEventListener('mouseenter', function () {
+        enter(false);
+      });
+      row.addEventListener('mouseleave', leave);
+      row.addEventListener('focusin', function () {
+        enter(true);
+      });
+      row.addEventListener('focusout', leave);
+    }
+  );
+})();
