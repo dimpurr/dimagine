@@ -7,6 +7,19 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer (Phase 2a): `/?c=<note>` is the collection page. A collection is a
+  note that embeds images (FORMAT §5), so the view renders as the note's own
+  page: a header naming it, the note's own text (its body without the member
+  rows the grid lists — the embeds and the caption lines directly after them
+  — rendered by the Markdown sanitiser every rendered note goes through), the
+  number of items the page lists, and an "Open note" link to the note's
+  source. The members follow in the order the note embeds them, each with the
+  caption line its embed gave it, and a duplicate embed shows once, at its
+  first position. Narrowings beside the collection (`tag`, `q`, `in`,
+  `untagged`, `recent`) pick which members show, in the note's order.
+- Viewer: `/raw/<path>` serves a note as its source view — the bytes as
+  written, `text/plain`, never a content type a browser could interpret as a
+  page of the viewer's origin. Images on `/raw` are unchanged.
 - Viewer Phase 1: the library is the home. `/` shows every image with the
   scope in the query string (`in`, `sub`, `c`, `tag`, `q`, `sort`, `dir`,
   `size`, `p`, and the `untagged` and `recent` lenses), and `/folders`,
@@ -88,6 +101,13 @@ All notable changes to this project are documented here. The format follows
   documentation index.
 
 ### Changed
+- Viewer: a collection view states its order instead of offering one it does
+  not keep ("Note order", the counterpart of the Recent lens's arrow — a
+  collection is ordered by the embeds in its note, FORMAT §5), and a `sort`
+  in a collection URL says it was ignored rather than looking like it
+  decided something. A narrowed view that is also a collection is named by
+  the collection, not by the folder that merely narrows it; its empty state
+  blames the filters beside it when they matched none of the members.
 - Viewer: "Recent" is the 200 most recently added images, however old they
   are — labelled "Recent — last 200 added" — instead of a fixed 30-day
   window that covered 95% of a library imported inside it. The sidebar row,

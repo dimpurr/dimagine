@@ -74,6 +74,30 @@ pub struct CollectionMember {
     pub caption: String,
 }
 
+/// A collection as the collection page renders it (FORMAT §5): the same
+/// members, order and diagnostics the JSON listing answers with, plus the
+/// note's own text.
+///
+/// FORMAT §5 makes the note the collection: the embeds are the members, in
+/// order, and "a line directly after an embed is that member's note" — the
+/// caption belongs to the member, which the grid beside the text shows with
+/// it. What belongs to the note itself is everything else: its prose, its
+/// headings, and the embeds that resolved to nothing, which stay because
+/// FORMAT §5.1 keeps the line and the diagnostics report it. This is exactly
+/// that remainder — the member embeds' lines and the caption lines that
+/// follow them are taken out of the body — rendered by the sanitiser the
+/// image page already uses, its links resolved against the library, so a
+/// wikilink resolves, hostile markup stays text, and an empty string means
+/// the note has no text of its own.
+#[derive(Clone, Debug)]
+pub struct CollectionPage {
+    /// The collection as [`Catalog::collection`] reports it.
+    pub collection: Collection,
+    /// The note's own text rendered to safe HTML, or an empty string when
+    /// the note is only embeds and captions.
+    pub own_text_html: String,
+}
+
 /// Parsed image note details.
 #[derive(Clone, Debug, Serialize)]
 pub struct ImageDetail {
@@ -107,6 +131,9 @@ pub trait Catalog: Send + Sync + 'static {
     fn list_collections(&self, folder: &str) -> Result<Vec<Collection>, CatalogError>;
     /// Return a collection by note path.
     fn collection(&self, path: &str) -> Result<Collection, CatalogError>;
+    /// Return a collection as the collection page renders it: the listing
+    /// plus the note's own text as safe HTML (FORMAT §5).
+    fn collection_page(&self, path: &str) -> Result<CollectionPage, CatalogError>;
     /// Return image detail by image path.
     fn image_detail(&self, path: &str) -> Result<ImageDetail, CatalogError>;
     /// Resolve and validate a path beneath the library root.
@@ -204,7 +231,7 @@ impl FsCatalog {
             let text = fs::read_to_string(self.root.join(&entry.path))
                 .map_err(|_| CatalogError::Unreadable)?;
             let parsed = parse_note(&text);
-            let (members, diagnostics) =
+            let (members, diagnostics, _) =
                 collect_collection(&self.resolver, &self.library.files, entry, &parsed, &text);
             if !is_collection(
                 entry.class == FileClass::ImageNote,
@@ -225,6 +252,61 @@ impl FsCatalog {
         }
         items.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(items)
+    }
+
+    /// Read one note and decide what it collects: the collection the
+    /// listing reports, the 1-based file line of each member's embed, and
+    /// the note's body as written. Everything that asks a note for its
+    /// members shares this one read, so the listing and the collection page
+    /// can never disagree about a note or about its order.
+    fn collection_note(
+        &self,
+        path: &str,
+    ) -> Result<(Collection, Vec<usize>, ParsedNote), CatalogError> {
+        let safe = self.resolve_path(path)?;
+        if !safe.is_file() {
+            return Err(CatalogError::NotFound);
+        }
+        let native_name = safe.file_name().unwrap_or_default().to_os_string();
+        let name = native_name.to_string_lossy().into_owned();
+        let class = dimagine_core::library::classify(&name);
+        if !matches!(class, FileClass::Note | FileClass::ImageNote) {
+            return Err(CatalogError::NotFound);
+        }
+        let rel = safe
+            .strip_prefix(&self.root)
+            .map_err(|_| CatalogError::Forbidden)?
+            .to_path_buf();
+        let text = fs::read_to_string(&safe).map_err(|_| CatalogError::Unreadable)?;
+        let parsed = parse_note(&text);
+        let note = FileEntry {
+            rel: rel.to_string_lossy().into_owned(),
+            name: name.clone(),
+            path: rel,
+            native_name,
+            class,
+        };
+        let (members, diagnostics, member_lines) =
+            collect_collection(&self.resolver, &self.library.files, &note, &parsed, &text);
+        if !is_collection(
+            class == FileClass::ImageNote,
+            &parsed,
+            &members,
+            &diagnostics,
+        ) {
+            return Err(CatalogError::NotFound);
+        }
+        Ok((
+            Collection {
+                path: path.to_owned(),
+                title: yaml_string(&parsed.properties, "title")
+                    .unwrap_or_else(|| name.trim_end_matches(".md").to_string()),
+                members,
+                diagnostics,
+            },
+            member_lines,
+            parsed,
+        ))
     }
 
     /// The note body rendered to safe HTML, its wikilinks and
@@ -281,45 +363,20 @@ impl Catalog for FsCatalog {
     }
 
     fn collection(&self, path: &str) -> Result<Collection, CatalogError> {
-        let safe = self.resolve_path(path)?;
-        if !safe.is_file() {
-            return Err(CatalogError::NotFound);
-        }
-        let native_name = safe.file_name().unwrap_or_default().to_os_string();
-        let name = native_name.to_string_lossy().into_owned();
-        let class = dimagine_core::library::classify(&name);
-        if !matches!(class, FileClass::Note | FileClass::ImageNote) {
-            return Err(CatalogError::NotFound);
-        }
-        let rel = safe
-            .strip_prefix(&self.root)
-            .map_err(|_| CatalogError::Forbidden)?
-            .to_path_buf();
-        let text = fs::read_to_string(&safe).map_err(|_| CatalogError::Unreadable)?;
-        let parsed = parse_note(&text);
-        let note = FileEntry {
-            rel: rel.to_string_lossy().into_owned(),
-            name: name.clone(),
-            path: rel,
-            native_name,
-            class,
-        };
-        let (members, diagnostics) =
-            collect_collection(&self.resolver, &self.library.files, &note, &parsed, &text);
-        if !is_collection(
-            class == FileClass::ImageNote,
-            &parsed,
-            &members,
-            &diagnostics,
-        ) {
-            return Err(CatalogError::NotFound);
-        }
-        Ok(Collection {
-            path: path.to_owned(),
-            title: yaml_string(&parsed.properties, "title")
-                .unwrap_or_else(|| name.trim_end_matches(".md").to_string()),
-            members,
-            diagnostics,
+        Ok(self.collection_note(path)?.0)
+    }
+
+    fn collection_page(&self, path: &str) -> Result<CollectionPage, CatalogError> {
+        let (collection, member_lines, parsed) = self.collection_note(path)?;
+        let own_text_markdown = own_text_markdown(
+            &parsed.body,
+            parsed.body_line,
+            &collection.members,
+            &member_lines,
+        );
+        Ok(CollectionPage {
+            collection,
+            own_text_html: self.render_note_body(path, &own_text_markdown),
         })
     }
 
@@ -758,17 +815,25 @@ fn is_collection(
     })
 }
 
+/// The members a note collects, the embeds it could not resolve, and the
+/// 1-based file line of each member's embed.
+///
+/// The lines are what the note's own text is not ([`own_text_markdown`]):
+/// the page that lists the members beside the note's text takes both rows
+/// out of it. Every member's line is returned in the same order as the
+/// member, so `members[i]` embeds at `lines[i]`.
 fn collect_collection(
     resolver: &Resolver,
     files: &[FileEntry],
     note: &FileEntry,
     parsed: &ParsedNote,
     text: &str,
-) -> (Vec<CollectionMember>, Vec<CollectionDiagnostic>) {
+) -> (Vec<CollectionMember>, Vec<CollectionDiagnostic>, Vec<usize>) {
     let links = extract_markdown_links(&parsed.body, parsed.body_line);
     let lines: Vec<&str> = text.lines().collect();
     let mut members = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut member_lines = Vec::new();
     for link in links.iter().filter(|link| link.syntax.is_strong_image()) {
         match resolver.resolve(&link.target, note, link.syntax) {
             Outcome::Resolved(idx) if files[idx].class == FileClass::Image => {
@@ -780,6 +845,7 @@ fn collect_collection(
                     path: image.rel.clone(),
                     caption: caption_after(&lines, link.line),
                 });
+                member_lines.push(link.line);
             }
             Outcome::Ambiguous(hits) => diagnostics.push(CollectionDiagnostic {
                 target: link.target.clone(),
@@ -796,7 +862,7 @@ fn collect_collection(
             Outcome::NotImageTarget | Outcome::Resolved(_) => {}
         }
     }
-    (members, diagnostics)
+    (members, diagnostics, member_lines)
 }
 
 fn is_self_embed(note: &FileEntry, image: &FileEntry) -> bool {
@@ -815,6 +881,49 @@ fn caption_after(lines: &[&str], link_line: usize) -> String {
         return String::new();
     }
     next.to_string()
+}
+
+/// The lines a collection note keeps for itself, as Markdown (FORMAT §5).
+///
+/// [`collect_collection`] reports every embed that resolved to an image as a
+/// member, with the row it occupies in the note: the embed's line, and the
+/// caption line directly after it when it has one ("a line directly after an
+/// embed is that member's note"). Those two rows belong to the members, and
+/// the page lists the members with their captions — so the note's own text
+/// is its body without them: its prose, its headings, the note links, and
+/// the embeds that resolved to nothing, which stay in place because FORMAT
+/// §5.1 keeps the line while its diagnostic reports the failure.
+///
+/// `body_line` is the 1-based file line the body starts at, the same offset
+/// the link extractor was given, so a member's body-relative index is its
+/// file line minus it. A note without any text of its own — only embeds
+/// and captions — yields an empty string.
+fn own_text_markdown(
+    body: &str,
+    body_line: usize,
+    members: &[CollectionMember],
+    member_lines: &[usize],
+) -> String {
+    let member_rows: HashSet<usize> = members
+        .iter()
+        .zip(member_lines)
+        .flat_map(|(member, line)| {
+            // 0-based within the body: the embed's own row, and the caption
+            // row that `caption_after` took for it.
+            let embed = line.saturating_sub(body_line);
+            if member.caption.is_empty() {
+                vec![embed]
+            } else {
+                vec![embed, embed + 1]
+            }
+        })
+        .collect();
+    body.lines()
+        .enumerate()
+        .filter(|(index, _)| !member_rows.contains(index))
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Link resolution for one note body (FORMAT §5.1).

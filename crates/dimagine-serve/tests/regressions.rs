@@ -3,8 +3,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use dimagine_serve::{
-    router, Catalog, CatalogError, Collection, FsCatalog, ImageDetail, ImageEntry, OriginalPreview,
-    ServeConfig, LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
+    router, Catalog, CatalogError, Collection, CollectionPage, FsCatalog, ImageDetail, ImageEntry,
+    OriginalPreview, ServeConfig, LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
 };
 use std::{
     fs,
@@ -410,6 +410,9 @@ impl Catalog for SlowListingCatalog {
         Ok(Vec::new())
     }
     fn collection(&self, _path: &str) -> Result<Collection, CatalogError> {
+        Err(CatalogError::NotFound)
+    }
+    fn collection_page(&self, _path: &str) -> Result<CollectionPage, CatalogError> {
         Err(CatalogError::NotFound)
     }
     fn image_detail(&self, _path: &str) -> Result<ImageDetail, CatalogError> {

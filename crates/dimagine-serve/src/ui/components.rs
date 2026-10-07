@@ -225,14 +225,19 @@ pub fn result_count(total: u64) -> String {
 
 /// The sort menu, as a native `<select>` in a GET form so it works without JS.
 ///
+/// Two views have no order to choose, so they state the order in force
+/// instead of a menu whose picks the grid would ignore: a collection
+/// (note order, [`note_order_control`]) and the Recent lens (added order,
+/// [`recent_sort_control`], W37 review, Medium #1).
+///
 /// Only the parameters that are not the sort travel as hidden fields, so
 /// changing the sort keeps the scope and returns to page one.
-///
-/// The Recent lens never gets this menu: its order is not a choice, so it has
-/// [`recent_sort_control`] instead.
 pub fn sort_control(params: &ViewParams) -> String {
+    if params.collection.is_some() {
+        return note_order_control();
+    }
     if params.recent {
-        return recent_sort_control(params);
+        return recent_sort_control();
     }
     let mut out = String::from("<form class=\"sort-form\" method=\"get\" action=\"/\">");
     for (name, value) in [
@@ -256,12 +261,8 @@ pub fn sort_control(params: &ViewParams) -> String {
     if params.untagged {
         out.push_str("<input type=\"hidden\" name=\"untagged\" value=\"1\">");
     }
-    if let Some(collection) = &params.collection {
-        out.push_str(&format!(
-            "<input type=\"hidden\" name=\"c\" value=\"{}\">",
-            escape_html(&query_value(collection))
-        ));
-    }
+    // `c` needs no hidden field: a view over a collection never reaches this
+    // menu — it states the note's own order instead (`note_order_control`).
     if !params.recursive {
         out.push_str("<input type=\"hidden\" name=\"sub\" value=\"0\">");
     }
@@ -281,6 +282,27 @@ pub fn sort_control(params: &ViewParams) -> String {
     // Without JavaScript the control needs a button to submit the form.
     out.push_str("</select><button class=\"sort-submit\" type=\"submit\">Go</button></form>");
     out
+}
+
+/// The sort control over a collection, where there is no order to choose.
+///
+/// "Order of embeds is the order of the collection" (FORMAT §5), so every
+/// menu choice would be a promise the grid does not keep — the lie the
+/// Recent lens's menu told (W37 review, Medium #1). Like Recent, the control
+/// states the order in force: a focusable label (W39 review L1 — never a
+/// disabled control, which cannot be focused or announced), the whole
+/// sentence in `title` and `aria-label` (hover, focus, screen readers), and
+/// only the short words visible, keeping the toolbar's one row within a
+/// 390 px phone beside the count, the size segments and the theme switch
+/// (W39 review M1). "Note order" is the shortest honest name for the
+/// order of the embeds in the note.
+fn note_order_control() -> String {
+    let note = "A collection is ordered by the embeds in its note.";
+    format!(
+        "<span class=\"sort-form\">         <span class=\"search-hint note-order\" role=\"note\" \
+         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">Note order</span></span>",
+        note = escape_html(note),
+    )
 }
 
 /// The sort control on the Recent lens, where there is nothing to choose.
@@ -307,15 +329,10 @@ pub fn sort_control(params: &ViewParams) -> String {
 /// worded label and the hint it carried did (W39 review M1). The words are not
 /// gone, they are one hover or one Tab away.
 ///
-/// Over a collection it renders nothing at all. The grid keeps the collection's
-/// own member order (`ViewQuery::collection`), so there is no order of Recent's
-/// to state, and "newest first" would be false there (W39 review L3) — the
-/// wording is left out rather than shown as a lie, which is also what keeps the
-/// toolbar fitting on `/?c=<note>&recent=1`.
-fn recent_sort_control(params: &ViewParams) -> String {
-    if params.collection.is_some() {
-        return String::new();
-    }
+/// The one view that reaches it with a collection set narrows its members and
+/// keeps their note order, so the collection's own label ([`note_order_control`])
+/// states that order instead — `sort_control` visits it first.
+fn recent_sort_control() -> String {
     let note = format!("Recent is always the last {RECENT_LIMIT} added, newest first.");
     format!(
         "<span class=\"sort-form\"><span class=\"search-hint recent-order\" role=\"note\" \
@@ -444,6 +461,56 @@ pub fn grid(items: &[ViewItem], params: &ViewParams) -> String {
     )
 }
 
+/// One collection member as the collection page lists it: the image as the
+/// library grid shows it, plus the caption line its note gives it.
+pub struct CollectionTile {
+    /// Display data for the tile, joined from the index where it knows the
+    /// image; a member the index has never seen still shows, named by its
+    /// file.
+    pub item: ViewItem,
+    /// The line directly after the embed (FORMAT §5), as written; empty is
+    /// no caption, a distinct fact that is not invented here.
+    pub caption: String,
+}
+
+/// The collection page's grid: the library's tiles, each with the caption
+/// its note gives it shown under the picture — the same place the inspector
+/// renders a note's caption (DESIGN.md §4.6), not the hover overlay the
+/// tile's own name uses. A member without a caption line shows no caption.
+///
+/// The tile inside each item is exactly the library tile ([`tile`]): its
+/// prefix is the contract `tests/viewer.rs` parses, the inspector fills
+/// from its `data-path`, and the aspect script finds it.
+pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String {
+    format!(
+        "<section class=\"grid grid-collection size-{}\" data-total=\"{}\">{}</section>",
+        params.size.as_str(),
+        items.len(),
+        items
+            .iter()
+            .map(|member| {
+                let caption = if member.caption.is_empty() {
+                    String::new()
+                } else {
+                    // The caption is the note's own words: escaped for the
+                    // element and the tooltip, and truncating only after
+                    // the whole line stays readable one hover away
+                    // (DESIGN.md §4.1).
+                    format!(
+                        "<span class=\"member-caption\" title=\"{}\">{}</span>",
+                        escape_html(&member.caption),
+                        escape_html(&member.caption)
+                    )
+                };
+                format!(
+                    "<div class=\"grid-item\">{}{caption}</div>",
+                    tile(&member.item, params)
+                )
+            })
+            .collect::<String>()
+    )
+}
+
 /// "Load more": a link to the next page, which JS turns into a fetch-and-append.
 pub fn load_more(params: &ViewParams, total: u64) -> String {
     let next = u64::from(params.page) * u64::from(PAGE_SIZE);
@@ -465,7 +532,27 @@ pub fn load_more(params: &ViewParams, total: u64) -> String {
 /// nothing else is.
 pub fn empty_state(params: &ViewParams) -> String {
     let (title, sentence, action): (String, String, Option<(String, String)>) =
-        if let Some(folder) = &params.folder {
+        if let Some(collection) = &params.collection {
+            // A collection is the page (FORMAT §5); a filter beside it
+            // (folder, tags, words, a lens) only narrows which members show,
+            // so the empty sentence says which of the two found nothing —
+            // the same order `view_title` names the view in. The chip row
+            // and the action below already carry the way out.
+            let narrowed = params.folder.is_some()
+                || !params.tags.is_empty()
+                || params.q.is_some()
+                || params.untagged
+                || params.recent;
+            (
+                format!("{} has no images", leaf_name(collection)),
+                if narrowed {
+                    "No member of this collection matches the filters beside it.".to_owned()
+                } else {
+                    "Its embeds resolve to no image that is still here.".to_owned()
+                },
+                None,
+            )
+        } else if let Some(folder) = &params.folder {
             if params.recursive {
                 (
                     format!("No images in {}", leaf_name(folder)),
@@ -488,12 +575,6 @@ pub fn empty_state(params: &ViewParams) -> String {
                 "Try a different word, or clear the filters.".to_owned(),
                 None,
             )
-        } else if let Some(collection) = &params.collection {
-            (
-                format!("{} has no images", leaf_name(collection)),
-                "Its embeds resolve to no image that is still here.".to_owned(),
-                None,
-            )
         } else if params.untagged {
             (
                 "Every image has a tag".to_owned(),
@@ -502,8 +583,8 @@ pub fn empty_state(params: &ViewParams) -> String {
             )
         } else if params.recent {
             // W34 audit #10: Recent is "the last 200 added", so an empty lens
-            // means an empty library or filters that match none of it — never a
-            // claim about days.
+            // means an empty library or filters that match none of it — never
+            // a claim about days.
             (
                 "Nothing in Recent".to_owned(),
                 "The library is empty, or the filters beside Recent match no image.".to_owned(),
@@ -907,13 +988,15 @@ mod tests {
 
     #[test]
     fn the_sort_menu_carries_the_lenses_and_a_non_recursive_folder() {
-        // Not `recent`: that lens has no menu to carry anything (W37 review,
-        // Medium #1) — see `the_recent_order_is_a_focusable_arrow_not_a_wide_hint`.
-        let params = ViewParams::parse("in=refs&sub=0&untagged=1&c=set.md");
+        // Not `recent` and not a collection: those two views state the order
+        // in force instead of offering choices the grid would ignore (W37
+        // review, Medium #1; FORMAT §5 note order) — see
+        // `the_recent_order_is_a_focusable_arrow_not_a_wide_hint` and
+        // `a_collection_states_the_note_order_not_a_menu`.
+        let params = ViewParams::parse("in=refs&sub=0&untagged=1");
         let html = sort_control(&params);
         assert!(html.contains("name=\"sub\" value=\"0\""));
         assert!(html.contains("name=\"untagged\" value=\"1\""));
-        assert!(html.contains("name=\"c\" value=\"set.md\""));
     }
 
     #[test]
@@ -1413,21 +1496,65 @@ mod tests {
     }
 
     /// W39 review L3: over a collection the grid keeps the collection's own
-    /// member order (`ViewQuery::collection`), so "newest first" would be false
-    /// there. The wording is left out rather than shown as a lie — which also
-    /// keeps the toolbar's five controls fitting at 390px on this combination.
+    /// member order — the order of the embeds in its note (FORMAT §5) — so
+    /// "newest first" would be false there, and the earlier silence is
+    /// replaced by the honest name of the order in force: the W46
+    /// counterpart of the Recent arrow.
     #[test]
-    fn the_recent_order_over_a_collection_states_no_order_at_all() {
+    fn the_order_label_over_a_collection_is_the_note_order_not_the_recent_one() {
         let html = sort_control(&ViewParams::parse(
             "c=collections/featured-picks.md&recent=1",
         ));
-        assert!(html.is_empty(), "no claim to make: {html}");
+        assert!(
+            html.contains(">Note order</span>"),
+            "the grid is in note order whatever the URL says: {html}"
+        );
         assert!(
             !html.contains("newest first"),
-            "a collection cannot be reordered by Recent: {html}"
+            "Recent's order would be false over a collection: {html}"
         );
     }
 
+    /// The sort menu's choices could not say the truth on a collection: the
+    /// grid keeps the note's embed order whatever `sort` the URL carries, so
+    /// the control states the order in force the way the Recent lens's does
+    /// (W37 review, Medium #1; W39 review M1/L1/L2): a focusable label, its
+    /// whole sentence in `title` and `aria-label`, only the two short words
+    /// visible, never a disabled control and never a menu.
+    #[test]
+    fn a_collection_states_the_note_order_not_a_menu() {
+        for query in [
+            "c=browse.md",
+            "c=browse.md&sort=name-asc",
+            "c=browse.md&dir=asc",
+        ] {
+            let html = sort_control(&ViewParams::parse(query));
+            assert!(
+                html.contains("role=\"note\" tabindex=\"0\""),
+                "'{query}': a focusable label, not a disabled control: {html}"
+            );
+            assert!(
+                html.contains(">Note order</span>"),
+                "'{query}': the order in force is the one shown: {html}"
+            );
+            assert!(
+                html.contains(
+                    "aria-label=\"Sort order — A collection is ordered by the embeds in its note.\""
+                ),
+                "'{query}': a screen reader hears the whole sentence: {html}"
+            );
+            assert!(
+                !html.contains("<option"),
+                "'{query}': a menu would promise what the grid does not keep: {html}"
+            );
+            assert!(!html.contains("disabled"), "'{query}': {html}");
+        }
+    }
+
+    /// W37 review, Medium #1 (W39 review M1/L1/L2): the Recent lens is
+    /// newest-first by definition, so its sort menu offered choices the grid
+    /// ignored. W39 M1/L1/L2 considerations made the replacement a focusable
+    /// label; see `the_recent_order_is_a_focusable_arrow_not_a_wide_hint`.
     #[test]
     fn the_recent_sort_control_shows_the_forced_order_not_the_url() {
         let html = sort_control(&ViewParams::parse("recent=1&sort=name-asc"));
@@ -1440,7 +1567,7 @@ mod tests {
 
     #[test]
     fn every_other_view_keeps_the_real_sort_menu() {
-        for query in ["", "tag=nature", "in=refs", "c=browse.md", "untagged=1"] {
+        for query in ["", "tag=nature", "in=refs", "untagged=1"] {
             let html = sort_control(&ViewParams::parse(query));
             assert!(
                 html.contains(

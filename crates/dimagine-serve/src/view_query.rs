@@ -362,6 +362,17 @@ impl ViewParams {
             ));
         }
 
+        // A collection's order is the order of the embeds in its note
+        // (FORMAT §5): the view the index answers keeps that order whatever
+        // the query says — like the Recent lens, a sort beside it cannot
+        // decide it. Unlike Recent, no spelling of `sort` names the order
+        // in force, so a sort the URL asked for is always worth reporting.
+        if params.collection.is_some() && asked_for_an_order {
+            params
+                .notices
+                .push("Ignored sort: a collection keeps the order of its note's embeds".to_owned());
+        }
+
         params
     }
 
@@ -684,7 +695,16 @@ mod tests {
         assert_eq!(parsed.direction, Direction::Asc);
         assert_eq!(parsed.size, ThumbnailSize::L);
         assert_eq!(parsed.page, 3);
-        assert!(parsed.notices.is_empty());
+        // The query asks for a sort beside a collection, and a collection
+        // keeps the order of its note's embeds (FORMAT §5): the reader is
+        // told the sort was ignored, so the URL cannot look like it decided
+        // the order.
+        assert_eq!(
+            parsed.notices,
+            vec!["Ignored sort: a collection keeps the order of its note's embeds".to_owned()],
+            "{:?}",
+            parsed.notices
+        );
 
         let reserialised = parsed.to_query_string();
         let parsed2 = ViewParams::parse(&reserialised);
@@ -697,6 +717,27 @@ mod tests {
         assert_eq!(parsed2.direction, parsed.direction);
         assert_eq!(parsed2.size, parsed.size);
         assert_eq!(parsed2.page, parsed.page);
+    }
+
+    /// A collection view says which order it keeps, and only when the URL
+    /// asked for another — a lens on its own has nothing to ignore, the same
+    /// rule the Recent lens follows (W37 review, Medium #1).
+    #[test]
+    fn a_collection_reports_a_sort_it_cannot_take() {
+        assert_eq!(
+            ViewParams::parse("c=favs.md&sort=name").notices,
+            vec!["Ignored sort: a collection keeps the order of its note's embeds".to_owned()]
+        );
+        assert_eq!(
+            ViewParams::parse("c=favs.md&dir=asc").notices,
+            vec!["Ignored sort: a collection keeps the order of its note's embeds".to_owned()]
+        );
+        // A collection on its own, or beside filters that are not a sort,
+        // says nothing: there was no order to ignore.
+        assert!(ViewParams::parse("c=favs.md").notices.is_empty());
+        assert!(ViewParams::parse("c=favs.md&tag=x&untagged=0")
+            .notices
+            .is_empty());
     }
 
     #[test]

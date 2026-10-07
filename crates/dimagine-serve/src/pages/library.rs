@@ -82,20 +82,53 @@ pub(crate) async fn library_page(
     let Some(result) = read(&state, &params) else {
         return index_failure(&state, false);
     };
-    let diagnostics = collection_diagnostics(&state, &params).await;
     // W34 audit #12: a narrowed view says its own name — in the tab and in a
     // heading above the grid — while the plain library stays "Library".
     let view_name = view_title(&params, &result.sidebar);
-    let body = format!(
-        "{}{diagnostics}{}",
-        view_heading(view_name.as_deref()),
-        grid_body(&params, &result.page)
-    );
+    // A collection is a page of its own (FORMAT §5): the note's header above
+    // the members in note order, the count of what is listed. Every other
+    // narrowing of the library keeps the plain grid.
+    let (body, result_counts) = if let Some(_collection) = &params.collection {
+        // `/?c=<note>` is the collection page, whoever narrowed it further,
+        // so its header always names the note (view_title puts the collection
+        // before the folder that only narrows its members).
+        let header_name = view_name.as_deref().unwrap_or("Collection").to_owned();
+        match crate::pages::collections::collection_page_parts(&state, &params, &header_name).await
+        {
+            Some(parts) => {
+                // The count says what the page lists — the note's members,
+                // once each — never the index's per-link rows, so the header,
+                // the toolbar and the tiles can never disagree.
+                let shown = parts.items.len() as u64;
+                let grid = if parts.items.is_empty() {
+                    components::empty_state(&params)
+                } else {
+                    components::collection_grid(&parts.items, &params)
+                };
+                (
+                    format!("{}{}{}", parts.header, parts.diagnostics, grid),
+                    (shown, shown),
+                )
+            }
+            // The note is not a collection, or could not be read: the view
+            // the library always gave for `/?c=<path>`, heading and grid and
+            // nothing invented.
+            None => (
+                plain_body(&params, &result.page, view_name.as_deref()),
+                (result.page.total, result.page.items.len() as u64),
+            ),
+        }
+    } else {
+        (
+            plain_body(&params, &result.page, view_name.as_deref()),
+            (result.page.total, result.page.items.len() as u64),
+        )
+    };
     let frame = Frame {
         banner: state.banner(),
         sidebar: Some(&result.sidebar),
         view: Some(&params),
-        result: Some((result.page.total, result.page.items.len() as u64)),
+        result: Some(result_counts),
         notices: &params.notices,
         inspector: true,
         ..Frame::new(
@@ -107,24 +140,10 @@ pub(crate) async fn library_page(
     Html(frame.render()).into_response()
 }
 
-/// A collection view also states which embeds it could not resolve.
-///
-/// FORMAT §5.1: an embed that matches no image, or matches several, is
-/// reported rather than dropped. Reading the members from the index would lose
-/// that, so the note is read for its diagnostics and the index answers the
-/// listing.
-async fn collection_diagnostics(state: &AppState, params: &ViewParams) -> String {
-    let Some(collection) = &params.collection else {
-        return String::new();
-    };
-    let path = collection.clone();
-    let catalog = state.catalog.clone();
-    match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
-        Ok(Ok(collection)) => {
-            crate::pages::collections::collection_diagnostics_html(&collection.diagnostics)
-        }
-        _ => String::new(),
-    }
+/// The body every non-collection view uses: the heading and the grid, or
+/// what is missing.
+fn plain_body(params: &ViewParams, page: &ViewPage, view_name: Option<&str>) -> String {
+    format!("{}{}", view_heading(view_name), grid_body(params, page))
 }
 
 /// `GET /api/view` — the same page of the same query, as JSON.
@@ -201,18 +220,21 @@ fn grid_body(params: &ViewParams, page: &ViewPage) -> String {
 }
 
 /// What the browser tab and the heading call this view (W34 audit #12). The
-/// order a person would say it in: which folder, which collection, which
-/// words, which tags, then the two lenses. `None` is the whole library,
+/// order a person would say it in: which collection, which folder, which
+/// words, which tags, then the two lenses — a collection is the page its
+/// note gives (`/?c=` renders the note's header and its members), so `in`
+/// beside it only narrows which members show, and the folder chip and the
+/// breadcrumb already say which folder. `None` is the whole library,
 /// which names itself without narrowing.
 fn view_title(params: &ViewParams, sidebar: &SidebarData) -> Option<String> {
-    if let Some(folder) = &params.folder {
-        return Some(format!("Folder: {folder}"));
-    }
     if let Some(collection) = &params.collection {
         return Some(format!(
             "Collection: {}",
             collection_name(sidebar, collection)
         ));
+    }
+    if let Some(folder) = &params.folder {
+        return Some(format!("Folder: {folder}"));
     }
     if let Some(text) = &params.q {
         return Some(format!("Search: {text}"));

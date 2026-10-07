@@ -242,6 +242,7 @@ THEMES=("dark" "light")
 declare -a LIBRARY_ROUTES=(
     "/|library"
     "/?in=refs/ui|folder-in"
+    "/?c=collections/featured-picks.md|collection"
     "/folders|folders"
     "/collections|collections"
     "/search|search"

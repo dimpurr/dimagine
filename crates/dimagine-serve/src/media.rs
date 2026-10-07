@@ -43,6 +43,15 @@ pub(crate) async fn media(
             .resolve_path(&path)
             .map_err(ServeImageError::Catalog)?;
         if !is_image(&original) {
+            // `/raw` is also the source view of a file the page links to as
+            // "Open note": the bytes as written. Served as `text/plain`, so a
+            // browser shows the note's markup as text and never runs it as a
+            // page of this origin — the media path's counterpart of the
+            // sanitiser the rendered notes go through. Rendition routes
+            // (`/media`, `/thumb`) stay for images only.
+            if kind.is_none() {
+                return open_hashed_file(&original, SourceView::Text);
+            }
             return Err(ServeImageError::Catalog(CatalogError::NotFound));
         }
         let served = match kind {
@@ -53,7 +62,7 @@ pub(crate) async fn media(
                 .unwrap_or_else(|| original.clone()),
             None => original.clone(),
         };
-        open_hashed_image(&served)
+        open_hashed_file(&served, SourceView::Image)
     })
     .await;
     match prepared {
@@ -71,8 +80,19 @@ enum ServeImageError {
     Io,
 }
 
-fn open_hashed_image(
+/// How `/raw` answers one file: as an image (detected MIME, with a note
+/// when the extension disagrees) or as the source view of a note — the
+/// bytes as `text/plain`, which a browser shows and never interprets.
+enum SourceView {
+    Image,
+    Text,
+}
+
+const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+
+fn open_hashed_file(
     path: &FsPath,
+    view: SourceView,
 ) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
     let mut file = fs::File::open(path).map_err(|_| ServeImageError::Io)?;
     let metadata = file.metadata().map_err(|_| ServeImageError::Io)?;
@@ -100,11 +120,19 @@ fn open_hashed_image(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
-    let extension_mime = mime_guess::from_path(path)
-        .first_raw()
-        .unwrap_or("application/octet-stream");
-    Ok((file, metadata, etag, mime, mime != extension_mime))
+    match view {
+        // The source view of a note: always `text/plain`, whatever the file
+        // is named, so nothing a note contains is ever served as a page of
+        // this origin.
+        SourceView::Text => Ok((file, metadata, etag, TEXT_PLAIN, false)),
+        SourceView::Image => {
+            let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
+            let extension_mime = mime_guess::from_path(path)
+                .first_raw()
+                .unwrap_or("application/octet-stream");
+            Ok((file, metadata, etag, mime, mime != extension_mime))
+        }
+    }
 }
 
 /// A streamed file that keeps its admission permit until the last byte.

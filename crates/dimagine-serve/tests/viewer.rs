@@ -1304,3 +1304,355 @@ async fn a_collection_title_carrying_markup_reaches_the_page_only_escaped() {
         "the raw form rendered: {cards}"
     );
 }
+
+// =========================== W46 · the collection page ====================
+//
+// A collection is a note that embeds images (FORMAT §5), and `/?c=<note>` is
+// the collection page: the note's header — its title, the text the note keeps
+// for itself, the number of items, the way to the note's source — above its
+// members in embed order, each with the caption line its embed gave it
+// (FORMAT §5: "a line directly after an embed is that member's note").
+
+/// A curated collection whose embed order no sort would produce (name, added
+/// and size each disagree with it), one member embedded twice with two
+/// captions, one member without a caption, a hostile caption line, a note
+/// with a hostile title, and an empty collection: every fact the collection
+/// page states is somewhere in this library.
+fn page_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    write("omega/wide.png", PNG_BYTES);
+    write("alpha/zen.png", PNG_BYTES);
+    write("shrine/torii.png", PNG_BYTES);
+    write(
+        "tour.md",
+        &(["---", "title: Tour", "---", "", "The plan for the trip.", ""]
+            .join("\n")
+            + "![[omega/wide.png]]\n"
+            + "The gate that opens the day.\n"
+            + "![[alpha/zen.png]]\n"
+            + "![[shrine/torii.png]]\n"
+            + "Torii, <img src=x onerror=alert(1)> at dawn.\n"
+            // The same member again, through its bare name: a different
+            // line, a different caption, and the same image exactly once.
+            + "![[zen.png]]\n"
+            + "Seen again on the way back.\n"),
+    );
+    // A title with markup: the page shows it, the browser must read it.
+    write(
+        "hostile.md",
+        "---\ntitle: Set <img onerror=x>\n---\n![[shrine/torii.png]]\n",
+    );
+    // `kind: collection` with no embeds yet: a collection with nothing to
+    // list, which is a different fact than not being a collection.
+    write(
+        "empty.md",
+        "---\nkind: collection\ntitle: Empty Days\n---\nNothing collected yet.\n",
+    );
+    dir
+}
+
+/// The collection page's header, without anything after it.
+fn collection_header(html: &str) -> &str {
+    let start = html
+        .find("class=\"search-section collection-header\"")
+        .expect("a collection header")
+        + "class=\"search-section collection-header\"".len();
+    let end = html[start..].find("</section>").expect("a closed header");
+    &html[start..start + end]
+}
+
+/// The member captions a page shows, in the order their tiles appear.
+fn member_captions(html: &str) -> Vec<String> {
+    html.split("class=\"member-caption\" title=\"")
+        .skip(1)
+        .map(|tail| {
+            tail[..tail.find("\">").expect("a closed attribute")]
+                .replace("&amp;", "&")
+                .replace("&lt;", "<")
+                .replace("&gt;", ">")
+                .replace("&quot;", "\"")
+                .replace("&#39;", "'")
+        })
+        .collect()
+}
+
+/// W46 §1: the members arrive in the order the note embeds them — an order
+/// no sort control would produce — and a duplicate embed appears once, at
+/// its first position: the row the note gave it first, caption included.
+#[tokio::test]
+async fn a_collection_lists_its_members_in_embed_order_and_a_duplicate_once() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/?c=tour.md", &cookie).await;
+
+    assert_eq!(
+        html_paths(&html),
+        vec!["omega/wide.png", "alpha/zen.png", "shrine/torii.png"],
+        "the embed order wins over every sort, and the fourth embed — \
+         alpha again — is the same member again"
+    );
+    // The header and the toolbar say the size of that list: three members,
+    // once each, never the four link rows the index counts for this note.
+    let header = collection_header(&html);
+    assert!(header.contains("3 items"), "{header}");
+    assert!(
+        html.contains("<span class=\"result-count\">3 items</span>"),
+        "{html}"
+    );
+    assert_eq!(html.matches("grid-item").count(), 3, "{html}");
+    // The order the toolbar names the note's, not a sort's.
+    assert!(html.contains(">Note order</span>"), "{html}");
+}
+
+/// W46 §2: a member shows the line directly after its embed (FORMAT §5) —
+/// a duplicated member keeps the caption of its first row — and a member
+/// whose embed is followed by another has no caption, because the note gave
+/// it none: absent is not inventable.
+#[tokio::test]
+async fn a_member_shows_its_own_caption_and_a_member_without_one_shows_none() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/?c=tour.md", &cookie).await;
+
+    let captions = member_captions(&html);
+    assert_eq!(
+        captions,
+        vec![
+            "The gate that opens the day.".to_owned(),
+            "Torii, <img src=x onerror=alert(1)> at dawn.".to_owned(),
+        ],
+        "the captions in tile order; the second member's embed sits \
+         directly before the next one, so the note gave it no caption"
+    );
+    // The caption is the note's own words, so hostile markup in it is
+    // rendered as text: escaped in the element and the tooltip, the raw
+    // form never appears.
+    assert!(
+        html.contains("title=\"Torii, &lt;img src=x onerror=alert(1)&gt; at dawn.\""),
+        "{html}"
+    );
+    assert!(
+        html.contains("&lt;img src=x onerror=alert(1)&gt; at dawn."),
+        "the caption rendered: {html}"
+    );
+    assert!(
+        !html.contains("<img src=x"),
+        "a hostile caption must never become markup: {html}"
+    );
+}
+
+/// W46 §3: the header names the collection the tab names (the title from the
+/// note's own properties), shows the text the note keeps for itself — the
+/// prose, without the member rows the grid below lists — states the item
+/// count, and links to the note's source view.
+#[tokio::test]
+async fn the_collection_header_shows_the_note_itself_and_the_way_to_its_source() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/?c=tour.md", &cookie).await;
+    let header = collection_header(&html);
+
+    // The same words the tab shows, once (W34 audit #12).
+    assert!(
+        html.contains("<title>Collection: Tour · dimagine</title>"),
+        "{html}"
+    );
+    assert!(header.contains("<h1>Collection: Tour</h1>"), "{header}");
+    // The note's own text: the prose, rendered as Markdown.
+    assert!(
+        header.contains("<div class=\"collection-note note-body\">"),
+        "{header}"
+    );
+    assert!(header.contains("<p>The plan for the trip.</p>"), "{header}");
+    // The member rows belong to the grid, not to the note's own text: no
+    // caption line and no embed target appears in the header.
+    assert!(
+        !header.contains("The gate that opens the day"),
+        "a member's caption is the member's, shown under its tile: {header}"
+    );
+    assert!(
+        !header.contains("Seen again on the way back"),
+        "the second caption belongs to the row the page does not list: {header}"
+    );
+    assert!(
+        !header.contains("wide.png") && !header.contains("zen.png"),
+        "the members are tiles below, not text above: {header}"
+    );
+    // The count of what is listed, and the way to the note's source.
+    assert!(header.contains("3 items"), "{header}");
+    assert!(
+        header.contains("<a class=\"open-note\" href=\"/raw/tour.md\">Open note</a>"),
+        "{header}"
+    );
+
+    // The source view serves the note as it is written: raw Markdown, shown
+    // as text — never a page of this origin that a note could rig.
+    let response = get(&app, "/raw/tour.md", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        body.contains("![[omega/wide.png]]"),
+        "the note's source, as written: {body}"
+    );
+}
+
+/// A hostile title renders as text on the collection page, as it already
+/// does on the sidebar and the cards (W38 rules).
+#[tokio::test]
+async fn a_hostile_collection_title_reaches_the_page_only_escaped() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/?c=hostile.md", &cookie).await;
+    let header = collection_header(&html);
+
+    assert!(
+        header.contains("<h1>Collection: Set &lt;img onerror=x&gt;</h1>"),
+        "{header}"
+    );
+    assert!(!header.contains("<img onerror"), "the raw form: {header}");
+}
+
+/// W46 §3, the empty case: a `kind: collection` note with nothing embedded
+/// is a collection with no items — the header still names it, its own text
+/// still shows, the count still tells the truth, and the empty state below
+/// says what is empty rather than a collection page that looks broken.
+#[tokio::test]
+async fn an_empty_collection_keeps_its_header_and_says_what_is_empty() {
+    let dir = page_library();
+    let (empty_app, cookie) = login(app(&dir)).await;
+    let html = text(&empty_app, "/?c=empty.md", &cookie).await;
+    let header = collection_header(&html);
+
+    assert!(
+        html.contains("<title>Collection: Empty Days · dimagine</title>"),
+        "{html}"
+    );
+    assert!(
+        header.contains("<h1>Collection: Empty Days</h1>"),
+        "{header}"
+    );
+    assert!(header.contains("<p>Nothing collected yet.</p>"), "{header}");
+    assert!(header.contains("0 items"), "{header}");
+    assert!(
+        header.contains("<a class=\"open-note\" href=\"/raw/empty.md\">Open note</a>"),
+        "{header}"
+    );
+    // No tiles, and the empty state's own words for a collection.
+    assert!(html_paths(&html).is_empty(), "{html}");
+    assert!(html.contains("empty.md has no images"), "{html}");
+    assert!(
+        html.contains("Its embeds resolve to no image that is still here."),
+        "{html}"
+    );
+    // A note with no text of its own has no text block: the header is the
+    // heading, the count and the link, not an empty rendered div.
+    let bare = page_library();
+    fs::write(
+        bare.path().join("bare.md"),
+        "---\nkind: collection\ntitle: Bare\n---\n",
+    )
+    .unwrap();
+    let (bare_app, cookie) = login(app(&bare)).await;
+    let html = text(&bare_app, "/?c=bare.md", &cookie).await;
+    let header = collection_header(&html);
+    assert!(!header.contains("collection-note"), "{header}");
+}
+
+/// A narrowing beside the collection keeps the page's header and picks which
+/// members show — in the note's order, with the count of what is listed —
+/// and when it matches none, the empty state blames the narrowing, not the
+/// note's embeds.
+#[tokio::test]
+async fn a_narrowing_picks_members_but_the_note_keeps_the_page() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let html = text(&app, "/?c=tour.md&in=alpha", &cookie).await;
+    assert_eq!(
+        html_paths(&html),
+        vec!["alpha/zen.png"],
+        "the folder narrows which members show, in the note's order: {html}"
+    );
+    let header = collection_header(&html);
+    assert!(
+        header.contains("<h1>Collection: Tour</h1>"),
+        "the collection is the page; the folder is a narrowing of it: {header}"
+    );
+    assert!(header.contains("1 item"), "{header}");
+    assert!(
+        html.contains("<span class=\"result-count\">1 item</span>"),
+        "{html}"
+    );
+    // The narrowed-away members are not the page's list.
+    assert!(!header.contains("3 items"), "{header}");
+
+    let html = text(&app, "/?c=tour.md&in=nowhere", &cookie).await;
+    assert!(
+        html.contains("No member of this collection matches the filters beside it."),
+        "{html}"
+    );
+}
+
+/// The diagnostics of a note's broken embeds stay on its collection page
+/// (FORMAT §5.1: reported, and the line is kept), beside the note's own
+/// text — the missing embed's line still shows in that text.
+#[tokio::test]
+async fn a_broken_embed_is_reported_and_its_line_is_kept_in_the_note_text() {
+    let root = tempfile::tempdir().unwrap();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.path().join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+    write("a.png", PNG_BYTES);
+    write(
+        "gone.md",
+        "---\ntitle: Gone\n---\nBefore it went away.\n![[a.png]]\nFirst.\n![[missing.png]]\nTail line.\n",
+    );
+    write("twin-a/photo.png", PNG_BYTES);
+    write("twin-b/photo.png", PNG_BYTES);
+    write("twin.md", "---\ntitle: Twin\n---\n![[photo.png]]\n");
+    let (app, cookie) = login(app(&root)).await;
+
+    let html = text(&app, "/?c=gone.md", &cookie).await;
+    assert!(html.contains("matches no file"), "{html}");
+    assert_eq!(html_paths(&html), vec!["a.png"]);
+    let header = collection_header(&html);
+    // §5.1: the line a missing embed sits on is kept; its caption "First."
+    // belongs to the member above, and the tail prose to the note.
+    assert!(
+        header.contains("Before it went away."),
+        "the prose: {header}"
+    );
+    assert!(
+        header.contains("[[missing.png]]"),
+        "the broken embed's line is kept in the note's text: {header}"
+    );
+    assert!(
+        header.contains("Tail line."),
+        "the line after the missing embed is the note's, not a caption: {header}"
+    );
+
+    // The ambiguous embed: reported with both candidates.
+    let html = text(&app, "/?c=twin.md", &cookie).await;
+    assert!(html.contains("matches several files"), "{html}");
+    assert!(html.contains("twin-a/photo.png"), "{html}");
+    assert!(html.contains("twin-b/photo.png"), "{html}");
+}

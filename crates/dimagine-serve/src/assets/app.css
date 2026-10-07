@@ -461,6 +461,71 @@ a.search-pill-container:hover {
   color: var(--danger);
 }
 
+/* ===================== W46 · the collection page =========================
+ * K27 Motion 6 owns the shape and DESIGN.md the tokens: the note's header
+ * above its members — the title the tab already names, the note's own text,
+ * the items and the way to the note's source — and the members in the
+ * note's order, each with the caption line its embed gave it (FORMAT §5).
+ * The header shares the view-heading section (`.search-section`), and the
+ * note's text borrows the rendered-note component (`.note-body`, §4.6), so
+ * every note this viewer renders has one typography.
+ * ======================================================================= */
+
+.collection-header h1 {
+  margin-bottom: 4px;  /* --space-2: the meta line reads as its byline */
+}
+
+/* The note's prose, marked up like any rendered note but with a measure:
+ * a caption-heavy header would still be a wall of text at 1440 px. */
+.collection-note {
+  max-width: 72ch;
+  margin-bottom: 8px;  /* --space-4 */
+}
+
+.collection-meta {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.collection-meta .open-note {
+  font-size: var(--text-sm);
+}
+
+/* The "Note order" the toolbar states where the library's sort menu would
+ * be: a focusable label in the hint voice (W39 review L1), never a control
+ * that could promise a reorder the grid does not keep. The whole sentence
+ * is an attribute on the label itself. */
+.search-hint.note-order {
+  white-space: nowrap;
+}
+
+/* --- the members, with the captions the note gives them ----------------- */
+
+/* A grid cell holds the tile and its caption; the tile keeps the square
+ * and every behaviour of the library grid (selection, inspector, aspect
+ * crop), so nothing here touches it. */
+.grid-item {
+  min-width: 0;
+}
+
+/* The member's caption: the line directly after the embed (FORMAT §5),
+ * under the picture in the note-voice captions use (§4.6 renders a note's
+ * own captions the same way) — not the hover overlay the tile's name uses
+ * (§4.5). Two lines, then the whole line stays one hover away in its
+ * `title` (DESIGN.md §4.1: never truncate without a way to read it all). */
+.member-caption {
+  display: -webkit-box;
+  margin-top: 4px;  /* --space-2 */
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 /* ---------------------------------------------------------------- grid */
 
 /* ========================= W41 · grid and tiles =========================
