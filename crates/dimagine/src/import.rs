@@ -70,6 +70,15 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .get_one::<PathBuf>("source")
         .expect("source is required")
         .clone();
+    // Both modes are pointed at a folder to read, so both answer the same way
+    // when that folder cannot be opened at all: exit code 3, "did not finish
+    // reading" (HLD). Exit code 1 would say a reading happened and turned up a
+    // problem; here no reading happened.
+    if let Some(detail) = unreadable_folder(&source) {
+        let message = format!("did not finish reading {}: {detail}", source.display());
+        report_unfinished_read(json, library_dir, &message, None);
+        return ExitCode::from(3);
+    }
     if sub.get_flag("backfill_added") {
         return run_backfill_added(&source, sub);
     }
@@ -93,30 +102,70 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }) => {
             // Something was imported before the failure; show both. The
             // retained paths are only meaningful to a human with the folder.
+            // The run stopped short of reading the whole source, which is exit
+            // code 3 rather than a completed import with problems.
             let message = format!(
                 "I/O failure after partial import ({} retained artifacts): {error}",
                 retained_artifacts.len()
             );
-            if json {
-                let error = serde_json::json!({
-                    "schema": "dimagine.error/0.1",
-                    "error": message,
-                    "import": progress,
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&error).unwrap_or_default()
-                );
-            } else {
-                print_human(library_dir, &progress);
-                emit_failure(false, &message);
-            }
-            ExitCode::from(1)
+            report_unfinished_read(json, library_dir, &message, Some(&progress));
+            ExitCode::from(3)
         }
         Err(error) => {
             emit_failure(json, &error.to_string());
             ExitCode::from(1)
         }
+    }
+}
+
+/// Whether `path` cannot be read at all, as raw OS text.
+///
+/// Only the two kinds that stop a reading before it starts count: a folder that
+/// is not there, and a folder that is locked. Anything else — a plain file
+/// where a library was expected, say — is left to the importer to describe,
+/// because there the reading happened and found the wrong thing.
+fn unreadable_folder(path: &Path) -> Option<String> {
+    match std::fs::read_dir(path) {
+        Ok(_) => None,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Some(error.to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// Report a reading that stopped short (HLD exit code 3), carrying whatever the
+/// run got through first. `read_complete` is the same flag `scan`, `check` and
+/// `previews` use, so a machine reader can tell "no findings" from "no reading".
+fn report_unfinished_read(
+    json: bool,
+    library_dir: &Path,
+    message: &str,
+    progress: Option<&ImportReport>,
+) {
+    if json {
+        let mut document = serde_json::json!({
+            "schema": "dimagine.error/0.1",
+            "error": message,
+            "read_complete": false,
+        });
+        if let Some(progress) = progress {
+            document["import"] = serde_json::to_value(progress).unwrap_or(serde_json::Value::Null);
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&document).unwrap_or_default()
+        );
+    } else {
+        if let Some(progress) = progress {
+            print_human(library_dir, progress);
+        }
+        emit_failure(false, message);
     }
 }
 

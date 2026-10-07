@@ -11,7 +11,7 @@ license.workspace = true
 default = ["import-eagle", "previews", "serve"]
 import-eagle = ["dep:dimagine-eagle"]
 previews = ["dep:dimagine-preview"]
-serve = ["dep:dimagine-serve", "dep:tokio"]
+serve = ["dep:dimagine-serve", "dep:tokio", "dep:axum"]
 
 [[bin]]
 name = "dimagine"
@@ -25,7 +25,11 @@ dimagine-index = { path = "../dimagine-index" }
 dimagine-eagle = { path = "../dimagine-eagle", optional = true }
 dimagine-preview = { path = "../dimagine-preview", optional = true }
 dimagine-serve = { path = "../dimagine-serve", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "time"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "signal"], optional = true }
+# Same major version as `dimagine-serve` uses, so the `Router` it builds and the
+# serve machinery here are the same types; the CLI needs the serve builder
+# itself to run the graceful shutdown on stop signals.
+axum = { version = "0.7", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

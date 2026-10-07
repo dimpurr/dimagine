@@ -17,10 +17,17 @@
 //!
 //! The switch is read before clap runs, because it changes which subcommands
 //! exist; clap usage errors for a disabled subcommand are ordinary exit-2
-//! errors.
+//! errors. It is read once per process per library: the answer is already
+//! baked into the command line that got parsed, so a second read could only
+//! disagree with the first.
 
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+/// Every switch file this process has consulted, by library.
+static CONSULTED: Mutex<BTreeMap<PathBuf, CorePlugins>> = Mutex::new(BTreeMap::new());
 
 /// Which built-in plugin subcommands this binary offers. Defaults to every
 /// compiled-in plugin (ADR-013); the switch file can only disable.
@@ -42,9 +49,21 @@ impl Default for CorePlugins {
 }
 
 impl CorePlugins {
-    /// Load the switches for the library at `library`, falling back to the
-    /// defaults whenever the file is missing, unreadable or malformed.
+    /// The switches for the library at `library`, reading its switch file only
+    /// the first time this process asks about that library.
     pub fn load(library: &Path) -> Self {
+        let mut consulted = CONSULTED.lock().unwrap();
+        if let Some(plugins) = consulted.get(library) {
+            return *plugins;
+        }
+        let plugins = Self::read(library);
+        consulted.insert(library.to_path_buf(), plugins);
+        plugins
+    }
+
+    /// Read the switch file once. Falls back to the defaults whenever the file
+    /// is missing, unreadable or malformed.
+    fn read(library: &Path) -> Self {
         let mut plugins = Self::default();
         let path = library.join(".dimagine/core-plugins.json");
         let bytes = match std::fs::read(&path) {
@@ -193,6 +212,26 @@ mod tests {
 
         std::fs::write(&path, br#"{"previews": "off"}"#).unwrap();
         assert_eq!(CorePlugins::load(&dir), CorePlugins::default());
+    }
+
+    #[test]
+    fn a_library_s_switch_file_is_consulted_once_per_process() {
+        let dir = scratch("once");
+        let path = dir.join(".dimagine/core-plugins.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"serve": false}"#).unwrap();
+        assert!(!CorePlugins::load(&dir).serve);
+
+        // The file is gone; a second read would answer with the defaults and
+        // warn on stderr. The command line already hid `serve` on the first
+        // answer, so that answer is what this process keeps.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!CorePlugins::load(&dir).serve);
+
+        // Another library is its own question: its missing switch file means
+        // the defaults, not the answer kept for the first library.
+        let other = scratch("once-other");
+        assert!(CorePlugins::load(&other).serve);
     }
 
     #[test]

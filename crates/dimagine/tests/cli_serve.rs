@@ -90,7 +90,10 @@ struct Server {
     address: String,
     auth: String,
     state: Option<DirGuard>,
-    stdout: std::process::ChildStdout,
+    stdout: std::io::BufReader<std::process::ChildStdout>,
+    /// Everything the server wrote to stdout: the startup lines read before it
+    /// started serving, then whatever came after.
+    log: String,
 }
 
 impl Server {
@@ -140,7 +143,22 @@ impl Server {
         for (key, value) in envs {
             command.env(key, value);
         }
-        Server::spawn(command)
+        let server = Server::spawn(command);
+        // Every serve test pays for one real check on where the socket is:
+        // the advertised address is the listener's own `local_addr`, not the
+        // flag or the help text, so a default that drifted to `0.0.0.0` fails
+        // here rather than quietly passing on a loopback connection.
+        if !extra.contains(&"--bind") {
+            let socket: std::net::SocketAddr = server
+                .address
+                .parse()
+                .expect("the startup document advertises an address:port");
+            assert!(
+                socket.ip().is_loopback(),
+                "serve must bind loopback with no --bind: {socket}"
+            );
+        }
+        server
     }
 
     /// The isolated state directory this server was started with.
@@ -173,15 +191,23 @@ impl Server {
             .expect("address field")
             .trim_start_matches("http://")
             .to_string();
-        let stdout = reader.into_inner();
         wait_listening(&address);
         Server {
             child: Some(child),
             address,
             auth,
             state: None,
-            stdout,
+            log: buffer,
+            // The reader keeps whatever it buffered past the startup document,
+            // so the rest of stdout is still there to drain later.
+            stdout: reader,
         }
+    }
+
+    /// Stop the server and hand back everything it wrote: stdout, then stderr.
+    fn output(mut self) -> (String, String) {
+        let stderr = self.shutdown();
+        (std::mem::take(&mut self.log), stderr)
     }
 
     fn url(&self) -> &str {
@@ -214,7 +240,56 @@ impl Server {
         }
         let mut drain = String::new();
         let _ = self.stdout.read_to_string(&mut drain);
+        self.log.push_str(&drain);
         stderr
+    }
+
+    /// Send the server a unix signal by name (`"INT"`, `"TERM"`), the way an
+    /// operator stops a foreground server. `kill(1)` keeps the test free of a
+    /// libc dependency.
+    #[cfg(unix)]
+    fn signal(&self, name: &str) {
+        let pid = self.child.as_ref().expect("server still running").id();
+        let output = Command::new("kill")
+            .arg(format!("-{name}"))
+            .arg(pid.to_string())
+            .output()
+            .expect("run kill");
+        assert!(
+            output.status.success(),
+            "kill -{name} {pid} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Wait for the server to leave on its own; a server that never leaves
+    /// fails the test instead of hanging the suite.
+    #[cfg(unix)]
+    fn wait_for_exit(&mut self, within: Duration) -> std::process::ExitStatus {
+        let child = self.child.as_mut().expect("server still running");
+        let deadline = Instant::now() + within;
+        loop {
+            if let Some(status) = child.try_wait().expect("poll the server") {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the server was still running {}s after the stop signal",
+                within.as_secs()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Signal the server, wait for it to exit, and hand back its exit code
+    /// with its stderr. A process killed by a signal has no exit code, so
+    /// `Some(0)` is what a clean stop looks like.
+    #[cfg(unix)]
+    fn stop_with_signal(&mut self, name: &str, within: Duration) -> (Option<i32>, String) {
+        self.signal(name);
+        let status = self.wait_for_exit(within);
+        let stderr = self.shutdown();
+        (status.code(), stderr)
     }
 }
 
@@ -448,6 +523,63 @@ fn serve_wrong_passcode_is_rejected() {
     server.kill();
 }
 
+/// The passcode is a secret the operator hands the server; the server's own
+/// output is the one place it must never appear.
+#[test]
+fn serve_never_logs_the_passcode() {
+    let dir = library("quiet-pass");
+    // A string that would be obvious in a log line if the server ever printed
+    // one — plus one that is only ever sent wrong, to catch a handler that logs
+    // what a client tried.
+    const SECRET: &str = "s3cr3t-passcode-stay-out-of-logs";
+    const TRIED: &str = "wrong-passcode-never-logged-either";
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", SECRET)],
+    );
+    let address = server.url().to_string();
+
+    // The paths a passcode touches: the gate, the form, the right answer, the
+    // answer that is not right, and the page the session opens.
+    let anonymous = http_get(&address, "/", None);
+    assert_eq!(status_of(&anonymous), "303");
+    let page = http_get(&address, "/login", None);
+    assert_eq!(status_of(&page), "200");
+    let (accepted, cookie) = post_login(&address, SECRET);
+    assert_eq!(accepted, "303", "the passcode still works");
+    let cookie = cookie.expect("session cookie");
+    assert_eq!(
+        status_of(&http_get(&address, "/", Some(&cookie))),
+        "200",
+        "the session the passcode opened still serves the library"
+    );
+    let rejected = http_request(
+        &address,
+        &format!(
+            "POST /login HTTP/1.1\r\nHost: viewer\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\npasscode={TRIED}",
+            TRIED.len() + "passcode=".len()
+        ),
+    );
+    assert_eq!(status_of(&rejected), "401", "the wrong answer is refused");
+
+    let (stdout, stderr) = server.output();
+    assert!(
+        stdout.contains("dimagine.serve/0.1"),
+        "the test must be reading a log that exists: {stdout}"
+    );
+    for (name, output) in [("stdout", &stdout), ("stderr", &stderr)] {
+        for secret in [SECRET, TRIED] {
+            assert!(
+                !output.contains(secret),
+                "a passcode appeared on {name}: {output}"
+            );
+        }
+    }
+}
+
 #[test]
 fn serve_passcode_from_env_overrides_the_default() {
     let dir = library("env-pass");
@@ -611,7 +743,7 @@ fn serve_quiet_when_trusted_proxy_family_matches_bind() {
 fn serve_default_passcode_on_non_loopback_bind_warns() {
     let dir = library("warn");
     // Bind to all local IPv4 interfaces while reaching it on loopback; the
-    // serve crate must warn that the default passcode is active.
+    // viewer must warn that the default passcode is active.
     let server = Server::start(
         &dir.root,
         &["--port", "0", "--bind", "0.0.0.0"],
@@ -625,8 +757,182 @@ fn serve_default_passcode_on_non_loopback_bind_warns() {
     let stderr = server.kill();
     assert!(
         stderr.contains("WARNING: the default passcode is active"),
-        "expected the crate's default-passcode warning: stderr={stderr:?}"
+        "expected the default-passcode warning: stderr={stderr:?}"
     );
+}
+
+/// An uncompressed 24-bit BMP, so a test can put a multi-megabyte image in the
+/// library without an encoder. `width` is a multiple of four, which is what a
+/// BMP row needs no padding for.
+#[cfg(unix)]
+fn bmp(width: usize, height: usize, seed: u8) -> Vec<u8> {
+    let mut out = Vec::with_capacity(54 + width * 3 * height);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + width * 3 * height) as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0]);
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(width as u32).to_le_bytes());
+    out.extend_from_slice(&(height as u32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in 0..height {
+        for x in 0..width {
+            out.push((x + y + usize::from(seed)) as u8);
+            out.push((x * 3 + y + usize::from(seed)) as u8);
+            out.push((x + y * 2 + usize::from(seed)) as u8);
+        }
+    }
+    out
+}
+
+/// Ctrl-C and SIGTERM have to leave through the command's own exit path: the
+/// default disposition would kill the process with a signal number instead of
+/// a status, and would drop the requests being answered.
+#[test]
+#[cfg(unix)]
+fn serve_stops_cleanly_on_a_stop_signal() {
+    for name in ["TERM", "INT"] {
+        let dir = library("stop");
+        let mut server = Server::start(&dir.root, &["--port", "0"], &[]);
+        let address = server.url().to_string();
+        assert_eq!(status_of(&http_get(&address, "/", None)), "303");
+        let (code, stderr) = server.stop_with_signal(name, Duration::from_secs(10));
+        assert_eq!(
+            code,
+            Some(0),
+            "a {name}-stopped viewer exits by itself: stderr={stderr:?}"
+        );
+        // A viewer with nothing to drain has no reason to spend the grace
+        // period: that message only appears on the fallback that gives up on
+        // requests still running after five seconds.
+        assert!(
+            !stderr.contains("stopped without waiting"),
+            "an idle viewer leaves by finishing, not by timing out: stderr={stderr:?}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn serve_answers_a_request_that_was_already_in_flight() {
+    let dir = library("inflight");
+    // Twelve megabytes: more than any socket buffer pair, so a client that
+    // stops reading is certain to leave the viewer blocked inside the body.
+    let image = bmp(2048, 2048, 7);
+    let size = image.len();
+    std::fs::write(dir.root.join("big.bmp"), &image).unwrap();
+    let mut server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    let (_, cookie) = post_login(&address, "2333");
+    let cookie = cookie.expect("session cookie");
+
+    let mut stream = connect(&address);
+    stream
+        .write_all(
+            format!(
+                "GET /raw/big.bmp HTTP/1.1\r\nHost: viewer\r\nCookie: {cookie}\r\n\
+                 Connection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .expect("send the media request");
+
+    // Read the framing and a little of the body, then stop reading. The
+    // socket buffers fill with the rest of the megabytes, so the viewer is
+    // blocked inside this response when the signal lands.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut response = Vec::new();
+    let mut one = [0_u8; 1];
+    while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = stream.read(&mut one).expect("read the response head");
+        assert!(read > 0, "the viewer closed the connection mid-header");
+        response.extend_from_slice(&one);
+    }
+    let head_end = response.len();
+    response.resize(head_end + 64 * 1024, 0);
+    let mut filled = head_end;
+    while filled < response.len() {
+        let read = stream
+            .read(&mut response[filled..])
+            .expect("read the first body bytes");
+        assert!(read > 0, "the body stopped before the planned pause");
+        filled += read;
+    }
+    response.truncate(filled);
+
+    server.signal("TERM");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("read timeout");
+    let mut rest = Vec::new();
+    stream
+        .read_to_end(&mut rest)
+        .expect("keep reading the response");
+    response.extend_from_slice(&rest);
+
+    let body = &response[head_end..];
+    let head = String::from_utf8_lossy(&response[..head_end]).into_owned();
+    assert!(head.contains("200"), "the media response started: {head:?}");
+    let body = if head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(body)
+    } else {
+        body.to_vec()
+    };
+    assert_eq!(
+        body.len(),
+        size,
+        "a request in flight when the signal arrived is answered, not cut short"
+    );
+    assert_eq!(body, &image[..], "the bytes streamed all the way through");
+    let status = server.wait_for_exit(Duration::from_secs(10));
+    assert_eq!(status.code(), Some(0), "the viewer stopped by itself");
+}
+
+/// The grace window is a bound, not a promise to wait: a client that starts a
+/// request and then says nothing holds a connection the viewer would otherwise
+/// wait for forever.
+#[test]
+#[cfg(unix)]
+fn serve_stops_at_the_deadline_when_a_request_never_finishes() {
+    let dir = library("deadline");
+    let mut server = Server::start(
+        &dir.root,
+        &["--port", "0"],
+        &[("DIMAGINE_PASSCODE", "2333")],
+    );
+    let address = server.url().to_string();
+    let mut stream = connect(&address);
+    stream
+        .write_all(
+            b"POST /login HTTP/1.1\r\nHost: viewer\r\n\
+               Content-Type: application/x-www-form-urlencoded\r\n\
+               Content-Length: 100000\r\n\r\npasscode=",
+        )
+        .expect("send the start of a body that never ends");
+
+    let started = Instant::now();
+    let (code, stderr) = server.stop_with_signal("TERM", Duration::from_secs(60));
+    let waited = started.elapsed();
+    assert_eq!(code, Some(0), "the deadline still leaves with status 0");
+    assert!(
+        waited < Duration::from_secs(30),
+        "the wait for the stalled request is bounded, not forever: {waited:?}"
+    );
+    assert!(
+        stderr.contains("stopped without waiting"),
+        "the deadline says so on stderr: {stderr:?}"
+    );
+    drop(stream);
 }
 
 #[test]
@@ -930,6 +1236,27 @@ fn serve_lists_in_help_with_default_bind_and_port() {
     assert!(stdout.contains("8917"), "{stdout}");
     assert!(stdout.contains("127.0.0.1"), "{stdout}");
     assert!(stdout.contains("DIMAGINE_PASSCODE"), "{stdout}");
+}
+
+/// The help text is a promise; the socket is the guarantee. With no `--bind`,
+/// the address the listener reports for itself must be loopback, so nothing
+/// else on the network can reach the library.
+#[test]
+fn serve_without_bind_listens_on_loopback() {
+    let dir = library("default-bind");
+    let server = Server::start(&dir.root, &["--port", "0"], &[]);
+    let socket: std::net::SocketAddr = server
+        .url()
+        .parse()
+        .expect("the startup document advertises an address:port");
+    assert_eq!(
+        socket.ip(),
+        std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        "the bound address, read from the socket itself"
+    );
+    assert_ne!(socket.port(), 0, "--port 0 must land on a real port");
+    assert_eq!(status_of(&http_get(server.url(), "/", None)), "303");
+    server.kill();
 }
 
 fn post_form(address: &str, path: &str, body: &str) -> (String, Option<String>) {

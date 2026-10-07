@@ -7,12 +7,12 @@
 //! sniffs headers, so a truncated image must show up here as a finding.
 //! Renditions that already exist and decode cleanly count as cached.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::SystemTime;
 
 use clap::{Arg, ArgMatches, Command};
 use dimagine_core::library::{FileClass, Library};
@@ -85,7 +85,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .map(|file| (file.rel.clone(), library.root.join(&file.path)))
         .collect();
 
-    let run_start = SystemTime::now();
+    let cached_at_start = cached_at_start(&library.root);
     let next = AtomicUsize::new(0);
     let outcomes = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -95,7 +95,7 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
                 let Some((rel, path)) = images.get(index) else {
                     break;
                 };
-                let outcome = build(&library.root, rel, path, run_start);
+                let outcome = build(&library.root, rel, path, &cached_at_start);
                 outcomes.lock().unwrap().push(outcome);
             });
         }
@@ -140,14 +140,14 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     }
 }
 
-fn build(root: &Path, rel: &str, path: &Path, run_start: SystemTime) -> ImageOutcome {
+fn build(root: &Path, rel: &str, path: &Path, cached: &HashSet<PathBuf>) -> ImageOutcome {
     match ensure(root, path, &[Kind::Thumb, Kind::View]) {
         Ok(renditions) => {
-            let (generated, cached) = classify(&renditions, run_start);
+            let (generated, hits) = classify(&renditions, cached);
             ImageOutcome {
                 rel: rel.to_string(),
                 generated,
-                cached,
+                cached: hits,
                 failure: None,
             }
         }
@@ -160,25 +160,51 @@ fn build(root: &Path, rel: &str, path: &Path, run_start: SystemTime) -> ImageOut
     }
 }
 
-/// `ensure` returns existing and freshly written renditions alike, so a
-/// rendition counts as cached when its file predates this run. A file whose
-/// stored preview was invalid (e.g. truncated) has just been rewritten by
-/// `ensure`, which correctly counts as generated.
-fn classify(renditions: &[Rendition], run_start: SystemTime) -> (usize, usize) {
+/// The derived-data folder as it stands when the run starts: every file path,
+/// whichever shard it lives in.
+///
+/// A missing folder is not an error — it is the first run on a library, and
+/// everything is then generated.
+fn cached_at_start(root: &Path) -> HashSet<PathBuf> {
+    let mut existing = HashSet::new();
+    let mut pending = vec![root.join(".dimagine").join("cache")];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(path);
+            } else {
+                existing.insert(path);
+            }
+        }
+    }
+    existing
+}
+
+/// `ensure` returns existing and freshly written renditions alike, and each is
+/// named after the content hash of the image it came from, so a path that was
+/// not in the cache at the start is one this run had to make. No timestamp can
+/// stand in for that: a file written in the second the run began looks as old
+/// as one that was cached, and a file that predates the run by a year can still
+/// be a rendition this run rewrote.
+///
+/// A stored rendition that `ensure` found unusable and rewrote keeps its name,
+/// so it counts as cached: the two numbers say how much of the cache this run
+/// had to build from the images, not how many bytes reached the disk.
+fn classify(renditions: &[Rendition], cached: &HashSet<PathBuf>) -> (usize, usize) {
     let mut generated = 0;
-    let mut cached = 0;
+    let mut hits = 0;
     for rendition in renditions {
-        let predates_run = fs::symlink_metadata(&rendition.path)
-            .and_then(|meta| meta.modified())
-            .map(|mtime| mtime < run_start)
-            .unwrap_or(false);
-        if predates_run {
-            cached += 1;
+        if cached.contains(&rendition.path) {
+            hits += 1;
         } else {
             generated += 1;
         }
     }
-    (generated, cached)
+    (generated, hits)
 }
 
 fn code_for(error: &PreviewError) -> &'static str {

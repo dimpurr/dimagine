@@ -100,6 +100,21 @@ All notable changes to this project are documented here. The format follows
   "Folder: path", "Collection: name" (the note's `title`, else the file), or
   "Search: q" — instead of the generic "Search" that never said what was on
   screen (W34 audit #12). The whole library stays quietly "Library".
+||||||| 4517f1e
+- `dimagine serve` stops cleanly: Ctrl-C (SIGINT) and SIGTERM now close the
+  listening socket, answer the requests already in flight, and exit with status
+  `0`. The wait is bounded at 5 seconds, so a client that has stalled cannot
+  hold the viewer open forever; whatever is still running when the window
+  closes is dropped with a line on stderr.
+- CLI: `dimagine import eagle` answers exit code `3` — "did not finish reading",
+  the code `scan`, `check` and `previews` already use — when the folder it was
+  pointed at cannot be read at all (missing, or locked) or when an I/O failure
+  stops the import partway through. Exit code `1` stays for a reading that
+  finished and found something: a folder that is not an Eagle library, a
+  destination that is not empty, overlapping paths. The `--json` document for an
+  incomplete read carries `"read_complete": false` and, when the run got that
+  far, the partial import report. `import eagle --backfill-added` follows the
+  same rule, so a missing library folder is now `3` where it used to be `1`.
 - Viewer: the collection list — the sidebar section, the `/collections` page
   and the `/api/sidebar` `collections` array — carries only the notes that
   mean to collect: `kind: collection`, or a non-image note that embeds at
@@ -135,6 +150,15 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- CLI: `dimagine previews` decides "generated" from "cached" by what the cache
+  held when the run started — a rendition is named after the content hash of
+  the image it came from — instead of by the file's timestamp. On a filesystem
+  with coarse (one-second) mtimes a first run could report "0 generated, N
+  cached" for work it had just done, and a cached rendition carrying a newer
+  timestamp than the run was reported as generated. A rendition the run found
+  unusable and rewrote now counts as cached rather than generated: the counts
+  say how much of the cache had to be built from the images, not how many bytes
+  reached the disk.
 - Viewer: an accounts store that becomes unreadable while the server runs
   fails every gated request with 500 and the store's own error message, and
   the auth gate's comment says what the code does. Read errors were read as

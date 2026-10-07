@@ -1,7 +1,9 @@
 //! `dimagine serve`: read-only web viewer for a dimagine library (HLD module
 //! `serve`), built on the `dimagine-serve` public API: `FsCatalog`,
-//! `CachedPreview`, `ServeConfig`, `router` and `serve`. Compiled when the
-//! `serve` feature is on and not switched off at runtime (ADR-013).
+//! `CachedPreview`, `ServeConfig` and `router_from`. The server loop is the
+//! CLI's own, because stopping on a signal needs `axum::serve`'s graceful
+//! shutdown. Compiled when the `serve` feature is on and not switched off at
+//! runtime (ADR-013).
 //!
 //! Accounts live outside the library in the state directory selected by
 //! `--data-dir`. With the default `--auth account` the viewer sends every page
@@ -12,17 +14,20 @@
 //! altogether (every page is public and carries a banner, and the accounts
 //! store is not needed). Binding defaults to loopback: other devices need an
 //! explicit `--bind`, and a default passcode on a non-loopback bind earns a
-//! warning from the serve crate itself.
+//! warning at startup. The passcode itself stays a secret: neither stdout nor
+//! stderr ever carries it, not even when a client sends the wrong one.
 
+use std::future::IntoFuture;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Arg, ArgMatches, Command};
 use dimagine_serve::{
-    accounts::AccountsStore, remind_until_owner_exists, router_from, serve, AuthMode,
-    CachedPreview, FsCatalog, ServeConfig, NO_OWNER_REMINDER_INTERVAL,
+    accounts::AccountsStore, remind_until_owner_exists, router_from, AuthMode, CachedPreview,
+    FsCatalog, ServeConfig, NO_OWNER_REMINDER_INTERVAL,
 };
 use std::sync::Arc;
 
@@ -34,6 +39,10 @@ const SCHEMA: &str = "dimagine.serve/0.1";
 const DEFAULT_PORT: u16 = 8917;
 /// Passcode environment variable, matching the serve crate's convention.
 const PASSCODE_ENV: &str = "DIMAGINE_PASSCODE";
+/// How long a shutdown signal waits for the requests already in flight.
+/// Long enough for a phone on a slow link to finish one media response,
+/// short enough that stopping the viewer never feels stuck.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 pub fn command() -> Command {
     Command::new("serve")
@@ -244,7 +253,35 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
                 |message| eprintln!("{message}"),
             ));
         }
-        match serve(listener, app, &config).await {
+        // The viewer drives `axum::serve` itself instead of calling
+        // `dimagine_serve::serve`, because stopping on a signal — stop
+        // accepting, then let the requests already in flight finish — is a
+        // property of the serve builder. The startup check that call made is
+        // made here too: a default passcode on an address others can reach
+        // deserves a warning whoever runs the router.
+        if config.passcode == ServeConfig::default().passcode && !bind.is_loopback() {
+            eprintln!("WARNING: the default passcode is active on a non-loopback address");
+        }
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .into_future();
+        let stopped = tokio::select! {
+            drained = server => drained,
+            _ = async {
+                shutdown_signal().await;
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+            } => {
+                eprintln!(
+                    "dimagine: requests were still running {SHUTDOWN_GRACE:?} after the stop \
+                     signal, so the viewer stopped without waiting for them"
+                );
+                Ok(())
+            }
+        };
+        match stopped {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 emit_failure(json, &format!("the viewer stopped: {error}"));
@@ -252,6 +289,29 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
             }
         }
     })
+}
+
+/// Resolve when the operator asks the viewer to stop: Ctrl-C (SIGINT) or
+/// SIGTERM, which are how a foreground server gets stopped.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut interrupt =
+            signal(SignalKind::interrupt()).expect("cannot install a SIGINT handler");
+        let mut terminate =
+            signal(SignalKind::terminate()).expect("cannot install a SIGTERM handler");
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("cannot install a Ctrl-C handler");
+    }
 }
 
 fn passcode_from_env() -> Option<String> {

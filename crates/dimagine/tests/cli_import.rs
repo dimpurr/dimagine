@@ -7,13 +7,32 @@ use std::process::Command;
 
 use serde_json::json;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 const BIN: &str = env!("CARGO_BIN_EXE_dimagine");
 
 struct TempDir(PathBuf);
 
 impl Drop for TempDir {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        allow_everything(&self.0);
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A test that locked a folder out must not leave it locked, or the folder
+/// cannot be removed when the temporary directory is dropped.
+#[cfg(unix)]
+fn allow_everything(root: &Path) {
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let _ =
+                    std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(0o755));
+            }
+        }
     }
 }
 
@@ -228,6 +247,63 @@ fn import_eagle_partial_import_exits_one() {
     assert_eq!(report["dangling_folder_refs"], 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn import_eagle_write_failure_mid_run_exits_three() {
+    let tmp = tmp("writedefeat");
+    let source = tmp.0.join("Fixture.library");
+    clean_eagle_library(&source);
+
+    // A destination that is readable, so the empty-destination check passes,
+    // but sealed for writing: the import stops partway through the source,
+    // which is the incomplete read rather than a completed one with problems.
+    let destination = tmp.0.join("dest");
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        source.to_str().unwrap(),
+        "--library",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        code, 3,
+        "stdout: {stdout}\nstderr: {stderr}\n(only a writer that cannot write fails this way)"
+    );
+    assert!(
+        stderr.contains("I/O failure after partial import"),
+        "{stderr}"
+    );
+
+    let json_dest = tmp.0.join("dest-json");
+    std::fs::create_dir_all(&json_dest).unwrap();
+    std::fs::set_permissions(&json_dest, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (code, stdout, stderr) = dimagine(&[
+        "--json",
+        "import",
+        "eagle",
+        source.to_str().unwrap(),
+        "--library",
+        json_dest.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["schema"], "dimagine.error/0.1");
+    assert_eq!(report["read_complete"], false);
+    assert!(
+        report["error"]
+            .as_str()
+            .unwrap()
+            .contains("I/O failure after partial import"),
+        "{report}"
+    );
+    assert!(
+        report["import"]["skipped"].is_array(),
+        "the part that did get read is still reported: {report}"
+    );
+}
+
 #[test]
 fn import_eagle_name_flag_sets_the_import_label() {
     let tmp = tmp("name");
@@ -261,9 +337,12 @@ fn import_eagle_usage_errors_exit_two() {
 }
 
 #[test]
-fn import_eagle_bad_source_exits_one() {
-    let tmp = tmp("badsource");
+fn import_eagle_source_that_cannot_be_read_exits_three() {
+    let tmp = tmp("unreadablesource");
     let destination = tmp.0.join("dest");
+
+    // Not there at all: the reading never started, so this is not a completed
+    // import that found a problem.
     let (code, _, stderr) = dimagine(&[
         "import",
         "eagle",
@@ -271,13 +350,74 @@ fn import_eagle_bad_source_exits_one() {
         "--library",
         destination.to_str().unwrap(),
     ]);
-    assert_eq!(code, 1);
+    assert_eq!(
+        code, 3,
+        "an unreadable source is an incomplete read: {stderr}"
+    );
     assert!(
         stderr.contains("No such file or directory"),
         "the importer reports the raw filesystem error: {stderr}"
     );
+    assert!(
+        !destination.exists(),
+        "a run that read nothing writes no destination"
+    );
 
-    // Not an Eagle library: metadata.json is missing.
+    // There, but locked: same exit code, same reason.
+    #[cfg(unix)]
+    {
+        let source = tmp.0.join("locked.library");
+        clean_eagle_library(&source);
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (code, stdout, stderr) = dimagine(&[
+            "--json",
+            "import",
+            "eagle",
+            source.to_str().unwrap(),
+            "--library",
+            tmp.0.join("locked-dest").to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code, 3,
+            "stdout: {stdout}\nstderr: {stderr}\n(only a reader that cannot open the folder fails this way)"
+        );
+        let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+        assert_eq!(report["schema"], "dimagine.error/0.1");
+        assert_eq!(report["read_complete"], false);
+        assert!(
+            report["error"]
+                .as_str()
+                .unwrap()
+                .contains("Permission denied"),
+            "{report}"
+        );
+        assert!(
+            !tmp.0.join("locked-dest").exists(),
+            "a refused read leaves nothing behind to clean up"
+        );
+
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (code, stdout, stderr) = dimagine(&[
+            "import",
+            "eagle",
+            source.to_str().unwrap(),
+            "--library",
+            tmp.0.join("unlocked-dest").to_str().unwrap(),
+        ]);
+        assert_eq!(
+            code, 0,
+            "the lock, not the library, was the problem: {stdout}\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn import_eagle_bad_source_exits_one() {
+    let tmp = tmp("badsource");
+    let destination = tmp.0.join("dest");
+
+    // Not an Eagle library: metadata.json is missing. The folder was read
+    // through, and what the reading found is the problem.
     let plain = tmp.0.join("plain.library");
     std::fs::create_dir_all(&plain).unwrap();
     let (code, _, stderr) = dimagine(&[
@@ -462,7 +602,7 @@ fn backfill_added_json_report() {
 }
 
 #[test]
-fn backfill_added_rejects_missing_library() {
+fn backfill_added_rejects_a_library_that_cannot_be_read() {
     let tmp = tmp("backfill-missing");
     let missing = tmp.0.join("absent");
     let (code, stdout, stderr) = dimagine(&[
@@ -471,6 +611,24 @@ fn backfill_added_rejects_missing_library() {
         "--backfill-added",
         missing.to_str().unwrap(),
     ]);
-    assert_eq!(code, 1, "stdout: {stdout}");
-    assert!(stderr.contains("not a dimagine library"), "{stderr}");
+    assert_eq!(
+        code, 3,
+        "the backfill read nothing, so it is an incomplete read: stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("No such file or directory"),
+        "the raw filesystem error is kept: {stderr}"
+    );
+
+    // A folder that is there but holds no library is a completed read with a
+    // problem to report.
+    let empty = tmp.0.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let (code, _, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        "--backfill-added",
+        empty.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "stderr: {stderr}");
 }

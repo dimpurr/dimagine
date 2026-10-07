@@ -189,6 +189,67 @@ fn previews_json_document_shape() {
     assert_eq!(report["cached"], 2, "second run is a cache hit");
 }
 
+/// Every rendition this library's cache holds.
+fn cache_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.join(".dimagine/cache/previews")];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            if entry.path().is_dir() {
+                pending.push(entry.path());
+            } else {
+                found.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The counts are about the cache, whose entries are named after the content
+/// they came from — not about timestamps, which cannot tell a cached rendition
+/// from one written in the same second the run started.
+#[test]
+fn previews_counts_ignore_the_timestamp_on_a_rendition() {
+    let tmp = tmp("timestamp");
+    write(&tmp.0, "one.jpg", JPG);
+    let lib = tmp.0.to_str().unwrap();
+    let (code, stdout, stderr) = dimagine(&["--json", "previews", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["generated"], 2);
+
+    let renditions = cache_files(&tmp.0);
+    assert_eq!(renditions.len(), 2, "{renditions:?}");
+    let bytes: Vec<Vec<u8>> = renditions
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+
+    // Stamp them from the future: a file whose own clock is newer than the run
+    // is still the rendition the cache already had.
+    let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3_600);
+    for path in &renditions {
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(future))
+            .unwrap();
+    }
+
+    let (code, stdout, stderr) = dimagine(&["--json", "previews", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(
+        report["cached"], 2,
+        "a cached rendition stays cached whatever its timestamp says: {report}"
+    );
+    assert_eq!(report["generated"], 0, "{report}");
+    let after: Vec<Vec<u8>> = renditions
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert_eq!(after, bytes, "nothing was rewritten to say so");
+}
+
 #[test]
 fn previews_truncated_image_is_a_finding_exit_one() {
     let tmp = tmp("truncated");
@@ -274,9 +335,35 @@ fn previews_failed_and_unreadable_reports_both_exits_three() {
     let mut truncated = PNG.to_vec();
     truncated.truncate(20);
     write(&tmp.0, "tiny-broken.png", truncated);
-    let (code, stdout, _) = dimagine(&["previews", "--library", lib]);
-    assert_eq!(code, 1, "{stdout}");
+    // A folder this run cannot list, so the reading did not finish: with a
+    // decode failure in the readable part too, exit code 3 wins because "not
+    // found" here proves nothing, while a failure is something found.
+    write(&tmp.0, "locked/hidden.gif", GIF);
+    #[cfg(unix)]
+    std::fs::set_permissions(tmp.0.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (code, stdout, stderr) = dimagine(&["previews", "--library", lib]);
+    assert_eq!(
+        code, 3,
+        "an incomplete reading outranks a finding: {stdout}\nstderr: {stderr}"
+    );
     assert!(stdout.contains("1 failed"), "{stdout}");
+    assert!(stdout.contains("error tiny-broken.png"), "{stdout}");
+    assert!(stdout.contains("could not read folder"), "{stdout}");
+    assert!(stdout.contains("reading incomplete"), "{stdout}");
+
+    let (code, stdout, stderr) = dimagine(&["--json", "previews", "--library", lib]);
+    assert_eq!(code, 3, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["read_complete"], false);
+    assert_eq!(report["failed"], 1, "{report}");
+    assert!(
+        !report["unreadable_dirs"].as_array().unwrap().is_empty(),
+        "{report}"
+    );
+
+    #[cfg(unix)]
+    std::fs::set_permissions(tmp.0.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -325,6 +412,81 @@ fn previews_jobs_flag_bounds_concurrency() {
     );
     assert!(stdout.contains("2 generated"), "{stdout}");
     assert!(stdout.contains("4 cached"), "{stdout}");
+}
+
+/// An uncompressed 24-bit BMP, `side` by `side` (a multiple of four, so rows
+/// need no padding), whose pixels move with `seed` so distinct seeds are
+/// distinct files and share no cache key.
+fn bmp(side: usize, seed: usize) -> Vec<u8> {
+    assert_eq!(side % 4, 0, "BMP rows are padded to four bytes");
+    let mut out = Vec::with_capacity(54 + side * side * 3);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + side * side * 3) as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0, 54, 0, 0, 0]);
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(side as u32).to_le_bytes());
+    out.extend_from_slice(&(side as u32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]);
+    for y in 0..side {
+        for x in 0..side {
+            out.push((x + y + seed * 29) as u8);
+            out.push((x * 3 + y + seed) as u8);
+            out.push((x + y * 2 + seed * 7) as u8);
+        }
+    }
+    out
+}
+
+/// The `--jobs` bound has to show up in the run, or nothing distinguishes a
+/// worker pool that obeys it from one that ignores it.
+#[test]
+fn previews_jobs_bound_shows_in_the_wall_clock() {
+    let cpus = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    if cpus < 2 {
+        // One CPU has no parallelism to measure; the bound is honest but
+        // invisible here, so there is nothing to assert.
+        return;
+    }
+    let jobs = cpus.min(4);
+    let tmp = tmp("bound");
+    let lib = tmp.0.to_str().unwrap();
+    // Six images large enough that decoding dominates: a run that skipped the
+    // work would finish too fast to compare.
+    for seed in 0..6 {
+        write(&tmp.0, &format!("slow-{seed}.bmp"), bmp(640, seed));
+    }
+
+    let measure = |jobs: &str| {
+        let started = std::time::Instant::now();
+        let (code, stdout, stderr) = dimagine(&["previews", "--library", lib, "--jobs", jobs]);
+        assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stdout.contains("6 images (12 generated, 0 cached, 0 failed)"),
+            "--jobs {jobs} must build, not skip: {stdout}"
+        );
+        started.elapsed()
+    };
+
+    let serial = measure("1");
+    // The cache is derived state (FORMAT §8): deleting it is the supported way
+    // to ask the same library for the same work again.
+    std::fs::remove_dir_all(tmp.0.join(".dimagine")).unwrap();
+    let parallel = measure(&jobs.to_string());
+
+    // Half the workers a run asked for, and never less than one and a half:
+    // that leaves room for process start-up, the other tests and a busy CI box,
+    // while a pool that ran the images serially anyway lands at one.
+    let speedup = serial.as_secs_f64() / parallel.as_secs_f64();
+    let floor = (jobs as f64 / 2.0).max(1.5);
+    assert!(
+        speedup >= floor,
+        "{jobs} workers took {parallel:?} against {serial:?} serially: {speedup:.1}x, \
+         short of the {floor:.1}x the bound promises"
+    );
 }
 
 #[test]
