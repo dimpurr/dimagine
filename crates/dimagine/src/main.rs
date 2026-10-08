@@ -180,8 +180,9 @@ fn refresh_index(
         ));
     }
     dimagine_core::sync_index(library, &mut index)?;
-    // What the index now holds, counted from its own rows: an unreadable
-    // header is a recorded fact about content, so every scan reports it.
+    // What the index now holds, counted from its own rows: dimensions that
+    // stayed unknown are a recorded fact about content, so every scan reports
+    // them.
     index.image_meta_stats()
 }
 
@@ -231,8 +232,9 @@ fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMeta
         report: &'a ScanReport,
         /// Per-image header facts of the index, present whenever the index
         /// was refreshed: images, how many have dimensions, a taken time,
-        /// or a header that could not be read. Absent is a refresh that did
-        /// not happen, which is not "zero images have dimensions".
+        /// or dimensions that stayed unknown (a header that could not be read,
+        /// or a format this build has no reader for). Absent is a refresh that
+        /// did not happen, which is not "zero images have dimensions".
         #[serde(skip_serializing_if = "Option::is_none")]
         index: Option<IndexStatsJson>,
     }
@@ -241,11 +243,16 @@ fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMeta
         images: u64,
         with_dimensions: u64,
         with_taken: u64,
-        unreadable_image_headers: u64,
+        unknown_dimensions: u64,
         /// Images with no taken time, counted by the reason their own bytes
         /// gave (`no-exif`, `exif-without-date`, `exif-unreadable`,
-        /// `date-unreadable`, `file-unreadable`). Empty is every image having
-        /// a time; a reason that counted nothing is simply absent.
+        /// `date-unreadable`, `file-unreadable`). The counts add up to
+        /// `images - with_taken`: an image whose reason is *unrecorded* — a
+        /// foreign or hand-edited index, or one written by a build whose
+        /// reason code this version does not know — is counted under
+        /// `reason not recorded` rather than left out of the sum. Empty is
+        /// every image having a time; a reason that counted nothing is simply
+        /// absent.
         taken_missing: std::collections::BTreeMap<&'static str, u64>,
     }
     let document = ScanJson {
@@ -255,18 +262,37 @@ fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMeta
             images: stats.images,
             with_dimensions: stats.with_dimensions,
             with_taken: stats.with_taken,
-            unreadable_image_headers: stats.unreadable_headers,
-            taken_missing: stats
-                .taken_missing
-                .iter()
-                .map(|(reason, count)| (reason.as_str(), *count))
-                .collect(),
+            unknown_dimensions: stats.unknown_dimensions,
+            taken_missing: {
+                let mut missing: std::collections::BTreeMap<&'static str, u64> = stats
+                    .taken_missing
+                    .iter()
+                    .map(|(reason, count)| (reason.as_str(), *count))
+                    .collect();
+                let unrecorded = unrecorded_taken_reasons(stats);
+                if unrecorded > 0 {
+                    missing.insert("reason not recorded", unrecorded);
+                }
+                missing
+            },
         }),
     };
     println!(
         "{}",
         serde_json::to_string_pretty(&document).unwrap_or_default()
     );
+}
+
+/// The images with no taken time whose reason is none of the recorded kinds:
+/// `images - with_taken` less what the breakdown accounts for. It is a row
+/// nobody recorded a reason for — a foreign or hand-edited index, or one
+/// written by a build whose reason code this version does not know — and both
+/// the human summary and the JSON name it rather than leaving it out of a sum
+/// that then disagrees with its own total (RW50 L1).
+fn unrecorded_taken_reasons(stats: &dimagine_index::ImageMetaStats) -> u64 {
+    let missing = stats.images.saturating_sub(stats.with_taken);
+    let recorded: u64 = stats.taken_missing.iter().map(|(_, count)| count).sum();
+    missing.saturating_sub(recorded)
 }
 
 fn print_scan_human(report: &ScanReport, index: Option<&dimagine_index::ImageMetaStats>) {
@@ -289,30 +315,35 @@ fn print_scan_human(report: &ScanReport, index: Option<&dimagine_index::ImageMet
             dims = index.with_dimensions,
             taken = index.with_taken
         );
-        if index.unreadable_headers > 0 {
+        if index.unknown_dimensions > 0 {
+            // Not "unreadable headers": a format this build has no reader for
+            // (AVIF, HEIF) lands here beside a header that failed to parse,
+            // and the row does not record which of the two it was.
             println!(
-                "index unreadable image headers: {}",
-                index.unreadable_headers
+                "index: dimensions unknown for {} images",
+                index.unknown_dimensions
             );
         }
         if index.with_taken < index.images {
             // The count without the kinds is the number that started this: an
             // operator can see dates are missing but not whether the files
             // carry none, carry one that could not be read, or carry nothing
-            // we could read at all.
-            let kinds = if index.taken_missing.is_empty() {
-                "reason not recorded".to_string()
-            } else {
-                index
-                    .taken_missing
-                    .iter()
-                    .map(|(reason, count)| format!("{reason} {count}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
+            // we could read at all. The kinds add up to that count; whatever
+            // is left is an image whose reason nobody recorded, and it is
+            // named rather than quietly dropped from the sum (RW50 L1).
+            let mut kinds = index
+                .taken_missing
+                .iter()
+                .map(|(reason, count)| format!("{reason} {count}"))
+                .collect::<Vec<_>>();
+            let unrecorded = unrecorded_taken_reasons(index);
+            if unrecorded > 0 {
+                kinds.push(format!("reason not recorded {unrecorded}"));
+            }
             println!(
-                "index: taken time missing for {} images ({kinds})",
-                index.images - index.with_taken
+                "index: taken time missing for {} images ({})",
+                index.images - index.with_taken,
+                kinds.join(", ")
             );
         }
     }

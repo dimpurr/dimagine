@@ -406,6 +406,16 @@ impl ViewParams {
                 .push("Ignored sort: a collection keeps the order of its note's embeds".to_owned());
         }
 
+        // Neither does it have pages: the members are the whole of one note's
+        // embed list, listed at once (the count in the header is the count on
+        // the page), so `p` beside `c` asks for a second page of a list that
+        // has no second page. Say so in the same voice as the sort above.
+        if params.collection.is_some() && params.page != 1 {
+            params.notices.push(
+                "Ignored page number: a collection lists all of its members at once".to_owned(),
+            );
+        }
+
         params
     }
 
@@ -827,13 +837,17 @@ mod tests {
         assert_eq!(parsed.direction, Direction::Asc);
         assert_eq!(parsed.size, ThumbnailSize::L);
         assert_eq!(parsed.page, 3);
-        // The query asks for a sort beside a collection, and a collection
-        // keeps the order of its note's embeds (FORMAT §5): the reader is
-        // told the sort was ignored, so the URL cannot look like it decided
-        // the order.
+        // The query asks for a sort and a page number beside a collection:
+        // the collection keeps the order of its note's embeds and lists all of
+        // its members at once (FORMAT §5), so neither is something it can take,
+        // and the reader is told both — the URL cannot look like it decided the
+        // order or picked a page of a list with no pages.
         assert_eq!(
             parsed.notices,
-            vec!["Ignored sort: a collection keeps the order of its note's embeds".to_owned()],
+            vec![
+                "Ignored sort: a collection keeps the order of its note's embeds".to_owned(),
+                "Ignored page number: a collection lists all of its members at once".to_owned(),
+            ],
             "{:?}",
             parsed.notices
         );
@@ -870,6 +884,29 @@ mod tests {
         assert!(ViewParams::parse("c=favs.md&tag=x&untagged=0")
             .notices
             .is_empty());
+    }
+
+    /// The same lens answers for the page number as for the sort: a
+    /// collection has no second page, so a `p` asked beside `c` is ignored,
+    /// and saying so is the only thing left to do with it.
+    #[test]
+    fn a_collection_reports_a_page_number_it_cannot_take() {
+        assert_eq!(
+            ViewParams::parse("c=favs.md&p=3").notices,
+            vec!["Ignored page number: a collection lists all of its members at once".to_owned()]
+        );
+        // The first page is what the page shows anyway, so it is not a
+        // request being refused, and a page number no page could be already
+        // has its own, more specific notice.
+        assert!(ViewParams::parse("c=favs.md&p=1").notices.is_empty());
+        assert_eq!(
+            ViewParams::parse("c=favs.md&p=many").notices,
+            vec!["Ignored invalid page number 'many' (expected >= 1)".to_owned()]
+        );
+        // A page number on an ordinary view is honoured, and says nothing.
+        let paged = ViewParams::parse("p=3");
+        assert_eq!(paged.page, 3);
+        assert!(paged.notices.is_empty());
     }
 
     #[test]
@@ -1221,6 +1258,42 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(params.without_tag("nope").tags, vec!["Eagle", "URBAN"]);
+    }
+
+    /// "Clear all filters" clears filters: the folder, the collection, the
+    /// tags, the words and the two lenses. Everything else the reader chose —
+    /// the order, the tile size, the page they are standing on, the facet
+    /// lists they asked to see all of — travels to the destination with them,
+    /// because the label promised filters and nothing else (W47b Low-5).
+    /// `sub` goes too: it is the folder rows' own setting, not a filter.
+    ///
+    /// This is the unit beside the helper, which the integration test cannot
+    /// replace: on a URL whose only parameters are filters the link with the
+    /// bug and the link without it are the same string (`href="/"`).
+    #[test]
+    fn clearing_filters_keeps_everything_that_is_not_a_filter() {
+        let view = ViewParams::parse(
+            "in=refs&sub=0&c=favs.md&tag=art&q=street&sort=name&dir=desc\
+             &size=l&p=2&untagged=1&recent=1&more=tags",
+        );
+        let cleared = view.without_filters();
+        assert_eq!(cleared.folder, None);
+        assert_eq!(cleared.collection, None);
+        assert!(cleared.tags.is_empty());
+        assert_eq!(cleared.q, None);
+        assert!(!cleared.untagged);
+        assert!(!cleared.recent);
+        assert_eq!(cleared.sort, SortKey::Name);
+        assert_eq!(cleared.direction, Direction::Desc);
+        assert_eq!(cleared.size, ThumbnailSize::L);
+        assert_eq!(cleared.page, 2);
+        assert_eq!(cleared.more, vec!["tags".to_owned()]);
+        assert!(!cleared.recursive);
+        // The link the panel prints, in the order the serialiser writes it.
+        assert_eq!(
+            cleared.to_query_string(),
+            "sub=0&sort=name&dir=desc&size=l&p=2&more=tags"
+        );
     }
 
     /// W47: the panel caps each facet list and the *Show more* link is a URL,

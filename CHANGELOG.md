@@ -60,14 +60,14 @@ All notable changes to this project are documented here. The format follows
   after that reuses everything (dimensions, taken time and digest) while
   size and nanosecond mtime stand. Identical content is cached by its
   SHA-256 digest the way previews are, so a duplicate, a moved file or a
-  touched file never parses twice. Unreadable headers record `NULL` —
-  an unknown, never a zero — and are counted on every scan in
-  `dimagine scan`'s human and JSON output (`index.images`,
-  `index.with_dimensions`, `index.with_taken`,
-  `index.unreadable_image_headers`; the JSON key is absent when the
-  refresh did not happen). The read API: `Index::image_meta` for one
-  image's metadata, `Index::view_by_taken` for a page ordered by taken
-  time (NULLs last in both directions, ties broken by path).
+  touched file never parses twice. A header that cannot be read records
+  `NULL` — an unknown, never a zero — and the dimensions that stay
+  unknown are counted on every scan in `dimagine scan`'s human and JSON
+  output (`index.images`, `index.with_dimensions`, `index.with_taken`,
+  `index.unknown_dimensions`; the JSON key is absent when the refresh
+  did not happen). The read API: `Index::image_meta` for one image's
+  metadata, `Index::view_by_taken` for a page ordered by taken time
+  (NULLs last in both directions, ties broken by path).
 - Index: the reason an image has no taken time, recorded beside the missing
   value in every image row and in the digest cache (`TakenReason`: `no-exif`,
   `exif-without-date`, `exif-unreadable`, `date-unreadable`,
@@ -256,6 +256,57 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Index: the review follow-ups on the taken-time round (RW50). A date property
+  that a file's XMP merely *mentions* — a caption spelling
+  `exif:DateTimeOriginal='2019-…'` inside a `dc:description` — no longer speaks
+  for the file: only a real property position counts, so the date the file
+  actually sets wins and a sentence inside a caption stays a sentence. And the
+  "taken time missing" line and `index.taken_missing` now account for the whole
+  count they name: an image whose reason nobody recorded is counted under
+  `reason not recorded` rather than left out of a sum that disagreed with its
+  own total.
+- Index: the review follow-ups on the image-metadata round (RW48). An
+  `OffsetTimeOriginal` that parses but names no zone — `+25:00`, `+99:99`, an
+  hour past 23 or a minute past 59 — is refused rather than applied: a corrupt
+  or hand-edited field used to move a photo by up to ±6.7 days, where the
+  documented rule keeps the date in the zone-less rule instead (a companion
+  tag that is refused) or names no moment at all (a value that carries its
+  own bad zone). The images whose dimensions are unknown are counted under a
+  name that says so, `index.unknown_dimensions`, rather than as "unreadable
+  image headers" — a format this build has no reader for (AVIF, HEIF) lands
+  there beside a header that failed to parse, and the count now claims only
+  what it knows. The content-keyed header cache is pruned with the content it
+  describes instead of only growing, and two properties that held by
+  construction now hold under test: an upgrade interrupted before its `COMMIT`
+  rolls back to the old schema and completes on the next open, and an
+  unchanged file is re-read by nothing.
+- Viewer: the review follow-ups on the media and collection routes (RW46).
+  `/raw` is the source view of a *note*, and now gates on the library's own
+  class test instead of on "not an image": what a note's page links as
+  "Open note" comes back as text, while a raw source JSON, a canvas, or
+  anything else an importer left in the library stays unreachable through it.
+  Answering one such click no longer reads the whole file either — a note's
+  ETag is its own size and modification time rather than a SHA-256 of its
+  bytes, which is what a file the viewer never writes needs to revalidate on;
+  images and renditions keep the content hash. A collection page says it
+  ignored a page number, the way it already says it ignored a sort: its members
+  are the whole of the note's embed list, listed at once, so `p` asks for a
+  page of a list that has no pages. And the collection grid stops carrying a
+  class no rule of the stylesheet or line of the script has ever read.
+  `/raw` and `/media` are named beside the pages in the passcode test, the
+  source view is pinned against traversal and the outside-symlink, and a
+  collection's own hostile prose is pinned arriving escaped at the route a
+  reader reaches rather than only where the sanitiser is unit-tested.
+- Viewer: the image page's three review follow-ups (RW45). "Back to view" asks
+  for the page the tile is actually on: the arrows walk the whole view while
+  the `p` the tile carried stays where the reader started, so after a walk past
+  a page boundary Esc was anchoring a tile that is not in the page it opened
+  and landed at the top of the grid. "Appears in" no longer reads an index that
+  did not answer as "Not in any collection." — the section says the collections
+  could not be read, because an unknown is not an empty row. And the pull-up
+  sheet's `aria-expanded` (with its "Show details"/"Hide details" label) moves
+  onto the handle that changes it, where a screen reader reads it, instead of
+  the panel it opens, where one is read as nothing.
 - CLI: `dimagine previews` decides "generated" from "cached" by what the cache
   held when the run started — a rendition is named after the content hash of
   the image it came from — instead of by the file's timestamp. On a filesystem

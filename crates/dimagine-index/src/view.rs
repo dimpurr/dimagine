@@ -24,10 +24,16 @@ pub struct ImageMetaStats {
     pub with_dimensions: u64,
     /// Images whose taken time was read.
     pub with_taken: u64,
-    /// Images whose header stayed unknown (dimensions `NULL`), counted on
+    /// Images whose dimensions stayed unknown (`width IS NULL`), counted on
     /// every scan, because the unknown is a recorded fact about the content
     /// and not a transient failure only the first scan sees.
-    pub unreadable_headers: u64,
+    ///
+    /// This is every image with a header that could not be read *and* every
+    /// image in a format this build has no header reader for (AVIF, HEIF); the
+    /// row does not record which, so the count says only that the dimensions
+    /// are unknown. It is not a corruption count — a library of healthy AVIFs
+    /// reports all of them here (RW48 Low-3).
+    pub unknown_dimensions: u64,
     /// Images with no taken time, counted by the reason their own header gave
     /// ([`TakenReason`]) and ordered by it. A reason with no images is left
     /// out, so what is here is what an operator can act on; added to
@@ -340,13 +346,11 @@ fn view_sql_with_order(q: &ViewQuery, order_by: String) -> ViewSql {
         // The collection's own embed order is the only meaningful order for
         // its members, so the links table's insertion order is the sort key.
         // The self-embed is excluded here, once, for both members and count.
-        sql.with = String::from(
-            "WITH members(ord,path) AS ( \
-               SELECT rowid,target FROM links WHERE src=? AND syntax<>'wiki_link' \
-                 AND target IS NOT NULL \
-                 AND target<>COALESCE((SELECT image_path FROM notes WHERE path=?),'') \
-             ) ",
-        );
+        // One spelling for the whole crate ([`members_cte`]), because the
+        // neighbour reads ask `MIN`/`MAX(m.ord)` of this same CTE: two
+        // spellings would be two rules for what counts as a member, and a drift
+        // between them would mis-place a neighbour in silence.
+        sql.with = members_cte().to_owned();
         sql.from = String::from(
             "FROM files f JOIN members m ON m.path=f.path \
              LEFT JOIN notes n ON n.image_path=f.path",
@@ -587,7 +591,12 @@ fn collection_offsets(
     let Some(collection) = query.collection.clone() else {
         return Ok(None);
     };
-    let (first_ord, last_ord): (i64, i64) = index.conn()?.query_row(
+    // `MIN`/`MAX` over no row are SQL `NULL`, not an error value: the member
+    // check above said this image is in the collection and this one now says it
+    // is not, which only a rescan finishing underneath a page render can do.
+    // That is an answer — there is no place to walk from — and it is returned as
+    // one, not as a type error the caller has to guess at.
+    let (first_ord, last_ord): (Option<i64>, Option<i64>) = index.conn()?.query_row(
         &format!(
             "{with}SELECT MIN(m.ord), MAX(m.ord) FROM members m WHERE m.path=?",
             with = members_cte()
@@ -595,6 +604,9 @@ fn collection_offsets(
         rusqlite::params![collection, collection, image],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
+    let (Some(first_ord), Some(last_ord)) = (first_ord, last_ord) else {
+        return Ok(None);
+    };
     let count_before = |ord: i64| -> Result<u64, IndexError> {
         let extras: Vec<&dyn rusqlite::ToSql> = vec![&ord];
         let counted: i64 = index.conn()?.query_row(
@@ -622,8 +634,11 @@ fn collection_offsets(
     )))
 }
 
-/// The `WITH members ...` clause a collection view orders by, on its own for
-/// the key reads, which do not need the rest of the view statement.
+/// The `WITH members ...` clause a collection view orders by — the one spelling
+/// of it, used both by [`view_sql_with_order`] (which stores it as `sql.with`)
+/// and on its own for the key reads, which do not need the rest of the view
+/// statement. What counts as a member is spelled once in this crate because
+/// both halves have to mean the same rows.
 fn members_cte() -> &'static str {
     "WITH members(ord,path) AS ( \
        SELECT rowid,target FROM links WHERE src=? AND syntax<>'wiki_link' \
@@ -1248,7 +1263,7 @@ impl Index {
             images: max_zero(row.0),
             with_dimensions: max_zero(row.1),
             with_taken: max_zero(row.2),
-            unreadable_headers: max_zero(row.3),
+            unknown_dimensions: max_zero(row.3),
             taken_missing,
         })
     }
@@ -1669,6 +1684,19 @@ mod tests {
                 },
                 None,
             ),
+            // RW45 review L-6: the case above is a one-item view, so it cannot
+            // see an offset move wrongly. Every note's body carries the word, so
+            // this is the FTS path holding all four images, with neighbours on
+            // both sides of the middle ones.
+            (
+                "full text over every image",
+                ViewQuery {
+                    text: Some("match".into()),
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
             (
                 "the untagged lens",
                 ViewQuery {
@@ -1688,8 +1716,13 @@ mod tests {
                 None,
             ),
         ];
+        let mut interior = 0;
         for (name, query, lens) in cases {
             let page = index.view(&query).unwrap();
+            assert!(
+                !page.items.is_empty(),
+                "{name}: a case whose view shows nothing compares nothing"
+            );
             let mut asked = std::collections::HashSet::new();
             for (first, item) in page.items.iter().enumerate() {
                 // An image embedded more than once is one image: ask once, at
@@ -1726,12 +1759,22 @@ mod tests {
                     item.path
                 );
                 assert_eq!(neighbours.position, first + 1, "{name}: {}", item.path);
+                if expected_previous.is_some() && expected_next.is_some() {
+                    interior += 1;
+                }
                 assert_eq!(
                     neighbours.total, page.total,
                     "{name}: the total is the grid's own"
                 );
             }
         }
+        // A case whose view holds one image compares nothing, so the walk as a
+        // whole has to have read images with something on either side of them —
+        // otherwise the loop above could pass having seen nothing at all.
+        assert!(
+            interior >= 8,
+            "only {interior} images had a neighbour on both sides across every case"
+        );
     }
 
     /// The ends of a view answer `None` rather than wrapping around, and the
@@ -2476,7 +2519,7 @@ mod tests {
                 images: 6,
                 with_dimensions: 6,
                 with_taken: 4,
-                unreadable_headers: 0,
+                unknown_dimensions: 0,
                 taken_missing: vec![(TakenReason::NoExif, 2)]
             }
         );
@@ -2553,7 +2596,7 @@ mod tests {
                 images: 3,
                 with_dimensions: 2,
                 with_taken: 1,
-                unreadable_headers: 1,
+                unknown_dimensions: 1,
                 taken_missing: vec![
                     (TakenReason::ExifWithoutDate, 1),
                     (TakenReason::UnreadableFile, 1),
@@ -2586,7 +2629,7 @@ mod tests {
                 images: 0,
                 with_dimensions: 0,
                 with_taken: 0,
-                unreadable_headers: 0,
+                unknown_dimensions: 0,
                 taken_missing: Vec::new()
             }
         );

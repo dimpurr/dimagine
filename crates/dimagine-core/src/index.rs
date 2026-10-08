@@ -603,7 +603,7 @@ mod tests {
                 images: 4,
                 with_dimensions: 2,
                 with_taken: 1,
-                unreadable_headers: 2,
+                unknown_dimensions: 2,
                 taken_missing: vec![(TakenReason::NoExif, 1), (TakenReason::UnreadableFile, 2)],
             },
             "bad.jpg and t.png stayed unknown, and both are counted"
@@ -665,12 +665,16 @@ mod tests {
         );
     }
 
-    /// W48: an unchanged file is not read again, and the metadata it earned
-    /// in the last refresh is carried through, "recorded unreadable"
-    /// included — the statistics of the second refresh are the statistics of
-    /// the first, not zero.
+    /// W48: the metadata an unchanged file earned in the last refresh is
+    /// carried through, "recorded unreadable" included — the statistics of
+    /// the second refresh are the statistics of the first, not zero.
+    ///
+    /// This is the reuse *outcome*, read from the stored facts and the digest
+    /// columns; that no read happened is asserted directly, with unreadable
+    /// fixtures, by `a_rescan_keeps_the_facts_of_files_it_cannot_open`
+    /// (RW48 Low-2).
     #[test]
-    fn a_rescan_reuses_header_metadata_without_reading_the_files() {
+    fn a_rescan_reuses_the_recorded_header_facts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let refs = root.join("refs");
@@ -707,6 +711,60 @@ mod tests {
             .unwrap());
     }
 
+    /// W48 (RW48 Low-2): the no-read half of the reuse is asserted directly.
+    /// The fixtures are made unreadable before the second refresh, so a
+    /// refresh that opened either one would record `UnreadableFile` where the
+    /// old facts were; only a refresh that decided from size, mtime and the
+    /// stored digest can keep them. A file that was read but happened to
+    /// yield the same bytes would have passed the outcome-only test above.
+    #[test]
+    #[cfg(unix)]
+    fn a_rescan_keeps_the_facts_of_files_it_cannot_open() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let refs = root.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("dated.jpg"), EXIF_DATE_JPEG).unwrap();
+        std::fs::write(refs.join("bad.jpg"), b"jpeg").unwrap();
+        let library = Library::open(root).unwrap();
+        let mut index = Index::open(root).unwrap();
+        sync_index(&library, &mut index).unwrap();
+
+        let dated = seen_meta(&index, "refs/dated.jpg");
+        let first = index.image_meta_stats().unwrap();
+        assert_eq!(
+            dated,
+            Some((Some(12), Some(1), Some(1_689_191_647_123_000_000))),
+            "the first refresh read the file it was given"
+        );
+
+        // Opening either file now fails; only a reuse can keep the facts.
+        for name in ["dated.jpg", "bad.jpg"] {
+            std::fs::set_permissions(refs.join(name), std::fs::Permissions::from_mode(0o000))
+                .unwrap();
+        }
+        sync_index(&library, &mut index).unwrap();
+        assert_eq!(
+            index.image_meta_stats().unwrap(),
+            first,
+            "a file that cannot be opened keeps the facts it already earned"
+        );
+        assert_eq!(seen_meta(&index, "refs/dated.jpg"), dated);
+        assert_eq!(
+            seen_meta(&index, "refs/bad.jpg"),
+            Some((None, None, None)),
+            "and a recorded unreadable stays the same unknown"
+        );
+
+        // Restore for the temp dir's cleanup.
+        for name in ["dated.jpg", "bad.jpg"] {
+            std::fs::set_permissions(refs.join(name), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+    }
+
     /// W48: identical content at a second path, and a move to a new path,
     /// share the digest cache: dimensions and taken time arrive without a
     /// second parse, and never turn into unknowns.
@@ -726,7 +784,7 @@ mod tests {
                 images: 1,
                 with_dimensions: 1,
                 with_taken: 1,
-                unreadable_headers: 0,
+                unknown_dimensions: 0,
                 taken_missing: Vec::new()
             }
         );
@@ -743,7 +801,7 @@ mod tests {
                 images: 2,
                 with_dimensions: 2,
                 with_taken: 2,
-                unreadable_headers: 0,
+                unknown_dimensions: 0,
                 taken_missing: Vec::new()
             },
             "both files carry the cached facts of identical content"
@@ -756,5 +814,45 @@ mod tests {
                 "{path} inherited the cached facts of identical content"
             );
         }
+    }
+
+    /// W48 (RW48 Low-4): the digest cache does not outlive the content it
+    /// describes. A digest no image row carries any more is pruned, so the
+    /// cache tracks the library instead of only growing — while a digest that
+    /// another copy still carries is left alone, because the cache is keyed by
+    /// content and the content is still here.
+    #[test]
+    fn the_digest_cache_is_pruned_with_the_content_it_describes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let refs = root.join("refs");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("a.jpg"), EXIF_DATE_JPEG).unwrap();
+        std::fs::write(refs.join("b.jpg"), EXIF_DATE_JPEG).unwrap();
+        let digest = format!("{:x}", sha2::Sha256::digest(EXIF_DATE_JPEG));
+        let library = Library::open(root).unwrap();
+        let mut index = Index::open(root).unwrap();
+        sync_index(&library, &mut index).unwrap();
+        assert!(index.cached_image_meta(&digest).unwrap().is_some());
+
+        // One copy goes; the other still carries the digest, so the row is
+        // still reachable and stays.
+        std::fs::remove_file(refs.join("b.jpg")).unwrap();
+        let library = Library::open(root).unwrap();
+        sync_index(&library, &mut index).unwrap();
+        assert!(
+            index.cached_image_meta(&digest).unwrap().is_some(),
+            "a digest another image still carries is not pruned"
+        );
+
+        // The last copy goes, and the cached header goes with it.
+        std::fs::remove_file(refs.join("a.jpg")).unwrap();
+        let library = Library::open(root).unwrap();
+        sync_index(&library, &mut index).unwrap();
+        assert_eq!(
+            index.cached_image_meta(&digest).unwrap(),
+            None,
+            "the header of content the library no longer holds is pruned"
+        );
     }
 }

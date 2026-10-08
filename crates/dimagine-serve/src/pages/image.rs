@@ -24,7 +24,7 @@ use crate::catalog::ImageDetail;
 use crate::index_sync::RECENT_LIMIT;
 use crate::ui::shell::Frame;
 use crate::ui::{encode_path, escape_html, markdown_html, tile_anchor};
-use crate::view_query::{query_value, ViewParams};
+use crate::view_query::{query_value, ViewParams, PAGE_SIZE};
 use crate::{catalog_error_page, error_page, error_response, AppState};
 
 /// The destination of "Back to view".
@@ -75,11 +75,16 @@ pub(crate) async fn image_page(
             context.lens_limit(),
         )
         .unwrap_or(None);
-    let appears_in = state
-        .index
-        .appears_in_titled(&detail.path)
-        .unwrap_or_else(|_| Vec::new());
-    let body = image_body(&detail, &appears_in, &context, neighbours.as_ref());
+    // `None` here is the index declining to answer, which is a different fact
+    // from answering "no collection embeds this picture" — the section says
+    // which of the two it is (invariant 4).
+    let appears_in = state.index.appears_in_titled(&detail.path).ok();
+    let body = image_body(
+        &detail,
+        appears_in.as_deref(),
+        &context,
+        neighbours.as_ref(),
+    );
     let frame = Frame {
         banner: state.banner(),
         ..Frame::new(&detail.path, DESTINATION, body)
@@ -113,14 +118,26 @@ impl ViewContext {
     /// Where "Back to view" points: the view the page came from, anchored to
     /// the image's own tile, so the grid comes back where it was — a fragment
     /// jump the browser makes without any script.
-    fn back_href(&self, image: &str) -> String {
+    ///
+    /// `position` is the image's 1-based place in the view, which the walk
+    /// knows whenever it answered at all. The page that holds the tile comes
+    /// from it, not from the `p` the `v` carried: the arrows walk the whole
+    /// view while that `p` stays where the reader started, so a walk across a
+    /// page boundary would otherwise anchor the link to a tile that is not in
+    /// the page it opens (RW45 M-2). Without a position — a stale `v`, an index
+    /// that did not answer — the carried view travels as it was written.
+    fn back_href(&self, image: &str, position: Option<u64>) -> String {
         let anchor = tile_anchor(image);
-        if self.query.is_empty() {
+        let query = match position {
+            Some(position) => with_page(&self.query, page_of_position(position)),
+            None => self.query.clone(),
+        };
+        if query.is_empty() {
             format!("/#{anchor}")
         } else {
             // The query is escaped whole: it arrived validated as a query
             // string, and its `&` characters stay readable links.
-            format!("/?{}#{anchor}", escape_html(&self.query))
+            format!("/?{query}#{anchor}", query = escape_html(&query))
         }
     }
 
@@ -147,6 +164,33 @@ impl ViewContext {
             &self.query
         }
     }
+}
+
+/// The page of the grid that holds the image at this 1-based position: the
+/// grid is [`PAGE_SIZE`] tiles to a page, so the tile at position 121 is on
+/// page 2. The Recent lens pages inside its own window the same way.
+fn page_of_position(position: u64) -> u64 {
+    (position.saturating_sub(1)) / u64::from(PAGE_SIZE) + 1
+}
+
+/// The view's query string with its page set to `page`. Every other pair
+/// travels exactly as it was written; the page is the one thing the position
+/// knows better than the link that arrived here. Page 1 needs no pair, so a
+/// view that never carried one stays as bare as it was.
+fn with_page(query: &str, page: u64) -> String {
+    let mut pairs: Vec<String> = Vec::new();
+    let mut carried_page = false;
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        if pair.split('=').next() == Some("p") {
+            carried_page = true;
+            continue;
+        }
+        pairs.push(pair.to_owned());
+    }
+    if page > 1 || carried_page {
+        pairs.push(format!("p={page}"));
+    }
+    pairs.join("&")
 }
 
 /// Read the `?v=` a tile or a hand wrote, and the view it names.
@@ -190,7 +234,7 @@ fn is_query_character(character: char) -> bool {
 
 fn image_body(
     detail: &ImageDetail,
-    appears_in: &[AppearsIn],
+    appears_in: Option<&[AppearsIn]>,
     context: &ViewContext,
     neighbours: Option<&Neighbours>,
 ) -> String {
@@ -202,7 +246,7 @@ fn image_body(
     out.push_str("<header class=\"image-header\">");
     out.push_str(&format!(
         "<a class=\"back-link\" href=\"{}\">← Back to view</a>",
-        context.back_href(&detail.path)
+        context.back_href(&detail.path, neighbours.map(|walk| walk.position))
     ));
     out.push_str(&nav_html(context, neighbours));
     out.push_str(&format!(
@@ -592,26 +636,35 @@ fn path_row(path: &str) -> String {
 /// the sidebar names a collection — its own `title`, falling back to the
 /// file name — and linked to its view (K27 motion 6). None is a state a
 /// person reads, not a section left off: this picture is in no collection.
-fn appears_in_html(appears_in: &[AppearsIn]) -> String {
+///
+/// An index that did not answer is a third state and says so: "not in any
+/// collection" is a fact about the library, and a closed index does not know
+/// it (invariant 4 — the same rule the walk follows when the index is silent,
+/// which is why the arrows are simply absent rather than said to be nowhere).
+fn appears_in_html(appears_in: Option<&[AppearsIn]>) -> String {
     let mut out = String::from("<section class=\"image-section\"><h2>Appears in</h2>");
-    if appears_in.is_empty() {
-        out.push_str("<p class=\"appears-in-empty\">Not in any collection.</p>");
-    } else {
-        out.push_str("<ul class=\"appears-in\">");
-        for collection in appears_in {
-            let label = if collection.title.is_empty() {
-                leaf_name(&collection.note_path).to_owned()
-            } else {
-                collection.title.clone()
-            };
-            out.push_str(&format!(
-                "<li><a href=\"/?c={}\" title=\"{}\">{}</a></li>",
-                escape_html(&query_value(&collection.note_path)),
-                escape_html(&collection.note_path),
-                escape_html(&label)
-            ));
+    match appears_in {
+        None => out.push_str(
+            "<p class=\"appears-in-empty\">The collections could not be read right now.</p>",
+        ),
+        Some([]) => out.push_str("<p class=\"appears-in-empty\">Not in any collection.</p>"),
+        Some(collections) => {
+            out.push_str("<ul class=\"appears-in\">");
+            for collection in collections {
+                let label = if collection.title.is_empty() {
+                    leaf_name(&collection.note_path).to_owned()
+                } else {
+                    collection.title.clone()
+                };
+                out.push_str(&format!(
+                    "<li><a href=\"/?c={}\" title=\"{}\">{}</a></li>",
+                    escape_html(&query_value(&collection.note_path)),
+                    escape_html(&collection.note_path),
+                    escape_html(&label)
+                ));
+            }
+            out.push_str("</ul>");
         }
-        out.push_str("</ul>");
     }
     out.push_str("</section>");
     out
@@ -709,7 +762,7 @@ mod tests {
         let image = "refs/猫.png";
         // A tile carries the view query without its `?`.
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(&detail(), &[], &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None);
         assert!(
             html.contains(&format!("href=\"/?tag=eagle#{}\"", tile_anchor(image))),
             "{html}"
@@ -717,16 +770,84 @@ mod tests {
         // A hand-written link may include it.
         let context = view_context(Some("v=%3Ftag%3Deagle"));
         assert_eq!(
-            context.back_href(image),
+            context.back_href(image, None),
             format!("/?tag=eagle#{}", tile_anchor(image))
         );
         let plain = view_context(None);
-        assert_eq!(plain.back_href(image), format!("/#{}", tile_anchor(image)));
-        let html = image_body(&detail(), &[], &plain, None);
+        assert_eq!(
+            plain.back_href(image, None),
+            format!("/#{}", tile_anchor(image))
+        );
+        let html = image_body(&detail(), Some(&[]), &plain, None);
         assert!(
             html.contains(&format!("href=\"/#{}\">← Back to view", tile_anchor(image))),
             "{html}"
         );
+    }
+
+    /// RW45 M-2: the arrows walk the whole view while the `p` the reader
+    /// arrived with stays where they arrived, so the page the way back asks for
+    /// is the one the position says the tile is on — an anchor into a page that
+    /// is not there lands at the top of the grid, not on the tile.
+    #[test]
+    fn the_way_back_asks_for_the_page_the_tile_is_on() {
+        let image = "refs/猫.png";
+        let anchor = tile_anchor(image);
+        // A tile from page 3 of a tag view, walked to a later page and back
+        // out past the first one.
+        let carried = view_context(Some("v=tag%3Deagle%26p%3D3"));
+        assert_eq!(
+            carried.back_href(image, Some(121)),
+            format!("/?tag=eagle&amp;p=2#{anchor}"),
+            "the carried filter travels, the page comes from the position"
+        );
+        assert_eq!(
+            carried.back_href(image, Some(1)),
+            format!("/?tag=eagle&amp;p=1#{anchor}"),
+            "the page the walk carried there is replaced, not left behind"
+        );
+        // The plain library pages too, and its first page needs no pair.
+        let plain = view_context(None);
+        assert_eq!(plain.back_href(image, Some(120)), format!("/#{anchor}"));
+        assert_eq!(
+            plain.back_href(image, Some(121)),
+            format!("/?p=2#{anchor}"),
+            "the first tile of the second page"
+        );
+        assert_eq!(
+            plain.back_href(image, Some(361)),
+            format!("/?p=4#{anchor}"),
+            "{PAGE_SIZE} tiles to a page"
+        );
+        // Nothing to place the image by — a stale `v`, an index that did not
+        // answer — and the carried view travels exactly as it was written.
+        assert_eq!(
+            carried.back_href(image, None),
+            format!("/?tag=eagle&amp;p=3#{anchor}")
+        );
+    }
+
+    /// RW45 M-3: an index that did not answer is not an answer of "none". The
+    /// section says which of the two it is (invariant 4), the way the walk
+    /// leaves the arrows out rather than claiming the picture is nowhere.
+    #[test]
+    fn a_collection_answer_that_did_not_arrive_is_not_called_an_empty_one() {
+        let (context, _) = plain();
+        let silent = image_body(&detail(), None, &context, None);
+        assert!(
+            silent.contains(
+                "<p class=\"appears-in-empty\">The collections could not be read right now.</p>"
+            ),
+            "{silent}"
+        );
+        assert!(
+            !silent.contains("Not in any collection."),
+            "an unknown is not an empty row: {silent}"
+        );
+        // The answered "none" keeps its own sentence, unchanged.
+        let answered = image_body(&detail(), Some(&[]), &context, None);
+        assert!(answered.contains("Not in any collection."), "{answered}");
+        assert!(!answered.contains("could not be read"), "{answered}");
     }
 
     #[test]
@@ -740,7 +861,11 @@ mod tests {
             Some("v=%FF"),
             None,
         ] {
-            assert_eq!(view_context(query).back_href(image), plain, "{query:?}");
+            assert_eq!(
+                view_context(query).back_href(image, None),
+                plain,
+                "{query:?}"
+            );
         }
     }
 
@@ -755,7 +880,7 @@ mod tests {
             "v=%22%3E%3Cscript%3E",
         ] {
             let context = view_context(Some(value));
-            let target = context.back_href(image);
+            let target = context.back_href(image, None);
             assert!(
                 target.starts_with('/') && !target.starts_with("//"),
                 "{value} produced {target}"
@@ -767,7 +892,7 @@ mod tests {
     #[test]
     fn the_arrows_walk_the_view_and_the_position_names_it() {
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(&detail(), &[], &context, Some(&neighbours_at(3, 124)));
+        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours_at(3, 124)));
         // Both links carry the same view the page arrived with, spelled as
         // the tiles spell it, and name their image for the tooltip.
         assert!(
@@ -790,7 +915,7 @@ mod tests {
         );
         // The plain library needs no ?v= on its arrows ...
         let (plain, _) = plain();
-        let html = image_body(&detail(), &[], &plain, Some(&neighbours_at(1, 4)));
+        let html = image_body(&detail(), Some(&[]), &plain, Some(&neighbours_at(1, 4)));
         assert!(html.contains("href=\"/image/refs/prev1.png\" "), "{html}");
         assert!(html.contains("title=\"All\">1 / 4</span>"), "{html}");
     }
@@ -803,7 +928,7 @@ mod tests {
         let (context, _) = plain();
         let mut neighbours = neighbours_at(1, 4);
         neighbours.previous = None;
-        let html = image_body(&detail(), &[], &context, Some(&neighbours));
+        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours));
         assert!(
             html.contains("<span class=\"image-nav-prev nav-end\" aria-hidden=\"true\">"),
             "{html}"
@@ -823,7 +948,7 @@ mod tests {
     #[test]
     fn an_image_the_view_does_not_show_walks_nowhere() {
         let context = view_context(Some("c=none.md"));
-        let html = image_body(&detail(), &[], &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None);
         assert!(!html.contains("image-nav"), "{html}");
         assert!(html.contains("Back to view"), "{html}");
     }
@@ -831,7 +956,7 @@ mod tests {
     #[test]
     fn the_path_is_shown_and_copyable_and_the_note_is_sanitised() {
         let (context, _) = plain();
-        let html = image_body(&detail(), &[], &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None);
         assert!(html.contains("data-copy-text=\"refs/猫.png\""));
         assert!(html.contains("A <strong>quiet</strong> cat"));
         assert!(html.contains("&lt;script&gt;"));
@@ -843,7 +968,7 @@ mod tests {
         let (context, _) = plain();
         let html = image_body(
             &detail(),
-            &[
+            Some(&[
                 AppearsIn {
                     note_path: "browse.md".into(),
                     title: "Browse".into(),
@@ -852,7 +977,7 @@ mod tests {
                     note_path: "sets/eagle.md".into(),
                     title: String::new(),
                 },
-            ],
+            ]),
             &context,
             None,
         );
@@ -878,7 +1003,7 @@ mod tests {
             note_path: "sets/x.md".into(),
             title: "\"><img onerror=alert(1)><svg><script>".into(),
         }];
-        let html = image_body(&detail(), &appears_in, &context, None);
+        let html = image_body(&detail(), Some(&appears_in), &context, None);
         assert!(
             html.contains("Appears in</h2><ul class=\"appears-in\">"),
             "{html}"
@@ -902,7 +1027,7 @@ mod tests {
     #[test]
     fn an_image_in_no_collection_says_so() {
         let (context, _) = plain();
-        let html = image_body(&detail(), &[], &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None);
         assert!(html.contains("<h2>Appears in</h2>"), "{html}");
         assert!(html.contains("Not in any collection."), "{html}");
     }
@@ -910,7 +1035,7 @@ mod tests {
     #[test]
     fn the_sheet_handle_names_the_picture_and_controls_the_panel() {
         let (context, _) = plain();
-        let html = image_body(&detail(), &[], &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None);
         assert!(
             html.contains(
                 "class=\"sheet-handle\" aria-expanded=\"false\" aria-controls=\"image-panel\""
@@ -919,6 +1044,13 @@ mod tests {
         );
         assert!(
             html.contains("<span class=\"sheet-label\">猫</span>"),
+            "{html}"
+        );
+        // The state of a disclosure belongs to the button that changes it: the
+        // panel is the region named by `aria-controls`, and an `aria-expanded`
+        // on a plain <div> would be read as a second, meaningless one.
+        assert!(
+            html.contains("<div class=\"image-panel\" id=\"image-panel\">"),
             "{html}"
         );
     }
@@ -937,7 +1069,7 @@ mod tests {
         let mut detail = detail();
         detail.front_matter_error = Some("expected a list".into());
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
         assert!(html.contains("Front matter error: expected a list"));
     }
 
@@ -958,7 +1090,7 @@ mod tests {
             "height": 3429,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
 
         // A definition list, not raw JSON.
         assert!(html.contains("<dl class=\"property-list\">"), "{html}");
@@ -998,7 +1130,7 @@ mod tests {
             "imported": "2026-10-04T14:30:12+01:00",
         });
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
         assert!(
             html.contains("<dt>Created</dt><dd><span title=\"2021-10-15\">15 Oct 2021</span></dd>"),
             "{html}"
@@ -1014,7 +1146,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({ "created": "sometime last year" });
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
         assert!(
             html.contains("<span title=\"sometime last year\">sometime last year</span>"),
             "{html}"
@@ -1026,7 +1158,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({"title": "猫", "height": 3429});
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
         assert!(
             html.contains("<details class=\"properties-raw\"><summary>Raw properties</summary>"),
             "{html}"
@@ -1051,7 +1183,7 @@ mod tests {
             "height": null,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, &[], &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None);
         assert!(html.contains("<dt>Title</dt>"), "{html}");
         assert!(!html.contains("<dt>Tags</dt>"), "{html}");
         assert!(!html.contains("<dt>height</dt>"), "{html}");
@@ -1066,16 +1198,16 @@ mod tests {
         // A phone screenshot, and a panorama.
         detail.properties = json!({"width": 780, "height": 48000});
         assert!(
-            image_body(&detail, &[], &context, None)
+            image_body(&detail, Some(&[]), &context, None)
                 .contains("class=\"image-stage\" data-fit=\"tall\""),
             "a tall picture fills the column and scrolls"
         );
         detail.properties = json!({"width": 2400, "height": 800});
-        assert!(image_body(&detail, &[], &context, None)
+        assert!(image_body(&detail, Some(&[]), &context, None)
             .contains("class=\"image-stage\" data-fit=\"wide\""));
         // An ordinary picture, including one an importer wrote as text.
         detail.properties = json!({"width": "1200", "height": "800"});
-        assert!(image_body(&detail, &[], &context, None)
+        assert!(image_body(&detail, Some(&[]), &context, None)
             .contains("class=\"image-stage\" data-fit=\"normal\""));
     }
 
@@ -1097,7 +1229,7 @@ mod tests {
         let mut bare = detail();
         bare.properties = json!({});
         let (context, _) = plain();
-        let html = image_body(&bare, &[], &context, None);
+        let html = image_body(&bare, Some(&[]), &context, None);
         assert!(html.contains("<figure class=\"image-stage\">"), "{html}");
         assert!(!html.contains("data-fit"), "{html}");
     }

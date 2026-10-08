@@ -28,6 +28,7 @@ fn library() -> (TempDir, axum::Router) {
         "{\"origin\":true}",
     )
     .unwrap();
+    fs::write(temp.path().join("art/board.canvas"), "{\"nodes\":[]}").unwrap();
     fs::write(temp.path().join(".ignored.png"), b"ignored").unwrap();
     let catalog = FsCatalog::new(temp.path()).unwrap();
     let config = ServeConfig {
@@ -220,7 +221,15 @@ async fn traversal_and_outside_symlink_are_rejected() {
     #[cfg(unix)]
     assert!(catalog.resolve_path("leak.png").is_err());
     let (app, cookie) = login(app).await;
-    for path in ["/media/..%2F..%2Fetc%2Fpasswd", "/media/leak.png"] {
+    for path in [
+        "/media/..%2F..%2Fetc%2Fpasswd",
+        "/media/leak.png",
+        // The source view is the third route that answers straight from a
+        // path, and the one a browser links to by hand, so it takes the same
+        // two rejections.
+        "/raw/..%2F..%2Fetc%2Fpasswd",
+        "/raw/leak.png",
+    ] {
         let response = app
             .clone()
             .oneshot(
@@ -233,6 +242,69 @@ async fn traversal_and_outside_symlink_are_rejected() {
             .await
             .unwrap();
         assert_ne!(response.status(), StatusCode::OK);
+    }
+}
+
+/// `/raw` is the source view of a note, not of the library. The library holds
+/// a raw source JSON (`art/猫.png.source.json`, FORMAT §3.4) beside the note,
+/// and the route has to tell them apart: the note's bytes come back as text,
+/// the importer's leftovers do not come back at all.
+#[tokio::test]
+async fn raw_serves_a_notes_own_bytes_and_nothing_else() {
+    let (_temp, app) = library();
+    let (app, cookie) = login(app).await;
+    let note = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/raw/art/%E7%8C%AB.png.md")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(note.status(), StatusCode::OK);
+    assert_eq!(note.headers()["content-type"], "text/plain; charset=utf-8");
+    // Whatever the source view's ETag is built from, it has to do its job: the
+    // page sends it back and gets a 304 rather than the note again.
+    let etag = note.headers()["etag"].clone();
+    let bytes = to_bytes(note.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(
+        bytes.as_ref(),
+        "---\ntitle: 猫\nrating: 5\n---\nA **quiet** cat.\n<script>alert(1)</script>\n".as_bytes()
+    );
+    let again = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/raw/art/%E7%8C%AB.png.md")
+                .header("cookie", &cookie)
+                .header("if-none-match", &etag)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(again.headers()["etag"], etag);
+
+    for path in [
+        "/raw/art/%E7%8C%AB.png.source.json",
+        "/raw/art/board.canvas",
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header("cookie", &cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::OK, "{path}");
     }
 }
 

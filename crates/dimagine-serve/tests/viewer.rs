@@ -1062,6 +1062,29 @@ async fn an_invalid_parameter_is_reported_and_never_a_server_error() {
     assert!(html.contains("Added ↓"), "the default sort is still shown");
 }
 
+/// A collection has no second page to ask for, so a page number asked of one
+/// is ignored in the same voice the page already uses for a sort — and the
+/// members it does list are still the whole of the note.
+#[tokio::test]
+async fn a_collection_page_says_so_about_a_page_number_it_cannot_take() {
+    let dir = page_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/?c=tour.md&p=2", &cookie).await;
+    assert!(
+        html.contains("Ignored page number: a collection lists all of its members at once"),
+        "{html}"
+    );
+    assert_eq!(
+        html_paths(&html),
+        vec!["omega/wide.png", "alpha/zen.png", "shrine/torii.png"],
+        "asking for a second page takes nothing away"
+    );
+    // The ordinary view, where a page number means something, still says
+    // nothing about it.
+    let plain = text(&app, "/?p=2", &cookie).await;
+    assert!(!plain.contains("Ignored page number"), "{plain}");
+}
+
 #[tokio::test]
 async fn a_tile_remembers_the_view_it_came_from() {
     let dir = library();
@@ -1456,6 +1479,71 @@ async fn an_unknown_view_param_still_walks_and_gets_back_safely() {
     assert!(html.contains(&position(3, 4, "All")), "{html}");
 }
 
+/// RW45 M-2: the arrows walk the whole view, while the `p` the `v` carries is
+/// the page the reader arrived on. Past a page boundary the way back has to ask
+/// for the page that holds the tile — an anchor into a page that is not there
+/// leaves the reader at the top of the grid, which is the half of "lands on the
+/// tile you left" that used to break after ~120 presses of `→`.
+#[tokio::test]
+async fn the_way_back_asks_for_the_page_the_tile_is_on() {
+    let dir = big_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // Name ascending: `rec-120` is the 121st image, the first tile of page two.
+    let html = text(
+        &app,
+        &format!("/image/refs/rec-120.jpg?v={}", v_param("sort=name")),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&position(121, 205, "sort=name")), "{html}");
+    assert!(
+        html.contains("href=\"/?sort=name&amp;p=2#img-refs/rec-120.jpg\">← Back to view"),
+        "the view carries, the page comes from the position: {html}"
+    );
+    // The page it names really holds that tile, and the page the walk started
+    // on really does not — which is the whole reason for rewriting `p`.
+    let page_two = text(&app, "/?sort=name&p=2", &cookie).await;
+    assert!(
+        page_two.contains("id=\"img-refs/rec-120.jpg\""),
+        "the anchor is on the page the link asks for"
+    );
+    let page_one = text(&app, "/?sort=name", &cookie).await;
+    assert!(
+        !page_one.contains("id=\"img-refs/rec-120.jpg\""),
+        "and not on the page it arrived from"
+    );
+
+    // A `p` carried from further in is corrected in both directions: this image
+    // is page two's, whatever the link said.
+    let html = text(
+        &app,
+        &format!("/image/refs/rec-130.jpg?v={}", v_param("sort=name&p=3")),
+        &cookie,
+    )
+    .await;
+    assert!(
+        html.contains(&position(131, 205, "sort=name&p=3")),
+        "{html}"
+    );
+    assert!(
+        html.contains("href=\"/?sort=name&amp;p=2#img-refs/rec-130.jpg\">← Back to view"),
+        "{html}"
+    );
+
+    // And the first page of a view needs no page of its own.
+    let html = text(
+        &app,
+        &format!("/image/refs/rec-005.jpg?v={}", v_param("sort=name&p=3")),
+        &cookie,
+    )
+    .await;
+    assert!(
+        html.contains("href=\"/?sort=name&amp;p=1#img-refs/rec-005.jpg\">← Back to view"),
+        "the page the reader arrived on stays stated: {html}"
+    );
+}
+
 /// "Appears in" with many collections: each named by what the collection
 /// calls itself — a title, or its file name when it has none — linked to its
 /// view, and a hostile title reaches the page only escaped (RW37's rule,
@@ -1609,6 +1697,63 @@ async fn the_assets_are_served_once_with_a_content_hash() {
     assert_eq!(stale.status(), StatusCode::NOT_FOUND);
 }
 
+/// RW45 M-1: the pull-up sheet's open/closed state is a disclosure, and a
+/// disclosure only reaches a screen reader through the control that changes it.
+/// There is no JavaScript harness in this repository, so the pin is on the
+/// script the page actually serves: the sheet state is set on the handle, with
+/// the label that goes with it, and never on the panel the handle opens.
+#[tokio::test]
+async fn the_pull_up_sheet_states_itself_on_its_own_button() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+    let page = text(&app, "/image/refs/landscape.png", &cookie).await;
+    assert!(
+        page.contains(
+            "<button type=\"button\" class=\"sheet-handle\" aria-expanded=\"false\" \
+             aria-controls=\"image-panel\" aria-label=\"Show details\">"
+        ),
+        "the markup starts collapsed: {page}"
+    );
+
+    let script = {
+        let hash = page
+            .split("src=\"/assets/app-")
+            .nth(1)
+            .expect("the page loads the script")
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+        let response = get(&app, &format!("/assets/app-{hash}"), &cookie).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/javascript; charset=utf-8"
+        );
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    };
+    assert!(
+        script.contains("handle.setAttribute('aria-expanded'"),
+        "the button carries the state"
+    );
+    assert!(
+        script.contains("handle.setAttribute('aria-label'")
+            && script.contains("'Hide details'")
+            && script.contains("'Show details'"),
+        "and says which way it is"
+    );
+    assert!(
+        !script.contains("panel.setAttribute('aria-expanded'"),
+        "the region it opens is not the control"
+    );
+}
+
 #[tokio::test]
 async fn everything_stays_behind_the_passcode() {
     let dir = library();
@@ -1624,6 +1769,11 @@ async fn everything_stays_behind_the_passcode() {
         "/folder/refs",
         "/collection/browse.md",
         "/image/refs/landscape.png",
+        // The source view of a note and the bytes of an image are routes of
+        // their own, added beside the pages rather than under them, and both
+        // answer straight from the file — so both have to be named here.
+        "/raw/browse.md",
+        "/media/refs/landscape.png",
     ] {
         let response = app
             .clone()
@@ -1783,6 +1933,10 @@ fn page_library() -> TempDir {
         "tour.md",
         &(["---", "title: Tour", "---", "", "The plan for the trip.", ""]
             .join("\n")
+            + // Prose a note author could have written to find out what the
+              // page does with it: the same shape as the hostile caption
+              // below, but where a reader's own words go.
+            "<script>alert(1)</script> and <img src=x onerror=alert(2)>.\n\n"
             + "![[omega/wide.png]]\n"
             + "The gate that opens the day.\n"
             + "![[alpha/zen.png]]\n"
@@ -1920,6 +2074,22 @@ async fn the_collection_header_shows_the_note_itself_and_the_way_to_its_source()
         "{header}"
     );
     assert!(header.contains("<p>The plan for the trip.</p>"), "{header}");
+    // And the hostile prose of the same note: a collection's own text is
+    // written by whoever owns the library, so the page has to arrive at the
+    // browser with it read as words — the sanitiser's work is stated here at
+    // the route that people actually reach, not only where it is unit-tested.
+    assert!(
+        header.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+        "the note's prose should be on the page as text: {header}"
+    );
+    assert!(
+        !header.contains("<script>"),
+        "raw script reached the page: {header}"
+    );
+    assert!(
+        !header.contains("<img src=x onerror"),
+        "a live error handler reached the page: {header}"
+    );
     // The member rows belong to the grid, not to the note's own text: no
     // caption line and no embed target appears in the header.
     assert!(
@@ -2624,6 +2794,23 @@ async fn the_panel_acts_through_links_alone_and_folds_without_a_script() {
     assert!(
         two.contains("<a class=\"filter-clear\" href=\"/\">Clear all filters</a>"),
         "{two}"
+    );
+    // The same link where the view carries more than filters. The label
+    // promises filters and nothing else, so the order, the tile size and the
+    // page the reader is standing on travel with them — and `href="/"` above,
+    // on a URL whose only parameters are filters, cannot tell that link apart
+    // from one that dropped all three (RW47b Low-1).
+    let ordered = text(
+        &app,
+        "/?tag=ui&in=refs&sort=name&dir=desc&size=l&p=2",
+        &cookie,
+    )
+    .await;
+    assert!(
+        ordered.contains(
+            "<a class=\"filter-clear\" href=\"/?sort=name&amp;dir=desc&amp;size=l&amp;p=2\">"
+        ),
+        "{ordered}"
     );
 }
 

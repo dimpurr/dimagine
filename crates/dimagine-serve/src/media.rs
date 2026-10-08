@@ -49,8 +49,15 @@ pub(crate) async fn media(
             // page of this origin — the media path's counterpart of the
             // sanitiser the rendered notes go through. Rendition routes
             // (`/media`, `/thumb`) stay for images only.
-            if kind.is_none() {
-                return open_hashed_file(&original, SourceView::Text);
+            //
+            // The gate is the note test, not "everything that is not an image":
+            // a library also holds raw source JSON, canvases and whatever else
+            // an importer left, and a route whose comment calls itself the
+            // source view of a note should not become a reader for all of them.
+            // Same classes `collection_note` accepts for a collection
+            // (`FileClass::Note | FileClass::ImageNote`, FORMAT §3).
+            if kind.is_none() && is_note(&original) {
+                return open_source_view(&original);
             }
             return Err(ServeImageError::Catalog(CatalogError::NotFound));
         }
@@ -62,7 +69,7 @@ pub(crate) async fn media(
                 .unwrap_or_else(|| original.clone()),
             None => original.clone(),
         };
-        open_hashed_file(&served, SourceView::Image)
+        open_hashed_file(&served)
     })
     .await;
     match prepared {
@@ -80,19 +87,51 @@ enum ServeImageError {
     Io,
 }
 
-/// How `/raw` answers one file: as an image (detected MIME, with a note
-/// when the extension disagrees) or as the source view of a note — the
-/// bytes as `text/plain`, which a browser shows and never interprets.
-enum SourceView {
-    Image,
-    Text,
+/// Whether a path is a note — the only thing `/raw` serves as text. The
+/// library walk's own classifier decides it (FORMAT §3), so the route and the
+/// walk cannot disagree about what a note is; an image note (`a.png.md`) counts,
+/// because it is read as a note just the same.
+fn is_note(path: &FsPath) -> bool {
+    matches!(
+        dimagine_core::library::classify(
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .as_ref()
+        ),
+        dimagine_core::library::FileClass::Note | dimagine_core::library::FileClass::ImageNote
+    )
 }
 
 const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
 
+/// The source view of a note: its bytes, `text/plain`, and an ETag built from
+/// the file's own size and modification time rather than a SHA-256 of its
+/// contents.
+///
+/// The image path hashes every byte it serves because a rendition URL carries no
+/// content hash and a regenerated preview has to be caught under the same URL.
+/// A note has no rendition behind its URL and the viewer never writes one, so a
+/// whole-file read per "Open note" click buys only the second-nanosecond
+/// certainty that the file's metadata does not already give: a revalidation
+/// misses only an edit that leaves both the size and the timestamp exactly as
+/// they were.
+fn open_source_view(
+    path: &FsPath,
+) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
+    let file = fs::File::open(path).map_err(|_| ServeImageError::Io)?;
+    let metadata = file.metadata().map_err(|_| ServeImageError::Io)?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos());
+    let etag = format!("\"size-{:x}-mtime-{:x}\"", metadata.len(), modified);
+    Ok((file, metadata, etag, TEXT_PLAIN, false))
+}
+
 fn open_hashed_file(
     path: &FsPath,
-    view: SourceView,
 ) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
     let mut file = fs::File::open(path).map_err(|_| ServeImageError::Io)?;
     let metadata = file.metadata().map_err(|_| ServeImageError::Io)?;
@@ -120,19 +159,13 @@ fn open_hashed_file(
             .map(|b| format!("{b:02x}"))
             .collect::<String>()
     );
-    match view {
-        // The source view of a note: always `text/plain`, whatever the file
-        // is named, so nothing a note contains is ever served as a page of
-        // this origin.
-        SourceView::Text => Ok((file, metadata, etag, TEXT_PLAIN, false)),
-        SourceView::Image => {
-            let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
-            let extension_mime = mime_guess::from_path(path)
-                .first_raw()
-                .unwrap_or("application/octet-stream");
-            Ok((file, metadata, etag, mime, mime != extension_mime))
-        }
-    }
+    // An image (or a rendition of one): the MIME the bytes say, detected from
+    // the prefix, with a note when the extension disagrees.
+    let mime = detected_image_mime(&prefix).unwrap_or("application/octet-stream");
+    let extension_mime = mime_guess::from_path(path)
+        .first_raw()
+        .unwrap_or("application/octet-stream");
+    Ok((file, metadata, etag, mime, mime != extension_mime))
 }
 
 /// A streamed file that keeps its admission permit until the last byte.

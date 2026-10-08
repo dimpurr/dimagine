@@ -685,11 +685,15 @@
       }
     });
 
-    // A finger's sideways stroke across the picture walks the view. The
-    // well's own scrolling wins first — a picture wider than the well
-    // scrolls horizontally, and a stroke that turns vertical pans the page —
-    // and the navigation itself is a plain link, so nothing moves that
-    // prefers-reduced-motion has not already stopped (§2.6).
+    // A finger's sideways stroke across the picture walks the view: a stroke
+    // that turns vertical pans the page instead, and the navigation itself is a
+    // plain link, so nothing moves that prefers-reduced-motion has not already
+    // stopped (§2.6). The check below hands the stroke to the well when it
+    // scrolls sideways — which no rule of this stylesheet gives it today, since
+    // `.image-stage img` is capped at the well's width and the stage's own
+    // `data-fit` rules only ever shrink it. It is the guard for the day a
+    // `.image-stage[data-fit="wide"]` rule makes the picture wider than the
+    // well: the scroll would be the reader's, not this handler's.
     var stroke = null;
     if (stage) {
       stage.addEventListener('pointerdown', function (event) {
@@ -732,14 +736,24 @@
       if (!panel) return;
       panel.style.removeProperty('--sheet-shift');
       panel.classList.add('sheet-open');
-      panel.setAttribute('aria-expanded', 'true');
+      stateSheet(true);
     }
 
     function closeSheet() {
       if (!panel) return;
       panel.style.removeProperty('--sheet-shift');
       panel.classList.remove('sheet-open');
-      panel.setAttribute('aria-expanded', 'false');
+      stateSheet(false);
+    }
+
+    // The state belongs to the button that changes it (the folder tree's
+    // triangles do the same, above): `aria-expanded` on a plain <div> says
+    // nothing to anyone, and the label is read out loud in place of the grip
+    // a sighted person drags.
+    function stateSheet(open) {
+      if (!handle) return;
+      handle.setAttribute('aria-expanded', String(open));
+      handle.setAttribute('aria-label', open ? 'Hide details' : 'Show details');
     }
 
     if (handle && panel) {

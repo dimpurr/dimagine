@@ -512,6 +512,111 @@ mod tests {
         assert!(!panel.contains("href=\"/?tag=gone\""), "{panel}");
     }
 
+    /// The labels of the dimmed rows, in the page's order.
+    fn dimmed_labels(panel: &str) -> Vec<String> {
+        panel
+            .split("<span class=\"filter-row is-empty\"")
+            .skip(1)
+            .map(|cell| {
+                let cell = &cell[..cell.find("</li>").unwrap_or(cell.len())];
+                let (_, label) = cell
+                    .split_once("<span class=\"filter-row-label\">")
+                    .expect("a dimmed row carries its label");
+                label[..label.find('<').expect("a closed label span")].to_owned()
+            })
+            .collect()
+    }
+
+    /// The rule a dimmed row is supposed to express: it is dimmed because the
+    /// view that value would open has nothing in it — and not for any other
+    /// reason. Beside the grid the integration walk can only see a number
+    /// printed as `0`, so a value wrongly dimmed while the map still holds its
+    /// count (RW47 High-1's shape, `refs` dimmed at 0 with ten images behind
+    /// its link) passes there; here the map is in the same room as the row.
+    #[test]
+    fn a_row_is_dimmed_because_the_counts_have_nothing_for_it() {
+        let sidebar = sidebar();
+        let counts = counts();
+        let mut expected = sidebar
+            .tags
+            .iter()
+            .filter(|tag| !counts.tags.contains_key(&tag.tag))
+            .map(|tag| tag.tag.clone())
+            .chain(
+                sidebar
+                    .folders
+                    .iter()
+                    .filter(|folder| !counts.folders.contains_key(&folder.path))
+                    .map(|folder| leaf_name(&folder.path)),
+            )
+            .chain(
+                sidebar
+                    .collections
+                    .iter()
+                    .filter(|collection| !counts.collections.contains_key(&collection.path))
+                    .map(|collection| {
+                        if collection.title.is_empty() {
+                            leaf_name(&collection.path)
+                        } else {
+                            collection.title.clone()
+                        }
+                    }),
+            )
+            .collect::<Vec<_>>();
+        if counts.recent == 0 {
+            expected.push("Recent".to_owned());
+        }
+        if counts.untagged == 0 {
+            expected.push("Untagged".to_owned());
+        }
+        let mut dimmed = dimmed_labels(&panel_of(&ViewParams::default()));
+        // The panel body is written twice (the phone's fold and the desktop
+        // column, `filter_panel`), so each label arrives twice.
+        expected.sort();
+        expected.dedup();
+        dimmed.sort();
+        dimmed.dedup();
+        assert_eq!(dimmed, expected, "the panel dimmed the wrong rows");
+
+        // The same rule on a view with nothing left for anything: the filter
+        // that is on is the way out and is never dimmed (W47), so it is the
+        // only row still a link — and every other row, in every group, has to
+        // say so rather than keep its old number or its old link.
+        let empty = filter_panel(
+            &sidebar,
+            &FacetCounts::default(),
+            &ViewParams::default().with_tag("gone".to_owned()),
+        );
+        let mut everything = sidebar
+            .tags
+            .iter()
+            .filter(|tag| tag.tag != "gone")
+            .map(|tag| tag.tag.clone())
+            .chain(sidebar.folders.iter().map(|folder| leaf_name(&folder.path)))
+            .chain(sidebar.collections.iter().map(|collection| {
+                if collection.title.is_empty() {
+                    leaf_name(&collection.path)
+                } else {
+                    collection.title.clone()
+                }
+            }))
+            .collect::<Vec<_>>();
+        everything.extend(["Recent".to_owned(), "Untagged".to_owned()]);
+        let mut dimmed = dimmed_labels(&empty);
+        everything.sort();
+        everything.dedup();
+        dimmed.sort();
+        dimmed.dedup();
+        assert_eq!(
+            dimmed, everything,
+            "a view with nothing left dims all of it"
+        );
+        assert!(
+            empty.contains("class=\"filter-row is-active\""),
+            "the filter that is on keeps its link: {empty}"
+        );
+    }
+
     #[test]
     fn a_filter_that_is_on_is_never_dimmed_even_when_it_reaches_zero() {
         // `tag=gone` leaves no images, so no folder has anything left either —

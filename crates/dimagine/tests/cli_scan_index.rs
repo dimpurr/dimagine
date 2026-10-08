@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use dimagine_index::{Index, SortKey, ViewQuery};
+use dimagine_index::{FileKind, FileRecord, Index, SortKey, ViewQuery};
 
 const BIN: &str = env!("CARGO_BIN_EXE_dimagine");
 
@@ -524,7 +524,7 @@ fn scan_reports_image_header_stats_and_never_recounts_as_zero() {
     assert_eq!(json["index"]["images"], 4);
     assert_eq!(json["index"]["with_dimensions"], 3);
     assert_eq!(json["index"]["with_taken"], 2);
-    assert_eq!(json["index"]["unreadable_image_headers"], 1);
+    assert_eq!(json["index"]["unknown_dimensions"], 1);
     assert_eq!(json["index"]["taken_missing"]["exif-without-date"], 1);
     assert_eq!(json["index"]["taken_missing"]["file-unreadable"], 1);
     assert!(
@@ -540,8 +540,8 @@ fn scan_reports_image_header_stats_and_never_recounts_as_zero() {
         "the human summary carries the fresh counts: {stdout}"
     );
     assert!(
-        stdout.contains("index unreadable image headers: 1"),
-        "the counted warning is on the same summary: {stdout}"
+        stdout.contains("index: dimensions unknown for 1 images"),
+        "the unknown dimensions are counted on the same summary: {stdout}"
     );
     assert!(
         stdout.contains(
@@ -556,6 +556,81 @@ fn scan_reports_image_header_stats_and_never_recounts_as_zero() {
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let again: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
     assert_eq!(again["index"], json["index"], "the counts repeat");
+}
+
+/// RW50 L1: the "taken time missing" line and its JSON account for the whole
+/// count they name. A row whose reason nobody recorded — written here by hand,
+/// which is also the shape a foreign or newer-built index has — is named
+/// instead of being dropped from a sum that would then disagree with its own
+/// total.
+#[test]
+fn the_missing_taken_breakdown_names_the_rows_with_no_recorded_reason() {
+    let tmp = tmp("scan-unrecorded-reason");
+    let root = tmp.0.join("library");
+    let refs = root.join("refs");
+    std::fs::create_dir_all(&refs).unwrap();
+    std::fs::write(
+        refs.join("dated.jpg"),
+        include_bytes!("../../../tests/fixtures/exif-date.jpg"),
+    )
+    .unwrap();
+    std::fs::write(
+        refs.join("undated.jpg"),
+        include_bytes!("../../../tests/fixtures/exif-no-date.jpg"),
+    )
+    .unwrap();
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    // Clear the undated image's reason while leaving its size, mtime and digest
+    // in place: the next refresh reuses the row, so the reason stays
+    // unrecorded and the missing count no longer equals the kinds' sum.
+    let metadata = std::fs::metadata(refs.join("undated.jpg")).unwrap();
+    let mtime_ns = metadata
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+    let mut index = open_index(&root);
+    index.begin_scan().unwrap();
+    index
+        .upsert_file(&FileRecord {
+            path: "refs/undated.jpg".into(),
+            size: metadata.len(),
+            mtime_ns,
+            sha256: Some("a".repeat(64)),
+            kind: FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+            width: Some(12),
+            height: Some(1),
+            taken_ns: None,
+            taken_reason: None,
+        })
+        .unwrap();
+    index
+        .finish_scan(&["refs/dated.jpg".into(), "refs/undated.jpg".into()])
+        .unwrap();
+    drop(index);
+
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("index: taken time missing for 1 images (reason not recorded 1)"),
+        "the image with no recorded reason is named, not dropped: {stdout}"
+    );
+
+    let (code, stdout, stderr) = dimagine(&["scan", "--json", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(json["index"]["images"], 2);
+    assert_eq!(json["index"]["with_taken"], 1);
+    assert_eq!(
+        json["index"]["taken_missing"]["reason not recorded"], 1,
+        "the JSON carries the residue the human line names: {}",
+        json["index"]["taken_missing"]
+    );
 }
 
 /// W48: opening the index the binary just refreshed and asking the read API
@@ -614,7 +689,7 @@ fn the_refreshed_index_answers_image_meta_queries() {
     let stats = index.image_meta_stats().unwrap();
     assert_eq!(stats.with_dimensions, 2);
     assert_eq!(stats.with_taken, 2);
-    assert_eq!(stats.unreadable_headers, 1);
+    assert_eq!(stats.unknown_dimensions, 1);
     assert_eq!(
         stats.taken_missing,
         vec![(dimagine_index::TakenReason::UnreadableFile, 1)],

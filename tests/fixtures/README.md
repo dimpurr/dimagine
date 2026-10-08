@@ -20,27 +20,31 @@ real image library.
 
 ## Taken-time fixtures
 
-The rest wrap one **camera stamp** — the `DateTimeOriginal` of
-`exif-date.jpg`, with its `SubSecTimeOriginal` and `OffsetTimeOriginal` — in
-the shapes a reader has to survive. Each is a hand-built EXIF or XMP block
-over the same real 12×1 red JPEG, PNG or WebP; `exif.heic` was converted from
-such a JPEG with `sips`.
+The rest are hand-built EXIF or XMP blocks over the same real 12×1 red JPEG,
+PNG or WebP; `exif.heic` was converted from such a JPEG with `sips`. Four of
+them wrap one **camera stamp** — the `DateTimeOriginal` of `exif-date.jpg`
+(`2023:07:12 20:54:07.123 +01:00`), with its `SubSecTimeOriginal` and
+`OffsetTimeOriginal`: `exif-broken-entry.jpg`, `exif.png`, `exif.webp` and
+`exif.heic`. The others carry their own dates, each given in the table below,
+because the reader is what is under test and one stamp cannot exercise every
+shape it has to survive.
 
 | File | What it is |
 | --- | --- |
-| `exif-digitized.jpg` | The stamp under `DateTimeDigitized` only, with its own `OffsetTimeDigitized`. |
-| `exif-datetime-only.jpg` | Only the TIFF `DateTime` of IFD 0 — no Exif sub-IFD at all. |
+| `exif-digitized.jpg` | The date under `DateTimeDigitized` only (`2019:04:02 08:15:00 −05:00`), with its own `OffsetTimeDigitized`. |
+| `exif-datetime-only.jpg` | Only the TIFF `DateTime` of IFD 0 (`2015:11:23 06:07:08`) — no Exif sub-IFD at all. |
 | `exif-no-date.jpg` | An EXIF block with entries and no date anywhere. |
 | `exif-broken-entry.jpg` | The stamp beside one entry whose offset runs past the end of the block: a camera's MakerNote. |
 | `exif-broken-block.jpg` | An APP1 `Exif` block that is not a TIFF past its header. |
-| `exif-iso-date.jpg` | The stamp written ISO 8601 (`2021-06-30T17:45:12+02:00`) where EXIF expects colons and a space. |
+| `exif-iso-date.jpg` | The date written ISO 8601 (`2021-06-30T17:45:12+02:00`) where EXIF expects colons and a space. |
 | `exif-no-seconds.jpg` | A date known to the minute (`2017-02-28 11:20`). |
-| `exif-undefined-date.jpg` | The date stored as UNDEFINED rather than ASCII, with a +09:00 offset. |
+| `exif-undefined-date.jpg` | The date stored as UNDEFINED rather than ASCII (`2016:05:04 03:02:01 +09:00`). |
 | `exif-far-date.jpg` | `9999:12:31 23:59:59` — a moment past what an epoch nanosecond can hold. |
-| `exif-second-ifd.jpg` | The metadata hanging off the second IFD, as a file with its thumbnail first is written. |
-| `xmp-date.jpg` | A JPEG stripped of EXIF, its only date an XMP APP1 packet (`xmp:CreateDate`). |
-| `xmp-date.webp` | A WebP whose only date is an `XMP ` chunk, in attribute form (`photoshop:DateCreated`). |
-| `xmp-in-exif.jpg` | The only date being an XMP packet stored as EXIF tag 700. |
+| `exif-second-ifd.jpg` | The metadata hanging off the second IFD (`2011:08:09 10:11:12`), as a file with its thumbnail first is written. |
+| `xmp-date.jpg` | A JPEG stripped of EXIF, its only date an XMP APP1 packet (`xmp:CreateDate`, `2022-09-01T10:11:12Z`). |
+| `xmp-date.webp` | A WebP whose only date is an `XMP ` chunk, in attribute form (`photoshop:DateCreated`, `2018-05-06T07:08:09`). |
+| `xmp-in-exif.jpg` | The only date being an XMP packet stored as EXIF tag 700 (`exif:DateTimeOriginal`, `2014-03-04T05:06:07Z`). |
+| `xmp-mention.jpg` | A JPEG whose XMP caption *mentions* `exif:DateTimeOriginal='2019-01-02T03:04:05Z'` inside a `dc:description`, beside a real `photoshop:DateCreated` (`2016-06-07T08:09:10Z`): the property is the file's date, the mention is only a sentence. |
 | `exif.png` | The stamp in a PNG `eXIf` chunk. |
 | `exif.webp` | A decodable 12×1 lossy WebP with the stamp in an `EXIF` chunk. |
 | `exif.heic` | A real HEIC whose EXIF carries the stamp: no dimension reader here, a readable date. |

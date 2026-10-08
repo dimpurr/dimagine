@@ -485,10 +485,13 @@ pub struct CollectionTile {
 ///
 /// The tile inside each item is exactly the library tile ([`tile`]): its
 /// prefix is the contract `tests/viewer.rs` parses, the inspector fills
-/// from its `data-path`, and the aspect script finds it.
+/// from its `data-path`, and the aspect script finds it. The section carries
+/// the same classes the library grid carries: this page's grid is the
+/// library's grid with captions, and no rule of the stylesheet knows it by
+/// any other name.
 pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String {
     format!(
-        "<section class=\"grid grid-collection size-{}\" data-total=\"{}\">{}</section>",
+        "<section class=\"grid size-{}\" data-total=\"{}\">{}</section>",
         params.size.as_str(),
         items.len(),
         items

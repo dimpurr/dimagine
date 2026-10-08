@@ -645,7 +645,10 @@ impl Index {
         self.fail_scan_on_error(result)
     }
 
-    /// Commits the scan and deletes file/note/link rows whose paths vanished.
+    /// Commits the scan and deletes file/note/link rows whose paths vanished,
+    /// together with any cached image header whose content no image row carries
+    /// any more (the digest cache is content-keyed, so it follows the content
+    /// and not the path).
     ///
     /// An active scan is required: call [`Index::begin_scan`] first. Finishing without one
     /// returns [`IndexError::ScanNotActive`] (or [`IndexError::ScanAborted`] after
@@ -717,6 +720,20 @@ impl Index {
             )?;
             conn.execute(
                 "DELETE FROM files WHERE path NOT IN (SELECT path FROM scan_seen)",
+                [],
+            )?;
+            // `image_meta` is a content-keyed cache, so it deliberately
+            // outlives the path that first earned it — a duplicate or a move
+            // reads the row back instead of parsing again. It does not outlive
+            // the *content*: a digest no image row carries any more (the file
+            // was deleted, or every copy of it was) is unreachable, and
+            // without this the cache only grows. `sha256 IS NOT NULL` is load
+            // bearing: a row whose header has not been read yet has a NULL
+            // digest, and `NOT IN` over a NULL answer is never true, which
+            // would prune nothing at all.
+            conn.execute(
+                "DELETE FROM image_meta WHERE sha256 NOT IN ( \
+                   SELECT sha256 FROM files WHERE kind='image' AND sha256 IS NOT NULL)",
                 [],
             )?;
             conn.execute(
@@ -1292,13 +1309,13 @@ fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-/// The [`TakenReason`] a stored column holds. An unknown code reads as the
-/// unknown it was meant to replace rather than as one of the known kinds: a
-/// code from a newer dimagine proves nothing about this version's categories.
 /// One row's per-image header columns, as SQLite hands them over: width,
 /// height, the taken time, and the reason it is missing.
 type MetaRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
 
+/// The [`TakenReason`] a stored column holds. An unknown code reads as the
+/// unknown it was meant to replace rather than as one of the known kinds: a
+/// code from a newer dimagine proves nothing about this version's categories.
 fn reason_from_code(code: Option<i64>) -> Option<TakenReason> {
     code.and_then(TakenReason::from_code)
 }
@@ -2065,6 +2082,76 @@ mod tests {
                 .unwrap();
             assert_eq!(columns, expected, "{table} has all columns");
         }
+    }
+
+    /// An upgrade interrupted before its `COMMIT` is not half-applied: every
+    /// statement the step runs is inside one transaction, so a crash leaves the
+    /// old schema exactly as it was and the next open completes the upgrade.
+    /// The two tests above cover keeping rows and re-running; this is the third
+    /// property, which nothing exercised (RW48 Low-1, RW50 L5).
+    #[test]
+    fn an_interrupted_upgrade_rolls_back_and_completes_on_the_next_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(V7_SCHEMA).unwrap();
+        // Begin the upgrade and stop before `COMMIT`: the same work the step
+        // does, with the transaction left open.
+        conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE files ADD COLUMN taken_reason INTEGER;
+             ALTER TABLE image_meta ADD COLUMN taken_reason INTEGER;
+             UPDATE files SET sha256=NULL WHERE kind='image';
+             DELETE FROM image_meta;
+             DELETE FROM schema_version;
+             INSERT INTO schema_version(version) VALUES(8);",
+        )
+        .unwrap();
+        // Dropping the connection with the transaction open is the crash:
+        // SQLite rolls it back rather than leaving a half-migrated database.
+        drop(conn);
+
+        let raw = Connection::open(&db).unwrap();
+        let version: i64 = raw
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 7, "an interrupted upgrade is not half-applied");
+        for (table, expected) in [("files", 14), ("image_meta", 4)] {
+            let columns: i64 = raw
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, expected, "{table} is still the old schema");
+        }
+        let rows: i64 = raw
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "the old rows are intact");
+        drop(raw);
+
+        // The next open finds version 7 and finishes the upgrade.
+        let index = Index::open(dir.path()).unwrap();
+        assert!(!index.rebuild_required());
+        let version: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 8, "the upgrade completes on the next open");
+        let rows: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "and keeps every row");
     }
 
     #[test]

@@ -445,16 +445,17 @@ fn riff_chunk<'a>(bytes: &'a [u8], fourcc: &[u8]) -> Option<&'a [u8]> {
 }
 
 /// The value the XMP property `name` carries, as an element
-/// (`<name>value</name>`) or as an attribute (`name="value"`): XMP writers use
-/// both forms. A name only counts at its own boundaries, so `exif:DateTime`
-/// never matches inside `exif:DateTimeDigitized`.
+/// (`<name>value</name>`) or as an attribute of a tag (`<tag name="value">`):
+/// XMP writers use both forms. A name counts only at its own boundaries — so
+/// `exif:DateTime` never matches inside `exif:DateTimeDigitized` — and only in
+/// one of those two positions, never as a *mention* inside another property's
+/// text or quoted value: a caption that happens to spell
+/// `exif:DateTimeOriginal='2019-…'` is not this file's date (RW50 M1).
 fn xmp_value<'a>(packet: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     let mut rest = packet;
     while let Some(offset) = find(rest, name) {
         let after = &rest[offset + name.len()..];
-        let whole = (offset == 0 || !is_name_byte(rest[offset - 1]))
-            && !after.first().is_some_and(|byte| is_name_byte(*byte));
-        if whole {
+        if property_position(rest, offset) {
             if let Some(value) = quoted_or_element(after) {
                 return Some(value);
             }
@@ -462,6 +463,52 @@ fn xmp_value<'a>(packet: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         rest = after;
     }
     None
+}
+
+/// Whether the occurrence of a property name at `offset` is one of the two
+/// positions a property is written in: the head of an element (`<name>`) or a
+/// top-level attribute of a tag (`<tag name="…">`).
+///
+/// Text content and quoted attribute values are where a *mention* lives. A
+/// `dc:description` caption that spells `exif:DateTimeOriginal='2019-…'` puts
+/// the name inside a tag — but inside a quoted value, and this is what tells
+/// the two apart.
+fn property_position(packet: &[u8], offset: usize) -> bool {
+    // The `<` that opens the tag this name sits in: the last one before it,
+    // with no `>` between. An occurrence with no such `<`, or one that follows
+    // a closed tag, is text content.
+    let before = &packet[..offset];
+    let Some(open) = before.iter().rposition(|byte| *byte == b'<') else {
+        return false;
+    };
+    let head = &before[open + 1..];
+    if head.contains(&b'>') {
+        return false;
+    }
+    // A name byte immediately before means this is part of a longer name.
+    if offset > 0 && is_name_byte(packet[offset - 1]) {
+        return false;
+    }
+    // `<name…>`: the element's own name.
+    if head.is_empty() {
+        return true;
+    }
+    // `<tag name…>`: an attribute, so the tag name must have ended and no
+    // quote may be open between the two — an open quote makes this a value.
+    head.last().is_some_and(|byte| byte.is_ascii_whitespace()) && !inside_quotes(head)
+}
+
+/// Whether a quote opened in `text` is still open at its end.
+fn inside_quotes(text: &[u8]) -> bool {
+    let mut open = None;
+    for byte in text {
+        match (open, byte) {
+            (None, b'"' | b'\'') => open = Some(*byte),
+            (Some(quote), _) if *byte == quote => open = None,
+            _ => {}
+        }
+    }
+    open.is_some()
 }
 
 /// The bytes after a property name: element text up to the closing tag, or an
@@ -634,6 +681,13 @@ fn subsec_ns(raw: &[u8]) -> Option<u32> {
 /// writers prefer, and `Z`. Nothing else is guessed at — a value that is not one
 /// of these leaves the date in the zone-less rule rather than a zone of the
 /// reader's choosing.
+///
+/// A syntactically perfect offset no zone could name is refused the same way,
+/// so a corrupt or hand-edited `OffsetTimeOriginal` cannot move the instant by
+/// days: no zone stands further than ±14:00 from UTC, and a minute field past
+/// 59 is not a time. `+25:00`, `+24:00` and `+99:99` all parse as shapes and
+/// then fail this check, which is what puts the caller back on its documented
+/// rule instead of applying six and a half days of error.
 fn offset_minutes(raw: &[u8]) -> Option<i32> {
     let mut rest = trim_outer(raw);
     let sign = match rest.first()? {
@@ -648,10 +702,11 @@ fn offset_minutes(raw: &[u8]) -> Option<i32> {
         rest = &rest[1..];
     }
     let minutes = fixed(&mut rest, 2)?;
-    if !rest.is_empty() {
+    if !rest.is_empty() || hours > 23 || minutes > 59 {
         return None;
     }
-    Some(sign * i32::try_from(hours * 60 + minutes).ok()?)
+    let from_utc = i32::try_from(hours * 60 + minutes).ok()?;
+    (from_utc <= 14 * 60).then_some(sign * from_utc)
 }
 
 #[cfg(test)]
@@ -909,7 +964,7 @@ mod tests {
     /// The camera stamp — `2023:07:12 20:54:07.123 +01:00` — is written
     /// identically in the JPEG, PNG and WebP fixtures, so the three containers
     /// are checked against one expected value.
-    const DATED: [(&[u8], &str, i64); 12] = [
+    const DATED: [(&[u8], &str, i64); 13] = [
         (
             include_bytes!("../../../tests/fixtures/exif-digitized.jpg"),
             "exif-digitized.jpg",
@@ -961,6 +1016,11 @@ mod tests {
             1_525_590_489_000_000_000,
         ),
         (
+            include_bytes!("../../../tests/fixtures/xmp-mention.jpg"),
+            "xmp-mention.jpg",
+            1_465_286_950_000_000_000,
+        ),
+        (
             include_bytes!("../../../tests/fixtures/exif.png"),
             "exif.png",
             1_689_191_647_123_000_000,
@@ -1005,8 +1065,9 @@ mod tests {
     /// The dates real files carry that a reader looking only for
     /// `DateTimeOriginal` in the first IFD would walk past: a later date tag,
     /// the file's own `DateTime`, a date to the minute, an ISO spelling, an
-    /// UNDEFINED type, a second IFD, an entry that fails beside the date, and
-    /// the XMP packet an exporter moved the date to.
+    /// UNDEFINED type, a second IFD, an entry that fails beside the date, the
+    /// XMP packet an exporter moved the date to, and a packet whose caption
+    /// merely *mentions* a date property beside the one the file really sets.
     #[test]
     fn dates_outside_the_narrow_reading_all_come_back() {
         for (bytes, name, expected) in DATED {
@@ -1014,6 +1075,31 @@ mod tests {
             assert_eq!(facts.taken_ns, Some(expected), "{name} names its moment");
             assert_eq!(facts.taken_reason, None, "{name} has no unknown left");
         }
+    }
+
+    /// The mention trap (RW50 M1): a caption that *spells* a date property
+    /// must not speak for the file. `xmp-mention.jpg` carries
+    /// `dc:description="scanned; exif:DateTimeOriginal='2019-01-02T03:04:05Z'
+    /// noted"` beside a real `<photoshop:DateCreated>`; the property wins, and
+    /// the sentence inside the caption stays a sentence. The reader searched
+    /// the packet for the *name* anywhere and took the first match that was
+    /// followed by `=` or `>`, so before this it recorded the mention — a date
+    /// the file does not carry — and counted the image as having a taken time,
+    /// where no "why missing" breakdown could ever flag it.
+    #[test]
+    fn a_date_property_mentioned_in_a_caption_does_not_speak_for_the_file() {
+        let facts = probe_fixture(include_bytes!("../../../tests/fixtures/xmp-mention.jpg"));
+        assert_eq!(
+            facts.taken_ns,
+            Some(1_465_286_950_000_000_000),
+            "the file's own photoshop:DateCreated, not the caption's mention"
+        );
+        assert_ne!(
+            facts.taken_ns,
+            Some(1_546_398_245_000_000_000),
+            "the date the caption mentions must not be recorded"
+        );
+        assert_eq!(facts.taken_reason, None);
     }
 
     /// The kinds of missing taken time, which look identical from the missing
@@ -1119,6 +1205,54 @@ mod tests {
             Some(1_689_195_247_250_000_000),
             "the value's own fraction is the nearer answer"
         );
+    }
+
+    /// An offset that parses but names no zone is refused, not applied. The
+    /// parser accepted the `±HH:MM` shape for any two digits and then moved
+    /// the instant by up to ±6.7 days, so a corrupt or hand-edited
+    /// `OffsetTimeOriginal` was a wrong date rather than an absent one
+    /// (RW48 Medium-1). A *tag* refused this way leaves the date in the
+    /// zone-less rule — the date still stands; a *value* that carries the bad
+    /// zone names no moment, because its zone is part of the text.
+    #[test]
+    fn an_offset_no_zone_could_name_is_refused() {
+        // ±14:00 is the furthest any zone stands from UTC, and both apply.
+        assert_eq!(
+            moment(b"2023:07:12 20:54:07", None, Some(b"+14:00")),
+            Some(1_689_144_847_000_000_000)
+        );
+        assert_eq!(
+            moment(b"2023:07:12 20:54:07", None, Some(b"-14:00")),
+            Some(1_689_245_647_000_000_000)
+        );
+        let zone_less = Some(1_689_195_247_000_000_000);
+        for offset in [
+            b"+14:01".as_slice(),
+            b"+23:59".as_slice(),
+            b"+24:00".as_slice(),
+            b"+25:00".as_slice(),
+            b"-25:00".as_slice(),
+            b"+60:00".as_slice(),
+            b"+99:99".as_slice(),
+            b"-99:99".as_slice(),
+        ] {
+            assert_eq!(
+                moment(b"2023:07:12 20:54:07", None, Some(offset)),
+                zone_less,
+                "the tag {} is refused, so the date stands without it",
+                String::from_utf8_lossy(offset)
+            );
+        }
+        for raw in [
+            b"2023:07:12 20:54:07+14:01".as_slice(),
+            b"2023:07:12 20:54:07+99:99".as_slice(),
+        ] {
+            assert_eq!(
+                moment(raw, None, None),
+                None,
+                "a value whose own zone is refused names no moment"
+            );
+        }
     }
 
     /// Nothing is invented: text that names no moment is `None`, whether it is
