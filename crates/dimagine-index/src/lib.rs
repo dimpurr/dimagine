@@ -2201,7 +2201,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "wall-clock scaling is not stable under parallel load; run on a quiet machine with scripts/dev/bench-index.sh"]
     fn ten_thousand_notes_refresh_fts_roughly_linearly() {
         fn index_notes(count: usize) -> (std::time::Duration, usize) {
             let dir = tempfile::tempdir().unwrap();
@@ -2227,8 +2226,26 @@ mod tests {
             let rows = index.search_text("synthetic").unwrap().len();
             (elapsed, rows)
         }
-        let (small, small_rows) = index_notes(1_000);
-        let (large, large_rows) = index_notes(10_000);
+        // The two sizes run interleaved and each one's median is
+        // compared: a loaded machine slows both runs the same way,
+        // and a load spike that hits a single round is not the
+        // median. The ratio is what the test guards — the FTS
+        // upkeep must scale with the note count, not its square,
+        // and 10x notes at quadratic cost is 100x time.
+        let mut small_times = Vec::new();
+        let mut large_times = Vec::new();
+        let (mut small_rows, mut large_rows) = (0, 0);
+        for _ in 0..3 {
+            let (small, rows) = index_notes(1_000);
+            small_times.push(small);
+            small_rows = rows;
+            let (large, rows) = index_notes(10_000);
+            large_times.push(large);
+            large_rows = rows;
+        }
+        small_times.sort_unstable();
+        large_times.sort_unstable();
+        let (small, large) = (small_times[1], large_times[1]);
         eprintln!("indexed 1,000 notes in {small:?}; 10,000 notes in {large:?}");
         assert_eq!(small_rows, 1_000);
         assert_eq!(large_rows, 10_000);

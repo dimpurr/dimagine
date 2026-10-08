@@ -36,3 +36,4 @@ serde_json = "1"
 [dev-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
 dimagine-index = { path = "../dimagine-index" }
+tempfile = "3.27.0"
