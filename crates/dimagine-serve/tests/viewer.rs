@@ -1012,14 +1012,18 @@ async fn a_tile_remembers_the_view_it_came_from() {
         "a tile carries the view: {html}"
     );
 
-    // And the image page offers the way back.
+    // And the image page offers the way back — landing on the tile it left,
+    // the anchor the page's own tiles carry.
     let html = text(
         &app,
         "/image/refs/ui/button.png?v=in%3Drefs%26sort%3Dname",
         &cookie,
     )
     .await;
-    assert!(html.contains("href=\"/?in=refs&amp;sort=name\""), "{html}");
+    assert!(
+        html.contains("href=\"/?in=refs&amp;sort=name#img-refs/ui/button.png\""),
+        "{html}"
+    );
     assert!(html.contains("Back to view"));
 }
 
@@ -1051,10 +1055,17 @@ async fn the_image_page_lists_the_collections_an_image_appears_in() {
     let html = text(&app, "/image/refs/landscape.png", &cookie).await;
     assert!(html.contains("Appears in"));
     assert!(html.contains("href=\"/?c=browse.md\""));
+    // The collection is named by its own title, and the path is the tooltip.
+    assert!(html.contains("<a href=\"/?c=browse.md\" title=\"browse.md\">Browse</a>"));
 
-    // An image in no collection says nothing about it.
+    // An image in no collection says so in one line, not in silence.
     let html = text(&app, "/image/refs2/trap.png", &cookie).await;
-    assert!(!html.contains("Appears in"), "{html}");
+    assert!(html.contains("Appears in"), "{html}");
+    assert!(html.contains("Not in any collection."), "{html}");
+    assert!(
+        !html.contains("<ul class=\"appears-in\">"),
+        "no list for an empty state: {html}"
+    );
 }
 
 #[tokio::test]
@@ -1068,6 +1079,384 @@ async fn an_image_with_no_note_still_shows_its_path() {
         "the file name is the alt text"
     );
     assert!(!html.contains("Tags"));
+}
+
+/// The `?v=` a tile or a hand writes, percent-encoded the way the page writes
+/// it back on its arrows (`NON_ALPHANUMERIC`, the tiles' own spelling).
+fn v_param(query: &str) -> String {
+    percent_encoding::utf8_percent_encode(query, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// `<span class="image-nav-position" title="…">n / t</span>`, as the page
+/// draws it, so a test states what it expects rather than scraping it. The
+/// view names itself in the tooltip HTML-escaped, the way the page writes a
+/// title attribute (`&` of a two-part query becomes `&amp;`).
+fn position(position: u64, total: u64, view: &str) -> String {
+    let view = view.replace('&', "&amp;");
+    format!("<span class=\"image-nav-position\" title=\"{view}\">{position} / {total}</span>")
+}
+
+/// One arrow as the page draws it: a link (carrying the view, or none at all
+/// when the plain library is the whole context), or the quiet stub at a
+/// view's end.
+fn prev_link(target: Option<&str>, view: &str) -> String {
+    arrow("image-nav-prev", "Previous image", target, view)
+}
+
+fn next_link(target: Option<&str>, view: &str) -> String {
+    arrow("image-nav-next", "Next image", target, view)
+}
+
+fn arrow(kind: &str, label: &str, target: Option<&str>, view: &str) -> String {
+    match target {
+        Some(path) => {
+            let suffix = if view.is_empty() {
+                String::new()
+            } else {
+                format!("?v={view}")
+            };
+            format!(
+                "<a class=\"{kind}\" href=\"/image/{path}{suffix}\" \
+                 title=\"{}\" aria-label=\"{label}\">",
+                path.rsplit('/').next().unwrap_or(path)
+            )
+        }
+        None => format!("<span class=\"{kind} nav-end\" aria-hidden=\"true\">"),
+    }
+}
+
+/// Four images whose every order is written in their notes: distinct `added`
+/// instants, a tag two of them share, and words only one body holds. Files
+/// one to four in folders a to d, so no sort agrees with another and a
+/// wrong walk cannot pass by accident.
+fn order_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    for (image, added, body) in [
+        (
+            "a/one.png",
+            "2026-01-01T00:00:00+00:00",
+            "the first picture",
+        ),
+        (
+            "b/two.png",
+            "2026-01-02T00:00:00+00:00",
+            "the second picture",
+        ),
+        (
+            "c/three.png",
+            "2026-01-03T00:00:00+00:00",
+            "the third picture",
+        ),
+        (
+            "d/four.png",
+            "2026-01-04T00:00:00+00:00",
+            "the fourth picture",
+        ),
+    ] {
+        write(image, PNG_BYTES);
+        let tags = if body.contains("second") || body.contains("third") {
+            "tags:\n  - cat\n".to_owned()
+        } else {
+            String::new()
+        };
+        write(
+            &format!("{image}.md"),
+            &format!("---\ntitle: {added}\n{tags}added: {added}\n---\n{body}\n"),
+        );
+    }
+    // Embed order is deliberately none of the sort orders: one, four, two, three.
+    write(
+        "set.md",
+        "---\ntitle: Set\n---\n![[a/one.png]]\n![[d/four.png]]\n![[b/two.png]]\n![[c/three.png]]\n",
+    );
+    dir
+}
+
+/// 205 images with dates in their notes, a minute apart, so the Recent lens
+/// has one picture past its 200 for every ordering under the sun.
+fn recent_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::create_dir_all(root.join("refs")).unwrap();
+    for index in 0..205u64 {
+        let image = format!("refs/rec-{index:03}.jpg");
+        fs::write(root.join(&image), PNG_BYTES).unwrap();
+        let added = format!("2026-05-01T{:02}:{:02}:00+00:00", index / 60, index % 60);
+        fs::write(
+            root.join(format!("{image}.md")),
+            format!("---\nadded: {added}\n---\nrecorded {index}\n"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[tokio::test]
+async fn prev_next_walk_the_view_the_page_was_reached_from() {
+    let dir = order_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // The plain library: added newest first — four, three, two, one.
+    let html = text(&app, "/image/c/three.png", &cookie).await;
+    assert!(
+        html.contains(&prev_link(Some("d/four.png"), "")),
+        "no v, so no ?v= on the arrows: {html}"
+    );
+    assert!(html.contains(&next_link(Some("b/two.png"), "")));
+    assert!(html.contains(&position(2, 4, "All")));
+    // The ends of the view answer stubs, not wraps.
+    let html = text(&app, "/image/d/four.png", &cookie).await;
+    assert!(html.contains(&prev_link(None, "")));
+    assert!(html.contains(&position(1, 4, "All")));
+    assert!(html.contains(&next_link(Some("c/three.png"), "")));
+    let html = text(&app, "/image/a/one.png", &cookie).await;
+    assert!(html.contains(&next_link(None, "")));
+    assert!(html.contains(&position(4, 4, "All")));
+
+    // A sort the reader picked: name ascending — four, one, three, two (the
+    // names sort, not the folders). The arrows keep carrying the view,
+    // spelled as the tiles spell it, and "Back to view" lands on the tile the
+    // picture was left from — where `b/two.png` is the tail of the list.
+    let view = "sort=name&dir=asc";
+    let html = text(
+        &app,
+        &format!("/image/b/two.png?v={}", v_param(view)),
+        &cookie,
+    )
+    .await;
+    assert!(
+        html.contains(&prev_link(Some("c/three.png"), &v_param(view))),
+        "{html}"
+    );
+    assert!(html.contains(&next_link(None, &v_param(view))), "{html}");
+    assert!(html.contains(&position(4, 4, view)));
+    assert!(
+        html.contains(&format!(
+            "href=\"/?{}#img-b/two.png\">← Back to view",
+            view.replace('&', "&amp;")
+        )),
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn prev_next_walk_a_folder_a_tag_and_a_search() {
+    let dir = order_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // A folder of its own: one image, nothing on either side.
+    let view = "in=b&sub=0";
+    let html = text(
+        &app,
+        &format!("/image/b/two.png?v={}", v_param(view)),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&prev_link(None, &v_param(view))));
+    assert!(html.contains(&next_link(None, &v_param(view))));
+    assert!(html.contains(&position(1, 1, view)));
+
+    // A tag both middles carry: three, two in added order.
+    let view = "tag=cat";
+    let html = text(
+        &app,
+        &format!("/image/b/two.png?v={}", v_param(view)),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&prev_link(Some("c/three.png"), &v_param(view))));
+    assert!(html.contains(&next_link(None, &v_param(view))));
+    assert!(html.contains(&position(2, 2, view)));
+    let html = text(
+        &app,
+        &format!("/image/c/three.png?v={}", v_param(view)),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&prev_link(None, &v_param(view))));
+    assert!(html.contains(&next_link(Some("b/two.png"), &v_param(view))));
+
+    // A search whose words only one body holds.
+    let view = "q=first";
+    let html = text(
+        &app,
+        &format!("/image/a/one.png?v={}", v_param(view)),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&position(1, 1, view)));
+    assert!(html.contains(&prev_link(None, &v_param(view))));
+    assert!(html.contains(&next_link(None, &v_param(view))));
+}
+
+/// A collection's own embed order is the only order its members have
+/// (FORMAT §5): the walk follows the note, here deliberately not any sort.
+#[tokio::test]
+async fn prev_next_walk_a_collection_in_its_embed_order() {
+    let dir = order_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let view = v_param("c=set.md");
+
+    // Set order: one, four, two, three.
+    let html = text(&app, &format!("/image/b/two.png?v={view}"), &cookie).await;
+    assert!(html.contains(&prev_link(Some("d/four.png"), &view)));
+    assert!(html.contains(&next_link(Some("c/three.png"), &view)));
+    assert!(html.contains(&position(3, 4, "c=set.md")));
+    let html = text(&app, &format!("/image/a/one.png?v={view}"), &cookie).await;
+    assert!(html.contains(&prev_link(None, &view)));
+    assert!(html.contains(&next_link(Some("d/four.png"), &view)));
+    assert!(html.contains(&position(1, 4, "c=set.md")));
+}
+
+/// The Recent lens reaches the last 200 added, no matter how large the
+/// library: the image at the lens's end has no next even though 199-odd more
+/// exist, and an image the lens never held walks nowhere at all.
+#[tokio::test]
+async fn the_recent_lens_walks_only_the_two_hundred_it_shows() {
+    let dir = recent_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let view = v_param("recent=1");
+
+    // rec-204 is the newest, rec-005 the last the lens holds.
+    let html = text(&app, &format!("/image/refs/rec-204.jpg?v={view}"), &cookie).await;
+    assert!(html.contains(&prev_link(None, &view)));
+    assert!(html.contains(&next_link(Some("refs/rec-203.jpg"), &view)));
+    assert!(html.contains(&position(1, 200, "recent=1")));
+
+    let html = text(&app, &format!("/image/refs/rec-005.jpg?v={view}"), &cookie).await;
+    assert!(html.contains(&prev_link(Some("refs/rec-006.jpg"), &view)));
+    assert!(
+        html.contains(&next_link(None, &view)),
+        "rec-004 exists but the lens never showed it: {html}"
+    );
+    assert!(html.contains(&position(200, 200, "recent=1")));
+
+    let html = text(&app, &format!("/image/refs/rec-004.jpg?v={view}"), &cookie).await;
+    assert!(
+        !html.contains("image-nav-position"),
+        "an image the lens never held has no place in it: {html}"
+    );
+    assert!(!html.contains("image-nav-prev\" href="), "{html}");
+    assert!(html.contains("Back to view"), "the way back stays: {html}");
+}
+
+/// A view that does not show this picture — a tag it does not carry — offers
+/// no walk: the header keeps only the way back, which is exactly what a
+/// stale `v=` means.
+#[tokio::test]
+async fn a_view_the_image_is_not_part_of_offers_no_walk() {
+    let dir = order_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(
+        &app,
+        &format!("/image/d/four.png?v={}", v_param("tag=cat")),
+        &cookie,
+    )
+    .await;
+    assert!(!html.contains("image-nav"), "{html}");
+    assert!(
+        html.contains("href=\"/?tag=cat#img-d/four.png\">← Back to view"),
+        "{html}"
+    );
+}
+
+/// An unknown `v` is walked as the plain library and linked as written; an
+/// unreadable `v` is the plain library entirely — either way, the arrows and
+/// the back link never disagree about which view they mean, and neither can
+/// leave the origin.
+#[tokio::test]
+async fn an_unknown_view_param_still_walks_and_gets_back_safely() {
+    let dir = order_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let html = text(&app, "/image/b/two.png?v=banana", &cookie).await;
+    assert!(
+        html.contains("href=\"/?banana#img-b/two.png\">← Back to view"),
+        "{html}"
+    );
+    assert!(
+        html.contains(&prev_link(Some("c/three.png"), &v_param("banana"))),
+        "the arrows carry the view as written: {html}"
+    );
+    assert!(html.contains(&position(3, 4, "banana")));
+
+    let html = text(&app, "/image/b/two.png?v=%FF", &cookie).await;
+    assert!(
+        html.contains("href=\"/#img-b/two.png\">← Back to view"),
+        "{html}"
+    );
+    assert!(html.contains(&prev_link(Some("c/three.png"), "")), "{html}");
+    assert!(html.contains(&position(3, 4, "All")), "{html}");
+}
+
+/// "Appears in" with many collections: each named by what the collection
+/// calls itself — a title, or its file name when it has none — linked to its
+/// view, and a hostile title reaches the page only escaped (RW37's rule,
+/// applied to the back-link list).
+#[tokio::test]
+async fn appears_in_names_many_collections_and_escapes_hostile_titles() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    write("hero.png", PNG_BYTES);
+    write("side.png", PNG_BYTES);
+    write(
+        "browse.md",
+        "---\ntitle: Browse\n---\n![[hero.png]]\nA browse.\n",
+    );
+    write(
+        "sets/round.md",
+        format!(
+            "---\ntitle: {}\n---\n![[hero.png]]\nA round.\n",
+            "Set <img onerror=alert(1)>\" quotes"
+        )
+        .as_str(),
+    );
+    write("deep.md", "---\n---\n![[hero.png]]\nNo title of its own.\n");
+
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/image/hero.png", &cookie).await;
+    assert!(
+        html.contains("<ul class=\"appears-in\">"),
+        "three collections, one list: {html}"
+    );
+    assert!(
+        html.contains("<a href=\"/?c=browse.md\" title=\"browse.md\">Browse</a>"),
+        "{html}"
+    );
+    // A title even with quotes and markup stays a label; the link keeps the
+    // path, percent-encoded.
+    assert!(
+        html.contains(
+            "<a href=\"/?c=sets/round.md\" title=\"sets/round.md\">\
+             Set &lt;img onerror=alert(1)&gt;&quot; quotes</a>"
+        ),
+        "{html}"
+    );
+    assert!(
+        !html.contains("Set <img onerror"),
+        "the raw title rendered as markup: {html}"
+    );
+    // No title: the file names the collection.
+    assert!(
+        html.contains("<a href=\"/?c=deep.md\" title=\"deep.md\">deep.md</a>"),
+        "{html}"
+    );
+
+    let html = text(&app, "/image/side.png", &cookie).await;
+    assert!(html.contains("Not in any collection."), "{html}");
 }
 
 #[tokio::test]

@@ -252,6 +252,14 @@ pub fn encode_path(path: &str) -> String {
         .join("/")
 }
 
+/// The fragment that names one image's tile: the `id` every tile carries,
+/// and the anchor the image page's "Back to view" returns to, so the grid
+/// comes back where it was — without the script, and without the browser
+/// having to remember anything (K27 motion 4).
+pub fn tile_anchor(path: &str) -> String {
+    format!("img-{}", encode_path(path))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

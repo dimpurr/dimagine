@@ -12,7 +12,7 @@
 
 use dimagine_core::library::Library;
 use dimagine_core::sync_index;
-use dimagine_index::{Index, IndexError, ViewPage, ViewQuery};
+use dimagine_index::{AppearsIn, Index, IndexError, Neighbours, ViewPage, ViewQuery};
 use serde::Serialize;
 use std::{
     fmt, fs,
@@ -210,6 +210,32 @@ impl IndexHandle {
     pub fn appears_in(&self, image_path: &str) -> Result<Vec<String>, IndexError> {
         match &*self.lock()? {
             Slot::Open(index) => index.appears_in(image_path),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
+    /// The same back-links, with what each collection calls itself (K27
+    /// motion 6: the image page names a collection the way the sidebar does,
+    /// by its `title`, falling back to the file name).
+    pub fn appears_in_titled(&self, image_path: &str) -> Result<Vec<AppearsIn>, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.appears_in_titled(image_path),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
+    /// Where one image sits in one view, and the images beside it there (K27
+    /// motion 4). `lens_limit` is the Recent lens's window: the cap belongs
+    /// to the viewer, so the caller states it in the same sizing the grid
+    /// used.
+    pub fn view_neighbours(
+        &self,
+        query: &ViewQuery,
+        image_path: &str,
+        lens_limit: Option<u64>,
+    ) -> Result<Option<Neighbours>, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.view_neighbours(query, image_path, lens_limit),
             Slot::Closed(reason) => Err(reason.clone().into()),
         }
     }
@@ -554,6 +580,50 @@ mod tests {
             vec!["collection.md".to_owned()]
         );
         assert!(handle.appears_in("plain.png").unwrap().is_empty());
+    }
+
+    /// The handle answers "Appears in" with what each collection calls
+    /// itself, not only its path: the image page labels a collection the way
+    /// the sidebar does (K27 motion 6).
+    #[test]
+    fn appears_in_also_carries_each_collections_title() {
+        use dimagine_index::AppearsIn;
+        let dir = test_library();
+        let handle = IndexHandle::open(dir.path()).unwrap();
+        assert_eq!(
+            handle.appears_in_titled("refs/img1.jpg").unwrap(),
+            vec![AppearsIn {
+                note_path: "collection.md".to_owned(),
+                title: "Sample Collection".to_owned(),
+            }]
+        );
+        let bare = handle.appears_in_titled("plain.png").unwrap();
+        assert!(bare.is_empty(), "{bare:?}");
+    }
+
+    /// The handle passes the neighbour question through with the lens the
+    /// caller states: a member answers its place, a non-member answers
+    /// `None`.
+    #[test]
+    fn the_handle_answers_neighbours_for_a_member_not_for_an_outsider() {
+        let dir = test_library();
+        let handle = IndexHandle::open(dir.path()).unwrap();
+        let single = ViewQuery {
+            collection: Some("collection.md".to_owned()),
+            ..ViewQuery::default()
+        };
+        let member = handle
+            .view_neighbours(&single, "refs/img1.jpg", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(member.position, 1);
+        assert_eq!(member.total, 1);
+        assert_eq!(member.previous, None);
+        assert_eq!(member.next, None);
+        assert!(handle
+            .view_neighbours(&single, "refs2/trap.jpg", None)
+            .unwrap()
+            .is_none());
     }
 
     /// W27f: an image note that embeds its siblings is a valid collection

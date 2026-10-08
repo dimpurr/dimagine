@@ -448,6 +448,23 @@
     var tile = document.createElement('a');
     tile.className = 'tile';
     tile.dataset.path = item.path;
+    // The same anchor the page gives its own tiles, so "Back to view" finds
+    // this tile too after "Load more" has appended it (encode the way the
+    // page does: encodeURIComponent leaves !, *, ', (, ) raw, the page does
+    // not).
+    tile.id =
+      'img-' +
+      item.path
+        .split('/')
+        .map(function (part) {
+          return encodeURIComponent(part)
+            .replace(/!/g, '%21')
+            .replace(/\*/g, '%2A')
+            .replace(/'/g, '%27')
+            .replace(/\(/g, '%28')
+            .replace(/\)/g, '%29');
+        })
+        .join('/');
     tile.href = imageHref(item.path);
 
     var image = document.createElement('img');
@@ -600,6 +617,195 @@
     if (image.complete) shape();
     else image.addEventListener('load', shape);
   }
+
+  /* ======================================= W45: the image page ========= */
+  /* Prev/next within the view the picture was reached from: the keys follow
+     the links the page already drew (K27 motion 4) — ←/→ walk the view, Esc
+     closes the sheet first and goes back to the view after, landing on the
+     tile the page left. On a phone a sideways stroke on the picture does the
+     same walk, and the info panel pulls up from the bottom edge. Everything
+     here follows a real href, so it all degrades to the same page without
+     this file. */
+
+  (function imagePage() {
+    var page = document.querySelector('.image-page');
+    if (!page) return;
+
+    var prev = page.querySelector('.image-nav-prev[href]');
+    var next = page.querySelector('.image-nav-next[href]');
+    var back = page.querySelector('.back-link');
+    var stage = page.querySelector('.image-stage');
+    var panel = page.querySelector('.image-panel');
+    var handle = page.querySelector('.sheet-handle');
+
+    // The top bar's height pins the inspector below it (desktop) and sizes
+    // the phone's stage; it also wraps at 520px, so it is measured, not
+    // guessed, and watched while it changes.
+    var bar = document.querySelector('.top-bar');
+    function measureTopBar() {
+      if (!bar) return;
+      document.documentElement.style.setProperty(
+        '--topbar-h',
+        bar.offsetHeight + 'px'
+      );
+    }
+    measureTopBar();
+    if (typeof ResizeObserver === 'function' && bar) {
+      new ResizeObserver(measureTopBar).observe(bar);
+    }
+
+    function follow(link) {
+      if (!link) return false;
+      window.location.href = link.href;
+      return true;
+    }
+
+    // Keyboard: ←/→ and Esc. The sheet owns Esc first — a person opening the
+    // details closes them before leaving the picture. Nav keys are edges the
+    // page already carries: an arrow at the end of a view is a stub with no
+    // href, and `follow` quietly does nothing, exactly like the missing link.
+    document.addEventListener('keydown', function (event) {
+      var target = event.target;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT')
+      ) {
+        return;
+      }
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === 'ArrowLeft') {
+        if (follow(prev)) event.preventDefault();
+      } else if (event.key === 'ArrowRight') {
+        if (follow(next)) event.preventDefault();
+      } else if (event.key === 'Escape' && panel) {
+        if (panel.classList.contains('sheet-open')) closeSheet();
+        else follow(back);
+      }
+    });
+
+    // A finger's sideways stroke across the picture walks the view. The
+    // well's own scrolling wins first — a picture wider than the well
+    // scrolls horizontally, and a stroke that turns vertical pans the page —
+    // and the navigation itself is a plain link, so nothing moves that
+    // prefers-reduced-motion has not already stopped (§2.6).
+    var stroke = null;
+    if (stage) {
+      stage.addEventListener('pointerdown', function (event) {
+        if (event.pointerType !== 'touch') return;
+        stroke = { x: event.clientX, y: event.clientY, id: event.pointerId };
+        try {
+          stage.setPointerCapture(event.pointerId);
+        } catch (error) {
+          /* a pointer that left between events is simply not tracked */
+        }
+      });
+      stage.addEventListener('pointerup', function (event) {
+        if (!stroke || event.pointerId !== stroke.id) return;
+        var dx = event.clientX - stroke.x;
+        var dy = event.clientY - stroke.y;
+        stroke = null;
+        if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
+        if (stage.scrollWidth > stage.clientWidth + 1) return;
+        // Left is forward — the same direction the row of a book turns.
+        follow(dx < 0 ? next : prev);
+      });
+      stage.addEventListener('pointercancel', function () {
+        stroke = null;
+      });
+    }
+
+    // The pull-up sheet. Peek matches the height the stylesheet leaves
+    // (44px). A tap toggles; a drag follows the finger and settles by which
+    // half it is in. Keyboard activation of the handle arrives as a click
+    // without any pointer, and toggles too.
+    var PEEK = 44;
+    var drag = null;
+    var settlingByDrag = false;
+
+    function isPhone() {
+      return window.matchMedia('(max-width: 767.98px)').matches;
+    }
+
+    function openSheet() {
+      if (!panel) return;
+      panel.style.removeProperty('--sheet-shift');
+      panel.classList.add('sheet-open');
+      panel.setAttribute('aria-expanded', 'true');
+    }
+
+    function closeSheet() {
+      if (!panel) return;
+      panel.style.removeProperty('--sheet-shift');
+      panel.classList.remove('sheet-open');
+      panel.setAttribute('aria-expanded', 'false');
+    }
+
+    if (handle && panel) {
+      handle.addEventListener('pointerdown', function (event) {
+        if (!isPhone()) return;
+        // Where the sheet is now: 0 when open, its closed shift when not.
+        drag = {
+          y: event.clientY,
+          shift: panel.classList.contains('sheet-open')
+            ? 0
+            : panel.getBoundingClientRect().height - PEEK,
+        };
+        panel.classList.add('dragging');
+        try {
+          handle.setPointerCapture(event.pointerId);
+        } catch (error) {
+          /* see the stroke above */
+        }
+        event.preventDefault();
+      });
+      handle.addEventListener('pointermove', function (event) {
+        if (!drag) return;
+        var height = panel.getBoundingClientRect().height;
+        var shift = Math.min(
+          height - PEEK,
+          Math.max(0, drag.shift + (event.clientY - drag.y))
+        );
+        panel.style.setProperty('--sheet-shift', shift + 'px');
+      });
+      var settle = function (event) {
+        if (!drag) return;
+        var height = panel.getBoundingClientRect().height;
+        // The sheet settles by which half it ends in: pulled past the
+        // middle opens, dropped before it closes. A hand that did not move
+        // it at all asks the click below for the tap instead.
+        var moved = Math.abs(event.clientY - drag.y) > 2;
+        var current = drag.shift + (event.clientY - drag.y);
+        drag = null;
+        panel.classList.remove('dragging');
+        if (!moved) return;
+        // The drag decided; the click it births must not undo it.
+        settlingByDrag = true;
+        if (current < (height - PEEK) / 2) openSheet();
+        else closeSheet();
+      };
+      handle.addEventListener('pointerup', settle);
+      handle.addEventListener('pointercancel', function () {
+        if (!drag) return;
+        drag = null;
+        panel.classList.remove('dragging');
+        settlingByDrag = true;
+        closeSheet();
+      });
+      handle.addEventListener('click', function () {
+        // A drag that ended on the handle leaves the settle above in
+        // charge; the click only toggles a real tap (or a keyboard press).
+        if (settlingByDrag) {
+          settlingByDrag = false;
+          return;
+        }
+        if (!isPhone()) return;
+        if (panel.classList.contains('sheet-open')) closeSheet();
+        else openSheet();
+      });
+    }
+  })();
 
   // An `![[embed]]` is a thumbnail with its caption beneath it. The renderer
   // writes the link and the image; the alt text is the caption to show.

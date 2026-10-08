@@ -409,7 +409,8 @@ pub fn notices(notices: &[String]) -> String {
 }
 
 /// One image tile. The tile is a plain link, so the grid works without JS; the
-/// `data-path` attribute is what the inspector fills from.
+/// `data-path` attribute is what the inspector fills from, and the `id` is
+/// what the image page's "Back to view" returns to (its own tile's anchor).
 ///
 /// The tile is square and the picture is whole (`object-fit: contain`). Only an
 /// extreme aspect ratio is cropped, and the aspect ratio cannot be emitted here:
@@ -426,10 +427,14 @@ pub fn tile(item: &ViewItem, params: &ViewParams) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| leaf_name(&item.path));
     format!(
-        "<a class=\"tile\" data-path=\"{path}\" href=\"/image/{path_encoded}{view}\" title=\"{label}\">\
+        // `data-path` stays the tile's second attribute: the viewer's own
+        // tests read a page's image paths back out of this exact prefix.
+        "<a class=\"tile\" data-path=\"{path}\" id=\"{anchor}\" \
+         href=\"/image/{path_encoded}{view}\" title=\"{label}\">\
          <img loading=\"lazy\" decoding=\"async\" src=\"/thumb/{path_encoded}\" alt=\"{label}\">\
          <span class=\"tile-caption\">{label}</span></a>",
         path = escape_html(&item.path),
+        anchor = escape_html(&crate::ui::tile_anchor(&item.path)),
         path_encoded = escape_html(&crate::ui::encode_path(&item.path)),
         view = image_view_suffix(params),
         label = escape_html(&label),
@@ -1259,6 +1264,31 @@ mod tests {
         assert!(html.contains("data-path=\"refs/ui/猫 &amp; co.png\""));
     }
 
+    /// W45: the tile's `id` is the anchor the image page's "Back to view"
+    /// lands on, spelled by the one helper both ends share — so the grid
+    /// comes back where it was, with only a fragment jump.
+    #[test]
+    fn a_tile_carries_the_anchor_the_image_page_returns_to() {
+        let item = ViewItem {
+            path: "refs/ui/猫 & co.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        };
+        let html = tile(&item, &ViewParams::default());
+        assert!(
+            html.contains(&format!("id=\"{}\"", crate::ui::tile_anchor(&item.path))),
+            "{html}"
+        );
+        assert_eq!(
+            crate::ui::tile_anchor("refs/ui/猫 & co.png"),
+            "img-refs/ui/%E7%8C%AB%20%26%20co.png"
+        );
+    }
+
     #[test]
     fn a_tile_without_a_title_is_named_after_its_file() {
         let item = ViewItem {
@@ -1601,5 +1631,21 @@ mod tests {
     #[test]
     fn a_page_past_the_end_of_a_one_item_view_says_item() {
         assert!(past_end_state(&ViewParams::parse("p=2"), 1).contains("This view has 1 item;"));
+    }
+}
+#[cfg(test)]
+mod debug_probe {
+    #[test]
+    fn probe() {
+        println!(
+            "SIZE: {}",
+            super::size_toggles(&crate::view_query::ViewParams::parse("in=refs&size=l"))
+        );
+        println!(
+            "CHIP: {}",
+            super::scope_chips(&crate::view_query::ViewParams::parse(
+                "in=refs/ui&tag=eagle&tag=nature&q=street&c=browse.md"
+            ))
+        );
     }
 }

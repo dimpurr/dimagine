@@ -14,8 +14,8 @@ use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
 pub use view::{
-    collection_is_listed, note_is_collection, note_rating, CollectionEvidence, CollectionInfo,
-    ImageMetaStats, SortKey, ViewItem, ViewPage, ViewQuery,
+    collection_is_listed, note_is_collection, note_rating, AppearsIn, CollectionEvidence,
+    CollectionInfo, ImageMetaStats, Neighbours, SortKey, ViewItem, ViewPage, ViewQuery,
 };
 
 const SCHEMA_VERSION: i64 = 7;

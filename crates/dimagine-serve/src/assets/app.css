@@ -46,6 +46,10 @@
   --rail-w: 60px;
   --inspector-w: 320px;
   --tabbar-h: 58px;
+  /* W45: the top bar's height, the offset the image page's pinned inspector
+     sticks below it. The script measures the real thing (the bar wraps at
+     520px); this default keeps a script-less page close. */
+  --topbar-h: 56px;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -1011,14 +1015,80 @@ html[data-theme="light"] .tile-badge {
   padding: var(--pad);
 }
 
-.image-header-nav {
+/* W45: the header holds the way back, the walk through the view, and the
+   original file — one line, in the order a person reads them. The arrows and
+   the position keep their shape at the ends of a view (a stub has no ink and
+   no link, §4.8's quiet applied to navigation). */
+.image-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
+  gap: 8px 12px;
   padding-bottom: 8px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--separator);
   font-size: var(--text-sm);
+}
+
+.back-link {
+  flex: 0 0 auto;
+}
+
+.image-nav {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-width: 0;
+  margin: 0 auto;
+}
+
+a.image-nav-prev,
+a.image-nav-next {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+}
+
+a.image-nav-prev:hover,
+a.image-nav-next:hover {
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+
+/* A view's end stays drawn, quietly: no ink, no link, no route. */
+.image-nav-prev.nav-end,
+.image-nav-next.nav-end {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  color: var(--border);
+}
+
+.nav-glyph {
+  width: 16px;
+  height: 16px;
+  fill: none;
+}
+
+.image-nav-position {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.original-link {
+  flex: 0 0 auto;
+  margin-left: auto;
 }
 
 .image-detail-layout {
@@ -1322,6 +1392,124 @@ html[data-theme="light"] .tile-badge {
 .missing-link {
   color: var(--text-muted);
   border-bottom: 1px dotted currentColor;
+}
+
+/* === W45: the pull-up sheet and the pinned inspector ===================== */
+
+/* The tokens this block needs, by their DESIGN.md names (values verbatim):
+   the sheet's duration and easing (§2.6), its elevation (§2.5) and the pill
+   radius of its grip (§2.4). Motion and elevation are theme-independent. */
+:root {
+  --dur-slow: 260ms;
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --elev-2: 0 12px 40px rgba(0, 0, 0, 0.22);
+  --radius-full: 999px;
+}
+
+/* "Appears in" states its empty case in one quiet line (§4.8's plain speech):
+   no collection is a fact a person reads, not a section left off. */
+.appears-in-empty {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+/* The pull-up sheet's handle. Nothing without the script: the base keeps it
+   out of the page, and only a phone layout under `html.js` draws it — on
+   every other width the panel below the picture needs no handle at all. The
+   peek it leaves is 44px, the same 44 the script drags from. */
+.sheet-handle {
+  display: none;
+}
+
+.sheet-grip {
+  width: 36px;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--text-muted);
+}
+
+.sheet-label {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Below the tablet breakpoint (a hair under 768: a fractional viewport
+   belongs to neither side of the breakpoint, so neither rule wins it), the
+   picture spans the width and the panel pulls up over it. Without the script
+   nothing here applies: the panel stays the plain section below the picture
+   that the markup has always been. */
+@media (max-width: 767.98px) {
+  .image-stage {
+    width: 100%;
+    max-height: calc(100dvh - var(--topbar-h) - 132px);
+  }
+
+  html.js .image-page {
+    padding-bottom: 44px;
+  }
+
+  html.js .image-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
+    z-index: 25;
+    max-height: 78vh;
+    max-height: 78dvh;
+    overflow-y: auto;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 14px 14px 0 0;
+    box-shadow: var(--elev-2);
+    transform: translateY(var(--sheet-shift, calc(100% - 44px)));
+    transition: transform var(--dur-slow) var(--ease-in-out);
+  }
+
+  /* A drag the finger owns: the transition ends (DESIGN.md §2.6: CSS
+     transitions stay interruptible), and the sheet follows the pointer. */
+  html.js .image-panel.dragging {
+    transition: none;
+  }
+
+  html.js .image-panel.sheet-open {
+    transform: translateY(0);
+  }
+
+  html.js .sheet-handle {
+    display: grid;
+    justify-items: center;
+    gap: 2px;
+    width: 100%;
+    min-height: 44px;
+    margin: -16px -16px 0;
+    padding: 8px 16px 4px;
+    border: 0;
+    border-bottom: 1px solid var(--separator);
+    border-radius: 14px 14px 0 0;
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    font-size: var(--text-sm);
+    cursor: grab;
+    touch-action: none;
+  }
+}
+
+/* At the desktop breakpoint the panel is a pinned inspector (K27 motion 4):
+   it stays beside the picture while the — possibly very tall — stage
+   scrolls, offset below the sticky top bar by the height the script keeps
+   current. The tablet keeps the plain two-column row. */
+@media (min-width: 1200px) {
+  .image-panel {
+    position: sticky;
+    top: calc(var(--topbar-h) + 8px);
+    max-height: calc(100vh - var(--topbar-h) - 24px);
+    max-height: calc(100dvh - var(--topbar-h) - 24px);
+    overflow-y: auto;
+  }
 }
 
 /* ------------------------------------------------------------- sidebar */

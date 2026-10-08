@@ -87,6 +87,36 @@ pub struct CollectionInfo {
     pub listed: bool,
 }
 
+/// One collection on an image's "Appears in" list: the note that embeds the
+/// image, and what the note calls itself. The title is library content
+/// (FORMAT §3.1), so whoever renders it still has to escape it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppearsIn {
+    /// Library-relative path of the collection note.
+    pub note_path: String,
+    /// Note `title`, empty when the note has none — the renderer then names
+    /// the collection by its file name, the way the list does.
+    pub title: String,
+}
+
+/// Where an image sits in a view, and what sits beside it (K27 motion 4:
+/// prev/next walk the view the picture was reached from, not the whole
+/// library).
+///
+/// `previous` and `next` are the images the grid showed immediately before
+/// and after this one, in the same order the grid showed them; `None` at
+/// either end of the view. `position` is 1-based inside the view and `total`
+/// is how many images the view holds, after the lens limit (the Recent lens
+/// reaches only [`RECENT_LIMIT`]-many rows; the caller states the cap because
+/// the limit belongs to the viewer, not the index).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Neighbours {
+    pub position: u64,
+    pub total: u64,
+    pub previous: Option<String>,
+    pub next: Option<String>,
+}
+
 /// What one note offers as evidence of being a collection (FORMAT §5).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CollectionEvidence<'a> {
@@ -399,6 +429,216 @@ fn order_by(q: &ViewQuery) -> String {
     format!(" ORDER BY {key} {direction}, f.path ASC")
 }
 
+/// One image's own sort key, read from its `files` row for the neighbour
+/// queries. The numbers are what `ORDER BY` compares, so the counts below
+/// never re-derive them from another column.
+#[derive(Clone, Debug)]
+struct SortKeyValues {
+    added_ns: i64,
+    mtime_ns: i64,
+    size: i64,
+    name_key: String,
+    rating: Option<i64>,
+}
+
+/// Read `image`'s `files` row. `None` when the index holds no such row — an
+/// image the scan has not seen yet has no position anywhere.
+fn read_sort_key(index: &Index, image: &str) -> Result<Option<SortKeyValues>, IndexError> {
+    Ok(index
+        .conn()?
+        .query_row(
+            "SELECT added_ns, mtime_ns, size, name_key, rating FROM files WHERE path=?1",
+            [image],
+            |row| {
+                Ok(SortKeyValues {
+                    added_ns: row.get(0)?,
+                    mtime_ns: row.get(1)?,
+                    size: row.get(2)?,
+                    name_key: row.get(3)?,
+                    rating: row.get(4)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Where one image sits in a view, and the 0-based offsets its neighbours sit
+/// at in the same ordering: `(position, previous, next)`, with `position`
+/// 1-based, `previous` `None` at the start of the view, and `next` the offset
+/// of the row right after the image (whose existence the caller checks
+/// against the total, or the lens limit, before fetching).
+type NeighbourOffsets = (u64, Option<u64>, u64);
+
+/// The offsets of a sorted view: the position is the count of rows the view's
+/// own order puts before `image` plus one, and the neighbours are the rows at
+/// the adjacent offsets — which the page statement answers, so the ordering
+/// that decides them is the grid's ordering by construction.
+fn sort_offsets(
+    index: &Index,
+    sql: &ViewSql,
+    query: &ViewQuery,
+    image: &str,
+) -> Result<Option<NeighbourOffsets>, IndexError> {
+    let Some(key) = read_sort_key(index, image)? else {
+        return Ok(None);
+    };
+    // The rows the view orders strictly before `image`. Every sort ties on
+    // `f.path ASC` ([`order_by`]), so the comparison is over the pair, and
+    // `NULL` ratings — which sort last in both directions ([`SortKey::Rating`])
+    // — are compared apart from the rating itself, never as a SQL `NULL` an
+    // `OR` would quietly swallow.
+    let (before, binds): (String, Vec<Box<dyn rusqlite::ToSql>>) = match query.sort {
+        SortKey::Added => key_before("f.added_ns", query.descending, key.added_ns, image),
+        SortKey::Modified => key_before("f.mtime_ns", query.descending, key.mtime_ns, image),
+        SortKey::Size => key_before("f.size", query.descending, key.size, image),
+        SortKey::Name => key_before("f.name_key", query.descending, key.name_key, image),
+        SortKey::Rating => rating_before(query.descending, key.rating, image),
+    };
+    let extra: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|value| value.as_ref()).collect();
+    let rows_before: i64 = index.conn()?.query_row(
+        &format!(
+            "{with}SELECT count(*) {from} WHERE {where_sql} AND ({before})",
+            with = sql.with,
+            from = sql.count_from,
+            where_sql = sql.where_sql,
+            before = before
+        ),
+        bound_with(sql, &extra),
+        |row| row.get(0),
+    )?;
+    let position = rows_before.max(0) as u64 + 1;
+    Ok(Some((position, position.checked_sub(2), position)))
+}
+
+/// `(condition, binds)` for the rows a sort column orders strictly before
+/// `current`, with the path breaking ties ascending. `current` is duplicated
+/// because the two `?` are two comparisons, and the path is `image` itself,
+/// the one row being placed.
+fn key_before<T: rusqlite::ToSql + Clone + 'static>(
+    column: &str,
+    descending: bool,
+    current: T,
+    image: &str,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    let comparison = if descending { ">" } else { "<" };
+    (
+        format!("({column} {comparison} ? OR ({column} = ? AND f.path < ?))"),
+        vec![
+            Box::new(current.clone()) as Box<dyn rusqlite::ToSql>,
+            Box::new(current),
+            Box::new(image.to_owned()),
+        ],
+    )
+}
+
+/// The rating sort's own comparison ([`order_by`]): `(f.rating IS NULL)` first,
+/// then `f.rating` in the view's direction, then the path. A `NULL` rating is
+/// a state, not a value ([`note_rating`](fn@note_rating)), so the two cases are
+/// written apart — one comparison for a rated current row, another for an
+/// unrated one — instead of one expression a SQL `NULL` would make leaky.
+fn rating_before(
+    descending: bool,
+    current: Option<i64>,
+    image: &str,
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    match current {
+        Some(rating) => {
+            let comparison = if descending { ">" } else { "<" };
+            (
+                format!(
+                    "((f.rating IS NOT NULL AND f.rating {comparison} ?) \
+                     OR (f.rating = ? AND f.path < ?))"
+                ),
+                vec![
+                    Box::new(rating) as Box<dyn rusqlite::ToSql>,
+                    Box::new(rating),
+                    Box::new(image.to_owned()),
+                ],
+            )
+        }
+        None => (
+            // Every rated row comes before every unrated one, in both
+            // directions; unrated rows order by path among themselves.
+            "(f.rating IS NOT NULL OR (f.rating IS NULL AND f.path < ?))".to_owned(),
+            vec![Box::new(image.to_owned()) as Box<dyn rusqlite::ToSql>],
+        ),
+    }
+}
+
+/// The same offsets for a collection view: the members CTE orders rows by the
+/// note's embed order (`m.ord`), so the position is the count of rows embedded
+/// before this image plus one. An image embedded more than once — two
+/// spellings of one embed, FORMAT §5 — holds the range between its first and
+/// last occurrence: the neighbours stand at the offsets outside that range,
+/// where a different picture is.
+fn collection_offsets(
+    index: &Index,
+    sql: &ViewSql,
+    query: &ViewQuery,
+    image: &str,
+) -> Result<Option<NeighbourOffsets>, IndexError> {
+    let Some(collection) = query.collection.clone() else {
+        return Ok(None);
+    };
+    let (first_ord, last_ord): (i64, i64) = index.conn()?.query_row(
+        &format!(
+            "{with}SELECT MIN(m.ord), MAX(m.ord) FROM members m WHERE m.path=?",
+            with = members_cte()
+        ),
+        rusqlite::params![collection, collection, image],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let count_before = |ord: i64| -> Result<u64, IndexError> {
+        let extras: Vec<&dyn rusqlite::ToSql> = vec![&ord];
+        let counted: i64 = index.conn()?.query_row(
+            &format!(
+                "{with}SELECT count(*) {from} WHERE {where_sql} AND (m.ord < ?)",
+                with = sql.with,
+                from = sql.count_from,
+                where_sql = sql.where_sql
+            ),
+            bound_with(sql, &extras),
+            |row| row.get(0),
+        )?;
+        Ok(counted.max(0) as u64)
+    };
+    let before_first = count_before(first_ord)?;
+    let before_last = count_before(last_ord)?;
+    Ok(Some((
+        // `before_first` is the 0-based index of the first occurrence, so the
+        // position is one past it and the neighbour before the image stands
+        // at the index before that; `before_last` is the index of the last
+        // occurrence, so the neighbour after the image follows it.
+        before_first + 1,
+        before_first.checked_sub(1),
+        before_last + 1,
+    )))
+}
+
+/// The `WITH members ...` clause a collection view orders by, on its own for
+/// the key reads, which do not need the rest of the view statement.
+fn members_cte() -> &'static str {
+    "WITH members(ord,path) AS ( \
+       SELECT rowid,target FROM links WHERE src=? AND syntax<>'wiki_link' \
+         AND target IS NOT NULL \
+         AND target<>COALESCE((SELECT image_path FROM notes WHERE path=?),'') \
+     ) "
+}
+
+/// The image at one 0-based offset in the view's own order, or `None` when the
+/// offset lies past the end. The statement is [`Index::view`]'s own page
+/// query, one row long, so what comes back is exactly what the grid showed at
+/// that place.
+fn row_at(index: &Index, query: &ViewQuery, offset: u64) -> Result<Option<String>, IndexError> {
+    // The offset fits an i64 the way any count does; and a rank that
+    // overflowed u32 could not have survived the count queries.
+    let (statement, params) = view_sql(query).into_page(1, offset.min(i64::MAX as u64) as i64);
+    Ok(index
+        .conn()?
+        .query_row(&statement, bound(&params), |row| row.get(0))
+        .optional()?)
+}
+
 /// The `ORDER BY` of [`Index::view_by_taken`]: the same shape a [`SortKey`]
 /// sort uses, over the EXIF taken time instead. Taken times order
 /// chronologically in the asked direction, ties break by path ascending, and
@@ -512,6 +752,93 @@ impl Index {
             total: total.max(0) as u64,
             items,
         })
+    }
+
+    /// The paths, the position and the size of the view: one image's place
+    /// among its neighbours, in the order the view itself orders them.
+    ///
+    /// Every step is a query over the index: the membership, the image's own
+    /// sort key, the count of rows the view orders before it, and the two rows
+    /// at the resulting offsets — the same statement `Index::view` runs for a
+    /// page, only one row long. Nothing walks the view in Rust, and the page
+    /// the neighbours come from is by construction the page the grid showed.
+    ///
+    /// `query.offset` and `query.limit` are ignored: neighbours walk the whole
+    /// matching set, not one page of it. `lens_limit` caps that set the way
+    /// the Recent lens caps the viewer's grid: an image further in than the
+    /// cap answers `None` (the lens never showed it, so it has no neighbours
+    /// there).
+    pub fn view_neighbours(
+        &self,
+        query: &ViewQuery,
+        image: &str,
+        lens_limit: Option<u64>,
+    ) -> Result<Option<Neighbours>, IndexError> {
+        let sql = view_sql(query);
+        let conn = self.conn()?;
+        // A view the image is not part of has no neighbours: a stale `v=`
+        // on a link, a filter that excludes it, a collection it is not
+        // embedded in. Membership is answered by the view's own filters
+        // (`count_from` carries the members join when the view is a
+        // collection), so it can never disagree with the rows themselves.
+        let member_sql = format!(
+            "{with}SELECT EXISTS(SELECT 1 {from} WHERE {where_sql} AND f.path=?)",
+            with = sql.with,
+            from = sql.count_from,
+            where_sql = sql.where_sql
+        );
+        let member_extras: Vec<&dyn rusqlite::ToSql> = vec![&image];
+        let member: bool =
+            conn.query_row(&member_sql, bound_with(&sql, &member_extras), |row| {
+                row.get(0)
+            })?;
+        if !member {
+            return Ok(None);
+        }
+        let total: u64 = {
+            let counted: i64 =
+                conn.query_row(&sql.count(), bound(&sql.params), |row| row.get(0))?;
+            counted.max(0) as u64
+        };
+        let (position, previous_offset, next_offset) = match if sql.collection {
+            collection_offsets(self, &sql, query, image)?
+        } else {
+            sort_offsets(self, &sql, query, image)?
+        } {
+            // The counts above found nothing to place: the image left the
+            // index between one query and the next, or a collection that
+            // says the image is a member cannot say where. Either way
+            // there is no view to walk.
+            Some(offsets) => offsets,
+            None => return Ok(None),
+        };
+        // The lens: the cap turns the position into a claim about the whole
+        // matching set, so an image further in than the cap was never on
+        // screen and has no neighbours there. Otherwise the totals say the
+        // same thing the capped grid said (Recent states its own size,
+        // W34 audit #10).
+        if let Some(cap) = lens_limit {
+            if position > cap {
+                return Ok(None);
+            }
+        }
+        let total = lens_limit.map_or(total, |cap| total.min(cap));
+        Ok(Some(Neighbours {
+            position,
+            total,
+            // `view_sql` builds the same statement the grid page runs, so the
+            // row at an offset is the row the grid showed there — and the end
+            // of the view answers `None`, never a wrap-around.
+            previous: match previous_offset {
+                Some(offset) if offset < total => row_at(self, query, offset)?,
+                _ => None,
+            },
+            next: if position < total {
+                row_at(self, query, next_offset)?
+            } else {
+                None
+            },
+        }))
     }
 
     /// How SQLite plans one [`Index::view`] query, one line per step. A
@@ -723,6 +1050,18 @@ impl Index {
     /// self-embed never counts (FORMAT §3.2).
     pub fn appears_in(&self, image_path: &str) -> Result<Vec<String>, IndexError> {
         Ok(self
+            .appears_in_titled(image_path)?
+            .into_iter()
+            .map(|collection| collection.note_path)
+            .collect())
+    }
+
+    /// The same back-links with what each note calls itself: the "Appears in"
+    /// list on the image page names a collection the way the sidebar does —
+    /// by its `title`, falling back to the file name — instead of by its
+    /// path alone (K27 motion 6).
+    pub fn appears_in_titled(&self, image_path: &str) -> Result<Vec<AppearsIn>, IndexError> {
+        Ok(self
             .collection_candidates(
                 &format!(
                     "SELECT {CANDIDATE_COLUMNS} FROM notes WHERE {CANDIDATE_WHERE} \
@@ -735,7 +1074,15 @@ impl Index {
             )?
             .into_iter()
             .filter(|candidate| note_is_collection(&candidate.evidence()))
-            .map(|candidate| candidate.path)
+            .map(|candidate| AppearsIn {
+                title: candidate
+                    .props
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                note_path: candidate.path,
+            })
             .collect())
     }
 
@@ -783,6 +1130,21 @@ fn bound(params: &[Box<dyn rusqlite::ToSql>]) -> impl rusqlite::Params + '_ {
     rusqlite::params_from_iter(params.iter().map(|value| value.as_ref()))
 }
 
+/// The same, with the statement's own parameters first and `extra` after
+/// them — the order an appended `AND (?)` places its `?` in. The extras come
+/// as references so a handful of locals can ride along without a box.
+fn bound_with<'a>(
+    sql: &'a ViewSql,
+    extra: &'a [&'a dyn rusqlite::ToSql],
+) -> impl rusqlite::Params + 'a {
+    rusqlite::params_from_iter(
+        sql.params
+            .iter()
+            .map(|value| value.as_ref())
+            .chain(extra.iter().copied()),
+    )
+}
+
 /// FORMAT §3.1 defines `rating` as an integer 0-5. A value outside that range,
 /// and any value that is not an integer, is not a rating: it reads as "no
 /// rating", so it sorts last and never above a real five-star rating.
@@ -804,6 +1166,383 @@ mod tests {
 
     fn props(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// Seed an index whose every neighbour answer is worked out by hand: four
+    /// images with deliberate ties — `a`, `b`, `d` share an `added`, `b` and
+    /// `d` share a size, `b` and `d` have no rating — and one collection whose
+    /// embed order is *not* any sort order and embeds `a` twice, in two
+    /// spellings (FORMAT §5), with the duplicate in the middle.
+    fn neighbour_library() -> (tempfile::TempDir, Index) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |name: &str, size: u64, added_ns: i64, rating: Option<u8>| FileRecord {
+            path: format!("x/{name}.png"),
+            size,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: Some(added_ns),
+            rating,
+            width: None,
+            height: None,
+            taken_ns: None,
+        };
+        let note = |path: &str, image_path: &str, props_json: &str| NoteRecord {
+            path: path.to_owned(),
+            image_path: Some(image_path.to_owned()),
+            id: None,
+            title: path.to_owned(),
+            tags: match props_json {
+                json if json.contains("\"red\"") => vec!["red".to_owned()],
+                _ => Vec::new(),
+            },
+            props_json: props_json.to_owned(),
+        };
+        index.begin_scan().unwrap();
+        index.upsert_file(&image("a", 100, 1000, Some(3))).unwrap();
+        index.upsert_file(&image("b", 50, 1000, None)).unwrap();
+        index.upsert_file(&image("c", 200, 900, Some(5))).unwrap();
+        index.upsert_file(&image("d", 50, 1000, None)).unwrap();
+        for (image_path, props_json) in [
+            ("x/a.png", r#"{"tags":["red"],"rating":3}"#),
+            ("x/b.png", r#"{"tags":["red"]}"#),
+            ("x/c.png", r#"{"rating":5}"#),
+            ("x/d.png", r#"{}"#),
+        ] {
+            let note_path = format!("{image_path}.md");
+            index
+                .upsert_note(&note(&note_path, image_path, props_json))
+                .unwrap();
+            index
+                .set_note_body(&note_path, &format!("match {image_path}"))
+                .unwrap();
+        }
+        let embed = |target: &str, raw: &str| crate::LinkRecord {
+            src: "set.md".to_owned(),
+            raw: raw.to_owned(),
+            target: Some(target.to_owned()),
+            state: crate::LinkState::Resolved,
+            syntax: crate::LinkSyntax::WikiEmbed,
+        };
+        index
+            .upsert_note(&NoteRecord {
+                path: "set.md".to_owned(),
+                image_path: None,
+                id: None,
+                title: "set.md".to_owned(),
+                tags: Vec::new(),
+                props_json: r#"{"kind":"collection","title":"Set"}"#.to_owned(),
+            })
+            .unwrap();
+        index
+            .replace_links(
+                "set.md",
+                &[
+                    embed("x/c.png", "![[c.png]]"),
+                    embed("x/a.png", "![[a.png]]"),
+                    embed("x/d.png", "![[d.png]]"),
+                    embed("x/a.png", "![[x/a.png]]"),
+                    embed("x/b.png", "![[b.png]]"),
+                ],
+            )
+            .unwrap();
+        index
+            .finish_scan(&[
+                "x/a.png".into(),
+                "x/b.png".into(),
+                "x/c.png".into(),
+                "x/d.png".into(),
+                "x/a.png.md".into(),
+                "x/b.png.md".into(),
+                "x/c.png.md".into(),
+                "x/d.png.md".into(),
+                "set.md".into(),
+            ])
+            .unwrap();
+        (dir, index)
+    }
+
+    /// For every image in a view, the neighbours are exactly the images the
+    /// view itself showed on either side — ties, ends and all — and the
+    /// position and total are the ones the grid would print (K27: the
+    /// neighbours walk the view, never the whole library).
+    #[test]
+    fn neighbours_match_the_grid_on_every_side_of_every_image() {
+        let (_dir, index) = neighbour_library();
+        let cases: Vec<(&str, ViewQuery, Option<u64>)> = vec![
+            (
+                "added descending, a three-way tie on added",
+                ViewQuery::default(),
+                None,
+            ),
+            (
+                "name ascending",
+                ViewQuery {
+                    sort: SortKey::Name,
+                    descending: false,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "size descending, a tie on size",
+                ViewQuery {
+                    sort: SortKey::Size,
+                    descending: true,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "rating descending, two images without one",
+                ViewQuery {
+                    sort: SortKey::Rating,
+                    descending: true,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "rating ascending",
+                ViewQuery {
+                    sort: SortKey::Rating,
+                    descending: false,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "a recursive folder",
+                ViewQuery {
+                    folder: Some("x".into()),
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "a non-recursive folder",
+                ViewQuery {
+                    folder: Some("x".into()),
+                    recursive: false,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "a tag",
+                ViewQuery {
+                    tags: vec!["red".into()],
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "full text",
+                ViewQuery {
+                    text: Some("match x/c.png".into()),
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "the untagged lens",
+                ViewQuery {
+                    untagged: true,
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+            (
+                "a collection in embed order, one image twice",
+                ViewQuery {
+                    collection: Some("set.md".into()),
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                None,
+            ),
+        ];
+        for (name, query, lens) in cases {
+            let page = index.view(&query).unwrap();
+            let mut asked = std::collections::HashSet::new();
+            for (first, item) in page.items.iter().enumerate() {
+                // An image embedded more than once is one image: ask once, at
+                // its first occurrence (`rposition` below finds the last).
+                if !asked.insert(item.path.clone()) {
+                    continue;
+                }
+                let first = first as u64;
+                let last = page
+                    .items
+                    .iter()
+                    .rposition(|row| row.path == item.path)
+                    .unwrap() as u64;
+                let neighbours = index
+                    .view_neighbours(&query, &item.path, lens)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .unwrap_or_else(|| panic!("{name}: {} has no place", item.path));
+                let expected_previous = first
+                    .checked_sub(1)
+                    .map(|before| page.items[before as usize].path.clone());
+                let expected_next = page
+                    .items
+                    .get(last as usize + 1)
+                    .cloned()
+                    .map(|row| row.path);
+                assert_eq!(
+                    neighbours.previous, expected_previous,
+                    "{name}: previous of {}",
+                    item.path
+                );
+                assert_eq!(
+                    neighbours.next, expected_next,
+                    "{name}: next of {}",
+                    item.path
+                );
+                assert_eq!(neighbours.position, first + 1, "{name}: {}", item.path);
+                assert_eq!(
+                    neighbours.total, page.total,
+                    "{name}: the total is the grid's own"
+                );
+            }
+        }
+    }
+
+    /// The ends of a view answer `None` rather than wrapping around, and the
+    /// position stays inside the view (K27: "3 / 124", never 0 / 0).
+    #[test]
+    fn the_ends_of_a_view_have_no_neighbour_beyond_them() {
+        let (_dir, index) = neighbour_library();
+        let first = index
+            .view_neighbours(&ViewQuery::default(), "x/a.png", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.previous, None, "the first image has nothing before");
+        assert_eq!(first.next.as_deref(), Some("x/b.png"));
+        assert_eq!(first.position, 1);
+        assert_eq!(first.total, 4);
+        let last = index
+            .view_neighbours(&ViewQuery::default(), "x/c.png", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.next, None, "the last image has nothing after");
+        assert_eq!(last.previous.as_deref(), Some("x/d.png"));
+        assert_eq!(last.position, 4);
+    }
+
+    /// An image embedded twice keeps one place, held by its first occurrence:
+    /// the neighbours stand outside the whole range the duplicates hold.
+    #[test]
+    fn an_image_embedded_twice_walks_the_range_of_its_occurrences() {
+        let (_dir, index) = neighbour_library();
+        // Embed order: c, a, d, a, b — `a` holds positions 2 and 4.
+        let bedded = index
+            .view_neighbours(
+                &ViewQuery {
+                    collection: Some("set.md".into()),
+                    limit: 100,
+                    ..ViewQuery::default()
+                },
+                "x/a.png",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(bedded.position, 2, "the first occurrence places the image");
+        assert_eq!(bedded.total, 5, "the collection counts its embed rows");
+        assert_eq!(bedded.previous.as_deref(), Some("x/c.png"));
+        assert_eq!(
+            bedded.next.as_deref(),
+            Some("x/b.png"),
+            "the neighbour after `a` is past every one of its occurrences"
+        );
+    }
+
+    /// A lens limit caps the walk the way it caps the grid (W34 audit #10):
+    /// the images past the cap were never shown, and the image at the cap has
+    /// no next even though the library holds more.
+    #[test]
+    fn a_lens_limit_cuts_the_glass_the_way_it_cut_the_grid() {
+        let (_dir, index) = neighbour_library();
+        // Added descending: a, b, d, c — a two-wide lens shows a, b.
+        let inside = index
+            .view_neighbours(&ViewQuery::default(), "x/b.png", Some(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                inside.position,
+                inside.total,
+                inside.previous.as_deref(),
+                inside.next
+            ),
+            (2, 2, Some("x/a.png"), None),
+            "the image at the cap has no next, exactly as the capped grid had none"
+        );
+        for outside in ["x/d.png", "x/c.png"] {
+            assert!(
+                index
+                    .view_neighbours(&ViewQuery::default(), outside, Some(2))
+                    .unwrap()
+                    .is_none(),
+                "{outside} was never in the lens, so it has no neighbours there"
+            );
+        }
+    }
+
+    /// An image a view does not show has no place in it — a filter that
+    /// excludes it, a collection it is not embedded in, an index that has
+    /// never seen it — and each answers `None` rather than a guess (invariant
+    /// 4: an unknown is not an empty row at index 0).
+    #[test]
+    fn an_image_the_view_does_not_show_has_no_neighbours_there() {
+        let (_dir, index) = neighbour_library();
+        let red = ViewQuery {
+            tags: vec!["red".into()],
+            limit: 100,
+            ..ViewQuery::default()
+        };
+        assert!(index
+            .view_neighbours(&red, "x/c.png", None)
+            .unwrap()
+            .is_none());
+        assert!(index
+            .view_neighbours(&red, "x/e.png", None)
+            .unwrap()
+            .is_none());
+        let set = ViewQuery {
+            collection: Some("set.md".into()),
+            limit: 100,
+            ..ViewQuery::default()
+        };
+        // `x/a.png` is embedded; a path beside the set is not.
+        assert!(index
+            .view_neighbours(&set, "x/a.png", None)
+            .unwrap()
+            .is_some());
+        assert!(index
+            .view_neighbours(&set, "x/e.png", None)
+            .unwrap()
+            .is_none());
+        // No collection of that name: a view with no members.
+        let empty = ViewQuery {
+            collection: Some("none.md".into()),
+            ..ViewQuery::default()
+        };
+        assert!(index
+            .view_neighbours(&empty, "x/a.png", None)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

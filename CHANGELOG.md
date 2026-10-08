@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer Phase 2a, the image page: the picture and its facts side by side.
+  Prev/next walk the view the picture was reached from — the sort, folder,
+  tag, collection, search or Recent-lens `v=` a tile carries; the neighbours
+  and the position ("3 / 124") are computed in SQL against the index, the
+  arrows are plain links, and the step keys are ←/→ with Esc back to the
+  tile the page left. On a phone the picture is full width and the info
+  panel pulls up as a sheet (a plain section below the picture without the
+  script) that a sideways stroke on the picture also walks. "Appears in"
+  names every collection that embeds the picture by its own title and links
+  to it, and says so in one line when there are none. At ≥ 1200 px the info
+  panel is a pinned inspector beside the stage.
 - Viewer (Phase 2a): `/?c=<note>` is the collection page. A collection is a
   note that embeds images (FORMAT §5), so the view renders as the note's own
   page: a header naming it, the note's own text (its body without the member
