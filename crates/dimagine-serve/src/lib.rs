@@ -198,6 +198,16 @@ pub(crate) struct AppState {
     /// Serialises owner creation: one critical section from the
     /// re-check to the write, so two concurrent setup requests cannot
     /// both create an owner.
+    ///
+    /// In-process only. It closes the window for every request this
+    /// server handles, but the store underneath is load → push → rename
+    /// with no file lock, so two servers sharing one `--data-dir` can
+    /// each create an owner and the second write wins (RW25b review Low).
+    /// A second viewer on a live state directory is operator error — the
+    /// two would also disagree about sessions, throttles and the index —
+    /// so the residual window is documented rather than locked; a file
+    /// lock, or refusing to start when another server holds the
+    /// directory, is the natural follow-up.
     pub(crate) setup_lock: Arc<Mutex<()>>,
     pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) throttles: Arc<Mutex<ThrottleState>>,
@@ -220,6 +230,15 @@ impl AppState {
 /// looked at — so a brute-force wave cannot test many passcodes at
 /// the same time.
 pub const LOGIN_CONCURRENCY_LIMIT: usize = 2;
+
+/// The longest one login attempt holds an in-flight slot: the
+/// escalating delay caps here, and the argon2 check that follows
+/// is shorter. An attempt refused because the slots are busy is
+/// told to come back no sooner than this worst case, so
+/// `Retry-After` never promises a slot a slow attempt still holds
+/// (RW19b review Low: `1` was shorter than the wait a busy slot
+/// could impose).
+pub const LOGIN_MAX_DELAY_SECS: u64 = 5;
 
 /// Attempts one client may spend inside `LOGIN_BUDGET_WINDOW_SECS`
 /// before the server stops comparing its guesses. Charged before the
@@ -973,10 +992,11 @@ async fn login(
         resolve_client_ip(client.map(|c| c.0), &headers, &state.config.trusted_proxies);
     // Bound how many guesses are in flight before anything else: a
     // parallel wave of guesses is refused without the passcode ever
-    // being compared.
+    // being compared. The hint says how long a busy slot can still
+    // hold, not a best case.
     let _slot = match state.login_slots.clone().try_acquire_owned() {
         Ok(slot) => slot,
-        Err(_) => return login_refused(1),
+        Err(_) => return login_refused(LOGIN_MAX_DELAY_SECS),
     };
     // Then charge the attempt to the per-client and the global budget,
     // still before comparing, so an exhausted budget refuses without
@@ -990,8 +1010,8 @@ async fn login(
             LoginGate::Refused { retry_after } => return login_refused(retry_after),
         }
     };
-    let millis =
-        (100u64.saturating_mul(1u64.checked_shl(delay_step.min(6)).unwrap_or(u64::MAX))).min(5000);
+    let millis = (100u64.saturating_mul(1u64.checked_shl(delay_step.min(6)).unwrap_or(u64::MAX)))
+        .min(LOGIN_MAX_DELAY_SECS * 1000);
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 
     let authenticated = if has_users {

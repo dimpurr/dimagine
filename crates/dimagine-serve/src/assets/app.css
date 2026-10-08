@@ -499,9 +499,65 @@ a.search-pill-container:hover {
 /* The "Note order" the toolbar states where the library's sort menu would
  * be: a focusable label in the hint voice (W39 review L1), never a control
  * that could promise a reorder the grid does not keep. The whole sentence
- * is an attribute on the label itself. */
-.search-hint.note-order {
+ * rides in `title` and `aria-label`, and as real text in a bubble the
+ * label fades in on hover or focus (W39b review L1: a native `title` is
+ * not shown on keyboard focus by every browser, so the sentence was one
+ * hover away but no tab stop away). */
+.search-hint.note-order,
+.search-hint.recent-order {
   white-space: nowrap;
+  position: relative;
+}
+
+/* The sentence a one-word order label stands for: real text, so a screen
+ * reader reads it, inside a bubble that takes no toolbar width (W39 review
+ * M1) and fades in below the label on hover or focus — the same surface
+ * the sidebar's truncated rows use (§4.1), revealed by the stylesheet
+ * instead of a script, so it works with scripting off. Below, not above:
+ * the label sits in the toolbar's only row, pinned to the top of the
+ * viewport by the sticky top bar, so a bubble opening above it would open
+ * off-screen — the sidebar can open upward only because it has rows above. */
+.sort-tip {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 30;
+  /* The label is nine pixels of arrow, so a shrink-to-fit bubble would
+     narrow to the label and break the sentence one character per line
+     (`overflow-wrap: anywhere` lets it): the bubble takes the width the
+     words need instead, capped to the viewport so it never clips off
+     the right edge of a phone, and wraps only past the cap. */
+  width: max-content;
+  max-width: min(280px, calc(100vw - 2 * var(--pad)));
+  padding: 4px 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: var(--elev-1);
+  color: var(--text);
+  font-size: 0.75rem;
+  font-weight: 400;
+  letter-spacing: normal;
+  line-height: 1.35;
+  text-transform: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.sort-form:hover .sort-tip,
+.sort-form:focus-within .sort-tip {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  /* Nothing to hover, so the bubble stays hidden — but the text
+     stays in the DOM, so a screen reader still reads it. */
+  .sort-tip {
+    display: none;
+  }
 }
 
 /* --- the members, with the captions the note gives them ----------------- */

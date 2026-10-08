@@ -39,7 +39,16 @@ fn main() -> ExitCode {
     // The offered subcommands depend on the library's switch file, so the
     // library is resolved before clap runs; a misread falls back to the
     // current directory, which is also clap's default for the flag.
-    let plugins = CorePlugins::load(&plugins::library_hint(std::env::args_os()));
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // An invocation that only asks how the command works is not a
+    // library operation, so a broken switch file stays quiet on the
+    // way to `--help` or `--version` (RW16 review L7).
+    let library = plugins::library_hint(args.iter().cloned());
+    let plugins = if asks_for_usage(&args) {
+        CorePlugins::load_for_usage(&library)
+    } else {
+        CorePlugins::load(&library)
+    };
     let matches = cli(&plugins).get_matches(); // clap exits with code 2 on usage errors
     let Some((name, sub)) = matches.subcommand() else {
         return ExitCode::from(2);
@@ -127,6 +136,16 @@ fn cli(plugins: &CorePlugins) -> Command {
     #[cfg(not(feature = "serve"))]
     let _ = &plugins.serve;
     command
+}
+
+/// Whether the invocation only asks for usage (`--help`, `-h`) or
+/// the version (`--version`, `-V`), at any position clap accepts
+/// them. A request like that never touches the library, so nothing
+/// about the library belongs in its output.
+fn asks_for_usage(args: &[std::ffi::OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| matches!(arg.to_str(), Some("--help" | "-h" | "--version" | "-V")))
 }
 
 fn resolve_library(sub: &ArgMatches) -> PathBuf {

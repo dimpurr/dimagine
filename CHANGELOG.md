@@ -270,6 +270,26 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: the review follow-ups on the older-Low round (W54), serve side. A login
+  refused because both in-flight slots are busy now answers `Retry-After: 5` —
+  the longest a held slot can last — instead of `1`, so a client is not sent
+  straight back into a refused attempt (RW19b). `/api/folder` lists collections
+  by the one shared list rule, so an image note that embeds its siblings is no
+  longer enumerated beside the deliberate collections, while its own
+  `/api/collection/` endpoint and `/?c=<note>` still answer for it (RW27f L-2).
+  And the sentence a stated sort order stands for — "Recent is always the last
+  200 added, newest first." on the lens, the collection's on `/?c=` — is now
+  real text in a bubble the label shows on hover or focus, so a sighted
+  keyboard user reaches it and a screen reader reads it, not only a native
+  `title` tooltip (RW39b L1). The cross-process setup race on a shared
+  `--data-dir` is documented rather than locked: the setup critical section is
+  in-process, and two servers on one live state directory are operator error
+  (RW25b).
+- CLI: `dimagine --help` and `--version` no longer warn about a malformed or
+  unknown-key `core-plugins.json`. The switch file is read before clap because
+  it decides which subcommands exist, but an invocation that only asks how the
+  command works is not a library operation, so the complaint now rides along
+  only when the invocation acts on the library (RW16 L7).
 - Viewer: "Back to view" out of a collection no longer asks the collection for a
   page number (RW51). Which page holds a tile is worked out from the image's
   place in the view — right for every view that pages — but a collection lists

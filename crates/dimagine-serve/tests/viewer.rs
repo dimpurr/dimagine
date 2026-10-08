@@ -807,14 +807,26 @@ async fn recent_is_the_last_two_hundred_not_the_whole_library() {
         html.contains("role=\"note\" tabindex=\"0\""),
         "the Recent order is a focusable label: {html}"
     );
-    assert!(html.contains(">↓</span>"), "showing the order: {html}");
+    // W39b review L1: the sentence is real text in the bubble the label
+    // shows on hover or focus, so a sighted keyboard user reaches it too,
+    // and the row still carries only the arrow (W39 review M1).
+    assert!(
+        html.contains(
+            ">↓<span class=\"sort-tip\">Recent is always the last 200 added, newest first.</span>"
+        ),
+        "the order and its sentence in the bubble: {html}"
+    );
     assert!(
         !html.contains("disabled"),
         "nothing on the Recent lens is unreachable: {html}"
     );
-    assert!(
-        !html.contains(">Recent is always"),
-        "and the sentence is not visible text that widens the toolbar: {html}"
+    // The sentence rides in `title`, `aria-label` and the bubble — three
+    // copies, none of them text on the toolbar row itself.
+    assert_eq!(
+        html.matches("Recent is always the last 200 added, newest first.")
+            .count(),
+        3,
+        "the sentence stays out of the row: {html}"
     );
     assert!(
         html.contains("title=\"Recent is always the last 200 added, newest first.\""),
@@ -824,7 +836,7 @@ async fn recent_is_the_last_two_hundred_not_the_whole_library() {
     // and says, in the notice box, that the sort was ignored.
     let html = text(&app, "/?recent=1&sort=name-asc", &cookie).await;
     assert!(
-        html.contains(">↓</span>"),
+        html.contains(">↓<span class=\"sort-tip\">"),
         "the label shows the order in force, not the URL's: {html}"
     );
     assert!(
@@ -2078,8 +2090,14 @@ async fn a_collection_lists_its_members_in_embed_order_and_a_duplicate_once() {
         "{html}"
     );
     assert_eq!(html.matches("grid-item").count(), 3, "{html}");
-    // The order the toolbar names the note's, not a sort's.
-    assert!(html.contains(">Note order</span>"), "{html}");
+    // The order the toolbar names the note's, not a sort's — with the
+    // sentence one Tab away in the bubble (W39b review L1).
+    assert!(
+        html.contains(
+            ">Note order<span class=\"sort-tip\">A collection is ordered by the embeds in its note.</span>"
+        ),
+        "{html}"
+    );
 }
 
 /// W46 §2: a member shows the line directly after its embed (FORMAT §5) —

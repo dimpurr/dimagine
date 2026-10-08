@@ -296,12 +296,18 @@ pub fn sort_control(params: &ViewParams) -> String {
 /// 390 px phone beside the count, the size segments and the theme switch
 /// (W39 review M1). "Note order" is the shortest honest name for the
 /// order of the embeds in the note.
+///
+/// The sentence also rides as real text in a bubble the label fades in on
+/// hover or focus ([`sort_tip`]): a native `title` is not shown on keyboard
+/// focus by every browser, so the words were one hover away but no tab stop
+/// away (W39b review L1).
 fn note_order_control() -> String {
     let note = "A collection is ordered by the embeds in its note.";
     format!(
         "<span class=\"sort-form\">         <span class=\"search-hint note-order\" role=\"note\" \
-         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">Note order</span></span>",
+         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">Note order{tip}</span></span>",
         note = escape_html(note),
+        tip = sort_tip(note),
     )
 }
 
@@ -321,6 +327,11 @@ fn note_order_control() -> String {
 /// focus ring, and carries the whole sentence in `title` (hover and focus) and
 /// `aria-label` (screen readers).
 ///
+/// The sentence also rides as real text in a bubble the label fades in on
+/// hover or focus ([`sort_tip`]): a native `title` is not shown on keyboard
+/// focus by every browser, so the words were one hover away but no tab stop
+/// away (W39b review L1).
+///
 /// It is deliberately as narrow as a label can be: one descending arrow beside
 /// the count, in the count's own muted text scale. The bar is one row
 /// (DESIGN.md §4.4) — count, this label, the size segments, the theme switch —
@@ -336,9 +347,22 @@ fn recent_sort_control() -> String {
     let note = format!("Recent is always the last {RECENT_LIMIT} added, newest first.");
     format!(
         "<span class=\"sort-form\"><span class=\"search-hint recent-order\" role=\"note\" \
-         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">↓</span></span>",
+         tabindex=\"0\" aria-label=\"Sort order — {note}\" title=\"{note}\">↓{tip}</span></span>",
         note = escape_html(&note),
+        tip = sort_tip(&note),
     )
+}
+
+/// The sentence a one-word order label stands for, as real text
+/// inside the label: a bubble the stylesheet fades in above the
+/// label on hover or focus. A native `title` is not shown on
+/// keyboard focus by every browser, so a sentence that rides in
+/// `title` alone is one hover away but no tab stop away (W39b
+/// review L1); as text it is in the DOM for a screen reader and
+/// one Tab away for a keyboard user, while the bubble takes no
+/// toolbar width (W39 review M1).
+fn sort_tip(sentence: &str) -> String {
+    format!("<span class=\"sort-tip\">{}</span>", escape_html(sentence))
 }
 
 /// The three-step thumbnail size control. `size` is a URL parameter as well as
@@ -1999,7 +2023,9 @@ mod tests {
     /// control cannot be focused, so its `title` is unreachable, and the 107px
     /// visible hint it carried overflowed the 390px phone toolbar. The visible
     /// label is one arrow because the toolbar's five controls only fit at 390px
-    /// when it is; the sentence rides in `title` and `aria-label`.
+    /// when it is; the sentence rides in `title` and `aria-label`, and as real
+    /// text in a bubble the label fades in on hover or focus (W39b review L1:
+    /// a native `title` is not shown on keyboard focus by every browser).
     #[test]
     fn the_recent_order_is_a_focusable_arrow_not_a_wide_hint() {
         let html = sort_control(&ViewParams::parse("recent=1"));
@@ -2008,7 +2034,7 @@ mod tests {
             "the order is a focusable label, not a disabled control: {html}"
         );
         assert!(
-            html.contains(">↓</span>"),
+            html.contains(">↓<span class=\"sort-tip\""),
             "the order in force is the one shown: {html}"
         );
         assert!(
@@ -2021,11 +2047,25 @@ mod tests {
             ),
             "and a screen reader hears it: {html}"
         );
-        // M1: the toolbar must fit a 390px phone, which holds only while the
-        // sentence stays an attribute and never becomes visible text.
+        // W39b review L1: the sentence is real text inside the label,
+        // in a bubble the stylesheet shows on hover or focus — so it is
+        // one Tab away for a keyboard user and in the DOM for a screen
+        // reader, not only a native tooltip.
         assert!(
-            !html.contains(">Recent is always"),
-            "the sentence is not a visible hint: {html}"
+            html.contains(
+                "<span class=\"sort-tip\">Recent is always the last 200 added, newest first.</span>"
+            ),
+            "the sentence is real text, not an attribute alone: {html}"
+        );
+        // M1: the toolbar must fit a 390px phone, which holds while
+        // the sentence lives only in the attributes and the bubble —
+        // three copies, never a fourth as text on the row itself.
+        assert_eq!(
+            html.matches("Recent is always the last 200 added, newest first.")
+                .count(),
+            3,
+            "the sentence rides in `title`, `aria-label` and the bubble, \
+             nowhere else: {html}"
         );
         assert!(
             !html.contains(">Added ↓</span>"),
@@ -2053,7 +2093,7 @@ mod tests {
             "c=collections/featured-picks.md&recent=1",
         ));
         assert!(
-            html.contains(">Note order</span>"),
+            html.contains(">Note order"),
             "the grid is in note order whatever the URL says: {html}"
         );
         assert!(
@@ -2066,7 +2106,8 @@ mod tests {
     /// grid keeps the note's embed order whatever `sort` the URL carries, so
     /// the control states the order in force the way the Recent lens's does
     /// (W37 review, Medium #1; W39 review M1/L1/L2): a focusable label, its
-    /// whole sentence in `title` and `aria-label`, only the two short words
+    /// whole sentence in `title` and `aria-label` and as real text in the
+    /// bubble the label fades in (W39b review L1), only the two short words
     /// visible, never a disabled control and never a menu.
     #[test]
     fn a_collection_states_the_note_order_not_a_menu() {
@@ -2081,8 +2122,14 @@ mod tests {
                 "'{query}': a focusable label, not a disabled control: {html}"
             );
             assert!(
-                html.contains(">Note order</span>"),
+                html.contains(">Note order"),
                 "'{query}': the order in force is the one shown: {html}"
+            );
+            assert!(
+                html.contains(
+                    "<span class=\"sort-tip\">A collection is ordered by the embeds in its note.</span>"
+                ),
+                "'{query}': the sentence is real text in the bubble: {html}"
             );
             assert!(
                 html.contains(
@@ -2106,7 +2153,7 @@ mod tests {
     fn the_recent_sort_control_shows_the_forced_order_not_the_url() {
         let html = sort_control(&ViewParams::parse("recent=1&sort=name-asc"));
         assert!(
-            html.contains(">↓</span>"),
+            html.contains(">↓"),
             "the grid is Added-descending whatever the URL says: {html}"
         );
         assert!(!html.contains(">Name A→Z<"), "{html}");

@@ -3,7 +3,7 @@
 use dimagine_core::format::file_extension;
 use dimagine_core::library::{FileClass, FileEntry, Library};
 use dimagine_core::links::{extract_markdown_links, key, LinkSyntax, Outcome, Resolver};
-use dimagine_index::{note_is_collection, CollectionEvidence};
+use dimagine_index::{collection_is_listed, note_is_collection, CollectionEvidence};
 use saphyr::{LoadableYamlNode, Yaml};
 use serde::Serialize;
 use std::{
@@ -233,7 +233,11 @@ impl FsCatalog {
             let parsed = parse_note(&text);
             let (members, diagnostics, _) =
                 collect_collection(&self.resolver, &self.library.files, entry, &parsed, &text);
-            if !is_collection(
+            // The folder API's `collections` array is a list surface, so it
+            // carries the list rule: an image note that embeds its siblings
+            // stays a collection (its own endpoint still answers for it) but
+            // is not enumerated here (RW27f review L-2).
+            if !is_listed_collection(
                 entry.class == FileClass::ImageNote,
                 &parsed,
                 &members,
@@ -808,6 +812,26 @@ fn is_collection(
     diagnostics: &[CollectionDiagnostic],
 ) -> bool {
     note_is_collection(&CollectionEvidence {
+        kind: yaml_string(&parsed.properties, "kind").as_deref(),
+        image_note,
+        members: members.len(),
+        unresolved: diagnostics.len(),
+    })
+}
+
+/// Whether the note is one the collection *list* carries, by the one shared
+/// rule ([`collection_is_listed`], FORMAT §3.2/§5) — the same verdict as the
+/// sidebar section, the `/collections` page and `/api/sidebar`. The folder
+/// API's `collections` array is a list surface too, so it carries the same
+/// rule: an image note that embeds its siblings is a collection, but listing
+/// one per image note buried the deliberate ones (RW27f review L-2).
+fn is_listed_collection(
+    image_note: bool,
+    parsed: &ParsedNote,
+    members: &[CollectionMember],
+    diagnostics: &[CollectionDiagnostic],
+) -> bool {
+    collection_is_listed(&CollectionEvidence {
         kind: yaml_string(&parsed.properties, "kind").as_deref(),
         image_note,
         members: members.len(),

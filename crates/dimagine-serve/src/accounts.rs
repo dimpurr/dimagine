@@ -335,6 +335,15 @@ impl AccountsStore {
     /// Create a new user with the given email, plain password, and role.
     ///
     /// Fails if a user with that email already exists.
+    ///
+    /// The read, the existence check, the push and the write are one
+    /// `rename`-atomic save: a reader never sees a half-written file. The
+    /// save is not, however, atomic against a second *writer* — there is no
+    /// file lock, so two processes sharing one `--data-dir` can both pass
+    /// the existence check and the later save wins (RW25b review Low). Within
+    /// one server the setup handler's `setup_lock` holds across this call and
+    /// closes the window; across two servers on one state directory it stays
+    /// open, which is operator error rather than a supported deployment.
     pub fn create_user(
         &self,
         email: &str,

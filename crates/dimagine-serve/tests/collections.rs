@@ -227,6 +227,98 @@ async fn a_collection_view_shows_ambiguous_and_missing_diagnostics() {
     assert!(body(missing).await.contains("matches no file"));
 }
 
+/// RW27f review L-2: an image note that embeds a sibling is a
+/// collection (FORMAT §5) — `collection()` still answers for it,
+/// members in note order — but every list surface carries only
+/// the notes that mean to collect (`collection_is_listed`), and
+/// the folder API's `collections` array is one of them: it used
+/// to enumerate image-note collections, the flood the list rule
+/// was written to stop.
+#[test]
+fn an_image_note_embedding_a_sibling_is_not_in_the_folder_listing() {
+    let root = library();
+    write_file(&root, "refs/page-01.png", PNG);
+    write_file(&root, "refs/page-02.png", PNG);
+    write_file(
+        &root,
+        "refs/page-01.png.md",
+        "![[page-02.png]]\nAn image note embedding a sibling.\n",
+    );
+    write_file(
+        &root,
+        "refs/roundup.md",
+        "![[refs/target.png]]\nA plain note, so a listed collection.\n",
+    );
+    let catalog = catalog(&root);
+
+    // Still a collection: the note's own endpoint answers, with
+    // the sibling as its member.
+    let collection = catalog.collection("refs/page-01.png.md").unwrap();
+    assert_eq!(collection.members.len(), 1);
+    assert_eq!(collection.members[0].path, "refs/page-02.png");
+
+    // The folder listing carries the plain note and leaves the
+    // image note off, like the sidebar, /collections and
+    // /api/sidebar.
+    let listed = catalog.list_collections("refs").unwrap();
+    let paths: Vec<&str> = listed
+        .iter()
+        .map(|collection| collection.path.as_str())
+        .collect();
+    assert_eq!(paths, ["refs/roundup.md"], "{paths:?}");
+}
+
+/// The same rule, end to end: `/api/folder/<path>` does not
+/// enumerate the image-note collection, while
+/// `/api/collection/<path>` still answers for it (RW27f review
+/// L-2).
+#[tokio::test]
+async fn the_folder_api_leaves_image_note_collections_off() {
+    let root = library();
+    write_file(&root, "refs/page-01.png", PNG);
+    write_file(&root, "refs/page-02.png", PNG);
+    write_file(
+        &root,
+        "refs/page-01.png.md",
+        "![[page-02.png]]\nAn image note embedding a sibling.\n",
+    );
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog(&root), OriginalPreview, config);
+    let cookie = login(&app).await;
+
+    let response = app
+        .clone()
+        .oneshot(request("/api/folder/refs", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body(response).await;
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let collections = json["collections"].as_array().unwrap();
+    assert!(
+        !collections
+            .iter()
+            .any(|collection| collection["path"] == "refs/page-01.png.md"),
+        "an image-note collection is not enumerated: {body}"
+    );
+
+    let response = app
+        .oneshot(request(
+            "/api/collection/refs/page-01.png.md",
+            Some(&cookie),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the image note is still a collection"
+    );
+}
+
 /// W39 review L4: the pretty URL is what names the collection, so a `c` it
 /// carries must not override it. The last `c` wins in a query string, so
 /// `/collection/<one>?c=<two>` used to render `<two>`.

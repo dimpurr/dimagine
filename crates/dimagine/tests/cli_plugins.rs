@@ -90,20 +90,51 @@ fn switch_missing_file_offers_everything() {
     assert!(stdout.contains("import"), "{stdout}");
 }
 
+/// A malformed switch file falls back to the defaults, so every
+/// compiled-in plugin is still offered — and the complaint about
+/// the file belongs to a library operation, not to the question
+/// "how do I use this" (RW16 review L7).
 #[test]
 #[cfg(feature = "import-eagle")]
 fn switch_malformed_file_warns_and_offers_everything() {
     let lib = tmp("malformed");
     set_switch(&lib.0, "{definitely not json");
     let lib_arg = lib.0.to_str().unwrap();
-    let (code, stdout, stderr) = dimagine(&["--library", lib_arg, "--help"]);
+    let (code, stdout, _) = dimagine(&["--library", lib_arg, "--help"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("import"), "{stdout}");
+
+    let (code, _, stderr) = dimagine(&["--library", lib_arg, "scan"]);
+    assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("core-plugins.json"), "{stderr}");
     assert!(
         stderr.contains("dimagine:"),
         "a proper warning prefix: {stderr}"
     );
+}
+
+/// `--help` and `--version` ask how the command works, not for a
+/// library operation, so a broken or unknown switch file stays
+/// quiet on the way to the answer (RW16 review L7).
+#[test]
+#[cfg(feature = "import-eagle")]
+fn usage_requests_do_not_warn_about_a_broken_switch_file() {
+    let lib = tmp("quiet");
+    set_switch(&lib.0, r#"{"vector-search": true, "import-eagle": "off"}"#);
+    let lib_arg = lib.0.to_str().unwrap();
+    for args in [
+        vec!["--library", lib_arg, "--help"],
+        vec!["--library", lib_arg, "--version"],
+        vec!["--library", lib_arg, "scan", "--help"],
+        vec!["--library", lib_arg, "import", "eagle", "--help"],
+    ] {
+        let (code, _, stderr) = dimagine(&args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("dimagine:"),
+            "{args:?} must not carry the switch complaint: {stderr}"
+        );
+    }
 }
 
 #[test]
@@ -112,9 +143,12 @@ fn switch_unknown_and_wrong_typed_keys_warn_but_keep_defaults() {
     let lib = tmp("unknown");
     set_switch(&lib.0, r#"{"vector-search": true, "import-eagle": "off"}"#);
     let lib_arg = lib.0.to_str().unwrap();
-    let (code, stdout, stderr) = dimagine(&["--library", lib_arg, "--help"]);
+    let (code, stdout, _) = dimagine(&["--library", lib_arg, "--help"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("import"), "{stdout}");
+
+    let (code, _, stderr) = dimagine(&["--library", lib_arg, "scan"]);
+    assert_eq!(code, 0, "{stderr}");
     assert!(stderr.contains("unknown plugin key"), "{stderr}");
     assert!(stderr.contains("expected a boolean"), "{stderr}");
 }

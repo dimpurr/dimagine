@@ -52,58 +52,83 @@ impl CorePlugins {
     /// The switches for the library at `library`, reading its switch file only
     /// the first time this process asks about that library.
     pub fn load(library: &Path) -> Self {
+        Self::consult(library, true)
+    }
+
+    /// The switches for an invocation that only asks how the command
+    /// works (`--help`, `--version`): the same read, but a broken or
+    /// unknown switch file stays quiet. The operator asked for usage,
+    /// not for a library operation, so a settings complaint would be
+    /// noise on the way to the answer (RW16 review L7).
+    pub fn load_for_usage(library: &Path) -> Self {
+        Self::consult(library, false)
+    }
+
+    fn consult(library: &Path, report_breakage: bool) -> Self {
         let mut consulted = CONSULTED.lock().unwrap();
         if let Some(plugins) = consulted.get(library) {
             return *plugins;
         }
-        let plugins = Self::read(library);
+        let plugins = Self::read(library, report_breakage);
         consulted.insert(library.to_path_buf(), plugins);
         plugins
     }
 
     /// Read the switch file once. Falls back to the defaults whenever the file
     /// is missing, unreadable or malformed.
-    fn read(library: &Path) -> Self {
+    fn read(library: &Path, report_breakage: bool) -> Self {
         let mut plugins = Self::default();
         let path = library.join(".dimagine/core-plugins.json");
         let bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return plugins,
             Err(error) => {
-                warn(&format!("cannot read {}: {error}", path.display()));
+                if report_breakage {
+                    warn(&format!("cannot read {}: {error}", path.display()));
+                }
                 return plugins;
             }
         };
         let value: serde_json::Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
-                warn(&format!("ignoring malformed {}: {error}", path.display()));
+                if report_breakage {
+                    warn(&format!("ignoring malformed {}: {error}", path.display()));
+                }
                 return plugins;
             }
         };
         let Some(entries) = value.as_object() else {
-            warn(&format!(
-                "ignoring {}: expected a JSON object of plugin switches",
-                path.display()
-            ));
+            if report_breakage {
+                warn(&format!(
+                    "ignoring {}: expected a JSON object of plugin switches",
+                    path.display()
+                ));
+            }
             return plugins;
         };
         for (key, setting) in entries {
             let Some(enabled) = setting.as_bool() else {
-                warn(&format!(
-                    "ignoring {}:{key}: expected a boolean",
-                    path.display()
-                ));
+                if report_breakage {
+                    warn(&format!(
+                        "ignoring {}:{key}: expected a boolean",
+                        path.display()
+                    ));
+                }
                 continue;
             };
             match key.as_str() {
                 "import-eagle" => plugins.import_eagle = enabled,
                 "previews" => plugins.previews = enabled,
                 "serve" => plugins.serve = enabled,
-                other => warn(&format!(
-                    "unknown plugin key {other:?} in {}",
-                    path.display()
-                )),
+                other => {
+                    if report_breakage {
+                        warn(&format!(
+                            "unknown plugin key {other:?} in {}",
+                            path.display()
+                        ));
+                    }
+                }
             }
         }
         plugins
