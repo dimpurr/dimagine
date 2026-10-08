@@ -242,6 +242,11 @@ fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMeta
         with_dimensions: u64,
         with_taken: u64,
         unreadable_image_headers: u64,
+        /// Images with no taken time, counted by the reason their own bytes
+        /// gave (`no-exif`, `exif-without-date`, `exif-unreadable`,
+        /// `date-unreadable`, `file-unreadable`). Empty is every image having
+        /// a time; a reason that counted nothing is simply absent.
+        taken_missing: std::collections::BTreeMap<&'static str, u64>,
     }
     let document = ScanJson {
         schema: scan::SCHEMA,
@@ -251,6 +256,11 @@ fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMeta
             with_dimensions: stats.with_dimensions,
             with_taken: stats.with_taken,
             unreadable_image_headers: stats.unreadable_headers,
+            taken_missing: stats
+                .taken_missing
+                .iter()
+                .map(|(reason, count)| (reason.as_str(), *count))
+                .collect(),
         }),
     };
     println!(
@@ -283,6 +293,26 @@ fn print_scan_human(report: &ScanReport, index: Option<&dimagine_index::ImageMet
             println!(
                 "index unreadable image headers: {}",
                 index.unreadable_headers
+            );
+        }
+        if index.with_taken < index.images {
+            // The count without the kinds is the number that started this: an
+            // operator can see dates are missing but not whether the files
+            // carry none, carry one that could not be read, or carry nothing
+            // we could read at all.
+            let kinds = if index.taken_missing.is_empty() {
+                "reason not recorded".to_string()
+            } else {
+                index
+                    .taken_missing
+                    .iter()
+                    .map(|(reason, count)| format!("{reason} {count}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            println!(
+                "index: taken time missing for {} images ({kinds})",
+                index.images - index.with_taken
             );
         }
     }

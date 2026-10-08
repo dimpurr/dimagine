@@ -506,26 +506,56 @@ fn scan_reports_image_header_stats_and_never_recounts_as_zero() {
         include_bytes!("../../../tests/fixtures/exif-date.jpg"),
     )
     .unwrap();
+    std::fs::write(
+        refs.join("undated.jpg"),
+        include_bytes!("../../../tests/fixtures/exif-no-date.jpg"),
+    )
+    .unwrap();
+    std::fs::write(
+        refs.join("xmp.jpg"),
+        include_bytes!("../../../tests/fixtures/xmp-date.jpg"),
+    )
+    .unwrap();
     std::fs::write(refs.join("plain.jpg"), b"jpeg").unwrap();
     let (code, stdout, stderr) = dimagine(&["scan", "--json", "--library", root.to_str().unwrap()]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
     assert_eq!(json["schema"], "dimagine.scan/0.1");
-    assert_eq!(json["index"]["images"], 2);
-    assert_eq!(json["index"]["with_dimensions"], 1);
-    assert_eq!(json["index"]["with_taken"], 1);
+    assert_eq!(json["index"]["images"], 4);
+    assert_eq!(json["index"]["with_dimensions"], 3);
+    assert_eq!(json["index"]["with_taken"], 2);
     assert_eq!(json["index"]["unreadable_image_headers"], 1);
+    assert_eq!(json["index"]["taken_missing"]["exif-without-date"], 1);
+    assert_eq!(json["index"]["taken_missing"]["file-unreadable"], 1);
+    assert!(
+        json["index"]["taken_missing"]["no-exif"].is_null(),
+        "a reason that counted nothing is absent, not zero: {}",
+        json["index"]["taken_missing"]
+    );
 
     let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
-        stdout.contains("index: 2 images (1 with dimensions, 1 with taken time)"),
+        stdout.contains("index: 4 images (3 with dimensions, 2 with taken time)"),
         "the human summary carries the fresh counts: {stdout}"
     );
     assert!(
         stdout.contains("index unreadable image headers: 1"),
         "the counted warning is on the same summary: {stdout}"
     );
+    assert!(
+        stdout.contains(
+            "index: taken time missing for 2 images (exif-without-date 1, file-unreadable 1)"
+        ),
+        "the missing count comes with the kinds that caused it: {stdout}"
+    );
+    // A second scan of the unchanged library reuses every header fact from the
+    // digest cache, and still reports the same kinds: a recorded unknown is a
+    // fact about content, not a first-run failure the reuse pass forgets.
+    let (code, stdout, stderr) = dimagine(&["scan", "--json", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let again: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(again["index"], json["index"], "the counts repeat");
 }
 
 /// W48: opening the index the binary just refreshed and asking the read API
@@ -558,6 +588,7 @@ fn the_refreshed_index_answers_image_meta_queries() {
             width: Some(12),
             height: Some(1),
             taken_ns: Some(1_689_191_647_123_000_000),
+            taken_reason: None,
         })
     );
     assert_eq!(
@@ -566,6 +597,7 @@ fn the_refreshed_index_answers_image_meta_queries() {
             width: Some(1),
             height: Some(12),
             taken_ns: Some(1_521_994_953_000_000_000),
+            taken_reason: None,
         }),
         "orientation 6 swaps the stored 12x1"
     );
@@ -575,6 +607,7 @@ fn the_refreshed_index_answers_image_meta_queries() {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: Some(dimagine_index::TakenReason::UnreadableFile),
         }),
         "an unreadable header is unknown, never zero"
     );
@@ -582,6 +615,11 @@ fn the_refreshed_index_answers_image_meta_queries() {
     assert_eq!(stats.with_dimensions, 2);
     assert_eq!(stats.with_taken, 2);
     assert_eq!(stats.unreadable_headers, 1);
+    assert_eq!(
+        stats.taken_missing,
+        vec![(dimagine_index::TakenReason::UnreadableFile, 1)],
+        "the one image without a time says that its file is why"
+    );
 }
 
 fn view_added(root: &Path, path: &str) -> Option<i64> {

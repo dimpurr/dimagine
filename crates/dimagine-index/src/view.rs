@@ -8,7 +8,7 @@
 //! Paths are library-relative and `/`-separated, the same spelling the scan
 //! stored. `folder` uses `""` for the library root.
 
-use crate::{ImageMeta, Index, IndexError};
+use crate::{reason_from_code, ImageMeta, Index, IndexError, MetaRow, TakenReason};
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 
@@ -16,18 +16,24 @@ use std::collections::BTreeMap;
 const MAX_RATING: u8 = 5;
 
 /// What the index knows about image headers, counted ([`Index::image_meta_stats`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageMetaStats {
     /// Image rows the index holds.
     pub images: u64,
     /// Images whose pixel dimensions were read.
     pub with_dimensions: u64,
-    /// Images whose EXIF taken time was read.
+    /// Images whose taken time was read.
     pub with_taken: u64,
     /// Images whose header stayed unknown (dimensions `NULL`), counted on
     /// every scan, because the unknown is a recorded fact about the content
     /// and not a transient failure only the first scan sees.
     pub unreadable_headers: u64,
+    /// Images with no taken time, counted by the reason their own header gave
+    /// ([`TakenReason`]) and ordered by it. A reason with no images is left
+    /// out, so what is here is what an operator can act on; added to
+    /// [`ImageMetaStats::with_taken`] it accounts for every image the refresh
+    /// read, and the difference is the rows it never reached.
+    pub taken_missing: Vec<(TakenReason, u64)>,
 }
 
 /// How to order a [`ViewPage`].
@@ -641,7 +647,7 @@ fn row_at(index: &Index, query: &ViewQuery, offset: u64) -> Result<Option<String
 }
 
 /// The `ORDER BY` of [`Index::view_by_taken`]: the same shape a [`SortKey`]
-/// sort uses, over the EXIF taken time instead. Taken times order
+/// sort uses, over the taken time instead. Taken times order
 /// chronologically in the asked direction, ties break by path ascending, and
 /// an image with no taken time — an unknown instant, not an old or a young
 /// one — sorts last in both directions, the flag before the value, never
@@ -1179,32 +1185,38 @@ impl Index {
     /// `None` fields are honest unknowns — the header (or the date) could not
     /// be read — and `None` of the whole answer means the index holds no such
     /// image. A viewer's justified row asks its `width` here; a "Taken"
-    /// detail asks its `taken_ns` here.
+    /// detail asks its `taken_ns` here, and shows [`ImageMeta::taken_reason`]
+    /// where an instant would have gone.
     ///
     /// This is a companion to [`Index::view`], not part of its page shape:
     /// the viewer's own page JSON is the index API's hand-mirrored mirror,
     /// and it grows when the viewer does, not when the index does.
     pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
-        let row: Option<(Option<i64>, Option<i64>, Option<i64>)> = self
+        let row: Option<MetaRow> = self
             .conn()?
             .query_row(
-                "SELECT width,height,taken_ns FROM files WHERE path=?1 AND kind='image'",
+                "SELECT width,height,taken_ns,taken_reason \
+                 FROM files WHERE path=?1 AND kind='image'",
                 [path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        Ok(row.map(|(width, height, taken_ns)| ImageMeta {
-            width: width.and_then(|value| u32::try_from(value).ok()),
-            height: height.and_then(|value| u32::try_from(value).ok()),
-            taken_ns,
-        }))
+        Ok(
+            row.map(|(width, height, taken_ns, taken_reason)| ImageMeta {
+                width: width.and_then(|value| u32::try_from(value).ok()),
+                height: height.and_then(|value| u32::try_from(value).ok()),
+                taken_ns,
+                taken_reason: reason_from_code(taken_reason),
+            }),
+        )
     }
 
     /// What the index knows about image headers, counted: how many images
     /// there are, how many have dimensions, a taken time, or a header that
-    /// could not be read (dims unknown). The counted warning of a refresh
-    /// — and of every scan that follows, because the unknowns are recorded
-    /// facts about content, not transient failures.
+    /// could not be read (dims unknown), and — for the images with no taken
+    /// time — how many each recorded reason accounts for. The counted warning
+    /// of a refresh — and of every scan that follows, because the unknowns are
+    /// recorded facts about content, not transient failures.
     pub fn image_meta_stats(&self) -> Result<ImageMetaStats, IndexError> {
         let row: (i64, i64, i64, i64) = self.conn()?.query_row(
             // `coalesce`, because `sum` over no image rows is NULL and an
@@ -1216,11 +1228,28 @@ impl Index {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
         let max_zero = |value: i64| value.max(0) as u64;
+        // The reasons are counted in one grouped pass, so a reason this version
+        // does not know (a code from a newer dimagine, or a hand-written one)
+        // simply names no count here rather than being guessed at.
+        let mut reasons = self.conn()?.prepare(
+            "SELECT taken_reason, count(*) FROM files \
+             WHERE kind='image' AND taken_ns IS NULL AND taken_reason IS NOT NULL \
+             GROUP BY taken_reason ORDER BY taken_reason",
+        )?;
+        let taken_missing = reasons
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|(code, count)| {
+                reason_from_code(Some(code)).map(|reason| (reason, max_zero(count)))
+            })
+            .collect();
         Ok(ImageMetaStats {
             images: max_zero(row.0),
             with_dimensions: max_zero(row.1),
             with_taken: max_zero(row.2),
             unreadable_headers: max_zero(row.3),
+            taken_missing,
         })
     }
 
@@ -1473,6 +1502,7 @@ mod tests {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: None,
         };
         let note = |path: &str, image_path: &str, props_json: &str| NoteRecord {
             path: path.to_owned(),
@@ -1919,6 +1949,7 @@ mod tests {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: None,
         };
         let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
             path: path.to_owned(),
@@ -2034,6 +2065,7 @@ mod tests {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: None,
         };
         let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
             path: path.to_owned(),
@@ -2151,6 +2183,8 @@ mod tests {
                         height: Some((index_in_folder % 4 + 1) as u32),
                         taken_ns: (index_in_folder % 3 != 0)
                             .then_some(1_600_000_000_000_000_000 + index_in_folder),
+                        taken_reason: (index_in_folder % 3 == 0)
+                            .then_some(crate::TakenReason::NoExif),
                     })
                     .unwrap();
                 let note_path = format!("{path}.md");
@@ -2330,6 +2364,7 @@ mod tests {
             width: Some(4),
             height: Some(3),
             taken_ns,
+            taken_reason: taken_ns.map_or(Some(TakenReason::NoExif), |_| None),
         };
         index.begin_scan().unwrap();
         // Taken on three intertwined days; two images tie at the same second
@@ -2417,6 +2452,7 @@ mod tests {
                 width: Some(4),
                 height: Some(3),
                 taken_ns: Some(1_650_000_000_000_000_000),
+                taken_reason: None,
             })
         );
         assert_eq!(
@@ -2425,8 +2461,9 @@ mod tests {
                 width: Some(4),
                 height: Some(3),
                 taken_ns: None,
+                taken_reason: Some(TakenReason::NoExif),
             }),
-            "an unknown taken time is not an unknown dimension"
+            "an unknown taken time is not an unknown dimension, and says what it is"
         );
         assert_eq!(
             index.image_meta("refs/absent.jpg").unwrap(),
@@ -2439,7 +2476,8 @@ mod tests {
                 images: 6,
                 with_dimensions: 6,
                 with_taken: 4,
-                unreadable_headers: 0
+                unreadable_headers: 0,
+                taken_missing: vec![(TakenReason::NoExif, 2)]
             }
         );
     }
@@ -2450,7 +2488,10 @@ mod tests {
     fn image_meta_stats_count_the_unknown_headers() {
         let dir = tempfile::tempdir().unwrap();
         let mut index = Index::open(dir.path()).unwrap();
-        let image = |path: &str, width: Option<u32>, taken_ns: Option<i64>| FileRecord {
+        let image = |path: &str,
+                     width: Option<u32>,
+                     taken_ns: Option<i64>,
+                     taken_reason: Option<TakenReason>| FileRecord {
             path: path.to_owned(),
             size: 1,
             mtime_ns: 1,
@@ -2461,15 +2502,28 @@ mod tests {
             width,
             height: width.map(|height| height + 1),
             taken_ns,
+            taken_reason,
         };
         index.begin_scan().unwrap();
         index
-            .upsert_file(&image("healthy.jpg", Some(640), Some(1)))
+            .upsert_file(&image("healthy.jpg", Some(640), Some(1), None))
             .unwrap();
         index
-            .upsert_file(&image("bare-dims.jpg", Some(12), None))
+            .upsert_file(&image(
+                "bare-dims.jpg",
+                Some(12),
+                None,
+                Some(TakenReason::ExifWithoutDate),
+            ))
             .unwrap();
-        index.upsert_file(&image("broken.jpg", None, None)).unwrap();
+        index
+            .upsert_file(&image(
+                "broken.jpg",
+                None,
+                None,
+                Some(TakenReason::UnreadableFile),
+            ))
+            .unwrap();
         index
             .upsert_file(&FileRecord {
                 path: "note.md".into(),
@@ -2482,6 +2536,7 @@ mod tests {
                 width: None,
                 height: None,
                 taken_ns: None,
+                taken_reason: None,
             })
             .unwrap();
         index
@@ -2498,7 +2553,11 @@ mod tests {
                 images: 3,
                 with_dimensions: 2,
                 with_taken: 1,
-                unreadable_headers: 1
+                unreadable_headers: 1,
+                taken_missing: vec![
+                    (TakenReason::ExifWithoutDate, 1),
+                    (TakenReason::UnreadableFile, 1),
+                ]
             }
         );
         // A non-image row never reports metadata, even though it is indexed.
@@ -2527,7 +2586,8 @@ mod tests {
                 images: 0,
                 with_dimensions: 0,
                 with_taken: 0,
-                unreadable_headers: 0
+                unreadable_headers: 0,
+                taken_missing: Vec::new()
             }
         );
     }
@@ -2571,6 +2631,7 @@ mod tests {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: None,
         };
         let note = |path: &str, image_path: Option<&str>, tags: &[&str], props: &str| NoteRecord {
             path: path.to_owned(),
@@ -2872,6 +2933,7 @@ mod tests {
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 })
                 .unwrap();
         }

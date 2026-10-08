@@ -27,6 +27,7 @@ use std::time::UNIX_EPOCH;
 
 use dimagine_index::{
     FileKind, FileRecord, ImageMeta, Index, IndexError, LinkRecord, LinkState, NoteRecord,
+    TakenReason,
 };
 use saphyr::{LoadableYamlNode, Yaml};
 use serde_json::Value;
@@ -118,6 +119,7 @@ fn sync_index_inner(library: &Library, index: &mut Index) -> Result<(), IndexErr
                     width: meta.width,
                     height: meta.height,
                     taken_ns: meta.taken_ns,
+                    taken_reason: meta.taken_reason,
                 })?;
             }
             FileClass::ImageNote | FileClass::Note => {
@@ -153,6 +155,7 @@ fn sync_index_inner(library: &Library, index: &mut Index) -> Result<(), IndexErr
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 })?;
             }
             FileClass::Canvas => {
@@ -168,6 +171,7 @@ fn sync_index_inner(library: &Library, index: &mut Index) -> Result<(), IndexErr
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 })?;
             }
             FileClass::Other => {
@@ -183,6 +187,7 @@ fn sync_index_inner(library: &Library, index: &mut Index) -> Result<(), IndexErr
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 })?;
             }
             FileClass::Special => {}
@@ -227,6 +232,7 @@ fn image_header_facts(
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: Some(TakenReason::UnreadableFile),
                 },
             ));
         }
@@ -238,6 +244,7 @@ fn image_header_facts(
                 width: facts.width,
                 height: facts.height,
                 taken_ns: facts.taken_ns,
+                taken_reason: facts.taken_reason,
             };
             index.cache_image_meta(&facts.sha256, &meta)?;
             meta
@@ -596,7 +603,8 @@ mod tests {
                 images: 4,
                 with_dimensions: 2,
                 with_taken: 1,
-                unreadable_headers: 2
+                unreadable_headers: 2,
+                taken_missing: vec![(TakenReason::NoExif, 1), (TakenReason::UnreadableFile, 2)],
             },
             "bad.jpg and t.png stayed unknown, and both are counted"
         );
@@ -652,6 +660,7 @@ mod tests {
                 width: Some(12),
                 height: Some(1),
                 taken_ns: Some(1_689_191_647_123_000_000),
+                taken_reason: None,
             })
         );
     }
@@ -717,7 +726,8 @@ mod tests {
                 images: 1,
                 with_dimensions: 1,
                 with_taken: 1,
-                unreadable_headers: 0
+                unreadable_headers: 0,
+                taken_missing: Vec::new()
             }
         );
 
@@ -733,7 +743,8 @@ mod tests {
                 images: 2,
                 with_dimensions: 2,
                 with_taken: 2,
-                unreadable_headers: 0
+                unreadable_headers: 0,
+                taken_missing: Vec::new()
             },
             "both files carry the cached facts of identical content"
         );

@@ -68,6 +68,32 @@ All notable changes to this project are documented here. The format follows
   refresh did not happen). The read API: `Index::image_meta` for one
   image's metadata, `Index::view_by_taken` for a page ordered by taken
   time (NULLs last in both directions, ties broken by path).
+- Index: the reason an image has no taken time, recorded beside the missing
+  value in every image row and in the digest cache (`TakenReason`: `no-exif`,
+  `exif-without-date`, `exif-unreadable`, `date-unreadable`,
+  `file-unreadable`). Schema v8 migrates a v7 database in place and keeps its
+  rows, dropping their image digests and the header cache with them: a digest
+  earned before the column existed would vouch for a row no refresh has any
+  reason to revisit, so the first v8 scan reads each image once to learn the
+  reason. `dimagine scan` then prints the images with no taken time broken
+  down by reason (the human summary, and `index.taken_missing` in the JSON),
+  because "0 with taken time" across a thousand images is something to fix
+  only if the files carry a date the reader could not use — and the number
+  alone cannot say which library this is.
+- Index: the taken time is read from wherever a date actually is — a later
+  IFD as readily as the first (a thumbnail-first file is how scanners write
+  TIFF), `DateTimeDigitized` or the file's own `DateTime` when nothing says
+  when the picture was taken, each refined by its own `SubSecTime*` and moved
+  into UTC by its own `OffsetTime*`, an UNDEFINED date as readily as an ASCII
+  one, and the XMP packet an exporter moved the date to (a JPEG APP1 segment,
+  a WebP `XMP ` chunk, EXIF tag 700) when EXIF names none. Dates are read
+  tolerantly (the ISO `2021-06-30T17:45:12+02:00` beside the EXIF
+  `2023:07:12 20:54:07`, a time to the minute, a date with no time of day,
+  `Z` or `±hh:mm` alike) and never invented: a date naming no moment stays an
+  unknown, and says it was a date that failed rather than the absence of one.
+  One entry whose offset runs past the block — the MakerNote cameras write —
+  no longer costs the date written beside it, and a block that yields no entry
+  at all is reported as unreadable rather than as holding no date.
 - Viewer Phase 1: the library is the home. `/` shows every image with the
   scope in the query string (`in`, `sub`, `c`, `tag`, `q`, `sort`, `dir`,
   `size`, `p`, and the `untagged` and `recent` lenses), and `/folders`,

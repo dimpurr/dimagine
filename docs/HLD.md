@@ -36,7 +36,7 @@ Every command takes `--library <path>` (default: current directory) and
 | `library` | Walk the folder (FORMAT §2.2 ignore rules), classify images, notes, raw files, canvases. |
 | `note` | Parse and minimally edit YAML front matter, preserving unknown keys and formatting. |
 | `links` | Extract `![[...]]`, `![](...)` and canvas `file` nodes; resolve per FORMAT §5.1. |
-| `index` | `.dimagine/cache/index.sqlite`: paths, sizes, mtimes, SHA-256, notes, links, per-image dimensions and EXIF "taken" time (schema v7; a v6 database migrates in place, keeping its rows). Rebuildable. Incremental: compare mtime and size, then hash; header facts and digests are cached by content hash, so duplicates, moves and touches never re-read what the index already knows. |
+| `index` | `.dimagine/cache/index.sqlite`: paths, sizes, mtimes, SHA-256, notes, links, per-image dimensions, the EXIF "taken" time and — where there is none — which kind of unknown that is (schema v8; a v7 database migrates in place, keeping its rows and re-reading each image once for the new column). Rebuildable. Incremental: compare mtime and size, then hash; header facts and digests are cached by content hash, so duplicates, moves and touches never re-read what the index already knows. |
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
 | `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. |

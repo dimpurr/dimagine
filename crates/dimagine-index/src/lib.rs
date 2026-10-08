@@ -19,17 +19,19 @@ pub use view::{
     ViewPage, ViewQuery,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 /// The schema version immediately below [`SCHEMA_VERSION`]. A database at
 /// this version migrates in place: columns and tables it lacks are added,
 /// every existing row is kept, and the first refresh backfills the new
 /// per-image columns. Anything older stays on the rebuild path — a migration
 /// only ever steps forward one version.
-const MIGRATABLE_FROM: i64 = 6;
-/// The `files` columns one migration step adds. All three hold the values a
-/// refresh read from the image header; `NULL` is an honest "unknown", never
-/// a zero (FORMAT §0: an unknown is not empty).
-const MIGRATION_COLUMNS: [&str; 3] = ["width", "height", "taken_ns"];
+const MIGRATABLE_FROM: i64 = 7;
+/// The `files` columns one migration step adds. They hold the values a refresh
+/// read from the image header; `NULL` is an honest "unknown", never a zero
+/// (FORMAT §0: an unknown is not empty).
+const MIGRATION_COLUMNS: [&str; 1] = ["taken_reason"];
+/// The `image_meta` columns one migration step adds, on the same terms.
+const CACHE_MIGRATION_COLUMNS: [&str; 1] = ["taken_reason"];
 static OPEN_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 /// The move pairings [`Index::finish_scan`] tries, strongest key first. Each
@@ -146,28 +148,112 @@ pub struct FileRecord {
     /// Pixel height after EXIF orientation; `None` under the same terms as
     /// [`FileRecord::width`].
     pub height: Option<u32>,
-    /// The EXIF `DateTimeOriginal` (with `OffsetTimeOriginal` when present)
-    /// as nanoseconds since the Unix epoch, or `None` when the image has no
-    /// readable one. A missing date is an unknown, never a zero instant.
+    /// The image's taken time as nanoseconds since the Unix epoch: the first
+    /// date the file's own metadata names, as `dimagine-core`'s `image_meta`
+    /// reads it. `None` when nothing in the file names one — an unknown, never
+    /// a zero instant, and explained by [`FileRecord::taken_reason`].
     pub taken_ns: Option<i64>,
+    /// Why that time is missing, when it is: one of [`TakenReason`]. It is
+    /// `None` exactly when [`FileRecord::taken_ns`] is `Some`, so the pair
+    /// always states either an instant or the kind of unknown.
+    pub taken_reason: Option<TakenReason>,
+}
+
+/// Why an image has no taken time, as far as its own bytes can say
+/// ([`ImageMeta::taken_reason`]).
+///
+/// The reason is a recorded fact about the file, not a status of the refresh.
+/// `taken_ns IS NULL` alone cannot tell an operator whether the file carries no
+/// date at all or whether a date is there and could not be read, and those two
+/// need different answers (CLAUDE.md invariant 4: an unknown is never recorded
+/// as empty — here even the unknown has kinds). [`Index::image_meta_stats`]
+/// counts the kinds so `dimagine scan` can name them.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TakenReason {
+    /// The container holds no EXIF block: a stripped or re-encoded export, a
+    /// screenshot, or a format with nowhere to put EXIF (BMP, GIF).
+    NoExif,
+    /// The EXIF block read cleanly and no date tag — nor an XMP date — names a
+    /// moment in it.
+    ExifWithoutDate,
+    /// The EXIF block itself did not parse, so nothing inside it could be read.
+    UnreadableExif,
+    /// A date was found — an EXIF date tag or an XMP date — but its value names
+    /// no moment: the classic all-zero date, a junk string, or a year outside
+    /// the range an epoch nanosecond can hold.
+    UnreadableDate,
+    /// The bytes could not be read as an image at all, so no header was read.
+    UnreadableFile,
+}
+
+impl TakenReason {
+    /// Every reason, in the order [`Index::image_meta_stats`] counts and
+    /// `dimagine scan` prints them.
+    pub const ALL: [Self; 5] = [
+        Self::NoExif,
+        Self::ExifWithoutDate,
+        Self::UnreadableExif,
+        Self::UnreadableDate,
+        Self::UnreadableFile,
+    ];
+
+    /// The value stored in `files.taken_reason` and `image_meta.taken_reason`.
+    /// Codes start at 1 so `NULL` stays the only "nobody looked" state.
+    pub fn code(self) -> i64 {
+        match self {
+            Self::NoExif => 1,
+            Self::ExifWithoutDate => 2,
+            Self::UnreadableExif => 3,
+            Self::UnreadableDate => 4,
+            Self::UnreadableFile => 5,
+        }
+    }
+
+    /// The reason a stored code names, or `None` for a code this version does
+    /// not know (a database written by a newer dimagine, or hand-edited).
+    pub fn from_code(code: i64) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.code() == code)
+    }
+
+    /// The one word `dimagine scan` and its JSON use for this reason, so an
+    /// operator and a script see the same spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoExif => "no-exif",
+            Self::ExifWithoutDate => "exif-without-date",
+            Self::UnreadableExif => "exif-unreadable",
+            Self::UnreadableDate => "date-unreadable",
+            Self::UnreadableFile => "file-unreadable",
+        }
+    }
+}
+
+impl fmt::Display for TakenReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// Per-image metadata extracted from the image header, cached by the SHA-256
 /// digest of the file content the way previews are keyed (HLD `preview`):
 /// content that already exists in the cache is never parsed twice, whatever
-/// path or mtime it arrives under. `None` fields are honest unknowns; a row
-/// with all three `None` is the recorded fact that this particular content
-/// has no readable header, so a duplicate or a later refresh neither re-reads
-/// it nor mistakes the unknown for a value.
+/// path or mtime it arrives under. `None` fields are honest unknowns: a row
+/// with all four `None` records that nothing was read from this content (the
+/// file could not even be opened), and a row that knows a [`TakenReason`]
+/// records the one thing the probe did learn about content it could not read
+/// fully. Either way a duplicate or a later refresh neither re-reads the file
+/// nor mistakes an unknown for a value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ImageMeta {
     /// Pixel width after EXIF orientation.
     pub width: Option<u32>,
     /// Pixel height after EXIF orientation.
     pub height: Option<u32>,
-    /// EXIF `DateTimeOriginal` (with `OffsetTimeOriginal` when present) in
-    /// ns since the Unix epoch.
+    /// The image's taken time in ns since the Unix epoch, as
+    /// [`FileRecord::taken_ns`] describes it.
     pub taken_ns: Option<i64>,
+    /// Why that time is missing, when it is ([`FileRecord::taken_reason`]).
+    pub taken_reason: Option<TakenReason>,
 }
 
 /// Parsed note fields. Body text is supplied separately with [`Index::set_note_body`].
@@ -417,8 +503,8 @@ impl Index {
             let folder = folder_of(&record.path);
             let name_key = name_key(&record.path);
             self.conn()?.execute(
-                "INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating,width,height,taken_ns) \
-                  VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?7,?6),?8,?9,?10,?11,?12,?13) \
+                "INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating,width,height,taken_ns,taken_reason) \
+                  VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?7,?6),?8,?9,?10,?11,?12,?13,?14) \
                   ON CONFLICT(path) DO UPDATE SET \
                   sha256=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns \
                     THEN COALESCE(excluded.sha256,files.sha256) ELSE excluded.sha256 END, \
@@ -426,7 +512,8 @@ impl Index {
                   note_added_ns=excluded.note_added_ns, \
                   added_ns=COALESCE(excluded.note_added_ns,files.first_seen_ns), \
                   folder=excluded.folder,name_key=excluded.name_key,rating=excluded.rating, \
-                  width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns",
+                  width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns, \
+                  taken_reason=excluded.taken_reason",
                 params![
                     record.path,
                     record.size,
@@ -441,6 +528,7 @@ impl Index {
                     record.width.map(i64::from),
                     record.height.map(i64::from),
                     record.taken_ns,
+                    record.taken_reason.map(TakenReason::code),
                 ],
             )?;
             self.conn()?.execute(
@@ -693,11 +781,12 @@ impl Index {
             width: Option<i64>,
             height: Option<i64>,
             taken_ns: Option<i64>,
+            taken_reason: Option<i64>,
         }
         let previous: Option<Stored> = self
             .conn()?
             .query_row(
-                "SELECT sha256,width,height,taken_ns FROM files \
+                "SELECT sha256,width,height,taken_ns,taken_reason FROM files \
                  WHERE path=?1 AND size=?2 AND mtime_ns=?3",
                 params![path, size as i64, mtime_ns],
                 |row| {
@@ -706,6 +795,7 @@ impl Index {
                         width: row.get(1)?,
                         height: row.get(2)?,
                         taken_ns: row.get(3)?,
+                        taken_reason: row.get(4)?,
                     })
                 },
             )
@@ -721,6 +811,7 @@ impl Index {
                             width: stored.width.and_then(|value| u32::try_from(value).ok()),
                             height: stored.height.and_then(|value| u32::try_from(value).ok()),
                             taken_ns: stored.taken_ns,
+                            taken_reason: reason_from_code(stored.taken_reason),
                         },
                     )
                 })
@@ -731,19 +822,22 @@ impl Index {
     /// `Some` of all-`NULL` is a hit: this content's header is known
     /// unreadable, which is exactly what a duplicate should reuse.
     pub fn cached_image_meta(&self, sha256: &str) -> Result<Option<ImageMeta>, IndexError> {
-        let cached: Option<(Option<i64>, Option<i64>, Option<i64>)> = self
+        let cached: Option<MetaRow> = self
             .conn()?
             .query_row(
-                "SELECT width,height,taken_ns FROM image_meta WHERE sha256=?1",
+                "SELECT width,height,taken_ns,taken_reason FROM image_meta WHERE sha256=?1",
                 [sha256],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        Ok(cached.map(|(width, height, taken_ns)| ImageMeta {
-            width: width.and_then(|value| u32::try_from(value).ok()),
-            height: height.and_then(|value| u32::try_from(value).ok()),
-            taken_ns,
-        }))
+        Ok(
+            cached.map(|(width, height, taken_ns, taken_reason)| ImageMeta {
+                width: width.and_then(|value| u32::try_from(value).ok()),
+                height: height.and_then(|value| u32::try_from(value).ok()),
+                taken_ns,
+                taken_reason: reason_from_code(taken_reason),
+            }),
+        )
     }
 
     /// Records the header metadata for one SHA-256 digest, so the same content
@@ -756,14 +850,16 @@ impl Index {
         let result = self
             .conn()?
             .execute(
-                "INSERT INTO image_meta(sha256,width,height,taken_ns) VALUES(?1,?2,?3,?4) \
+                "INSERT INTO image_meta(sha256,width,height,taken_ns,taken_reason) VALUES(?1,?2,?3,?4,?5) \
                  ON CONFLICT(sha256) DO UPDATE SET \
-                 width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns",
+                 width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns, \
+                 taken_reason=excluded.taken_reason",
                 params![
                     sha256,
                     meta.width.map(i64::from),
                     meta.height.map(i64::from),
-                    meta.taken_ns
+                    meta.taken_ns,
+                    meta.taken_reason.map(TakenReason::code)
                 ],
             )
             .map(|_| ())
@@ -873,13 +969,13 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
     if version.is_none() {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER,width INTEGER,height INTEGER,taken_ns INTEGER);
+             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER,width INTEGER,height INTEGER,taken_ns INTEGER,taken_reason INTEGER);
              CREATE TABLE IF NOT EXISTS notes(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,image_path TEXT,id TEXT,title TEXT NOT NULL,tags TEXT NOT NULL,props_json TEXT NOT NULL,body TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,syntax TEXT NOT NULL DEFAULT 'wiki_link',PRIMARY KEY(src,raw));
              CREATE TABLE IF NOT EXISTS note_tags(image_path TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(image_path,tag));
              CREATE TABLE IF NOT EXISTS scan_seen(path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS moved_from(path TEXT PRIMARY KEY,id TEXT,sha256 TEXT,kind TEXT NOT NULL);
-             CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER);
+             CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER,taken_reason INTEGER);
              CREATE INDEX IF NOT EXISTS files_sha256_idx ON files(sha256);
              CREATE INDEX IF NOT EXISTS files_added_ns_idx ON files(added_ns);
              CREATE INDEX IF NOT EXISTS files_size_idx ON files(size);
@@ -903,7 +999,7 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
                INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
              END;
              DELETE FROM schema_version;
-             INSERT INTO schema_version(version) VALUES(7);
+             INSERT INTO schema_version(version) VALUES(8);
              COMMIT;",
         )?;
     } else if version == Some(MIGRATABLE_FROM) {
@@ -922,19 +1018,34 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
 fn upgrade_from_previous(conn: &Connection) -> Result<(), IndexError> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let result = (|| {
-        for column in MIGRATION_COLUMNS {
-            if !table_has_column(conn, "files", column)? {
-                conn.execute(
-                    &format!("ALTER TABLE files ADD COLUMN {column} INTEGER"),
-                    [],
-                )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER,taken_reason INTEGER);",
+        )?;
+        for (table, columns) in [
+            ("files", &MIGRATION_COLUMNS[..]),
+            ("image_meta", &CACHE_MIGRATION_COLUMNS[..]),
+        ] {
+            for column in columns {
+                if !table_has_column(conn, table, column)? {
+                    conn.execute(
+                        &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER"),
+                        [],
+                    )?;
+                }
             }
         }
+        // A per-image column added by an upgrade starts out unknown for every
+        // row, and the content digest is what proves a refresh read the header.
+        // Reusing an old digest would therefore keep the unknown forever, so
+        // the upgrade drops the image digests and the header cache with them:
+        // the next refresh reads every image once — the price of learning the
+        // new fact — and writes both back.
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER);
+            "UPDATE files SET sha256=NULL WHERE kind='image';
+             DELETE FROM image_meta;
              CREATE INDEX IF NOT EXISTS files_taken_ns_idx ON files(taken_ns);
              DELETE FROM schema_version;
-             INSERT INTO schema_version(version) VALUES(7);
+             INSERT INTO schema_version(version) VALUES(8);
              COMMIT;",
         )?;
         Ok(())
@@ -995,6 +1106,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
                 "width",
                 "height",
                 "taken_ns",
+                "taken_reason",
             ][..],
         ),
         (
@@ -1014,7 +1126,10 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         ("note_tags", &["image_path", "tag"][..]),
         ("scan_seen", &["path"][..]),
         ("moved_from", &["path", "id", "sha256", "kind"][..]),
-        ("image_meta", &["sha256", "width", "height", "taken_ns"][..]),
+        (
+            "image_meta",
+            &["sha256", "width", "height", "taken_ns", "taken_reason"][..],
+        ),
     ] {
         let columns: HashSet<String> = {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -1177,6 +1292,17 @@ fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+/// The [`TakenReason`] a stored column holds. An unknown code reads as the
+/// unknown it was meant to replace rather than as one of the known kinds: a
+/// code from a newer dimagine proves nothing about this version's categories.
+/// One row's per-image header columns, as SQLite hands them over: width,
+/// height, the taken time, and the reason it is missing.
+type MetaRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+
+fn reason_from_code(code: Option<i64>) -> Option<TakenReason> {
+    code.and_then(TakenReason::from_code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1194,6 +1320,7 @@ mod tests {
             width: None,
             height: None,
             taken_ns: None,
+            taken_reason: None,
         }
     }
 
@@ -1749,17 +1876,18 @@ mod tests {
         assert!(index.rebuild_required());
     }
 
-    /// The schema of version 6 exactly as that code wrote it, so a database
-    /// built by the previous dimagine can be faked faithfully: no per-image
-    /// metadata columns, no probe cache, and rows written like the old
-    /// `upsert_file` did.
-    const V6_SCHEMA: &str = "CREATE TABLE schema_version(version INTEGER NOT NULL);
-             CREATE TABLE files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER);
+    /// The schema of version 7 exactly as that code wrote it: the per-image
+    /// metadata columns and their cache are there, the reason a taken time is
+    /// missing is not. One image row carries a digest, and the digest cache
+    /// holds its header, because what the upgrade does to those is the point.
+    const V7_SCHEMA: &str = "CREATE TABLE schema_version(version INTEGER NOT NULL);
+             CREATE TABLE files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER,width INTEGER,height INTEGER,taken_ns INTEGER);
              CREATE TABLE notes(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,image_path TEXT,id TEXT,title TEXT NOT NULL,tags TEXT NOT NULL,props_json TEXT NOT NULL,body TEXT NOT NULL DEFAULT '');
              CREATE TABLE links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,syntax TEXT NOT NULL DEFAULT 'wiki_link',PRIMARY KEY(src,raw));
              CREATE TABLE note_tags(image_path TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(image_path,tag));
              CREATE TABLE scan_seen(path TEXT PRIMARY KEY);
              CREATE TABLE moved_from(path TEXT PRIMARY KEY,id TEXT,sha256 TEXT,kind TEXT NOT NULL);
+             CREATE TABLE image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER);
              CREATE INDEX files_sha256_idx ON files(sha256);
              CREATE INDEX files_added_ns_idx ON files(added_ns);
              CREATE INDEX files_size_idx ON files(size);
@@ -1767,6 +1895,7 @@ mod tests {
              CREATE INDEX files_folder_idx ON files(folder);
              CREATE INDEX files_kind_path_idx ON files(kind,path);
              CREATE INDEX files_rating_idx ON files(rating);
+             CREATE INDEX files_taken_ns_idx ON files(taken_ns);
              CREATE INDEX notes_id_idx ON notes(id);
              CREATE INDEX notes_image_path_idx ON notes(image_path);
              CREATE INDEX note_tags_tag_idx ON note_tags(tag);
@@ -1781,28 +1910,31 @@ mod tests {
                INSERT INTO notes_fts(notes_fts,rowid,title,tags,body) VALUES('delete',old.note_id,old.title,old.tags,old.body);
                INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
              END;
-             INSERT INTO schema_version(version) VALUES(6);
-             INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating) \
-               VALUES('refs/old.jpg',7,8,NULL,'image',1000,NULL,1000,'refs','old.jpg',3);";
+             INSERT INTO schema_version(version) VALUES(7);
+             INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating,width,height,taken_ns) \
+               VALUES('refs/old.jpg',7,8,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','image',1000,NULL,1000,'refs','old.jpg',3,64,48,NULL);
+             INSERT INTO image_meta(sha256,width,height,taken_ns) \
+               VALUES('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',64,48,NULL);";
 
-    /// W48: a database from schema version 6 — the version immediately before
-    /// the per-image metadata columns — opens, migrates in place, and keeps
-    /// every row. The FIRST SCAN afterwards fills the new columns, because a
-    /// v6 image row has no content digest to reuse and the refresh must read
-    /// the file once.
+    /// A database from schema version 7 — the version immediately before the
+    /// reason column — opens, migrates in place and keeps its rows. Its image
+    /// digests and header cache are dropped, because a row whose digest was
+    /// earned before the column existed would never be re-read and would report
+    /// "no reason recorded" forever; the next refresh reads each image once and
+    /// writes the digest and the reason back together.
     #[test]
     fn previous_schema_version_migrates_in_place_keeping_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".dimagine/cache/index.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(V6_SCHEMA).unwrap();
+        conn.execute_batch(V7_SCHEMA).unwrap();
         drop(conn);
 
         let mut index = Index::open(dir.path()).unwrap();
         assert!(
             !index.rebuild_required(),
-            "a v6 database must not require a rebuild"
+            "a v7 database must not require a rebuild"
         );
         let version: i64 = index
             .conn()
@@ -1811,25 +1943,54 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7, "the schema version was bumped");
-        let (size, rating, width, taken): (i64, Option<i64>, Option<i64>, Option<i64>) = index
+        assert_eq!(version, 8, "the schema version was bumped");
+        let (size, rating, width, sha256, reason): (
+            i64,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = index
             .conn()
             .unwrap()
             .query_row(
-                "SELECT size,rating,width,taken_ns FROM files WHERE path='refs/old.jpg'",
+                "SELECT size,rating,width,sha256,taken_reason FROM files WHERE path='refs/old.jpg'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
         assert_eq!(
-            (size, rating, width, taken),
-            (7, Some(3), None, None),
-            "the old row is kept with its values, the new columns start unknown"
+            (size, rating, width, sha256, reason),
+            (7, Some(3), Some(64), None, None),
+            "the old row keeps what it knew, and its digest is dropped for a re-read"
+        );
+        let cached: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT count(*) FROM image_meta", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            cached, 0,
+            "the header cache goes with the digests it served"
+        );
+        assert!(
+            index
+                .reusable_image_meta("refs/old.jpg", 7, 8)
+                .unwrap()
+                .is_none(),
+            "the row is no longer reusable without a digest to vouch for it"
         );
 
         // The refresh that follows works exactly as on a fresh database: the
-        // fresh columns are written, and the next refresh reuses the digest
-        // now that the row has one.
+        // fresh column is written, and the next refresh reuses the digest.
         index.begin_scan().unwrap();
         index
             .upsert_file(&FileRecord {
@@ -1842,7 +2003,8 @@ mod tests {
                 rating: Some(3),
                 width: Some(64),
                 height: Some(48),
-                taken_ns: Some(1_689_191_647_000_000_000),
+                taken_ns: None,
+                taken_reason: Some(TakenReason::ExifWithoutDate),
             })
             .unwrap();
         index.finish_scan(&["refs/old.jpg".into()]).unwrap();
@@ -1853,7 +2015,8 @@ mod tests {
                 ImageMeta {
                     width: Some(64),
                     height: Some(48),
-                    taken_ns: Some(1_689_191_647_000_000_000),
+                    taken_ns: None,
+                    taken_reason: Some(TakenReason::ExifWithoutDate),
                 },
             )),
             "after the first refresh the columns are reusable like any other row's"
@@ -1871,25 +2034,26 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
-    /// A v6 database that someone already hand-patched with some or all of
-    /// the new columns still migrates: the step only adds what is missing.
+    /// A v7 database that someone already hand-patched with the new column, in
+    /// one table or both, still migrates: the step only adds what is missing.
     #[test]
-    fn migrating_a_partially_newer_v6_database_adds_only_missing_columns() {
+    fn migrating_a_partially_newer_v7_database_adds_only_missing_columns() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join(".dimagine/cache/index.sqlite");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(V6_SCHEMA).unwrap();
-        // A strange half-state: `width` already exists, the other two do not.
-        conn.execute("ALTER TABLE files ADD COLUMN width INTEGER", [])
+        conn.execute_batch(V7_SCHEMA).unwrap();
+        // A strange half-state: `files.taken_reason` already exists, the
+        // cache table's does not.
+        conn.execute("ALTER TABLE files ADD COLUMN taken_reason INTEGER", [])
             .unwrap();
         drop(conn);
         let index = Index::open(dir.path()).unwrap();
         assert!(!index.rebuild_required());
-        for (table, expected_key) in [("files", 11 + 3), ("image_meta", 4)] {
+        for (table, expected) in [("files", 15), ("image_meta", 5)] {
             let columns: i64 = index
                 .conn()
                 .unwrap()
@@ -1899,7 +2063,7 @@ mod tests {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(columns, expected_key as i64, "{table} has all columns");
+            assert_eq!(columns, expected, "{table} has all columns");
         }
     }
 
@@ -2031,6 +2195,7 @@ mod tests {
                 width: Some(640),
                 height: Some(480),
                 taken_ns: Some(1_689_191_647_000_000_000),
+                taken_reason: None,
             })
             .unwrap();
         // The production shape of an old row: no digest, so nothing is known
@@ -2046,6 +2211,7 @@ mod tests {
                     width: Some(640),
                     height: Some(480),
                     taken_ns: Some(1_689_191_647_000_000_000),
+                    taken_reason: None,
                 },
             ))
         );
@@ -2098,6 +2264,7 @@ mod tests {
                     width: Some(12),
                     height: Some(1),
                     taken_ns: None,
+                    taken_reason: None,
                 },
             )
             .unwrap();
@@ -2107,6 +2274,7 @@ mod tests {
                 width: Some(12),
                 height: Some(1),
                 taken_ns: None,
+                taken_reason: None,
             }),
             "read back inside the same scan"
         );
@@ -2117,6 +2285,7 @@ mod tests {
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 },
             )
             .unwrap();
@@ -2126,6 +2295,7 @@ mod tests {
                 width: None,
                 height: None,
                 taken_ns: None,
+                taken_reason: None,
             }),
             "the last writer for a digest wins"
         );
@@ -2137,6 +2307,7 @@ mod tests {
                     width: None,
                     height: None,
                     taken_ns: None,
+                    taken_reason: None,
                 }
             ),
             Err(IndexError::ScanNotActive),
