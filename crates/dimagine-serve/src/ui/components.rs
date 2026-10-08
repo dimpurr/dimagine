@@ -3,14 +3,14 @@
 //! Everything here returns HTML fragments. No component reads the request or
 //! the filesystem; the page handlers decide what data a component gets.
 
-use dimagine_index::ViewItem;
+use dimagine_index::{ImageMeta, ViewItem};
 use percent_encoding::utf8_percent_encode;
 
 use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
 use crate::view_query::{
-    sort_key_as_str, Direction, SortKey, ThumbnailSize, ViewParams, PAGE_SIZE,
+    sort_key_as_str, Direction, ThumbnailSize, ViewParams, ViewSort, PAGE_SIZE,
 };
 
 /// How many tags the sidebar lists before offering the rest on `/search`.
@@ -408,37 +408,178 @@ pub fn notices(notices: &[String]) -> String {
     )
 }
 
+/// The aspect ratios the design system crops at (DESIGN.md §5.4): below 0.4 a
+/// picture is very tall, above 2.5 very wide. The same pair the tile's
+/// `data-fit` rules and the image page's stage use, so a tile, a stage and a
+/// justified row all agree on what "extreme" means.
+pub const TALL_BELOW: f64 = 0.4;
+pub const WIDE_ABOVE: f64 = 2.5;
+
+/// What one tile is told about its image's header, as the grid read it from
+/// the index.
+///
+/// `None` in every field is the honest unknown — a header that could not be
+/// read — and it lands the tile in a square cell rather than in a guessed shape
+/// (invariant 4). It is also what a page carries when the index could not
+/// answer at all: the grid still renders.
+pub type TileMeta = Option<ImageMeta>;
+
+/// The layout ratio of one tile, as the `--ar` the stylesheet justifies rows
+/// by: the indexed width over the indexed height, and `1` for a square cell
+/// when the index knows no dimensions.
+///
+/// The ratio is rounded to three decimals — enough that a row of tiles is
+/// indistinguishable from the exact shapes, few enough that a page of a
+/// hundred carries three digits per image rather than a float.
+fn aspect_ratio(meta: TileMeta) -> String {
+    let ratio = match meta {
+        Some(ImageMeta {
+            width: Some(width),
+            height: Some(height),
+            ..
+        }) if width > 0 && height > 0 => f64::from(width) / f64::from(height),
+        // One dimension without the other is no shape at all, so it reads as
+        // the unknown it is.
+        _ => 1.0,
+    };
+    let ratio = ratio.clamp(1.0 / WIDE_ABOVE, WIDE_ABOVE);
+    format!("--ar:{ratio:.3}")
+}
+
+/// `tall`, `wide` or `normal` for an indexed shape, `None` when there is none.
+///
+/// The thresholds are DESIGN.md §5.4's and both boundaries are exclusive: an
+/// aspect ratio of exactly 0.4 or exactly 2.5 is an ordinary picture. An
+/// extreme picture is cropped to its cell the way the square tile cropped it,
+/// with the badge that says so.
+fn known_fit(meta: TileMeta) -> Option<&'static str> {
+    let ImageMeta {
+        width: Some(width),
+        height: Some(height),
+        ..
+    } = meta?
+    else {
+        return None;
+    };
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let ratio = f64::from(width) / f64::from(height);
+    Some(if ratio < TALL_BELOW {
+        "tall"
+    } else if ratio > WIDE_ABOVE {
+        "wide"
+    } else {
+        "normal"
+    })
+}
+
+/// The `width`/`height` attributes of the thumbnail, when the index knows them.
+///
+/// Two facts of the picture in the attributes every browser reserves space
+/// from before a byte of the thumbnail arrives, so a page does not reflow as
+/// its pictures load. A header the index could not read contributes nothing:
+/// an unknown is never recorded as a size, and the tile's square cell already
+/// holds the place.
+fn size_attributes(meta: TileMeta) -> String {
+    match meta {
+        Some(ImageMeta {
+            width: Some(width),
+            height: Some(height),
+            ..
+        }) if width > 0 && height > 0 => format!(" width=\"{width}\" height=\"{height}\""),
+        _ => String::new(),
+    }
+}
+
+/// The badge on a picture cropped to its cell, or nothing for an ordinary one.
+///
+/// Server-rendered rather than left to the script, so the badge is there on the
+/// first paint: a shape the index already knows needs no measurement to know
+/// it is extreme.
+fn fit_badge(fit: Option<&str>) -> String {
+    let (glyph, title) = match fit {
+        Some("tall") => (BADGE_TALL, "Tall image — top-aligned crop"),
+        Some("wide") => (BADGE_WIDE, "Wide image — centre crop"),
+        _ => return String::new(),
+    };
+    format!(
+        "<span class=\"tile-badge\" aria-hidden=\"true\" title=\"{}\">{glyph}</span>",
+        escape_html(title)
+    )
+}
+
+/// The Tall mark: a vertical bar with its ends.
+const BADGE_TALL: &str = r##"<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><path d="M6 1v10M3.5 8.5 6 11l2.5-2.5M3.5 3.5 6 1l2.5 2.5"/></svg>"##;
+/// The Wide mark: a horizontal one.
+const BADGE_WIDE: &str = r##"<svg viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true" focusable="false"><path d="M1 6h10M3.5 3.5 1 6l2.5 2.5M8.5 3.5 11 6l-2.5 2.5"/></svg>"##;
+
+/// The "no time" mark on a tile in a view ordered by the EXIF taken time.
+///
+/// The taken time is a fact about the picture, so it can be unknown — and in
+/// this order those images sit last, which would read as "the oldest pictures"
+/// if the grid said nothing. It says something: a small mark and a tooltip that
+/// names the unknown. Never a date nobody recorded (invariant 4), and only in
+/// the one order where "unknown" would otherwise be misread as an end of the
+/// timeline.
+fn no_time_marker() -> String {
+    "<span class=\"tile-notime\" title=\"No taken time — this image carries no EXIF date, so it sorts last\" \
+     aria-hidden=\"true\"></span>"
+        .to_owned()
+}
+
 /// One image tile. The tile is a plain link, so the grid works without JS; the
 /// `data-path` attribute is what the inspector fills from, and the `id` is
 /// what the image page's "Back to view" returns to (its own tile's anchor).
 ///
-/// The tile is square and the picture is whole (`object-fit: contain`). Only an
-/// extreme aspect ratio is cropped, and the aspect ratio cannot be emitted here:
-/// the index stores no dimensions (DESIGN.md §4.5 — "computed from the loaded
-/// image's natural size" until it does). The script therefore measures the
-/// thumbnail once it loads and writes `data-fit` (`tall` / `wide` / `normal`)
-/// plus the measured `data-w` / `data-h` on the tile, which is what the
-/// stylesheet crops by. A size that never arrives leaves the tile in its
-/// default `contain`, so an unknown is never turned into a guess (invariant 4).
-pub fn tile(item: &ViewItem, params: &ViewParams) -> String {
+/// The tile's shape comes from the index, not from the thumbnail: `width` and
+/// `height` on the image and `--ar` on the tile are the picture's own
+/// dimensions, so the layout is settled before a byte of the picture arrives
+/// and a justified row is a row rather than a guess. A header the index could
+/// not read falls back to a square cell (`--ar:1`, no size attributes), which
+/// is the shape the grid had before dimensions were indexed.
+///
+/// `data-fit` marks the shapes DESIGN.md §4.5/§5.4 crop, from the same indexed
+/// dimensions; the script still measures a picture whose shape the index does
+/// not know, and a shape nobody knows keeps `contain` rather than becoming a
+/// crop.
+pub fn tile(item: &ViewItem, params: &ViewParams, meta: TileMeta) -> String {
     let label = item
         .title
         .as_deref()
         .map(str::to_owned)
         .unwrap_or_else(|| leaf_name(&item.path));
+    let fit = known_fit(meta);
+    let no_time = if params.orders_by_taken() && meta.and_then(|meta| meta.taken_ns).is_none() {
+        no_time_marker()
+    } else {
+        String::new()
+    };
     format!(
         // `data-path` stays the tile's second attribute: the viewer's own
         // tests read a page's image paths back out of this exact prefix.
-        "<a class=\"tile\" data-path=\"{path}\" id=\"{anchor}\" \
-         href=\"/image/{path_encoded}{view}\" title=\"{label}\">\
-         <img loading=\"lazy\" decoding=\"async\" src=\"/thumb/{path_encoded}\" alt=\"{label}\">\
+        "<a class=\"tile\" data-path=\"{path}\" id=\"{anchor}\" style=\"{ar}\" \
+         href=\"/image/{path_encoded}{view}\" title=\"{label}\"{fit}>\
+         {badge}{no_time}\
+         <img loading=\"lazy\" decoding=\"async\" src=\"/thumb/{path_encoded}\" alt=\"{label}\"{size}>\
          <span class=\"tile-caption\">{label}</span></a>",
         path = escape_html(&item.path),
         anchor = escape_html(&crate::ui::tile_anchor(&item.path)),
         path_encoded = escape_html(&crate::ui::encode_path(&item.path)),
         view = image_view_suffix(params),
         label = escape_html(&label),
+        ar = aspect_ratio(meta),
+        fit = fit_attribute(fit),
+        badge = fit_badge(fit),
+        no_time = no_time,
+        size = size_attributes(meta),
     )
+}
+
+/// The `data-fit="…"` attribute, or nothing when the shape is unknown.
+fn fit_attribute(fit: Option<&str>) -> String {
+    fit.map(|fit| format!(" data-fit=\"{fit}\""))
+        .unwrap_or_default()
 }
 
 /// The `?v=` suffix that lets the image page offer "Back to view".
@@ -453,15 +594,43 @@ fn image_view_suffix(params: &ViewParams) -> String {
     )
 }
 
+/// The `data-taken` marker on a grid whose order is the EXIF taken time.
+///
+/// It is what lets the tiles say "no taken time" — the server writes that mark
+/// on the tiles themselves, and `app.js` writes it on the tiles a later "Load
+/// more" appends, in this order and no other.
+fn taken_marker(params: &ViewParams) -> &'static str {
+    if params.orders_by_taken() {
+        " data-taken"
+    } else {
+        ""
+    }
+}
+
+/// The header facts of the images on one page, keyed by image path.
+///
+/// A path this map says nothing about has no known header, and its tile falls
+/// back to the square cell — an unknown recorded as an unknown, never as a
+/// size (invariant 4).
+pub type TileMetas = std::collections::HashMap<String, ImageMeta>;
+
 /// The grid of tiles for one page of results.
-pub fn grid(items: &[ViewItem], params: &ViewParams) -> String {
+///
+/// `metas` carries the header facts the index holds, keyed by image path; a
+/// path it says nothing about simply has none, and its tile falls back to the
+/// square cell. The section carries `data-justify` because the justified
+/// layout is progressive enhancement: the stylesheet keeps the plain grid
+/// unless the page has a script to enhance it (see `app.js`), and without
+/// one this is still a complete grid of links.
+pub fn grid(items: &[ViewItem], params: &ViewParams, metas: &TileMetas) -> String {
     format!(
-        "<section class=\"grid size-{}\" data-total=\"{}\">{}</section>",
+        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{}>{}</section>",
         params.size.as_str(),
         items.len(),
+        taken_marker(params),
         items
             .iter()
-            .map(|item| tile(item, params))
+            .map(|item| tile(item, params, metas.get(item.path.as_str()).copied()))
             .collect::<String>()
     )
 }
@@ -476,6 +645,10 @@ pub struct CollectionTile {
     /// The line directly after the embed (FORMAT §5), as written; empty is
     /// no caption, a distinct fact that is not invented here.
     pub caption: String,
+    /// The header facts the index holds for the image, if it holds any: a
+    /// member the index has never seen carries none and lands in a square
+    /// cell, like a member whose header could not be read.
+    pub meta: TileMeta,
 }
 
 /// The collection page's grid: the library's tiles, each with the caption
@@ -491,9 +664,10 @@ pub struct CollectionTile {
 /// any other name.
 pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String {
     format!(
-        "<section class=\"grid size-{}\" data-total=\"{}\">{}</section>",
+        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{}>{}</section>",
         params.size.as_str(),
         items.len(),
+        taken_marker(params),
         items
             .iter()
             .map(|member| {
@@ -510,9 +684,13 @@ pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String 
                         escape_html(&member.caption)
                     )
                 };
+                // The row height is the tile's own (the caption sits under
+                // it), so the item carries the ratio the row is justified by:
+                // `--ar` inherits from here into the tile.
                 format!(
-                    "<div class=\"grid-item\">{}{caption}</div>",
-                    tile(&member.item, params)
+                    "<div class=\"grid-item\" style=\"{ar}\">{}{caption}</div>",
+                    tile(&member.item, params, member.meta),
+                    ar = aspect_ratio(member.meta)
                 )
             })
             .collect::<String>()
@@ -820,7 +998,7 @@ pub fn sidebar_sections(
 
 fn is_all(params: &ViewParams) -> bool {
     params.to_query_string().is_empty()
-        || (params.sort == SortKey::Added
+        || (params.sort == ViewSort::Added
             && params.direction == Direction::Desc
             && !params.untagged
             && !params.recent)
@@ -1258,7 +1436,7 @@ mod tests {
             rating: Some(5),
             note_path: None,
         };
-        let html = tile(&item, &ViewParams::parse("in=refs&sort=name"));
+        let html = tile(&item, &ViewParams::parse("in=refs&sort=name"), None);
         assert!(html.contains(
             "href=\"/image/refs/ui/%E7%8C%AB%20%26%20co.png?v=in%3Drefs%26sort%3Dname\""
         ));
@@ -1281,7 +1459,7 @@ mod tests {
             rating: None,
             note_path: None,
         };
-        let html = tile(&item, &ViewParams::default());
+        let html = tile(&item, &ViewParams::default(), None);
         assert!(
             html.contains(&format!("id=\"{}\"", crate::ui::tile_anchor(&item.path))),
             "{html}"
@@ -1303,7 +1481,7 @@ mod tests {
             rating: None,
             note_path: None,
         };
-        let html = tile(&item, &ViewParams::default());
+        let html = tile(&item, &ViewParams::default(), None);
         assert!(html.contains("alt=\"plain.png\""));
         assert!(
             !html.contains("?v="),
@@ -1313,6 +1491,12 @@ mod tests {
 
     /// The tile's own prefix is a contract: `tests/viewer.rs` reads a page's
     /// image paths back out of it.
+    ///
+    /// The `<a>`'s open tag must also close (after the tile's own attributes,
+    /// before its badge and its picture): a template that left the `>` to the
+    /// badge or the img swallowed whichever came first into the tag as a
+    /// bogus attribute — a tile a browser rendered as an empty box — and
+    /// every substring assertion around it still passed.
     #[test]
     fn a_tile_opens_with_the_attributes_the_pages_parse() {
         let item = ViewItem {
@@ -1324,15 +1508,20 @@ mod tests {
             rating: None,
             note_path: None,
         };
-        assert!(tile(&item, &ViewParams::default())
-            .starts_with("<a class=\"tile\" data-path=\"refs/a.png\""));
+        let html = tile(&item, &ViewParams::default(), None);
+        assert!(html.starts_with("<a class=\"tile\" data-path=\"refs/a.png\""));
+        assert!(
+            html.contains("title=\"a.png\"><img loading=\"lazy\""),
+            "the open tag closes before the picture begins: {html}"
+        );
     }
 
     /// W34 audit #3 / DESIGN.md §4.5: the whole name stays reachable while the
-    /// caption is hidden, and the aspect hooks belong to the script — the tile
-    /// never states a crop it has not measured.
+    /// caption is hidden. An image whose header the index could not read keeps
+    /// the shape the grid always had — a square cell, and no crop stated for a
+    /// shape nobody measured (invariant 4).
     #[test]
-    fn a_tile_carries_the_whole_name_and_no_guessed_aspect() {
+    fn a_tile_whose_header_is_unknown_states_no_shape() {
         let item = ViewItem {
             path: "refs/猫 & co.png".into(),
             size: 1,
@@ -1342,15 +1531,324 @@ mod tests {
             rating: None,
             note_path: None,
         };
-        let html = tile(&item, &ViewParams::default());
+        let html = tile(&item, &ViewParams::default(), None);
         assert!(html.contains("title=\"猫 &amp; co\""), "{html}");
         assert!(html.contains("alt=\"猫 &amp; co\""), "{html}");
-        for hook in ["data-fit", "data-w", "data-h"] {
+        assert!(html.contains("style=\"--ar:1.000\""), "{html}");
+        for hook in [
+            "data-fit",
+            "data-w",
+            "data-h",
+            " width=",
+            " height=",
+            "tile-badge",
+        ] {
             assert!(
                 !html.contains(hook),
-                "the aspect is measured in the browser, not assumed: {html}"
+                "an unknown header states no size and no crop: {html}"
             );
         }
+    }
+
+    /// W49: a tile with a known header carries the picture's own dimensions —
+    /// on the image, where a browser reserves space before the bytes arrive —
+    /// and the ratio a justified row is laid out by. Nothing here depends on a
+    /// thumbnail having loaded, so the grid does not jump while they load.
+    #[test]
+    fn a_tile_with_known_dimensions_carries_them_and_its_row_ratio() {
+        let item = ViewItem {
+            path: "refs/a.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        };
+        let landscape = Some(ImageMeta {
+            width: Some(1200),
+            height: Some(800),
+            taken_ns: Some(1_689_191_647_000_000_000),
+            taken_reason: None,
+        });
+        let html = tile(&item, &ViewParams::default(), landscape);
+        assert!(
+            html.contains("alt=\"a.png\" width=\"1200\" height=\"800\""),
+            "{html}"
+        );
+        assert!(html.contains("style=\"--ar:1.500\""), "{html}");
+        assert!(html.contains("data-fit=\"normal\""), "{html}");
+        assert!(
+            !html.contains("tile-badge"),
+            "an ordinary picture is not cropped, so it carries no badge: {html}"
+        );
+        assert!(
+            !html.contains("tile-notime"),
+            "no taken mark outside the taken order: {html}"
+        );
+
+        // A portrait is the same two numbers read the other way round.
+        let portrait = Some(ImageMeta {
+            width: Some(600),
+            height: Some(900),
+            taken_ns: None,
+            taken_reason: None,
+        });
+        let html = tile(&item, &ViewParams::default(), portrait);
+        assert!(html.contains("style=\"--ar:0.667\""), "{html}");
+        assert!(html.contains("width=\"600\" height=\"900\""), "{html}");
+    }
+
+    /// The clamp is the design system's, and it exists so an extreme picture
+    /// cannot make its own cell wider than the column — a row must never
+    /// overflow. DESIGN.md §5.4's 0.4 and 2.5, both inclusive here.
+    #[test]
+    fn a_row_ratio_is_clamped_to_the_shape_the_grid_can_crop() {
+        assert_eq!(
+            aspect_ratio(Some(ImageMeta {
+                width: Some(10_000),
+                height: Some(1_000),
+                taken_ns: None,
+                taken_reason: None,
+            })),
+            "--ar:2.500"
+        );
+        assert_eq!(
+            aspect_ratio(Some(ImageMeta {
+                width: Some(1_000),
+                height: Some(10_000),
+                taken_ns: None,
+                taken_reason: None,
+            })),
+            "--ar:0.400"
+        );
+        // Inside the range the picture keeps its own shape.
+        assert_eq!(
+            aspect_ratio(Some(ImageMeta {
+                width: Some(2_500),
+                height: Some(1_000),
+                taken_ns: None,
+                taken_reason: None,
+            })),
+            "--ar:2.500"
+        );
+    }
+
+    /// A half-known pair is no shape: one dimension without the other lands in
+    /// the square cell rather than in a ratio built from half the truth.
+    #[test]
+    fn half_a_shape_is_the_unknown_shape() {
+        for meta in [
+            Some(ImageMeta {
+                width: Some(1200),
+                height: None,
+                taken_ns: None,
+                taken_reason: None,
+            }),
+            Some(ImageMeta {
+                width: None,
+                height: Some(800),
+                taken_ns: None,
+                taken_reason: None,
+            }),
+            Some(ImageMeta {
+                width: Some(0),
+                height: Some(800),
+                taken_ns: None,
+                taken_reason: None,
+            }),
+            // A row the refresh recorded as unreadable: the unknown itself.
+            Some(ImageMeta {
+                width: None,
+                height: None,
+                taken_ns: None,
+                taken_reason: None,
+            }),
+        ] {
+            assert_eq!(aspect_ratio(meta), "--ar:1.000", "{meta:?}");
+        }
+    }
+
+    /// The two crop thresholds are DESIGN.md §5.4's and both boundaries are
+    /// exclusive, so an extreme shape is cropped (and badged) exactly where the
+    /// square tile cropped it.
+    #[test]
+    fn an_extreme_shape_is_cropped_and_badged_from_the_index() {
+        let item = ViewItem {
+            path: "refs/a.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        };
+        let tall = Some(ImageMeta {
+            width: Some(780),
+            height: Some(48_000),
+            taken_ns: None,
+            taken_reason: None,
+        });
+        let html = tile(&item, &ViewParams::default(), tall);
+        assert!(html.contains("data-fit=\"tall\""), "{html}");
+        assert!(html.contains("class=\"tile-badge\""), "{html}");
+        assert!(html.contains("Tall image"), "{html}");
+        // `data-fit` is an attribute of the tag and the badge is an element
+        // inside it: the tag closes between the two, so a browser reads the
+        // badge as the label it is (and never as stray attributes).
+        assert!(
+            html.contains("title=\"a.png\" data-fit=\"tall\"><span class=\"tile-badge\""),
+            "{html}"
+        );
+
+        // Exactly 0.4 and exactly 2.5 are ordinary pictures.
+        for (width, height) in [(4, 10), (25, 10)] {
+            let meta = Some(ImageMeta {
+                width: Some(width),
+                height: Some(height),
+                taken_ns: None,
+                taken_reason: None,
+            });
+            let html = tile(&item, &ViewParams::default(), meta);
+            assert!(
+                html.contains("data-fit=\"normal\""),
+                "{width}/{height}: {html}"
+            );
+            assert!(!html.contains("tile-badge"), "{width}/{height}: {html}");
+        }
+    }
+
+    /// W49: the "Taken" sort orders by a fact a picture may not carry, so the
+    /// grid says which images carry none — those sit last, and a tile that
+    /// said nothing would read as "the oldest pictures" (invariant 4).
+    #[test]
+    fn a_taken_ordered_view_marks_the_tiles_with_no_taken_time() {
+        let item = ViewItem {
+            path: "refs/a.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        };
+        let unknown = Some(ImageMeta {
+            width: Some(1200),
+            height: Some(800),
+            taken_ns: None,
+            taken_reason: None,
+        });
+        let known = Some(ImageMeta {
+            width: Some(1200),
+            height: Some(800),
+            taken_ns: Some(1_689_191_647_000_000_000),
+            taken_reason: None,
+        });
+
+        for direction in ["desc", "asc"] {
+            let params = ViewParams::parse(&format!("sort=taken&dir={direction}"));
+            assert!(params.orders_by_taken(), "{direction}");
+
+            let html = tile(&item, &params, unknown);
+            assert!(
+                html.contains("class=\"tile-notime\""),
+                "{direction}: {html}"
+            );
+            assert!(
+                html.contains("No taken time"),
+                "the tooltip names the unknown: {direction}: {html}"
+            );
+            assert!(
+                !tile(&item, &params, known).contains("tile-notime"),
+                "an image with a date is not marked: {direction}"
+            );
+            // The order is what brings the unknown into view, so any other
+            // order stays quiet about it.
+            assert!(
+                !tile(&item, &ViewParams::default(), unknown).contains("tile-notime"),
+                "outside the taken order the mark would be noise"
+            );
+        }
+    }
+
+    /// The justified rows are progressive enhancement: the plain grid is the
+    /// base, and `data-justify` is what asks the stylesheet for the rows — the
+    /// `js` class on the document, which only a script adds, is the switch.
+    #[test]
+    fn the_grid_asks_for_justified_rows_and_marks_a_taken_order() {
+        let items = vec![ViewItem {
+            path: "refs/a.png".into(),
+            size: 1,
+            mtime_ns: 0,
+            added_ns: 0,
+            title: None,
+            rating: None,
+            note_path: None,
+        }];
+        let plain = grid(&items, &ViewParams::default(), &TileMetas::new());
+        assert!(plain.contains("<section class=\"grid size-m\" data-total=\"1\" data-justify>"));
+        assert!(
+            !plain.contains("data-taken"),
+            "only a taken-ordered grid is marked: {plain}"
+        );
+
+        let taken = grid(&items, &ViewParams::parse("sort=taken"), &TileMetas::new());
+        assert!(taken.contains("data-justify data-taken>"), "{taken}");
+    }
+
+    /// A grid of known shapes passes each tile its own facts: the ratio, the
+    /// size attributes, and the taken mark, all from the index.
+    #[test]
+    fn a_grid_lays_each_tile_out_by_its_own_indexed_shape() {
+        let items = vec![
+            ViewItem {
+                path: "refs/a.png".into(),
+                size: 1,
+                mtime_ns: 0,
+                added_ns: 0,
+                title: None,
+                rating: None,
+                note_path: None,
+            },
+            ViewItem {
+                path: "refs/b.png".into(),
+                size: 1,
+                mtime_ns: 0,
+                added_ns: 0,
+                title: None,
+                rating: None,
+                note_path: None,
+            },
+        ];
+        let mut metas = TileMetas::new();
+        metas.insert(
+            "refs/a.png".to_owned(),
+            ImageMeta {
+                width: Some(600),
+                height: Some(1200),
+                taken_ns: None,
+                taken_reason: None,
+            },
+        );
+        metas.insert(
+            "refs/b.png".to_owned(),
+            ImageMeta {
+                width: Some(1600),
+                height: Some(900),
+                taken_ns: Some(1_689_191_647_000_000_000),
+                taken_reason: None,
+            },
+        );
+        let html = grid(&items, &ViewParams::parse("sort=taken"), &metas);
+        assert!(html.contains("style=\"--ar:0.500\""), "{html}");
+        assert!(html.contains("width=\"600\" height=\"1200\""), "{html}");
+        assert!(html.contains("style=\"--ar:1.778\""), "{html}");
+        assert!(html.contains("width=\"1600\" height=\"900\""), "{html}");
+        assert_eq!(
+            html.matches("tile-notime").count(),
+            1,
+            "only the image with no taken time is marked: {html}"
+        );
     }
 
     #[test]
@@ -1634,21 +2132,5 @@ mod tests {
     #[test]
     fn a_page_past_the_end_of_a_one_item_view_says_item() {
         assert!(past_end_state(&ViewParams::parse("p=2"), 1).contains("This view has 1 item;"));
-    }
-}
-#[cfg(test)]
-mod debug_probe {
-    #[test]
-    fn probe() {
-        println!(
-            "SIZE: {}",
-            super::size_toggles(&crate::view_query::ViewParams::parse("in=refs&size=l"))
-        );
-        println!(
-            "CHIP: {}",
-            super::scope_chips(&crate::view_query::ViewParams::parse(
-                "in=refs/ui&tag=eagle&tag=nature&q=street&c=browse.md"
-            ))
-        );
     }
 }

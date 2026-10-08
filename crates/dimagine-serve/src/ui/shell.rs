@@ -7,7 +7,7 @@
 use crate::assets::{css_url, js_url};
 use crate::index_sync::SidebarData;
 use crate::ui::escape_html;
-use crate::view_query::{Direction, SortKey, ViewParams};
+use crate::view_query::{Direction, ViewParams, ViewSort};
 
 /// W43: the theme boot, inlined into `<head>` so a stored choice paints
 /// before the first frame — `app.js` is `defer`red and can arrive after the
@@ -199,16 +199,25 @@ impl<'a> Frame<'a> {
 }
 
 /// The sort choices offered by the top-bar menu, in menu order.
-pub const SORT_CHOICES: [(SortKey, Direction, &str); 9] = [
-    (SortKey::Added, Direction::Desc, "Added ↓"),
-    (SortKey::Added, Direction::Asc, "Added ↑"),
-    (SortKey::Modified, Direction::Desc, "Modified ↓"),
-    (SortKey::Modified, Direction::Asc, "Modified ↑"),
-    (SortKey::Name, Direction::Asc, "Name A→Z"),
-    (SortKey::Name, Direction::Desc, "Name Z→A"),
-    (SortKey::Size, Direction::Desc, "Largest first"),
-    (SortKey::Size, Direction::Asc, "Smallest first"),
-    (SortKey::Rating, Direction::Desc, "Rating ★"),
+///
+/// The two times a person sorts by sit together at the top: "Added" is when
+/// the file came in, "Taken" is when the camera took the picture. The arrows
+/// mean the same in both pairs (↓ is the newer end first). Only "Taken" can be
+/// unknown — a screenshot, a scan, a JPEG without a date — and the menu does
+/// not pretend otherwise: the grid marks the tiles with no taken time while
+/// this order is in force, so an unknown is never read as a date (invariant 4).
+pub const SORT_CHOICES: [(ViewSort, Direction, &str); 11] = [
+    (ViewSort::Added, Direction::Desc, "Added ↓"),
+    (ViewSort::Added, Direction::Asc, "Added ↑"),
+    (ViewSort::Taken, Direction::Desc, "Taken ↓"),
+    (ViewSort::Taken, Direction::Asc, "Taken ↑"),
+    (ViewSort::Modified, Direction::Desc, "Modified ↓"),
+    (ViewSort::Modified, Direction::Asc, "Modified ↑"),
+    (ViewSort::Name, Direction::Asc, "Name A→Z"),
+    (ViewSort::Name, Direction::Desc, "Name Z→A"),
+    (ViewSort::Size, Direction::Desc, "Largest first"),
+    (ViewSort::Size, Direction::Asc, "Smallest first"),
+    (ViewSort::Rating, Direction::Desc, "Rating ★"),
 ];
 
 #[cfg(test)]

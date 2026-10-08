@@ -792,6 +792,132 @@ html[data-theme="light"] .tile-badge {
   }
 }
 
+/* ===================== W49 · justified rows (Phase 2 grid) ================
+ *
+ * The grid above is the base and needs nothing: `display: grid`, square
+ * cells, one link per picture. The justified rows are the enhancement, and
+ * they are gated on `html.js` — the class the script adds to the document —
+ * so a browser without JavaScript keeps a complete grid and nothing about the
+ * grid depends on a script arriving (K27 Motion 5: Phase 2 adds justified
+ * rows once the dimensions are indexed; W48 indexes them).
+ *
+ * A row is a line of tiles of one height that fills the column. Each tile
+ * carries the picture's own ratio as `--ar` (its width over its height, or 1
+ * for a header the index could not read — the square cell the grid always had)
+ * and the line's height is `--row-h`, which the size step picks:
+ *
+ *   width: calc(var(--ar) * var(--row-h))   this picture's shape at this height
+ *   flex: var(--ar) 0 auto                 grow in proportion, never shrink
+ *   height: var(--row-h)                   one height for the whole line
+ *
+ * Flexbox wraps on those widths, then shares the pixels left over on each line
+ * out by the same ratio — so a row ends exactly at the column edge while every
+ * tile in it still shows its own aspect, uncropped. The order is the order the
+ * server wrote: flex wraps in DOM order, so the keyboard's focus order follows
+ * the eye down each row.
+ *
+ * `--ar` is clamped to 0.4…2.5 (DESIGN.md §5.4) where the server writes it,
+ * so a panorama is never wider than the column and a portrait never thinner;
+ * the two shapes the clamp crops carry the Tall / Wide badge, exactly as the
+ * square tile cropped them.
+ * ======================================================================= */
+
+.grid {
+  --row-h: 200px; /* M: the middle step of the size control */
+}
+
+.grid.size-s {
+  --row-h: 150px;
+}
+
+.grid.size-l {
+  --row-h: 300px;
+}
+
+/* The phone holds fewer of them per row, so the rows are shorter: the same
+   count the plain grid showed at this width, with the last row's slack. */
+@media (max-width: 767px) {
+  .grid {
+    --row-h: 132px;
+  }
+
+  .grid.size-s {
+    --row-h: 72px;
+  }
+
+  .grid.size-l {
+    --row-h: 210px;
+  }
+}
+
+.js .grid[data-justify] {
+  /* Only the display is replaced: the gutters stay the plain grid's own
+     (12px, 6px for S, the page padding), inherited from the `.grid` rules
+     above, so the enhancement changes the packing and never the rhythm —
+     and the root `--gap`/`--pad` tokens are the shell's, not the grid's. */
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.js .grid[data-justify] > .tile,
+.js .grid[data-justify] > .grid-item {
+  flex: var(--ar) 0 auto;
+  width: calc(var(--ar) * var(--row-h));
+  /* The ratio is clamped, but a tall row height can still ask for
+     more width than the column has (a phone's large step asks a
+     panorama for 525px of a 358px column), and a flex item never
+     shrinks. The capped tile simply takes a line of its own and the
+     picture stays whole inside it, so no row ever overflows. */
+  max-width: 100%;
+}
+
+.js .grid[data-justify] > .tile {
+  height: var(--row-h);
+  aspect-ratio: auto;
+}
+
+/* A collection member is a cell with the caption under it: the cell is what
+   the row is justified by, and the tile fills it at the row's height. */
+.js .grid[data-justify] > .grid-item > .tile {
+  width: 100%;
+  height: var(--row-h);
+  aspect-ratio: auto;
+}
+
+/* The last row has no edge to fill, so growing its tiles would stretch one
+   picture across the whole column. `app.js` marks that row `row-end` once it
+   can see where the lines fell; until then they grow, and a page whose script
+   never arrives shows the plain grid anyway. */
+.js .grid[data-justify] > .tile.row-end,
+.js .grid[data-justify] > .grid-item.row-end {
+  flex-grow: 0;
+}
+
+/* "No taken time", on a tile in a view ordered by the EXIF taken time: a small
+   mark, not a date — the one thing the order could be misread as saying. */
+.tile-notime {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 14px;
+  height: 14px;
+  border-radius: 4px; /* --radius-sm */
+  background: rgba(20, 22, 26, 0.66);
+  color: #fff;
+  pointer-events: none;
+}
+
+.tile-notime::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid currentcolor;
+  border-radius: 50%;
+}
+
 /* ------------------------------------------------------- cards & lists */
 
 .folder-grid,

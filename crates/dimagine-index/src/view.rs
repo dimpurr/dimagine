@@ -450,6 +450,7 @@ struct SortKeyValues {
     size: i64,
     name_key: String,
     rating: Option<i64>,
+    taken_ns: Option<i64>,
 }
 
 /// Read `image`'s `files` row. `None` when the index holds no such row — an
@@ -458,7 +459,8 @@ fn read_sort_key(index: &Index, image: &str) -> Result<Option<SortKeyValues>, In
     Ok(index
         .conn()?
         .query_row(
-            "SELECT added_ns, mtime_ns, size, name_key, rating FROM files WHERE path=?1",
+            "SELECT added_ns, mtime_ns, size, name_key, rating, taken_ns \
+             FROM files WHERE path=?1",
             [image],
             |row| {
                 Ok(SortKeyValues {
@@ -467,6 +469,7 @@ fn read_sort_key(index: &Index, image: &str) -> Result<Option<SortKeyValues>, In
                     size: row.get(2)?,
                     name_key: row.get(3)?,
                     rating: row.get(4)?,
+                    taken_ns: row.get(5)?,
                 })
             },
         )
@@ -479,6 +482,17 @@ fn read_sort_key(index: &Index, image: &str) -> Result<Option<SortKeyValues>, In
 /// of the row right after the image (whose existence the caller checks
 /// against the total, or the lens limit, before fetching).
 type NeighbourOffsets = (u64, Option<u64>, u64);
+
+/// Which order a neighbours walk follows: the view's own sort, or the EXIF
+/// taken time ([`Index::view_neighbours`] and
+/// [`Index::view_neighbours_by_taken`]). A collection view keeps its embed
+/// order under both, so [`Index::neighbours`] reads this only for the
+/// offsets, never for the collection's own.
+#[derive(Clone, Copy)]
+enum NeighbourOrder {
+    Sorted,
+    Taken,
+}
 
 /// The offsets of a sorted view: the position is the count of rows the view's
 /// own order puts before `image` plus one, and the neighbours are the rows at
@@ -503,22 +517,9 @@ fn sort_offsets(
         SortKey::Modified => key_before("f.mtime_ns", query.descending, key.mtime_ns, image),
         SortKey::Size => key_before("f.size", query.descending, key.size, image),
         SortKey::Name => key_before("f.name_key", query.descending, key.name_key, image),
-        SortKey::Rating => rating_before(query.descending, key.rating, image),
+        SortKey::Rating => nulls_last_before("f.rating", query.descending, key.rating, image),
     };
-    let extra: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|value| value.as_ref()).collect();
-    let rows_before: i64 = index.conn()?.query_row(
-        &format!(
-            "{with}SELECT count(*) {from} WHERE {where_sql} AND ({before})",
-            with = sql.with,
-            from = sql.count_from,
-            where_sql = sql.where_sql,
-            before = before
-        ),
-        bound_with(sql, &extra),
-        |row| row.get(0),
-    )?;
-    let position = rows_before.max(0) as u64 + 1;
-    Ok(Some((position, position.checked_sub(2), position)))
+    count_before(index, sql, &before, &binds).map(offsets_from_rows_before)
 }
 
 /// `(condition, binds)` for the rows a sort column orders strictly before
@@ -542,38 +543,93 @@ fn key_before<T: rusqlite::ToSql + Clone + 'static>(
     )
 }
 
-/// The rating sort's own comparison ([`order_by`]): `(f.rating IS NULL)` first,
-/// then `f.rating` in the view's direction, then the path. A `NULL` rating is
-/// a state, not a value ([`note_rating`](fn@note_rating)), so the two cases are
-/// written apart — one comparison for a rated current row, another for an
-/// unrated one — instead of one expression a SQL `NULL` would make leaky.
-fn rating_before(
+/// `(condition, binds)` for the rows a **NULLs-last** column orders strictly
+/// before `current` — the shape [`order_by`] gives a missing rating and
+/// [`order_by_taken`] a missing taken time, because both spell "an unknown,
+/// not a value", and neither flips its place with the direction.
+///
+/// `Some(current)` places a valued row: other values order before it by the
+/// comparison (greater in a descending view, smaller ascending), ties by path
+/// ascending, and a `NULL` row never before it in either direction — written
+/// apart, never as one expression a SQL `NULL` would make leaky. `None` places
+/// the row the flag sends last in both directions: every valued row comes
+/// before it, and among its own kind only the smaller paths do.
+fn nulls_last_before(
+    column: &str,
     descending: bool,
     current: Option<i64>,
     image: &str,
 ) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     match current {
-        Some(rating) => {
+        Some(value) => {
             let comparison = if descending { ">" } else { "<" };
             (
                 format!(
-                    "((f.rating IS NOT NULL AND f.rating {comparison} ?) \
-                     OR (f.rating = ? AND f.path < ?))"
+                    "({column} IS NOT NULL AND {column} {comparison} ?) \
+                     OR ({column} = ? AND f.path < ?)"
                 ),
                 vec![
-                    Box::new(rating) as Box<dyn rusqlite::ToSql>,
-                    Box::new(rating),
+                    Box::new(value) as Box<dyn rusqlite::ToSql>,
+                    Box::new(value),
                     Box::new(image.to_owned()),
                 ],
             )
         }
         None => (
-            // Every rated row comes before every unrated one, in both
-            // directions; unrated rows order by path among themselves.
-            "(f.rating IS NOT NULL OR (f.rating IS NULL AND f.path < ?))".to_owned(),
+            format!("({column} IS NOT NULL OR ({column} IS NULL AND f.path < ?))"),
             vec![Box::new(image.to_owned()) as Box<dyn rusqlite::ToSql>],
         ),
     }
+}
+
+/// The offsets of a taken-ordered view ([`order_by_taken`]): the same
+/// construction as [`sort_offsets`], over the EXIF taken time — a valued row
+/// orders against the other valued rows by the time and the path, and a row
+/// with no taken time — an unknown instant, not an old or a young one — holds
+/// the end of the view in both directions.
+fn taken_offsets(
+    index: &Index,
+    sql: &ViewSql,
+    query: &ViewQuery,
+    image: &str,
+) -> Result<Option<NeighbourOffsets>, IndexError> {
+    let Some(key) = read_sort_key(index, image)? else {
+        return Ok(None);
+    };
+    let (before, binds) = nulls_last_before("f.taken_ns", query.descending, key.taken_ns, image);
+    count_before(index, sql, &before, &binds).map(offsets_from_rows_before)
+}
+
+/// The rows a comparison places strictly before `image`, counted inside the
+/// view's own filters — the number [`sort_offsets`] and [`taken_offsets`] turn
+/// into a position.
+fn count_before(
+    index: &Index,
+    sql: &ViewSql,
+    before: &str,
+    binds: &[Box<dyn rusqlite::ToSql>],
+) -> Result<u64, IndexError> {
+    let extra: Vec<&dyn rusqlite::ToSql> = binds.iter().map(|value| value.as_ref()).collect();
+    let rows_before: i64 = index.conn()?.query_row(
+        &format!(
+            "{with}SELECT count(*) {from} WHERE {where_sql} AND ({before})",
+            with = sql.with,
+            from = sql.count_from,
+            where_sql = sql.where_sql,
+            before = before
+        ),
+        bound_with(sql, &extra),
+        |row| row.get(0),
+    )?;
+    Ok(rows_before.max(0) as u64)
+}
+
+/// The offsets a count of before-rows settles: the position one past it, the
+/// neighbour before at the index before that, and the neighbour after on the
+/// row that follows.
+fn offsets_from_rows_before(rows_before: u64) -> Option<NeighbourOffsets> {
+    let position = rows_before + 1;
+    Some((position, position.checked_sub(2), position))
 }
 
 /// The same offsets for a collection view: the members CTE orders rows by the
@@ -648,13 +704,18 @@ fn members_cte() -> &'static str {
 }
 
 /// The image at one 0-based offset in the view's own order, or `None` when the
-/// offset lies past the end. The statement is [`Index::view`]'s own page
-/// query, one row long, so what comes back is exactly what the grid showed at
-/// that place.
-fn row_at(index: &Index, query: &ViewQuery, offset: u64) -> Result<Option<String>, IndexError> {
+/// offset lies past the end. The statement is the view's own page query —
+/// [`Index::view`] for a sorted view, [`Index::view_by_taken`] under the taken
+/// order — one row long, so what comes back is exactly what the grid showed at
+/// that place in whichever order the caller walks.
+fn row_at(
+    index: &Index,
+    build: &dyn Fn() -> ViewSql,
+    offset: u64,
+) -> Result<Option<String>, IndexError> {
     // The offset fits an i64 the way any count does; and a rank that
     // overflowed u32 could not have survived the count queries.
-    let (statement, params) = view_sql(query).into_page(1, offset.min(i64::MAX as u64) as i64);
+    let (statement, params) = build().into_page(1, offset.min(i64::MAX as u64) as i64);
     Ok(index
         .conn()?
         .query_row(&statement, bound(&params), |row| row.get(0))
@@ -1062,7 +1123,9 @@ impl Index {
     }
 
     /// The paths, the position and the size of the view: one image's place
-    /// among its neighbours, in the order the view itself orders them.
+    /// among its neighbours, in the order the view itself orders them — sorted
+    /// by [`ViewQuery::sort`] ([`Index::view`]'s order). For the taken time's
+    /// own order see [`Index::view_neighbours_by_taken`].
     ///
     /// Every step is a query over the index: the membership, the image's own
     /// sort key, the count of rows the view orders before it, and the two rows
@@ -1081,7 +1144,43 @@ impl Index {
         image: &str,
         lens_limit: Option<u64>,
     ) -> Result<Option<Neighbours>, IndexError> {
-        let sql = view_sql(query);
+        self.neighbours(query, image, lens_limit, NeighbourOrder::Sorted)
+    }
+
+    /// The neighbours of one image in the view ordered by the EXIF taken
+    /// time — the walk of [`Index::view_by_taken`]'s order, so a "Taken" view
+    /// the grid showed is the same view the arrows walk.
+    ///
+    /// Identical to [`Index::view_neighbours`] in every other respect: the
+    /// same filters, the same membership question, the same caps — and a
+    /// collection still keeps its own embed order, which always comes first
+    /// ([`order_by_taken`]).
+    pub fn view_neighbours_by_taken(
+        &self,
+        query: &ViewQuery,
+        image: &str,
+        lens_limit: Option<u64>,
+    ) -> Result<Option<Neighbours>, IndexError> {
+        self.neighbours(query, image, lens_limit, NeighbourOrder::Taken)
+    }
+
+    /// The shared body of the two neighbour walks: membership, the total, the
+    /// offsets in the chosen order, and the rows at the neighbouring offsets.
+    fn neighbours(
+        &self,
+        query: &ViewQuery,
+        image: &str,
+        lens_limit: Option<u64>,
+        order: NeighbourOrder,
+    ) -> Result<Option<Neighbours>, IndexError> {
+        // The statement of the order that is in force, built fresh wherever a
+        // row has to come back in it — the page query, one row long, is the
+        // grid's own by construction.
+        let build = || match order {
+            NeighbourOrder::Sorted => view_sql(query),
+            NeighbourOrder::Taken => view_sql_with_order(query, order_by_taken(query)),
+        };
+        let sql = build();
         let conn = self.conn()?;
         // A view the image is not part of has no neighbours: a stale `v=`
         // on a link, a filter that excludes it, a collection it is not
@@ -1110,7 +1209,10 @@ impl Index {
         let (position, previous_offset, next_offset) = match if sql.collection {
             collection_offsets(self, &sql, query, image)?
         } else {
-            sort_offsets(self, &sql, query, image)?
+            match order {
+                NeighbourOrder::Sorted => sort_offsets(self, &sql, query, image)?,
+                NeighbourOrder::Taken => taken_offsets(self, &sql, query, image)?,
+            }
         } {
             // The counts above found nothing to place: the image left the
             // index between one query and the next, or a collection that
@@ -1133,15 +1235,15 @@ impl Index {
         Ok(Some(Neighbours {
             position,
             total,
-            // `view_sql` builds the same statement the grid page runs, so the
+            // The builder is the same statement the grid page runs, so the
             // row at an offset is the row the grid showed there — and the end
             // of the view answers `None`, never a wrap-around.
             previous: match previous_offset {
-                Some(offset) if offset < total => row_at(self, query, offset)?,
+                Some(offset) if offset < total => row_at(self, &build, offset)?,
                 _ => None,
             },
             next: if position < total {
-                row_at(self, query, next_offset)?
+                row_at(self, &build, next_offset)?
             } else {
                 None
             },

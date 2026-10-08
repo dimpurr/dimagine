@@ -8,7 +8,8 @@
 //   * single click selects a tile and fills the inspector (desktop)
 //   * arrows move the selection, Enter opens, Esc clears, / focuses search
 //   * "Load more" fetches the next page from /api/view and appends it
-//   * tiles crop only a measured extreme aspect ratio, and say so with a badge
+//   * tiles lay out in justified rows by the indexed dimensions
+//   * tiles crop only an extreme aspect ratio, and say so with a badge
 //   * recent views, kept on this device only
 //   * the theme is a choice on this device: Auto, Light or Dark
 //   * the chips inside the search capsule scroll, and the tag list filters
@@ -426,6 +427,10 @@
             grid.appendChild(tileElement(item));
           });
           watchTiles(grid);
+          // The whole document again, not the grid: querySelectorAll never
+          // returns the element it is called on, so the grid itself would
+          // not be re-measured and the appended page's last row would grow.
+          justifyRows(null);
           var shown = grid.querySelectorAll('.tile[data-path]').length;
           if (shown >= page.total) {
             loadMore.remove();
@@ -466,11 +471,32 @@
         })
         .join('/');
     tile.href = imageHref(item.path);
+    // The same shape the server rendered, from the same fields: the ratio the
+    // row is justified by, the two attributes the browser reserves space
+    // from, the crop the design system gives an extreme shape, and the mark on
+    // an image with no taken time while this view is ordered by it.
+    if (item.width && item.height) {
+      tile.style.setProperty('--ar', String(clampedRatio(item.width, item.height)));
+      var fit = knownFit(item.width, item.height);
+      if (fit) {
+        tile.dataset.fit = fit;
+        tile.appendChild(badgeElement(fit));
+      }
+    } else {
+      tile.style.setProperty('--ar', '1');
+    }
+    if (item.taken_ns === null && gridOrdersByTaken(tile)) {
+      tile.appendChild(noTimeElement());
+    }
 
     var image = document.createElement('img');
     image.loading = 'lazy';
     image.src = '/thumb/' + encodeURIComponent(item.path).replace(/%2F/g, '/');
     image.alt = label;
+    if (item.width && item.height) {
+      image.width = item.width;
+      image.height = item.height;
+    }
 
     var caption = document.createElement('span');
     caption.className = 'tile-caption';
@@ -491,9 +517,11 @@
 
   // The tile is square and the picture is whole. Only an extreme aspect ratio
   // is cropped (DESIGN.md §4.5 and §5.4: below 0.4 is tall, above 2.5 is
-  // wide), and the index stores no dimensions, so the ratio is measured from
-  // the thumbnail the browser has loaded. Nothing measured means no crop: the
-  // tile keeps its `contain` default rather than guessing a shape.
+  // wide). The server now knows each picture's dimensions (the index read
+  // them from the header), so the tile arrives with its shape, its `data-fit`
+  // and its badge already written — and this measurement is the fallback for
+  // a picture whose header the index could not read. Nothing measured means no
+  // crop: the tile keeps its `contain` default rather than guessing a shape.
   var TALL_BELOW = 0.4;
   var WIDE_ABOVE = 2.5;
   var TILE_BADGE = {
@@ -524,6 +552,33 @@
     return 'normal';
   }
 
+  // The fit for dimensions the index already read, written on the tile the
+  // same way the measurement writes it.
+  function knownFit(width, height) {
+    return tileFit(width, height);
+  }
+
+  // The ratio a justified row is laid out by: the picture's own shape, clamped
+  // to the same 0.4…2.5 the crop uses, so a panorama cannot be wider than the
+  // column and a portrait cannot be thinner. A shape nobody knows is 1 — the
+  // square cell the grid always had.
+  function clampedRatio(width, height) {
+    if (!width || !height) return 1;
+    var ratio = width / height;
+    if (ratio < 1 / WIDE_ABOVE) return 1 / WIDE_ABOVE;
+    if (ratio > WIDE_ABOVE) return WIDE_ABOVE;
+    return ratio;
+  }
+
+  function badgeElement(fit) {
+    var badge = document.createElement('span');
+    badge.className = 'tile-badge';
+    badge.setAttribute('aria-hidden', 'true');
+    badge.innerHTML = TILE_BADGE[fit].glyph;
+    badge.title = TILE_BADGE[fit].title;
+    return badge;
+  }
+
   function badgeFor(tile, fit) {
     var badge = tile.querySelector('.tile-badge');
     if (fit !== 'tall' && fit !== 'wide') {
@@ -531,13 +586,34 @@
       return;
     }
     if (!badge) {
-      badge = document.createElement('span');
-      badge.className = 'tile-badge';
-      badge.setAttribute('aria-hidden', 'true');
+      badge = badgeElement(fit);
       tile.appendChild(badge);
+      return;
     }
     badge.innerHTML = TILE_BADGE[fit].glyph;
     badge.title = TILE_BADGE[fit].title;
+  }
+
+  // The mark on an image with no taken time, in a view ordered by it (the
+  // server writes the same mark, and the same wording, on the tiles it
+  // rendered). An unknown instant is never shown as a date.
+  var NO_TIME_TITLE =
+    'No taken time — this image carries no EXIF date, so it sorts last';
+
+  function noTimeElement() {
+    var mark = document.createElement('span');
+    mark.className = 'tile-notime';
+    mark.title = NO_TIME_TITLE;
+    mark.setAttribute('aria-hidden', 'true');
+    return mark;
+  }
+
+  // Whether the grid it belongs to is ordered by the EXIF taken time — the
+  // `data-taken` the server marks such a grid with. Only there does "no taken
+  // time" need saying: in any other order it is not on screen to be misread.
+  function gridOrdersByTaken(tile) {
+    var grid = tile.closest ? tile.closest('.grid') : null;
+    return !!(grid && grid.hasAttribute('data-taken'));
   }
 
   function markBroken(tile) {
@@ -602,6 +678,41 @@
       });
     });
   }
+
+  /* -------------------------------------------- justified rows (W49) */
+
+  // The grid is a plain grid of square cells until this file marks the
+  // document `js`; the stylesheet then lays the rows out by the ratio each
+  // tile carries (`--ar`, from the indexed dimensions, 1 for a header the
+  // index could not read). A row fills the column by growing its tiles in
+  // proportion, which is right for every row but the last: that one has no
+  // edge to fill, so growing it would stretch a single picture across the
+  // whole column. Which tiles are on it is only knowable after layout, so
+  // measure and mark that row.
+  function justifyRows(scope) {
+    var grids = (scope || document).querySelectorAll('.grid[data-justify]');
+    Array.prototype.forEach.call(grids, function (grid) {
+      var tiles = grid.children;
+      if (!tiles.length) return;
+      var lastTop = tiles[tiles.length - 1].offsetTop;
+      for (var index = 0; index < tiles.length; index += 1) {
+        tiles[index].classList.toggle('row-end', tiles[index].offsetTop === lastTop);
+      }
+    });
+  }
+
+  // The rows fall differently at every width, and again when "Load more"
+  // appends a page, so both re-measure — at most once per frame, since
+  // reading a row's offset is a layout read.
+  var justifyPending = false;
+  window.addEventListener('resize', function () {
+    if (justifyPending) return;
+    justifyPending = true;
+    window.requestAnimationFrame(function () {
+      justifyPending = false;
+      justifyRows(null);
+    });
+  });
 
   // The image page's stage takes the picture's shape as well (W34 #2).
   function watchStage() {
@@ -837,6 +948,7 @@
   }
 
   watchTiles(null);
+  justifyRows(null);
   watchStage();
   captionEmbeds();
 

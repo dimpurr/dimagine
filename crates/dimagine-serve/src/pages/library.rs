@@ -9,11 +9,11 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
-use dimagine_index::{ViewItem, ViewPage};
+use dimagine_index::{ImageMeta, ViewItem, ViewPage};
 use serde::Serialize;
 
 use crate::index_sync::{recent_label, recent_window, SidebarData, RECENT_LIMIT};
-use crate::ui::components;
+use crate::ui::components::{self, TileMetas};
 use crate::ui::escape_html;
 use crate::ui::filters;
 use crate::ui::shell::{Destination, Frame};
@@ -31,10 +31,33 @@ pub struct ViewItemJson {
     pub title: Option<String>,
     pub rating: Option<u8>,
     pub note_path: Option<String>,
+    /// Pixel width, when the index read the header. `null` is an unknown — a
+    /// header that could not be read — never a zero and never a guess.
+    pub width: Option<u32>,
+    /// Pixel height, under the terms of [`ViewItemJson::width`].
+    pub height: Option<u32>,
+    /// The EXIF taken time in ns since the Unix epoch, `null` when the image
+    /// carries no readable one. The same fact the "Taken" sort orders by, so
+    /// an agent can see why a row sits where it does — an image with no taken
+    /// time is last in both directions, not the oldest.
+    pub taken_ns: Option<i64>,
 }
 
 impl From<&ViewItem> for ViewItemJson {
     fn from(item: &ViewItem) -> Self {
+        Self::from_meta(item, None)
+    }
+}
+
+impl ViewItemJson {
+    /// The item joined with the header facts the index holds for it.
+    ///
+    /// These three are the viewer's own addition to the page shape: the index's
+    /// [`ViewItem`] deliberately does not carry them (its `image_meta` is a
+    /// companion read), so this is the one place they join the row an agent
+    /// reads — the dimensions the grid laid out by and the taken time the
+    /// "Taken" sort ordered by.
+    pub fn from_meta(item: &ViewItem, meta: Option<&ImageMeta>) -> Self {
         Self {
             path: item.path.clone(),
             size: item.size,
@@ -43,6 +66,9 @@ impl From<&ViewItem> for ViewItemJson {
             title: item.title.clone(),
             rating: item.rating,
             note_path: item.note_path.clone(),
+            width: meta.and_then(|meta| meta.width),
+            height: meta.and_then(|meta| meta.height),
+            taken_ns: meta.and_then(|meta| meta.taken_ns),
         }
     }
 }
@@ -66,6 +92,26 @@ impl From<&ViewPage> for ViewPageJson {
             page: 1,
             page_size: PAGE_SIZE,
             items: page.items.iter().map(ViewItemJson::from).collect(),
+        }
+    }
+}
+
+impl ViewPageJson {
+    /// The page the index answered, each row joined with its header facts.
+    pub fn from_metas(page: &ViewPage, metas: &TileMetas) -> Self {
+        let items = page
+            .items
+            .iter()
+            .map(|item| {
+                let meta = metas.get(item.path.as_str()).copied();
+                ViewItemJson::from_meta(item, meta.as_ref())
+            })
+            .collect();
+        Self {
+            total: page.total,
+            page: 1,
+            page_size: PAGE_SIZE,
+            items,
         }
     }
 }
@@ -115,13 +161,13 @@ pub(crate) async fn library_page(
             // the library always gave for `/?c=<path>`, heading and grid and
             // nothing invented.
             None => (
-                plain_body(&params, &result.page, view_name.as_deref()),
+                plain_body(&params, &result.page, &result.metas, view_name.as_deref()),
                 (result.page.total, result.page.items.len() as u64),
             ),
         }
     } else {
         (
-            plain_body(&params, &result.page, view_name.as_deref()),
+            plain_body(&params, &result.page, &result.metas, view_name.as_deref()),
             (result.page.total, result.page.items.len() as u64),
         )
     };
@@ -168,8 +214,17 @@ fn wrap_with_panel(
 
 /// The body every non-collection view uses: the heading and the grid, or
 /// what is missing.
-fn plain_body(params: &ViewParams, page: &ViewPage, view_name: Option<&str>) -> String {
-    format!("{}{}", view_heading(view_name), grid_body(params, page))
+fn plain_body(
+    params: &ViewParams,
+    page: &ViewPage,
+    metas: &TileMetas,
+    view_name: Option<&str>,
+) -> String {
+    format!(
+        "{}{}",
+        view_heading(view_name),
+        grid_body(params, page, metas)
+    )
 }
 
 /// `GET /api/view` — the same page of the same query, as JSON.
@@ -187,7 +242,7 @@ pub(crate) async fn view_json(
     };
     let page = ViewPageJson {
         page: params.page,
-        ..ViewPageJson::from(&result.page)
+        ..ViewPageJson::from_metas(&result.page, &result.metas)
     };
     Json(page).into_response()
 }
@@ -204,29 +259,68 @@ pub(crate) async fn sidebar_json(State(state): State<AppState>) -> Response {
     }
 }
 
-/// What one request needs from the index: the page and the sidebar.
+/// What one request needs from the index: the page, the header facts of the
+/// images on it, and the sidebar.
 struct Page {
     page: ViewPage,
+    metas: TileMetas,
     sidebar: std::sync::Arc<SidebarData>,
 }
 
 /// Run one view query and read the sidebar the frame needs. `None` means the
 /// index could not answer, and the caller turns that into a reported error
 /// rather than an empty page.
+///
+/// The "Taken" sort is the one order the index answers as its own query
+/// (`Index::view_by_taken`); every other view, including the two that keep an
+/// order of their own (a collection's embeds, the Recent lens), goes through
+/// `Index::view`. Which one is in force is [`ViewParams::orders_by_taken`].
 fn read(state: &AppState, params: &ViewParams) -> Option<Page> {
-    let mut page = state.index.view(&params.to_index_query()).ok()?;
+    let query = params.to_index_query();
+    let mut page = if params.orders_by_taken() {
+        state.index.view_by_taken(&query).ok()?
+    } else {
+        state.index.view(&query).ok()?
+    };
     if params.recent {
         // Recent is "the last [`RECENT_LIMIT`] added" (W34 audit #10); the
         // index counts every match, so the lens states its own size here:
         // 200 or fewer, the same number the sidebar row shows.
         page.total = page.total.min(RECENT_LIMIT);
     }
+    // The header facts of the images on this page: one indexed row each, no
+    // file opened. A path the index does not hold simply has none, and its
+    // tile falls back to the square cell.
+    let metas = tile_metas(state, page.items.iter().map(|item| item.path.as_str()));
     let sidebar = state.index.sidebar_data().ok()?;
-    Some(Page { page, sidebar })
+    Some(Page {
+        page,
+        metas,
+        sidebar,
+    })
+}
+
+/// The header facts of the images on one page, keyed by path.
+///
+/// Each row is a lookup on the primary key of a table the refresh already
+/// filled, so a page of a hundred and twenty costs a hundred and twenty
+/// primary-key reads rather than a scan; a failure is an unknown, never a
+/// guessed shape (invariant 4).
+pub(crate) fn tile_metas<'p>(state: &AppState, paths: impl Iterator<Item = &'p str>) -> TileMetas {
+    let mut metas = TileMetas::new();
+    for path in paths {
+        // One read answers with the row or with `None` for a path the index
+        // never saw; only a failing index is skipped, and it is skipped as the
+        // unknown it is rather than failing the page.
+        if let Ok(Some(meta)) = state.index.image_meta(path) {
+            metas.insert(path.to_owned(), meta);
+        }
+    }
+    metas
 }
 
 /// The result area: the grid, or what is missing, and the way on.
-fn grid_body(params: &ViewParams, page: &ViewPage) -> String {
+fn grid_body(params: &ViewParams, page: &ViewPage, metas: &TileMetas) -> String {
     if page.items.is_empty() {
         // An empty slice with a non-zero total is not an empty view: the page
         // is past the end, and the empty view's words ("The library is empty")
@@ -240,7 +334,7 @@ fn grid_body(params: &ViewParams, page: &ViewPage) -> String {
     }
     format!(
         "{}{}",
-        components::grid(&page.items, params),
+        components::grid(&page.items, params, metas),
         components::load_more(params, page.total)
     )
 }
@@ -414,7 +508,7 @@ mod tests {
             total: 200,
             items: Vec::new(),
         };
-        let html = grid_body(&ViewParams::parse("recent=1&p=3"), &past);
+        let html = grid_body(&ViewParams::parse("recent=1&p=3"), &past, &TileMetas::new());
         assert!(html.contains("Nothing on this page"), "{html}");
         assert!(!html.contains("The library is empty"), "{html}");
         assert!(!html.contains("Nothing in Recent"), "{html}");
@@ -424,7 +518,7 @@ mod tests {
             total: 0,
             items: Vec::new(),
         };
-        let html = grid_body(&ViewParams::default(), &empty);
+        let html = grid_body(&ViewParams::default(), &empty, &TileMetas::new());
         assert!(html.contains("The library is empty"), "{html}");
     }
 }

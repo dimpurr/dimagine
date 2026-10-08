@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use dimagine_index::{AppearsIn, Neighbours};
+use dimagine_index::{AppearsIn, ImageMeta, Neighbours};
 use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -31,9 +31,9 @@ use crate::{catalog_error_page, error_page, error_response, AppState};
 const DESTINATION: crate::ui::shell::Destination = crate::ui::shell::Destination::Library;
 
 /// The aspect-ratio thresholds that crop a tile or a stage (DESIGN.md §5.4),
-/// the same pair the stylesheet's `data-fit` rules use.
-const TALL_BELOW: f64 = 0.4;
-const WIDE_ABOVE: f64 = 2.5;
+/// the same pair the stylesheet's `data-fit` rules use and the tile reads
+/// (`crate::ui::components`).
+use crate::ui::components::{TALL_BELOW, WIDE_ABOVE};
 
 /// A left chevron, the glyph of the prev link. A 16-unit grid and currentColor
 /// strokes, like every glyph in the shell.
@@ -67,23 +67,48 @@ pub(crate) async fn image_page(
     // index that cannot answer does not take the page down — it leaves the
     // picture and its note standing (W34: a half-answered page beats an
     // error where the answer was ornamental).
-    let neighbours = state
-        .index
-        .view_neighbours(
-            &context.params.to_index_query(),
-            &detail.path,
-            context.lens_limit(),
-        )
-        .unwrap_or(None);
+    //
+    // The walk follows the order the view it was reached from keeps: the
+    // ordinary sort for everything, and the EXIF taken time for a "Taken"
+    // view (`v=sort=taken`), so the arrows and the position ("3 / 124")
+    // never contradict the grid behind the back link. The two views that
+    // keep an order of their own — a collection's embeds, the Recent lens —
+    // are never taken-ordered (`ViewParams::orders_by_taken`), so they land
+    // on the ordinary walk here.
+    let neighbours = if context.params.orders_by_taken() {
+        state
+            .index
+            .view_neighbours_by_taken(
+                &context.params.to_index_query(),
+                &detail.path,
+                context.lens_limit(),
+            )
+            .unwrap_or(None)
+    } else {
+        state
+            .index
+            .view_neighbours(
+                &context.params.to_index_query(),
+                &detail.path,
+                context.lens_limit(),
+            )
+            .unwrap_or(None)
+    };
     // `None` here is the index declining to answer, which is a different fact
     // from answering "no collection embeds this picture" — the section says
     // which of the two it is (invariant 4).
     let appears_in = state.index.appears_in_titled(&detail.path).ok();
+    // What the refresh read from the image's own header: its pixel
+    // dimensions and the EXIF taken time. An index that cannot answer leaves
+    // them unknown and the page shows nothing about them, rather than
+    // inventing a shape or a date (invariant 4).
+    let meta = state.index.image_meta(&detail.path).ok().flatten();
     let body = image_body(
         &detail,
         appears_in.as_deref(),
         &context,
         neighbours.as_ref(),
+        meta,
     );
     let frame = Frame {
         banner: state.banner(),
@@ -237,6 +262,7 @@ fn image_body(
     appears_in: Option<&[AppearsIn]>,
     context: &ViewContext,
     neighbours: Option<&Neighbours>,
+    meta: Option<ImageMeta>,
 ) -> String {
     let path = encode_path(&detail.path);
     let title = title_of(detail);
@@ -256,13 +282,14 @@ fn image_body(
 
     // The stage takes the picture's shape (W34 #2): a tall screenshot fills the
     // column and scrolls inside the well instead of painting a sliver in a big
-    // empty box. When the note records the dimensions the fit is known here and
-    // the page is right on the first paint; otherwise the script measures the
-    // loaded image, and a shape nobody knows keeps the whole picture.
+    // empty box. The indexed dimensions settle it on the first paint, and a
+    // note that records them too is the fallback for an image the index does
+    // not know; otherwise the script measures the loaded image, and a shape
+    // nobody knows keeps the whole picture.
     out.push_str(&format!(
         "<div class=\"image-detail-layout\"><figure class=\"image-stage\"{}>\
          <img src=\"/media/{path}\" alt=\"{}\"></figure>",
-        fit_attribute(known_fit(&detail.properties)),
+        fit_attribute(stage_fit(detail, meta)),
         escape_html(&title)
     ));
     out.push_str("<div class=\"image-panel\" id=\"image-panel\">");
@@ -281,6 +308,7 @@ fn image_body(
         escape_html(&title)
     ));
     out.push_str(&path_row(&detail.path));
+    out.push_str(&image_facts_section(meta));
     if let Some(source) = source_link(detail) {
         out.push_str(&format!("<p class=\"image-source\">Source: {source}</p>"));
     }
@@ -322,6 +350,40 @@ fn image_body(
     ));
     out.push_str("</div></div></div>");
     out
+}
+
+/// The stage's shape, from the indexed dimensions first and the note's own
+/// recorded ones second.
+///
+/// The index reads the header the file actually has, after EXIF orientation,
+/// so it is the better source; the note's `width`/`height` (the Eagle import
+/// writes them) is the fallback for an image the index has not read yet. When
+/// neither has both dimensions the fit is unknown and the stage says nothing:
+/// it does not guess (invariant 4).
+fn stage_fit(detail: &ImageDetail, meta: Option<ImageMeta>) -> Option<&'static str> {
+    if let Some(ImageMeta {
+        width: Some(width),
+        height: Some(height),
+        ..
+    }) = meta
+    {
+        if width > 0 && height > 0 {
+            return Some(fit_of(f64::from(width) / f64::from(height)));
+        }
+    }
+    known_fit(&detail.properties)
+}
+
+/// The crop a shape gets (DESIGN.md §5.4): below 0.4 tall, above 2.5 wide,
+/// both boundaries exclusive.
+fn fit_of(ratio: f64) -> &'static str {
+    if ratio < TALL_BELOW {
+        "tall"
+    } else if ratio > WIDE_ABOVE {
+        "wide"
+    } else {
+        "normal"
+    }
 }
 
 /// The arrows and the position: prev/next within the view the page was
@@ -392,14 +454,7 @@ fn leaf_name(path: &str) -> &str {
 fn known_fit(properties: &Value) -> Option<&'static str> {
     let width = numeric_property(properties, "width")?;
     let height = numeric_property(properties, "height")?;
-    let ratio = width / height;
-    Some(if ratio < TALL_BELOW {
-        "tall"
-    } else if ratio > WIDE_ABOVE {
-        "wide"
-    } else {
-        "normal"
-    })
+    Some(fit_of(width / height))
 }
 
 /// A property as a usable number: `3429`, `"3429"` and `1.5` all count.
@@ -417,6 +472,66 @@ fn numeric_property(properties: &Value, key: &str) -> Option<f64> {
 fn fit_attribute(fit: Option<&str>) -> String {
     fit.map(|fit| format!(" data-fit=\"{fit}\""))
         .unwrap_or_default()
+}
+
+/// What the image's own header says about it: its pixel dimensions and the
+/// EXIF "taken" time, as the refresh read them.
+///
+/// Two rows, in the Properties table's shape (DESIGN.md §4.6), placed beside
+/// the picture they describe rather than among the note's own properties —
+/// these are facts about the bytes, which the note does not own.
+///
+/// The section appears when the index holds a row for the image. A fact that is
+/// `NULL` there is a recorded unknown — a header that could not be read, or a
+/// picture with no date in it — and it is shown as the word "Unknown" rather
+/// than left out or filled with a placeholder date (invariant 4). An image the
+/// index holds no row for at all says nothing here: there is nothing recorded
+/// to report.
+fn image_facts_section(meta: Option<ImageMeta>) -> String {
+    let Some(meta) = meta else {
+        return String::new();
+    };
+    let dimensions = match (meta.width, meta.height) {
+        (Some(width), Some(height)) if width > 0 && height > 0 => {
+            format!("<dd>{width} × {height}</dd>")
+        }
+        // One dimension without the other is no shape at all, so the pair is
+        // the unknown rather than half a number.
+        _ => "<dd>Unknown</dd>".to_owned(),
+    };
+    let taken = match meta.taken_ns.and_then(taken_value) {
+        Some(taken) => taken,
+        None => "<dd>Unknown</dd>".to_owned(),
+    };
+    format!(
+        "<section class=\"image-section\"><h2>Image</h2><dl class=\"property-list\">\
+         <div class=\"property\"><dt>Dimensions</dt>{dimensions}</div>\
+         <div class=\"property\"><dt>Taken</dt>{taken}</div></dl></section>"
+    )
+}
+
+/// The EXIF taken time, as a machine-readable `<time>` beside the words a
+/// person reads.
+///
+/// The instant is stored in UTC and the camera's own offset is not stored with
+/// it, so the page says UTC rather than re-labelling the time as the reader's
+/// zone — a shift nobody recorded is not applied to a recorded time. Seconds
+/// appear only when the EXIF block refined below the minute, so an ordinary
+/// photo is not padded with a `:00` that was never written.
+fn taken_value(taken_ns: i64) -> Option<String> {
+    let seconds = taken_ns.div_euclid(1_000_000_000);
+    let nanos = taken_ns.rem_euclid(1_000_000_000) as u32;
+    let moment = DateTime::from_timestamp(seconds, nanos)?;
+    let clock = if nanos == 0 {
+        moment.format("%d %b %Y, %H:%M")
+    } else {
+        moment.format("%d %b %Y, %H:%M:%S")
+    };
+    Some(format!(
+        "<dd><time datetime=\"{}\">{} UTC</time></dd>",
+        escape_html(&moment.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+        escape_html(&clock.to_string())
+    ))
 }
 
 /// The properties as a definition list: the known FORMAT
@@ -762,7 +877,7 @@ mod tests {
         let image = "refs/猫.png";
         // A tile carries the view query without its `?`.
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(&detail(), Some(&[]), &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(
             html.contains(&format!("href=\"/?tag=eagle#{}\"", tile_anchor(image))),
             "{html}"
@@ -778,7 +893,7 @@ mod tests {
             plain.back_href(image, None),
             format!("/#{}", tile_anchor(image))
         );
-        let html = image_body(&detail(), Some(&[]), &plain, None);
+        let html = image_body(&detail(), Some(&[]), &plain, None, None);
         assert!(
             html.contains(&format!("href=\"/#{}\">← Back to view", tile_anchor(image))),
             "{html}"
@@ -833,7 +948,7 @@ mod tests {
     #[test]
     fn a_collection_answer_that_did_not_arrive_is_not_called_an_empty_one() {
         let (context, _) = plain();
-        let silent = image_body(&detail(), None, &context, None);
+        let silent = image_body(&detail(), None, &context, None, None);
         assert!(
             silent.contains(
                 "<p class=\"appears-in-empty\">The collections could not be read right now.</p>"
@@ -845,7 +960,7 @@ mod tests {
             "an unknown is not an empty row: {silent}"
         );
         // The answered "none" keeps its own sentence, unchanged.
-        let answered = image_body(&detail(), Some(&[]), &context, None);
+        let answered = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(answered.contains("Not in any collection."), "{answered}");
         assert!(!answered.contains("could not be read"), "{answered}");
     }
@@ -892,7 +1007,13 @@ mod tests {
     #[test]
     fn the_arrows_walk_the_view_and_the_position_names_it() {
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours_at(3, 124)));
+        let html = image_body(
+            &detail(),
+            Some(&[]),
+            &context,
+            Some(&neighbours_at(3, 124)),
+            None,
+        );
         // Both links carry the same view the page arrived with, spelled as
         // the tiles spell it, and name their image for the tooltip.
         assert!(
@@ -915,7 +1036,13 @@ mod tests {
         );
         // The plain library needs no ?v= on its arrows ...
         let (plain, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &plain, Some(&neighbours_at(1, 4)));
+        let html = image_body(
+            &detail(),
+            Some(&[]),
+            &plain,
+            Some(&neighbours_at(1, 4)),
+            None,
+        );
         assert!(html.contains("href=\"/image/refs/prev1.png\" "), "{html}");
         assert!(html.contains("title=\"All\">1 / 4</span>"), "{html}");
     }
@@ -928,7 +1055,7 @@ mod tests {
         let (context, _) = plain();
         let mut neighbours = neighbours_at(1, 4);
         neighbours.previous = None;
-        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours));
+        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours), None);
         assert!(
             html.contains("<span class=\"image-nav-prev nav-end\" aria-hidden=\"true\">"),
             "{html}"
@@ -948,7 +1075,7 @@ mod tests {
     #[test]
     fn an_image_the_view_does_not_show_walks_nowhere() {
         let context = view_context(Some("c=none.md"));
-        let html = image_body(&detail(), Some(&[]), &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(!html.contains("image-nav"), "{html}");
         assert!(html.contains("Back to view"), "{html}");
     }
@@ -956,7 +1083,7 @@ mod tests {
     #[test]
     fn the_path_is_shown_and_copyable_and_the_note_is_sanitised() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(html.contains("data-copy-text=\"refs/猫.png\""));
         assert!(html.contains("A <strong>quiet</strong> cat"));
         assert!(html.contains("&lt;script&gt;"));
@@ -980,6 +1107,7 @@ mod tests {
             ]),
             &context,
             None,
+            None,
         );
         assert!(html.contains("href=\"https://example.com/pic/1\""));
         assert!(html.contains("rel=\"noreferrer noopener\""));
@@ -994,6 +1122,29 @@ mod tests {
         assert!(html.contains("猫.png.eagle.json"));
     }
 
+    /// A picture with no note beside it has no tags and no note text to show,
+    /// and the panel says nothing about either rather than opening an empty
+    /// section; what it does keep is the picture itself and the collections
+    /// that name it (K27 principle 4: never a picture without its facts).
+    #[test]
+    fn an_image_with_no_note_shows_no_tags_and_no_note() {
+        let bare = ImageDetail {
+            path: "plain.png".into(),
+            properties: json!({}),
+            front_matter_error: None,
+            body: String::new(),
+            body_html: None,
+            raw_files: Vec::new(),
+            note_path: None,
+        };
+        let (context, _) = plain();
+        let html = image_body(&bare, Some(&[]), &context, None, None);
+        assert!(!html.contains("<h2>Tags</h2>"), "{html}");
+        assert!(!html.contains("<h2>Note</h2>"), "{html}");
+        assert!(html.contains("alt=\"plain.png\""), "{html}");
+        assert!(html.contains("Not in any collection."), "{html}");
+    }
+
     /// A collection's title is library content: whatever it says, it reaches
     /// the page escaped, and the link stays a link to this origin.
     #[test]
@@ -1003,7 +1154,7 @@ mod tests {
             note_path: "sets/x.md".into(),
             title: "\"><img onerror=alert(1)><svg><script>".into(),
         }];
-        let html = image_body(&detail(), Some(&appears_in), &context, None);
+        let html = image_body(&detail(), Some(&appears_in), &context, None, None);
         assert!(
             html.contains("Appears in</h2><ul class=\"appears-in\">"),
             "{html}"
@@ -1027,7 +1178,7 @@ mod tests {
     #[test]
     fn an_image_in_no_collection_says_so() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(html.contains("<h2>Appears in</h2>"), "{html}");
         assert!(html.contains("Not in any collection."), "{html}");
     }
@@ -1035,7 +1186,7 @@ mod tests {
     #[test]
     fn the_sheet_handle_names_the_picture_and_controls_the_panel() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None);
+        let html = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(
             html.contains(
                 "class=\"sheet-handle\" aria-expanded=\"false\" aria-controls=\"image-panel\""
@@ -1069,7 +1220,7 @@ mod tests {
         let mut detail = detail();
         detail.front_matter_error = Some("expected a list".into());
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
         assert!(html.contains("Front matter error: expected a list"));
     }
 
@@ -1090,7 +1241,7 @@ mod tests {
             "height": 3429,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
 
         // A definition list, not raw JSON.
         assert!(html.contains("<dl class=\"property-list\">"), "{html}");
@@ -1130,7 +1281,7 @@ mod tests {
             "imported": "2026-10-04T14:30:12+01:00",
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<dt>Created</dt><dd><span title=\"2021-10-15\">15 Oct 2021</span></dd>"),
             "{html}"
@@ -1146,7 +1297,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({ "created": "sometime last year" });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<span title=\"sometime last year\">sometime last year</span>"),
             "{html}"
@@ -1158,7 +1309,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({"title": "猫", "height": 3429});
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<details class=\"properties-raw\"><summary>Raw properties</summary>"),
             "{html}"
@@ -1183,7 +1334,7 @@ mod tests {
             "height": null,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None);
+        let html = image_body(&detail, Some(&[]), &context, None, None);
         assert!(html.contains("<dt>Title</dt>"), "{html}");
         assert!(!html.contains("<dt>Tags</dt>"), "{html}");
         assert!(!html.contains("<dt>height</dt>"), "{html}");
@@ -1198,16 +1349,16 @@ mod tests {
         // A phone screenshot, and a panorama.
         detail.properties = json!({"width": 780, "height": 48000});
         assert!(
-            image_body(&detail, Some(&[]), &context, None)
+            image_body(&detail, Some(&[]), &context, None, None)
                 .contains("class=\"image-stage\" data-fit=\"tall\""),
             "a tall picture fills the column and scrolls"
         );
         detail.properties = json!({"width": 2400, "height": 800});
-        assert!(image_body(&detail, Some(&[]), &context, None)
+        assert!(image_body(&detail, Some(&[]), &context, None, None)
             .contains("class=\"image-stage\" data-fit=\"wide\""));
         // An ordinary picture, including one an importer wrote as text.
         detail.properties = json!({"width": "1200", "height": "800"});
-        assert!(image_body(&detail, Some(&[]), &context, None)
+        assert!(image_body(&detail, Some(&[]), &context, None, None)
             .contains("class=\"image-stage\" data-fit=\"normal\""));
     }
 
@@ -1229,7 +1380,7 @@ mod tests {
         let mut bare = detail();
         bare.properties = json!({});
         let (context, _) = plain();
-        let html = image_body(&bare, Some(&[]), &context, None);
+        let html = image_body(&bare, Some(&[]), &context, None, None);
         assert!(html.contains("<figure class=\"image-stage\">"), "{html}");
         assert!(!html.contains("data-fit"), "{html}");
     }
@@ -1254,6 +1405,160 @@ mod tests {
             known_fit(&json!({"width": 25.001, "height": 10})),
             Some("wide")
         );
+    }
+
+    /// W49: the page shows what the image's own header says — its dimensions
+    /// and the EXIF taken time — and says "Unknown" where the index recorded
+    /// none, rather than leaving a gap a reader would read as a value
+    /// (DESIGN.md §4.6, invariant 4).
+    #[test]
+    fn the_page_shows_the_taken_time_and_the_dimensions_when_it_knows_them() {
+        let (context, _) = plain();
+        let html = image_body(
+            &detail(),
+            Some(&[]),
+            &context,
+            None,
+            Some(ImageMeta {
+                width: Some(3024),
+                height: Some(4032),
+                taken_ns: Some(1_689_191_647_123_000_000),
+                taken_reason: None,
+            }),
+        );
+        assert!(
+            html.contains("<dt>Dimensions</dt><dd>3024 × 4032</dd>"),
+            "{html}"
+        );
+        // The instant as stored (UTC, milliseconds) and the words beside it.
+        assert!(
+            html.contains(
+                "<dt>Taken</dt><dd><time datetime=\"2023-07-12T19:54:07.123Z\">\
+                 12 Jul 2023, 19:54:07 UTC</time></dd>"
+            ),
+            "{html}"
+        );
+        assert!(html.contains("<h2>Image</h2>"), "{html}");
+    }
+
+    /// An unknown is a recorded fact and stays one all the way to the page: a
+    /// screenshot has no EXIF date, and the page says so rather than showing a
+    /// date nobody recorded or leaving an empty cell.
+    #[test]
+    fn an_unknown_header_fact_reads_as_unknown_never_as_a_value() {
+        let (context, _) = plain();
+        let html = image_body(
+            &detail(),
+            Some(&[]),
+            &context,
+            None,
+            Some(ImageMeta {
+                width: Some(1200),
+                height: None,
+                taken_ns: None,
+                taken_reason: None,
+            }),
+        );
+        assert_eq!(
+            html.matches("<dd>Unknown</dd>").count(),
+            2,
+            "half a shape is no shape, and no date is no date: {html}"
+        );
+        assert!(!html.contains("1200 ×"), "{html}");
+        assert!(
+            !html.contains("1970") && !html.contains("1 Jan"),
+            "an epoch is not a taken time: {html}"
+        );
+
+        // A header the refresh could not read at all: both facts unknown.
+        let unreadable = image_body(
+            &detail(),
+            Some(&[]),
+            &context,
+            None,
+            Some(ImageMeta {
+                width: None,
+                height: None,
+                taken_ns: None,
+                taken_reason: None,
+            }),
+        );
+        assert!(unreadable.contains("<h2>Image</h2>"), "{unreadable}");
+        assert_eq!(unreadable.matches("<dd>Unknown</dd>").count(), 2);
+
+        // An image the index holds no row for says nothing about its header.
+        let unindexed = image_body(&detail(), Some(&[]), &context, None, None);
+        assert!(!unindexed.contains("<h2>Image</h2>"), "{unindexed}");
+        assert!(!unindexed.contains("<dt>Taken</dt>"), "{unindexed}");
+    }
+
+    /// The stored instant is an instant, so it is shown in UTC — the camera's
+    /// own offset is not stored beside it, and a shift nobody recorded is not
+    /// applied to a recorded time. Seconds appear only when EXIF refined below
+    /// the minute.
+    #[test]
+    fn a_taken_time_reads_in_utc_and_drops_a_second_nobody_wrote() {
+        let whole = taken_value(1_689_191_647_000_000_000).unwrap();
+        assert!(whole.contains("12 Jul 2023, 19:54 UTC"), "{whole}");
+        assert!(
+            whole.contains(">12 Jul 2023, 19:54 UTC</time>"),
+            "the visible words carry no second EXIF never wrote: {whole}"
+        );
+        assert!(
+            whole.contains("datetime=\"2023-07-12T19:54:07.000Z\""),
+            "{whole}"
+        );
+
+        let refined = taken_value(1_689_191_647_123_000_000).unwrap();
+        assert!(refined.contains("19:54:07 UTC"), "{refined}");
+
+        // Before the epoch and far past it are still instants, not errors.
+        assert!(taken_value(-1_000_000_000).unwrap().contains("1969"));
+        assert!(taken_value(4_102_444_800_000_000_000)
+            .unwrap()
+            .contains("2100"));
+    }
+
+    /// The indexed dimensions are the better source for the stage's shape —
+    /// they are the file's own, after EXIF orientation — and the note's
+    /// recorded ones are the fallback.
+    #[test]
+    fn the_stage_takes_the_indexed_shape_first() {
+        let mut detail = detail();
+        let (context, _) = plain();
+        // The note claims an ordinary shape; the file is a panorama.
+        detail.properties = json!({"width": 1000, "height": 1000});
+        let html = image_body(
+            &detail,
+            Some(&[]),
+            &context,
+            None,
+            Some(ImageMeta {
+                width: Some(1600),
+                height: Some(400),
+                taken_ns: None,
+                taken_reason: None,
+            }),
+        );
+        assert!(
+            html.contains("class=\"image-stage\" data-fit=\"wide\""),
+            "the file's own dimensions win: {html}"
+        );
+
+        // Half a shape from the index falls back to what the note records.
+        let html = image_body(
+            &detail,
+            Some(&[]),
+            &context,
+            None,
+            Some(ImageMeta {
+                width: None,
+                height: Some(400),
+                taken_ns: None,
+                taken_reason: None,
+            }),
+        );
+        assert!(html.contains("data-fit=\"normal\""), "{html}");
     }
 
     /// An unreadable `v` falls back to the plain library for the walk too: the

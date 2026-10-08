@@ -13,7 +13,8 @@
 use dimagine_core::library::Library;
 use dimagine_core::sync_index;
 use dimagine_index::{
-    AppearsIn, FacetCounts, Index, IndexError, Neighbours, RecentWindow, ViewPage, ViewQuery,
+    AppearsIn, FacetCounts, ImageMeta, Index, IndexError, Neighbours, RecentWindow, ViewPage,
+    ViewQuery,
 };
 use serde::Serialize;
 use std::{
@@ -224,6 +225,32 @@ impl IndexHandle {
         }
     }
 
+    /// One page of images ordered by the EXIF taken time — the "Taken" sort.
+    ///
+    /// The same query, the same filters and the same paging as [`Self::view`],
+    /// ordered by [`ViewQuery::descending`] on the taken time instead of by
+    /// [`ViewQuery::sort`] (which this call ignores). Images with no taken time
+    /// are an unknown instant and come last in both directions.
+    pub fn view_by_taken(&self, query: &ViewQuery) -> Result<ViewPage, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.view_by_taken(query),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
+    /// What the index knows about one image's header: its pixel dimensions
+    /// and its EXIF taken time, `None` where the header could not be read.
+    ///
+    /// A viewer's grid asks per tile, so this is the row of an indexed lookup
+    /// rather than a scan: the facts are already stored beside the path the
+    /// view returned, and no image file is opened.
+    pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.image_meta(path),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
     /// The counts behind one filter panel: for every facet value, how many
     /// images it would show given the view's other filters.
     ///
@@ -271,6 +298,22 @@ impl IndexHandle {
     ) -> Result<Option<Neighbours>, IndexError> {
         match &*self.lock()? {
             Slot::Open(index) => index.view_neighbours(query, image_path, lens_limit),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
+    /// The same walk in the "Taken" order (W49): the view a taken-sorted grid
+    /// showed, walked by the image page the grid's tiles open. The caller
+    /// decides the order is in force ([`crate::view_query::ViewParams::orders_by_taken`]);
+    /// the query is the ordinary one, whose `sort` field decides nothing here.
+    pub fn view_neighbours_by_taken(
+        &self,
+        query: &ViewQuery,
+        image_path: &str,
+        lens_limit: Option<u64>,
+    ) -> Result<Option<Neighbours>, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.view_neighbours_by_taken(query, image_path, lens_limit),
             Slot::Closed(reason) => Err(reason.clone().into()),
         }
     }

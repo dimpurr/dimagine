@@ -6,8 +6,8 @@
 //! - `c`: collection note path
 //! - `tag`: repeatable, AND
 //! - `q`: full-text search string
-//! - `sort`: `added` | `modified` | `name` | `size` | `rating` (default: `added`)
-//! - `dir`: `asc` | `desc` (default: `desc` for added/modified/size/rating, `asc` for name)
+//! - `sort`: `added` | `taken` | `modified` | `name` | `size` | `rating` (default: `added`)
+//! - `dir`: `asc` | `desc` (default: `desc` for added/taken/modified/size/rating, `asc` for name)
 //! - `size`: `s` | `m` | `l` (default: `m`)
 //! - `p`: 1-based page number, 120 items per page (default: `1`)
 //!
@@ -98,34 +98,98 @@ impl Direction {
     }
 }
 
-/// Default direction for a sort key (Spec §2: desc for added/modified/size/rating, asc for name).
-pub fn default_direction(sort: SortKey) -> Direction {
-    match sort {
-        SortKey::Name => Direction::Asc,
-        SortKey::Added | SortKey::Modified | SortKey::Size | SortKey::Rating => Direction::Desc,
+/// How the viewer orders a view (`sort`).
+///
+/// Five of the six keys are the index's own [`SortKey`]. The sixth,
+/// [`ViewSort::Taken`], is the EXIF "taken" time: the index stores it per image
+/// but does not order by it in [`Index::view`](dimagine_index::Index::view) —
+/// it answers that order as its own query,
+/// [`Index::view_by_taken`](dimagine_index::Index::view_by_taken). So a Taken
+/// view is routed by [`ViewParams::orders_by_taken`] rather than by the sort
+/// field of the query [`ViewParams::to_index_query`] builds, and that field
+/// never decides the order of a Taken view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ViewSort {
+    #[default]
+    Added,
+    /// The EXIF taken time: newest first by default, and an image with no
+    /// taken time — an unknown instant, not an old or a young one — last in
+    /// both directions.
+    Taken,
+    Modified,
+    Name,
+    Size,
+    Rating,
+}
+
+impl ViewSort {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Added => "added",
+            Self::Taken => "taken",
+            Self::Modified => "modified",
+            Self::Name => "name",
+            Self::Size => "size",
+            Self::Rating => "rating",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "added" => Some(Self::Added),
+            "taken" => Some(Self::Taken),
+            "modified" => Some(Self::Modified),
+            "name" => Some(Self::Name),
+            "size" => Some(Self::Size),
+            "rating" => Some(Self::Rating),
+            _ => None,
+        }
+    }
+
+    /// The index sort key this view sort is answered by.
+    ///
+    /// [`ViewSort::Taken`] maps to [`SortKey::Added`] as a placeholder: the
+    /// index orders a page by taken time only through
+    /// [`Index::view_by_taken`](dimagine_index::Index::view_by_taken), which
+    /// ignores the `sort` field entirely, so what the field says here decides
+    /// nothing. Recording that in one place keeps it from being mistaken for a
+    /// decision somewhere else.
+    pub fn index_key(&self) -> SortKey {
+        match self {
+            Self::Added | Self::Taken => SortKey::Added,
+            Self::Modified => SortKey::Modified,
+            Self::Name => SortKey::Name,
+            Self::Size => SortKey::Size,
+            Self::Rating => SortKey::Rating,
+        }
     }
 }
 
-pub fn sort_key_as_str(sort: SortKey) -> &'static str {
+/// Default direction for a sort key (Spec §2: desc for
+/// added/taken/modified/size/rating, asc for name).
+pub fn default_direction(sort: ViewSort) -> Direction {
     match sort {
-        SortKey::Added => "added",
-        SortKey::Modified => "modified",
-        SortKey::Name => "name",
-        SortKey::Size => "size",
-        SortKey::Rating => "rating",
+        ViewSort::Name => Direction::Asc,
+        ViewSort::Added
+        | ViewSort::Taken
+        | ViewSort::Modified
+        | ViewSort::Size
+        | ViewSort::Rating => Direction::Desc,
     }
 }
 
-pub fn parse_sort_key(s: &str) -> Option<SortKey> {
-    match s.to_ascii_lowercase().as_str() {
-        "added" => Some(SortKey::Added),
-        "modified" => Some(SortKey::Modified),
-        "name" => Some(SortKey::Name),
-        "size" => Some(SortKey::Size),
-        "rating" => Some(SortKey::Rating),
-        _ => None,
-    }
+pub fn sort_key_as_str(sort: ViewSort) -> &'static str {
+    sort.as_str()
 }
+
+pub fn parse_sort_key(s: &str) -> Option<ViewSort> {
+    ViewSort::parse(s)
+}
+
+/// Every `sort` value a URL may carry, in the words the notice uses when one
+/// is not among them.
+const SORT_KEYS: &str = "added, taken, modified, name, size, rating";
 
 /// Parsed viewer query parameters.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,7 +205,7 @@ pub struct ViewParams {
     /// Full-text query (`q`).
     pub q: Option<String>,
     /// Sort key (`sort`, default Added).
-    pub sort: SortKey,
+    pub sort: ViewSort,
     /// Sort direction (`dir`, default depends on sort).
     pub direction: Direction,
     /// Thumbnail size (`size`, default M).
@@ -200,7 +264,7 @@ impl Default for ViewParams {
             collection: None,
             tags: Vec::new(),
             q: None,
-            sort: SortKey::Added,
+            sort: ViewSort::Added,
             direction: Direction::Desc,
             size: ThumbnailSize::M,
             page: 1,
@@ -363,9 +427,9 @@ impl ViewParams {
             match parse_sort_key(&s) {
                 Some(key) => params.sort = key,
                 None => {
-                    params.notices.push(format!(
-                        "Ignored unknown sort '{s}' (expected added, modified, name, size, rating)"
-                    ));
+                    params
+                        .notices
+                        .push(format!("Ignored unknown sort '{s}' (expected {SORT_KEYS})"));
                 }
             }
         }
@@ -388,7 +452,7 @@ impl ViewParams {
         // rather than leaving a parameter that looks like it did something.
         if params.recent
             && asked_for_an_order
-            && (params.sort != SortKey::Added || params.direction != Direction::Desc)
+            && (params.sort != ViewSort::Added || params.direction != Direction::Desc)
         {
             params.notices.push(format!(
                 "Ignored sort: Recent is always the last {RECENT_LIMIT} added, newest first"
@@ -443,7 +507,7 @@ impl ViewParams {
             pairs.push(format!("q={}", utf8_percent_encode(q, QUERY_VALUE)));
         }
 
-        if self.sort != SortKey::Added {
+        if self.sort != ViewSort::Added {
             pairs.push(format!("sort={}", sort_key_as_str(self.sort)));
         }
 
@@ -489,13 +553,18 @@ impl ViewParams {
     }
 
     /// Convert to a `dimagine_index::ViewQuery`.
+    ///
+    /// The sort is the index key of [`ViewParams::sort`], and for a Taken view
+    /// that key is a placeholder: the page is read through
+    /// [`ViewParams::orders_by_taken`] instead, which asks the index for its
+    /// taken-time order ([`ViewSort::index_key`]).
     pub fn to_index_query(&self) -> dimagine_index::ViewQuery {
         // The Recent lens is "the most recently added [`RECENT_LIMIT`]"
         // (W34 audit #10), so Added-newest-first is the lens's definition,
         // not a choice: like a collection's embed order, a sort picked beside
         // it cannot decide which images the lens holds.
         let (sort, descending) = if self.recent {
-            (SortKey::Added, true)
+            (ViewSort::Added, true)
         } else {
             (self.sort, self.direction == Direction::Desc)
         };
@@ -517,13 +586,25 @@ impl ViewParams {
             text: self.q.clone(),
             untagged: self.untagged,
             added_after_ns: None,
-            sort,
+            sort: sort.index_key(),
             descending,
             // Saturating, so an absurd `p` reads as "far past the end" instead
             // of overflowing on its way to the index.
             offset: offset.min(u64::from(u32::MAX)) as u32,
             limit: limit.min(u64::from(u32::MAX)) as u32,
         }
+    }
+
+    /// Whether the EXIF taken time decides the order of this view.
+    ///
+    /// True only where the sort the URL asked for is actually in force. Two
+    /// views carry an order of their own and report the sort beside them as
+    /// ignored (see [`ViewParams::parse`]): a collection keeps the order of
+    /// its note's embeds, and the Recent lens is the most recently added
+    /// [`RECENT_LIMIT`] images, newest first. In both the taken time orders
+    /// nothing, so the page is read with `Index::view` like any other.
+    pub fn orders_by_taken(&self) -> bool {
+        self.sort == ViewSort::Taken && !self.recent && self.collection.is_none()
     }
 
     fn setting(&mut self, key: &str, value: bool) {
@@ -542,7 +623,7 @@ impl ViewParams {
     }
 
     /// New instance with updated sort key (and its default direction).
-    pub fn with_sort(&self, sort: SortKey) -> Self {
+    pub fn with_sort(&self, sort: ViewSort) -> Self {
         let mut next = self.clone();
         next.sort = sort;
         next.direction = default_direction(sort);
@@ -551,7 +632,7 @@ impl ViewParams {
     }
 
     /// New instance with updated sort key and direction.
-    pub fn with_sort_and_dir(&self, sort: SortKey, direction: Direction) -> Self {
+    pub fn with_sort_and_dir(&self, sort: ViewSort, direction: Direction) -> Self {
         let mut next = self.clone();
         next.sort = sort;
         next.direction = direction;
@@ -833,7 +914,7 @@ mod tests {
         assert_eq!(parsed.collection.as_deref(), Some("collections/favs.md"));
         assert_eq!(parsed.tags, vec!["art&design", "urban"]);
         assert_eq!(parsed.q.as_deref(), Some("street view"));
-        assert_eq!(parsed.sort, SortKey::Size);
+        assert_eq!(parsed.sort, ViewSort::Size);
         assert_eq!(parsed.direction, Direction::Asc);
         assert_eq!(parsed.size, ThumbnailSize::L);
         assert_eq!(parsed.page, 3);
@@ -946,7 +1027,7 @@ mod tests {
     fn invalid_parameters_are_ignored_with_notice() {
         let query = "sort=nonexistent&dir=sideways&size=huge&p=-1&sub=maybe";
         let parsed = ViewParams::parse(query);
-        assert_eq!(parsed.sort, SortKey::Added);
+        assert_eq!(parsed.sort, ViewSort::Added);
         assert_eq!(parsed.direction, Direction::Desc);
         assert_eq!(parsed.size, ThumbnailSize::M);
         assert_eq!(parsed.page, 1);
@@ -958,25 +1039,25 @@ mod tests {
     fn sort_defaults_and_direction() {
         // Default sort added -> default dir desc -> omitted from URL
         let p1 = ViewParams::parse("sort=added");
-        assert_eq!(p1.sort, SortKey::Added);
+        assert_eq!(p1.sort, ViewSort::Added);
         assert_eq!(p1.direction, Direction::Desc);
         assert_eq!(p1.to_query_string(), "");
 
         // Name sort -> default dir asc -> dir omitted
         let p2 = ViewParams::parse("sort=name");
-        assert_eq!(p2.sort, SortKey::Name);
+        assert_eq!(p2.sort, ViewSort::Name);
         assert_eq!(p2.direction, Direction::Asc);
         assert_eq!(p2.to_query_string(), "sort=name");
 
         // Name sort with explicit desc -> dir included
         let p3 = ViewParams::parse("sort=name&dir=desc");
-        assert_eq!(p3.sort, SortKey::Name);
+        assert_eq!(p3.sort, ViewSort::Name);
         assert_eq!(p3.direction, Direction::Desc);
         assert_eq!(p3.to_query_string(), "sort=name&dir=desc");
 
         // Added sort with explicit asc -> dir included
         let p4 = ViewParams::parse("sort=added&dir=asc");
-        assert_eq!(p4.sort, SortKey::Added);
+        assert_eq!(p4.sort, ViewSort::Added);
         assert_eq!(p4.direction, Direction::Asc);
         assert_eq!(p4.to_query_string(), "dir=asc");
     }
@@ -989,7 +1070,7 @@ mod tests {
             collection: None,
             tags: vec!["tag1".to_string(), "tag2".to_string()],
             q: Some("query".to_string()),
-            sort: SortKey::Rating,
+            sort: ViewSort::Rating,
             direction: Direction::Desc,
             size: ThumbnailSize::S,
             page: 2,
@@ -1152,7 +1233,7 @@ mod tests {
     #[test]
     fn a_sort_value_may_carry_its_direction() {
         let joined = ViewParams::parse("sort=name-desc");
-        assert_eq!(joined.sort, SortKey::Name);
+        assert_eq!(joined.sort, ViewSort::Name);
         assert_eq!(joined.direction, Direction::Desc);
         assert_eq!(joined.to_query_string(), "sort=name&dir=desc");
 
@@ -1161,8 +1242,123 @@ mod tests {
 
         // A sort key that merely contains a dash is not a direction.
         let unknown = ViewParams::parse("sort=nonsense-sideways");
-        assert_eq!(unknown.sort, SortKey::Added);
+        assert_eq!(unknown.sort, ViewSort::Added);
         assert!(!unknown.notices.is_empty());
+    }
+
+    /// W49: "Taken" is a sort like the others — newest first by default, both
+    /// directions available, and the direction spelled the same way as every
+    /// other sort's.
+    #[test]
+    fn taken_is_a_sort_with_both_directions() {
+        let newest = ViewParams::parse("sort=taken");
+        assert_eq!(newest.sort, ViewSort::Taken);
+        assert_eq!(newest.direction, Direction::Desc);
+        assert_eq!(newest.to_query_string(), "sort=taken");
+        assert!(newest.orders_by_taken());
+        assert!(newest.notices.is_empty());
+
+        let oldest = ViewParams::parse("sort=taken&dir=asc");
+        assert_eq!(oldest.direction, Direction::Asc);
+        assert_eq!(oldest.to_query_string(), "sort=taken&dir=asc");
+        assert!(oldest.orders_by_taken());
+
+        // The menu's own spelling of the same two views.
+        assert_eq!(
+            ViewParams::parse("sort=taken-asc"),
+            oldest,
+            "the direction rides in the sort value too"
+        );
+
+        // Not a direction of any other sort: `taken` is not an unknown key.
+        assert_eq!(
+            ViewParams::parse("sort=taken-sideways").notices,
+            vec![
+                "Ignored unknown sort 'taken-sideways' (expected added, taken, modified, \
+                  name, size, rating)"
+                    .to_owned()
+            ]
+        );
+    }
+
+    /// The sort survives in the URL beside every filter the view already had,
+    /// and comes back the same — a bookmark or a shared link is the same view.
+    #[test]
+    fn the_taken_sort_round_trips_with_the_filters_beside_it() {
+        for query in [
+            "sort=taken",
+            "sort=taken&dir=asc",
+            "sort=taken&in=refs/ui",
+            "sort=taken&dir=asc&in=refs%2Fui&tag=eagle&q=street+view&size=l&p=2",
+            "sort=taken&untagged=1",
+        ] {
+            let params = ViewParams::parse(query);
+            let again = ViewParams::parse(&params.to_query_string());
+            assert_eq!(again, params, "{query} did not round-trip");
+            assert_eq!(again.sort, ViewSort::Taken, "{query}");
+            assert_eq!(again.orders_by_taken(), params.orders_by_taken(), "{query}");
+        }
+
+        // Every filter comes back with it, not just the sort.
+        let narrowed = ViewParams::parse("sort=taken&dir=asc&in=refs%2Fui&tag=eagle&size=l");
+        assert_eq!(narrowed.folder.as_deref(), Some("refs/ui"));
+        assert_eq!(narrowed.tags, vec!["eagle"]);
+        assert_eq!(narrowed.size, ThumbnailSize::L);
+        // `/` is safe in a query value, so a folder path rides as it is read.
+        assert_eq!(
+            narrowed.to_url("/"),
+            "/?in=refs/ui&tag=eagle&sort=taken&dir=asc&size=l"
+        );
+    }
+
+    /// Two views carry an order of their own and report the sort beside them as
+    /// ignored — a collection keeps its note's embed order, Recent is the last
+    /// [`RECENT_LIMIT`] added, newest first. The taken time orders neither, so
+    /// `orders_by_taken` is false in both and the page is read the ordinary
+    /// way; the reader is told either way.
+    #[test]
+    fn the_taken_sort_is_reported_where_another_order_is_in_force() {
+        let collection = ViewParams::parse("c=browse.md&sort=taken");
+        assert!(!collection.orders_by_taken());
+        assert_eq!(
+            collection.notices,
+            vec!["Ignored sort: a collection keeps the order of its note's embeds".to_owned()]
+        );
+
+        let recent = ViewParams::parse("recent=1&sort=taken&dir=asc");
+        assert!(!recent.orders_by_taken());
+        assert_eq!(
+            recent.notices,
+            vec![format!(
+                "Ignored sort: Recent is always the last {RECENT_LIMIT} added, newest first"
+            )]
+        );
+
+        // Every other sort is not the taken order.
+        for query in ["", "sort=added", "sort=name", "recent=1", "c=browse.md"] {
+            assert!(
+                !ViewParams::parse(query).orders_by_taken(),
+                "{query} must not read the taken order"
+            );
+        }
+    }
+
+    /// The query the index answers is the ordinary one even for a Taken view:
+    /// `Index::view` has no taken sort, and the page goes to `view_by_taken`
+    /// instead, which ignores the field. Every filter and every paging value
+    /// is carried across untouched, so the two queries differ only in the
+    /// order they ask for.
+    #[test]
+    fn a_taken_view_shares_its_filters_and_paging_with_the_ordinary_query() {
+        let taken = ViewParams::parse("sort=taken&dir=asc&in=refs&tag=eagle&q=street&p=3&size=l");
+        let query = taken.to_index_query();
+        assert_eq!(query.folder.as_deref(), Some("refs"));
+        assert!(query.recursive);
+        assert_eq!(query.tags, vec!["eagle"]);
+        assert_eq!(query.text.as_deref(), Some("street"));
+        assert_eq!(query.offset, 2 * PAGE_SIZE);
+        assert_eq!(query.limit, PAGE_SIZE);
+        assert!(!query.descending);
     }
 
     #[test]
@@ -1283,7 +1479,7 @@ mod tests {
         assert_eq!(cleared.q, None);
         assert!(!cleared.untagged);
         assert!(!cleared.recent);
-        assert_eq!(cleared.sort, SortKey::Name);
+        assert_eq!(cleared.sort, ViewSort::Name);
         assert_eq!(cleared.direction, Direction::Desc);
         assert_eq!(cleared.size, ThumbnailSize::L);
         assert_eq!(cleared.page, 2);

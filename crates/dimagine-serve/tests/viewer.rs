@@ -2834,3 +2834,290 @@ async fn a_facet_list_over_the_cap_opens_through_a_second_query_parameter() {
     assert!(odd.contains("Ignored unknown facet list"), "{odd}");
     assert!(odd.contains("<aside class=\"filter-aside\""), "{odd}");
 }
+
+/// ================================ W49 · justified rows and the Taken sort ===
+///
+/// The library these tests sort is built from the fixtures the index crate
+/// reads its header facts from: real images with real dimensions, and real EXIF
+/// dates. Nothing here is a fabricated number the server had to be told.
+///
+/// The taken times, in ns since the epoch, straight from the fixtures:
+/// - `exif-date.jpg` 2023-07-12 20:54:07.123 +01:00 = 1_689_191_647_123_000_000
+/// - `exif-naive.jpg` the same wall clock, read as UTC     = 1_689_195_247_000_000_000
+/// - `rotated-exif.jpg` 2018-05-05, −05:00                   = 1_521_994_953_000_000_000
+/// - `exif-zeros.jpg` the classic all-zero date, and `pixel.png`, which is a
+///   PNG and carries no EXIF at all: both are an unknown instant.
+const EXIF_DATE: &[u8] = include_bytes!("../../../tests/fixtures/exif-date.jpg");
+const EXIF_NAIVE: &[u8] = include_bytes!("../../../tests/fixtures/exif-naive.jpg");
+const EXIF_ROTATED: &[u8] = include_bytes!("../../../tests/fixtures/rotated-exif.jpg");
+const EXIF_ZEROS: &[u8] = include_bytes!("../../../tests/fixtures/exif-zeros.jpg");
+const PIXEL_PNG: &[u8] = include_bytes!("../../../tests/fixtures/pixel.png");
+
+/// A library whose images carry the header facts the index reads: three taken
+/// times — one of them tied between two paths, because the two files are the
+/// same content — and two images with no taken time at all.
+fn header_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &[u8]| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+    write("refs/a-date.jpg", EXIF_DATE);
+    write("refs/b-date.jpg", EXIF_DATE);
+    write("refs/c-naive.jpg", EXIF_NAIVE);
+    write("refs/d-rotated.jpg", EXIF_ROTATED);
+    write("refs/e-zeros.jpg", EXIF_ZEROS);
+    write("refs/f-pixel.png", PIXEL_PNG);
+    // A tag on one dated image, so the sort can be combined with a filter.
+    fs::write(
+        root.join("refs/a-date.jpg.md"),
+        "---\ntags:\n  - dated\n---\nA dated shot.\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn the_taken_sort_orders_by_the_time_a_camera_recorded() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // Newest first: the naive date (later wall clock), then the tied pair in
+    // path order, then the older rotated shot, then the two unknowns — last in
+    // both directions, because an unknown instant is neither old nor young.
+    assert_eq!(
+        json_paths(&app, "sort=taken", &cookie).await,
+        vec![
+            "refs/c-naive.jpg",
+            "refs/a-date.jpg",
+            "refs/b-date.jpg",
+            "refs/d-rotated.jpg",
+            "refs/e-zeros.jpg",
+            "refs/f-pixel.png",
+        ],
+        "newest taken first, ties by path, unknowns last"
+    );
+
+    // Oldest first is the same order with the known times reversed, and the
+    // same two unknowns still last.
+    assert_eq!(
+        json_paths(&app, "sort=taken&dir=asc", &cookie).await,
+        vec![
+            "refs/d-rotated.jpg",
+            "refs/a-date.jpg",
+            "refs/b-date.jpg",
+            "refs/c-naive.jpg",
+            "refs/e-zeros.jpg",
+            "refs/f-pixel.png",
+        ],
+        "an unknown is not an old time: it stays last"
+    );
+
+    // The HTML page and the JSON agree, as they do for every other sort.
+    for query in ["sort=taken", "sort=taken&dir=asc"] {
+        assert_eq!(
+            page_paths(&app, query, &cookie).await,
+            json_paths(&app, query, &cookie).await,
+            "/?{query} disagrees with /api/view"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_taken_sort_combines_with_the_filters_and_survives_in_the_url() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // A tag narrows the same order, and the sort keeps its place in the URL.
+    assert_eq!(
+        json_paths(&app, "sort=taken&tag=dated", &cookie).await,
+        vec!["refs/a-date.jpg"],
+        "a filter narrows the taken order, it does not replace it"
+    );
+    assert_eq!(
+        json_paths(&app, "sort=taken&dir=asc&in=refs&tag=dated", &cookie).await,
+        vec!["refs/a-date.jpg"]
+    );
+
+    // The menu the page shows offers the sort in both directions, with the
+    // scope it is filtering carried along, and the tile's way back keeps it.
+    let html = text(&app, "/?in=refs&sort=taken", &cookie).await;
+    assert!(
+        html.contains("<option value=\"taken-desc\" selected>Taken ↓"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<option value=\"taken-asc\">Taken ↑"),
+        "{html}"
+    );
+    assert!(html.contains("name=\"in\" value=\"refs\""), "{html}");
+
+    // Dropping a filter keeps the sort: the chip's link is the same view
+    // without the one filter, so the order a person chose is still there.
+    let html = text(&app, "/?in=refs&sort=taken&tag=dated", &cookie).await;
+    assert!(
+        html.contains("href=\"/?in=refs&amp;sort=taken\""),
+        "dropping the tag keeps the taken sort: {html}"
+    );
+    assert!(
+        html.contains("?v=in%3Drefs%26tag%3Ddated%26sort%3Dtaken"),
+        "and the tile's back link keeps both: {html}"
+    );
+}
+
+#[tokio::test]
+async fn an_image_with_no_taken_time_says_so_where_the_order_shows_it() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // In the taken order the two unknowns are marked, and only those two.
+    let html = text(&app, "/?sort=taken", &cookie).await;
+    let grid = grid_section(&html);
+    assert_eq!(
+        grid.matches("class=\"tile-notime\"").count(),
+        2,
+        "the images with no EXIF date are marked: {grid}"
+    );
+    assert!(grid.contains("No taken time"), "{grid}");
+    assert!(html.contains("data-justify data-taken"), "{html}");
+
+    // In every other order they are quiet, because "no taken time" would only
+    // be noise: nothing on screen suggests the order is about dates.
+    for query in ["", "sort=name", "sort=added", "recent=1"] {
+        let html = text(&app, &format!("/?{query}"), &cookie).await;
+        assert!(
+            !html.contains("tile-notime"),
+            "/?{query} should not mark tiles"
+        );
+    }
+
+    // The sort the view cannot honour is reported rather than silently
+    // dropped, exactly as the Recent lens and a collection report theirs.
+    let recent = text(&app, "/?recent=1&sort=taken&dir=asc", &cookie).await;
+    assert!(
+        recent.contains("Ignored sort: Recent is always the last 200 added, newest first"),
+        "{recent}"
+    );
+    assert!(!recent.contains("tile-notime"), "{recent}");
+}
+
+#[tokio::test]
+async fn the_api_reports_the_header_facts_the_grid_laid_out_by() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let page = json(&app, "/api/view?sort=taken", &cookie).await;
+    let items = page["items"].as_array().unwrap();
+
+    let by_path = |name: &str| {
+        items
+            .iter()
+            .find(|item| item["path"] == name)
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .clone()
+    };
+
+    // The 12×1 fixture, as its header says, with the taken time it carries.
+    let dated = by_path("refs/a-date.jpg");
+    assert_eq!(dated["width"], 12);
+    assert_eq!(dated["height"], 1);
+    assert_eq!(dated["taken_ns"], 1_689_191_647_123_000_000_i64);
+
+    // The rotated fixture stores 12×1 and displays 1×12: the index reports the
+    // displayed shape, and the grid lays it out by that.
+    let rotated = by_path("refs/d-rotated.jpg");
+    assert_eq!(rotated["width"], 1);
+    assert_eq!(rotated["height"], 12);
+
+    // A PNG and a JPEG with an all-zero date: an unknown is `null` here, never
+    // a zero and never a made-up date.
+    for name in ["refs/e-zeros.jpg", "refs/f-pixel.png"] {
+        let unknown = by_path(name);
+        assert!(unknown["taken_ns"].is_null(), "{name}: {unknown}");
+    }
+    assert_eq!(by_path("refs/f-pixel.png")["width"], 1);
+    assert_eq!(by_path("refs/f-pixel.png")["height"], 1);
+}
+
+#[tokio::test]
+async fn a_page_carries_the_shape_of_a_known_image_and_a_square_for_an_unknown() {
+    let dir = header_library();
+    let (known_app, cookie) = login(app(&dir)).await;
+    let html = text(&known_app, "/?sort=taken", &cookie).await;
+
+    // A known image: its own dimensions on the thumbnail, so the browser holds
+    // the space before the bytes arrive, and the ratio the row is laid out by.
+    let grid = grid_section(&html);
+    assert!(
+        grid.contains("alt=\"a-date.jpg\" width=\"12\" height=\"1\""),
+        "{grid}"
+    );
+    assert!(grid.contains("style=\"--ar:2.500\""), "{grid}");
+    // The 1×12 fixture is below the tall threshold, so it is cropped to its
+    // cell and badged, and its row ratio is clamped so the row cannot overflow.
+    assert!(grid.contains("data-fit=\"tall\""), "{grid}");
+    assert!(grid.contains("class=\"tile-badge\""), "{grid}");
+
+    // A header nothing could read — the viewer never opens the file to find
+    // out, so the tile falls back to the square cell the grid always had.
+    let unknown = tempfile::tempdir().unwrap();
+    fs::write(unknown.path().join("scratch.png"), PNG_BYTES).unwrap();
+    let (square_app, cookie) = login(app(&unknown)).await;
+    let html = text(&square_app, "/", &cookie).await;
+    let grid = grid_section(&html);
+    assert!(grid.contains("style=\"--ar:1.000\""), "{grid}");
+    assert!(
+        !grid.contains(" width=") && !grid.contains("data-fit"),
+        "an unreadable header states no size and no crop: {grid}"
+    );
+    assert!(html.contains("data-justify"), "{html}");
+}
+
+/// The `<section class="grid …">` of a page, so an assertion about a tile is
+/// not read against the chrome's own SVG attributes.
+fn grid_section(html: &str) -> &str {
+    let start = html.find("<section class=\"grid").expect("a grid section");
+    let end = html[start..].find("</section>").expect("a closed grid") + start;
+    &html[start..end]
+}
+
+#[tokio::test]
+async fn the_image_page_shows_the_taken_time_and_the_dimensions() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/image/refs/a-date.jpg", &cookie).await;
+
+    assert!(
+        html.contains("<dt>Dimensions</dt><dd>12 × 1</dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains(
+            "<dt>Taken</dt><dd><time datetime=\"2023-07-12T19:54:07.123Z\">\
+                       12 Jul 2023, 19:54:07 UTC</time></dd>"
+        ),
+        "{html}"
+    );
+
+    // The rotated fixture: displayed 1×12, so the stage crops it tall and the
+    // panel says the shape the file really has.
+    let html = text(&app, "/image/refs/d-rotated.jpg", &cookie).await;
+    assert!(
+        html.contains("<dt>Dimensions</dt><dd>1 × 12</dd>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("class=\"image-stage\" data-fit=\"tall\""),
+        "{html}"
+    );
+
+    // An image with no EXIF date: the row is there and says so, rather than
+    // inventing a date (invariant 4).
+    let html = text(&app, "/image/refs/f-pixel.png", &cookie).await;
+    assert!(html.contains("<dt>Taken</dt><dd>Unknown</dd>"), "{html}");
+    assert!(
+        !html.contains("1970") && !html.contains("1 Jan"),
+        "an epoch is not a taken time: {html}"
+    );
+}

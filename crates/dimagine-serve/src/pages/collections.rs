@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::catalog::DiagnosticKind;
 use crate::index_sync::SidebarData;
-use crate::ui::components::{self, CollectionTile};
+use crate::ui::components::{self, CollectionTile, TileMetas};
 use crate::ui::shell::{Destination, Frame};
 use crate::view_query::{normalise_decoded_path, query_value, ViewParams};
 use crate::{
@@ -158,7 +158,17 @@ pub(crate) async fn collection_page_parts(
         || params.q.is_some()
         || params.untagged
         || params.recent;
-    let items = member_tiles(&page.collection.members, &known, narrowed);
+    // The header facts of the members, so a collection's tiles are laid out by
+    // the same indexed dimensions as the library grid's (and a member the
+    // index never saw still shows, in a square cell).
+    let metas = crate::pages::library::tile_metas(
+        state,
+        page.collection
+            .members
+            .iter()
+            .map(|member| member.path.as_str()),
+    );
+    let items = member_tiles(&page.collection.members, &known, &metas, narrowed);
     let count = items.len();
     Some(CollectionPageParts {
         header: collection_header_html(
@@ -182,6 +192,7 @@ pub(crate) async fn collection_page_parts(
 fn member_tiles(
     members: &[crate::catalog::CollectionMember],
     known: &HashMap<String, ViewItem>,
+    metas: &TileMetas,
     narrowed: bool,
 ) -> Vec<CollectionTile> {
     let mut seen: HashSet<&str> = HashSet::new();
@@ -206,6 +217,7 @@ fn member_tiles(
             },
         };
         tiles.push(CollectionTile {
+            meta: metas.get(&item.path).copied(),
             item,
             caption: member.caption.clone(),
         });
@@ -455,7 +467,7 @@ mod tests {
                 },
             );
         }
-        let tiles = member_tiles(&members, &known, false);
+        let tiles = member_tiles(&members, &known, &TileMetas::new(), false);
         assert_eq!(
             tiles
                 .iter()
@@ -488,7 +500,7 @@ mod tests {
                 note_path: None,
             },
         );
-        let narrowed = member_tiles(&members, &nothing, true);
+        let narrowed = member_tiles(&members, &nothing, &TileMetas::new(), true);
         assert_eq!(
             narrowed
                 .iter()
@@ -504,7 +516,12 @@ mod tests {
     /// not empty (invariant 4).
     #[test]
     fn a_member_the_index_does_not_know_still_lists() {
-        let tiles = member_tiles(&[member("new/thing.png", "Fresh")], &HashMap::new(), false);
+        let tiles = member_tiles(
+            &[member("new/thing.png", "Fresh")],
+            &HashMap::new(),
+            &TileMetas::new(),
+            false,
+        );
         assert_eq!(tiles.len(), 1);
         assert_eq!(tiles[0].item.path, "new/thing.png");
         assert_eq!(tiles[0].item.title, None, "nothing was invented");

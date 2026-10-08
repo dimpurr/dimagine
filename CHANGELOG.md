@@ -27,6 +27,20 @@ All notable changes to this project are documented here. The format follows
   queries — the Recent lens capping every count at its own window, and a
   `sub=0` view counting a folder's direct members — read once per HTML page and
   never for `/api/view` or `/api/sidebar`, whose shapes are untouched.
+- Viewer Phase 2b: justified rows and the "Taken" sort. The grid lays
+  images out in rows of equal height that fill the column, by the
+  width and height the index read from each picture's header — the
+  layout no longer jumps while thumbnails load, and a header nobody
+  could read keeps the square cell the grid always had. The justified
+  layout is progressive enhancement: without a script the grid is the
+  plain grid of links, and the keyboard's focus order follows the rows
+  the eye sees. The sort menu gains "Taken" (newest first and oldest
+  first): the order is the EXIF time the index holds, and an image
+  with no taken time goes last in both directions, marked "no taken
+  time" — an unknown is never a date nobody recorded. The sort survives
+  in the URL and combines with the folder, tag, text and size filters.
+  The image page shows the picture's dimensions and its taken time,
+  and "Unknown" for what the header did not say.
 - Viewer Phase 2a, the image page: the picture and its facts side by side.
   Prev/next walk the view the picture was reached from — the sort, folder,
   tag, collection, search or Recent-lens `v=` a tile carries; the neighbours
