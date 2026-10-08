@@ -419,11 +419,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dimagine-index",
+ "image",
+ "kamadak-exif",
  "libc",
  "percent-encoding",
  "saphyr",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "unicode-normalization",
 ]

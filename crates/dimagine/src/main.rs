@@ -154,25 +154,35 @@ fn run_scan(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     // as any other failure. The summary is still printed and the exit code is
     // still the summary's, but a stale index is never left unmentioned: the
     // viewer would otherwise serve pre-truncation results with no hint.
-    if let Err(error) = refresh_index(&library) {
-        eprintln!("dimagine: index not refreshed: {error}");
-    }
+    let index_stats = refresh_index(&library);
+    let index_stats = match index_stats {
+        Ok(stats) => Some(stats),
+        Err(error) => {
+            eprintln!("dimagine: index not refreshed: {error}");
+            None
+        }
+    };
     if json {
-        print_scan_json(&report);
+        print_scan_json(&report, index_stats.as_ref());
     } else {
-        print_scan_human(&report);
+        print_scan_human(&report, index_stats.as_ref());
     }
     ExitCode::from(report.exit_code().try_into().unwrap_or(1))
 }
 
-fn refresh_index(library: &Library) -> Result<(), dimagine_index::IndexError> {
+fn refresh_index(
+    library: &Library,
+) -> Result<dimagine_index::ImageMetaStats, dimagine_index::IndexError> {
     let mut index = dimagine_index::Index::open(&library.root)?;
     if index.rebuild_required() {
         return Err(dimagine_index::IndexError::RebuildRequired(
             "delete .dimagine/cache/index.sqlite and rescan".into(),
         ));
     }
-    dimagine_core::sync_index(library, &mut index)
+    dimagine_core::sync_index(library, &mut index)?;
+    // What the index now holds, counted from its own rows: an unreadable
+    // header is a recorded fact about content, so every scan reports it.
+    index.image_meta_stats()
 }
 
 fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
@@ -213,16 +223,35 @@ fn emit_failure(json: bool, message: &str) {
     }
 }
 
-fn print_scan_json(report: &ScanReport) {
+fn print_scan_json(report: &ScanReport, index: Option<&dimagine_index::ImageMetaStats>) {
     #[derive(serde::Serialize)]
     struct ScanJson<'a> {
         schema: &'a str,
         #[serde(flatten)]
         report: &'a ScanReport,
+        /// Per-image header facts of the index, present whenever the index
+        /// was refreshed: images, how many have dimensions, a taken time,
+        /// or a header that could not be read. Absent is a refresh that did
+        /// not happen, which is not "zero images have dimensions".
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<IndexStatsJson>,
+    }
+    #[derive(serde::Serialize)]
+    struct IndexStatsJson {
+        images: u64,
+        with_dimensions: u64,
+        with_taken: u64,
+        unreadable_image_headers: u64,
     }
     let document = ScanJson {
         schema: scan::SCHEMA,
         report,
+        index: index.map(|stats| IndexStatsJson {
+            images: stats.images,
+            with_dimensions: stats.with_dimensions,
+            with_taken: stats.with_taken,
+            unreadable_image_headers: stats.unreadable_headers,
+        }),
     };
     println!(
         "{}",
@@ -230,7 +259,7 @@ fn print_scan_json(report: &ScanReport) {
     );
 }
 
-fn print_scan_human(report: &ScanReport) {
+fn print_scan_human(report: &ScanReport, index: Option<&dimagine_index::ImageMetaStats>) {
     println!("library: {}", report.library);
     let formats = if report.images.is_empty() {
         "none".to_string()
@@ -243,6 +272,20 @@ fn print_scan_human(report: &ScanReport) {
             .join(", ")
     };
     println!("images: {} ({})", report.image_total, formats);
+    if let Some(index) = index {
+        println!(
+            "index: {images} images ({dims} with dimensions, {taken} with taken time)",
+            images = index.images,
+            dims = index.with_dimensions,
+            taken = index.with_taken
+        );
+        if index.unreadable_headers > 0 {
+            println!(
+                "index unreadable image headers: {}",
+                index.unreadable_headers
+            );
+        }
+    }
     println!(
         "image notes: {} (paired {}, unpaired {})",
         report.image_notes.total, report.image_notes.paired, report.image_notes.unpaired

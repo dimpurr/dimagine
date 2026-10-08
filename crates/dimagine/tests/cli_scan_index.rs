@@ -491,6 +491,99 @@ fn scan_preserving_copy_beside_a_move_transfers_to_neither() {
     );
 }
 
+/// W48: `dimagine scan` reports what the index knows about image headers, in
+/// the human summary and in the JSON document, and a second scan of an
+/// unchanged library reports exactly the same numbers — the recorded
+/// unknowns are facts, not first-run failures.
+#[test]
+fn scan_reports_image_header_stats_and_never_recounts_as_zero() {
+    let tmp = tmp("scan-index-stats");
+    let root = tmp.0.join("library");
+    let refs = root.join("refs");
+    std::fs::create_dir_all(&refs).unwrap();
+    std::fs::write(
+        refs.join("dated.jpg"),
+        include_bytes!("../../../tests/fixtures/exif-date.jpg"),
+    )
+    .unwrap();
+    std::fs::write(refs.join("plain.jpg"), b"jpeg").unwrap();
+    let (code, stdout, stderr) = dimagine(&["scan", "--json", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(json["schema"], "dimagine.scan/0.1");
+    assert_eq!(json["index"]["images"], 2);
+    assert_eq!(json["index"]["with_dimensions"], 1);
+    assert_eq!(json["index"]["with_taken"], 1);
+    assert_eq!(json["index"]["unreadable_image_headers"], 1);
+
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("index: 2 images (1 with dimensions, 1 with taken time)"),
+        "the human summary carries the fresh counts: {stdout}"
+    );
+    assert!(
+        stdout.contains("index unreadable image headers: 1"),
+        "the counted warning is on the same summary: {stdout}"
+    );
+}
+
+/// W48: opening the index the binary just refreshed and asking the read API
+/// for one image's header facts, end to end through the CLI's own scan.
+#[test]
+fn the_refreshed_index_answers_image_meta_queries() {
+    let tmp = tmp("scan-image-meta");
+    let root = tmp.0.join("library");
+    let refs = root.join("refs");
+    std::fs::create_dir_all(&refs).unwrap();
+    std::fs::write(
+        refs.join("dated.jpg"),
+        include_bytes!("../../../tests/fixtures/exif-date.jpg"),
+    )
+    .unwrap();
+    std::fs::write(
+        refs.join("rotated.jpg"),
+        include_bytes!("../../../tests/fixtures/rotated-exif.jpg"),
+    )
+    .unwrap();
+    std::fs::write(refs.join("unknown.jpg"), b"jpeg").unwrap();
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+
+    let index = Index::open(&root).unwrap();
+    assert!(!index.rebuild_required());
+    assert_eq!(
+        index.image_meta("refs/dated.jpg").unwrap(),
+        Some(dimagine_index::ImageMeta {
+            width: Some(12),
+            height: Some(1),
+            taken_ns: Some(1_689_191_647_123_000_000),
+        })
+    );
+    assert_eq!(
+        index.image_meta("refs/rotated.jpg").unwrap(),
+        Some(dimagine_index::ImageMeta {
+            width: Some(1),
+            height: Some(12),
+            taken_ns: Some(1_521_994_953_000_000_000),
+        }),
+        "orientation 6 swaps the stored 12x1"
+    );
+    assert_eq!(
+        index.image_meta("refs/unknown.jpg").unwrap(),
+        Some(dimagine_index::ImageMeta {
+            width: None,
+            height: None,
+            taken_ns: None,
+        }),
+        "an unreadable header is unknown, never zero"
+    );
+    let stats = index.image_meta_stats().unwrap();
+    assert_eq!(stats.with_dimensions, 2);
+    assert_eq!(stats.with_taken, 2);
+    assert_eq!(stats.unreadable_headers, 1);
+}
+
 fn view_added(root: &Path, path: &str) -> Option<i64> {
     open_index(root)
         .view(&ViewQuery {

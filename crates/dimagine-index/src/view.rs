@@ -8,10 +8,26 @@
 //! Paths are library-relative and `/`-separated, the same spelling the scan
 //! stored. `folder` uses `""` for the library root.
 
-use crate::{Index, IndexError};
+use crate::{ImageMeta, Index, IndexError};
+use rusqlite::OptionalExtension;
 
 /// The highest `rating` FORMAT §3.1 allows.
 const MAX_RATING: u8 = 5;
+
+/// What the index knows about image headers, counted ([`Index::image_meta_stats`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageMetaStats {
+    /// Image rows the index holds.
+    pub images: u64,
+    /// Images whose pixel dimensions were read.
+    pub with_dimensions: u64,
+    /// Images whose EXIF taken time was read.
+    pub with_taken: u64,
+    /// Images whose header stayed unknown (dimensions `NULL`), counted on
+    /// every scan, because the unknown is a recorded fact about the content
+    /// and not a transient failure only the first scan sees.
+    pub unreadable_headers: u64,
+}
 
 /// How to order a [`ViewPage`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,6 +290,14 @@ impl ViewSql {
 /// all happen in SQLite, so the sort columns and the tag table carry indexes
 /// instead of every call reading the whole index into memory.
 fn view_sql(q: &ViewQuery) -> ViewSql {
+    view_sql_with_order(q, order_by(q))
+}
+
+/// Build the SQL for one page query under an explicit `ORDER BY` — the
+/// subquery, connectors and filters of a view stay identical, only the chosen
+/// order differs ([`view_sql`] wraps this with [`order_by`],
+/// [`Index::view_by_taken`] with [`order_by_taken`]).
+fn view_sql_with_order(q: &ViewQuery, order_by: String) -> ViewSql {
     let mut sql = ViewSql::new();
     if let Some(collection) = &q.collection {
         // The collection's own embed order is the only meaningful order for
@@ -295,7 +319,7 @@ fn view_sql(q: &ViewQuery) -> ViewSql {
         sql.bind(collection.clone());
         sql.collection = true;
     } else {
-        sql.order_by = order_by(q);
+        sql.order_by = order_by;
     }
     if let Some(folder) = &q.folder {
         if !q.recursive {
@@ -375,6 +399,18 @@ fn order_by(q: &ViewQuery) -> String {
     format!(" ORDER BY {key} {direction}, f.path ASC")
 }
 
+/// The `ORDER BY` of [`Index::view_by_taken`]: the same shape a [`SortKey`]
+/// sort uses, over the EXIF taken time instead. Taken times order
+/// chronologically in the asked direction, ties break by path ascending, and
+/// an image with no taken time — an unknown instant, not an old or a young
+/// one — sorts last in both directions, the flag before the value, never
+/// flipped with the direction. A collection query keeps its own embed order,
+/// which always comes first (the rule [`ViewQuery::sort`] follows).
+fn order_by_taken(q: &ViewQuery) -> String {
+    let direction = if q.descending { "DESC" } else { "ASC" };
+    format!(" ORDER BY (f.taken_ns IS NULL), f.taken_ns {direction}, f.path ASC")
+}
+
 /// The columns that decide whether a note is a collection (FORMAT §5): its
 /// path and title source, whether it is the note of an image (FORMAT §3.2,
 /// which the list rule reads), the number of image members (self-embed
@@ -427,12 +463,36 @@ impl Index {
     /// the members are returned in collection-note order (the order their
     /// embeds appear in the note) and `sort`/`descending` are ignored.
     pub fn view(&self, q: &ViewQuery) -> Result<ViewPage, IndexError> {
-        let sql = view_sql(q);
+        self.view_page(|| view_sql(q), q.limit, q.offset)
+    }
+
+    /// Query images exactly like [`Index::view`], but ordered by the EXIF
+    /// taken time ([`order_by_taken`]) instead of [`ViewQuery::sort`]: the
+    /// read API a viewer's "Taken" sort is built on. Only images are
+    /// returned; every filter and the paging behave as in [`Index::view`],
+    /// and a `collection` query still answers in the collection's own embed
+    /// order, which always comes first.
+    pub fn view_by_taken(&self, q: &ViewQuery) -> Result<ViewPage, IndexError> {
+        self.view_page(
+            || view_sql_with_order(q, order_by_taken(q)),
+            q.limit,
+            q.offset,
+        )
+    }
+
+    /// Run one page query, fresh-built twice because the count and the page
+    /// bind temporary `ViewSql` state (the paging pair).
+    fn view_page(
+        &self,
+        build: impl Fn() -> ViewSql,
+        limit: u32,
+        offset: u32,
+    ) -> Result<ViewPage, IndexError> {
+        let sql = build();
         let total: i64 = self
             .conn()?
             .query_row(&sql.count(), bound(&sql.params), |row| row.get(0))?;
-        let (page_sql, page_params) =
-            view_sql(q).into_page(i64::from(q.limit), i64::from(q.offset));
+        let (page_sql, page_params) = build().into_page(i64::from(limit), i64::from(offset));
         let mut stmt = self.conn()?.prepare(&page_sql)?;
         let rows = stmt.query_map(bound(&page_params), |row| {
             let size: i64 = row.get(1)?;
@@ -458,12 +518,29 @@ impl Index {
     /// diagnostic for a slow viewer query: it shows whether the indexes earn
     /// their keep or the planner fell back to scanning the index.
     pub fn view_query_plan(&self, q: &ViewQuery) -> Result<Vec<String>, IndexError> {
+        self.plan_of(|| view_sql(q), q.limit, q.offset)
+    }
+
+    /// The same diagnostic for one [`Index::view_by_taken`] query.
+    pub fn taken_query_plan(&self, q: &ViewQuery) -> Result<Vec<String>, IndexError> {
+        self.plan_of(
+            || view_sql_with_order(q, order_by_taken(q)),
+            q.limit,
+            q.offset,
+        )
+    }
+
+    fn plan_of(
+        &self,
+        build: impl Fn() -> ViewSql,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<String>, IndexError> {
         let (count_sql, count_params) = {
-            let sql = view_sql(q);
+            let sql = build();
             (sql.count(), sql.params)
         };
-        let (page_sql, page_params) =
-            view_sql(q).into_page(i64::from(q.limit), i64::from(q.offset));
+        let (page_sql, page_params) = build().into_page(i64::from(limit), i64::from(offset));
         let mut lines = Vec::new();
         for (label, statement, params) in [
             ("count", &count_sql, &count_params),
@@ -482,6 +559,56 @@ impl Index {
             lines.extend(rows.collect::<Result<Vec<_>, _>>()?);
         }
         Ok(lines)
+    }
+
+    /// The per-image header metadata of one path, as the refresh read it:
+    /// pixel dimensions after EXIF orientation, and the EXIF "taken" time.
+    /// `None` fields are honest unknowns — the header (or the date) could not
+    /// be read — and `None` of the whole answer means the index holds no such
+    /// image. A viewer's justified row asks its `width` here; a "Taken"
+    /// detail asks its `taken_ns` here.
+    ///
+    /// This is a companion to [`Index::view`], not part of its page shape:
+    /// the viewer's own page JSON is the index API's hand-mirrored mirror,
+    /// and it grows when the viewer does, not when the index does.
+    pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
+        let row: Option<(Option<i64>, Option<i64>, Option<i64>)> = self
+            .conn()?
+            .query_row(
+                "SELECT width,height,taken_ns FROM files WHERE path=?1 AND kind='image'",
+                [path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(width, height, taken_ns)| ImageMeta {
+            width: width.and_then(|value| u32::try_from(value).ok()),
+            height: height.and_then(|value| u32::try_from(value).ok()),
+            taken_ns,
+        }))
+    }
+
+    /// What the index knows about image headers, counted: how many images
+    /// there are, how many have dimensions, a taken time, or a header that
+    /// could not be read (dims unknown). The counted warning of a refresh
+    /// — and of every scan that follows, because the unknowns are recorded
+    /// facts about content, not transient failures.
+    pub fn image_meta_stats(&self) -> Result<ImageMetaStats, IndexError> {
+        let row: (i64, i64, i64, i64) = self.conn()?.query_row(
+            // `coalesce`, because `sum` over no image rows is NULL and an
+            // empty library is zero unknowns, not an error.
+            "SELECT count(*), count(width), count(taken_ns), \
+                    coalesce(sum(CASE WHEN width IS NULL THEN 1 ELSE 0 END), 0) \
+             FROM files WHERE kind='image'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        let max_zero = |value: i64| value.max(0) as u64;
+        Ok(ImageMetaStats {
+            images: max_zero(row.0),
+            with_dimensions: max_zero(row.1),
+            with_taken: max_zero(row.2),
+            unreadable_headers: max_zero(row.3),
+        })
     }
 
     /// Image count per folder, including subfolders. Every folder that holds
@@ -764,6 +891,9 @@ mod tests {
             kind: crate::FileKind::Image,
             note_added_ns: None,
             rating: None,
+            width: None,
+            height: None,
+            taken_ns: None,
         };
         let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
             path: path.to_owned(),
@@ -876,6 +1006,9 @@ mod tests {
             kind: crate::FileKind::Image,
             note_added_ns: None,
             rating: None,
+            width: None,
+            height: None,
+            taken_ns: None,
         };
         let note = |path: &str, image_path: Option<&str>, props: &str| NoteRecord {
             path: path.to_owned(),
@@ -989,6 +1122,10 @@ mod tests {
                         kind: crate::FileKind::Image,
                         note_added_ns: Some(1_700_000_000_000_000_000 + index_in_folder),
                         rating: Some((index_in_folder % 6) as u8),
+                        width: Some((index_in_folder % 9 + 1) as u32),
+                        height: Some((index_in_folder % 4 + 1) as u32),
+                        taken_ns: (index_in_folder % 3 != 0)
+                            .then_some(1_600_000_000_000_000_000 + index_in_folder),
                     })
                     .unwrap();
                 let note_path = format!("{path}.md");
@@ -1054,6 +1191,15 @@ mod tests {
                 },
             ),
             (
+                "taken descending",
+                // The taken order is its own query (Index::view_by_taken),
+                // planned here so it answers from an index the same way.
+                ViewQuery {
+                    descending: true,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
                 "size descending",
                 ViewQuery {
                     sort: SortKey::Size,
@@ -1106,7 +1252,11 @@ mod tests {
             ),
         ];
         for (name, query) in queries {
-            let rendered = index.view_query_plan(&query).unwrap();
+            let rendered = if name == "taken descending" {
+                index.taken_query_plan(&query).unwrap()
+            } else {
+                index.view_query_plan(&query).unwrap()
+            };
             assert!(
                 !rendered.iter().any(|line| line.contains("AUTOMATIC")),
                 "{name} rebuilds an automatic index:\n{}",
@@ -1133,5 +1283,227 @@ mod tests {
             .explain("SELECT tag, count(*) FROM note_tags GROUP BY tag", &[])
             .join("; ");
         assert!(tags.contains("note_tags"), "{tags}");
+    }
+
+    /// W48: a taken sort is a real sort over values with an honest unknown.
+    /// Images without a taken time — an unreadable or absent EXIF date — sort
+    /// last in both directions (an unknown instant is neither oldest nor
+    /// newest), values order ascending or descending as asked, and equal
+    /// values keep the stable path tiebreak the other sorts use.
+    #[test]
+    fn taken_sort_is_nulls_last_in_both_directions_with_a_path_tiebreak() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str, taken_ns: Option<i64>| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+            width: Some(4),
+            height: Some(3),
+            taken_ns,
+        };
+        index.begin_scan().unwrap();
+        // Taken on three intertwined days; two images tie at the same second
+        // and two have no taken time at all.
+        index
+            .upsert_file(&image("newer.jpg", Some(1_700_000_000_000_000_001)))
+            .unwrap();
+        index
+            .upsert_file(&image("older.jpg", Some(1_600_000_000_000_000_000)))
+            .unwrap();
+        index
+            .upsert_file(&image("b-tie.jpg", Some(1_650_000_000_000_000_000)))
+            .unwrap();
+        index
+            .upsert_file(&image("a-tie.jpg", Some(1_650_000_000_000_000_000)))
+            .unwrap();
+        index.upsert_file(&image("unknown-b.jpg", None)).unwrap();
+        index.upsert_file(&image("unknown-a.jpg", None)).unwrap();
+        index
+            .finish_scan(&[
+                "newer.jpg".into(),
+                "older.jpg".into(),
+                "b-tie.jpg".into(),
+                "a-tie.jpg".into(),
+                "unknown-b.jpg".into(),
+                "unknown-a.jpg".into(),
+            ])
+            .unwrap();
+
+        let paths = |descending: bool| -> Vec<String> {
+            index
+                .view_by_taken(&ViewQuery {
+                    limit: 100,
+                    descending,
+                    ..ViewQuery::default()
+                })
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|item| item.path)
+                .collect()
+        };
+        assert_eq!(
+            paths(false),
+            [
+                "older.jpg".to_owned(),
+                "a-tie.jpg".to_owned(),
+                "b-tie.jpg".to_owned(),
+                "newer.jpg".to_owned(),
+                "unknown-a.jpg".to_owned(),
+                "unknown-b.jpg".to_owned(),
+            ],
+            "ascending: oldest first, ties by path, unknowns last"
+        );
+        assert_eq!(
+            paths(true),
+            [
+                "newer.jpg".to_owned(),
+                "a-tie.jpg".to_owned(),
+                "b-tie.jpg".to_owned(),
+                "older.jpg".to_owned(),
+                "unknown-a.jpg".to_owned(),
+                "unknown-b.jpg".to_owned(),
+            ],
+            "descending: newest first, and the unknowns are still last"
+        );
+        // The same query page-by-page: a page boundary keeps the order,
+        // because ORDER BY sits inside the paged subquery.
+        let page = index
+            .view_by_taken(&ViewQuery {
+                limit: 2,
+                offset: 2,
+                descending: true,
+                ..ViewQuery::default()
+            })
+            .unwrap();
+        let paged: Vec<String> = page.items.iter().map(|item| item.path.clone()).collect();
+        assert_eq!(paged, ["b-tie.jpg", "older.jpg"], "page two in order");
+
+        // The per-image metadata the viewer's justified row and Taken detail
+        // read: unknowns are distinct from values, per axis.
+        assert_eq!(
+            index.image_meta("b-tie.jpg").unwrap(),
+            Some(crate::ImageMeta {
+                width: Some(4),
+                height: Some(3),
+                taken_ns: Some(1_650_000_000_000_000_000),
+            })
+        );
+        assert_eq!(
+            index.image_meta("unknown-a.jpg").unwrap(),
+            Some(crate::ImageMeta {
+                width: Some(4),
+                height: Some(3),
+                taken_ns: None,
+            }),
+            "an unknown taken time is not an unknown dimension"
+        );
+        assert_eq!(
+            index.image_meta("refs/absent.jpg").unwrap(),
+            None,
+            "a path the index holds no image at is no metadata at all"
+        );
+        assert_eq!(
+            index.image_meta_stats().unwrap(),
+            ImageMetaStats {
+                images: 6,
+                with_dimensions: 6,
+                with_taken: 4,
+                unreadable_headers: 0
+            }
+        );
+    }
+
+    /// W48: the taken-order stats count what they should, including the
+    /// headers no reader could parse.
+    #[test]
+    fn image_meta_stats_count_the_unknown_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str, width: Option<u32>, taken_ns: Option<i64>| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+            width,
+            height: width.map(|height| height + 1),
+            taken_ns,
+        };
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&image("healthy.jpg", Some(640), Some(1)))
+            .unwrap();
+        index
+            .upsert_file(&image("bare-dims.jpg", Some(12), None))
+            .unwrap();
+        index.upsert_file(&image("broken.jpg", None, None)).unwrap();
+        index
+            .upsert_file(&FileRecord {
+                path: "note.md".into(),
+                size: 1,
+                mtime_ns: 1,
+                sha256: None,
+                kind: crate::FileKind::Note,
+                note_added_ns: None,
+                rating: None,
+                width: None,
+                height: None,
+                taken_ns: None,
+            })
+            .unwrap();
+        index
+            .finish_scan(&[
+                "healthy.jpg".into(),
+                "bare-dims.jpg".into(),
+                "broken.jpg".into(),
+                "note.md".into(),
+            ])
+            .unwrap();
+        assert_eq!(
+            index.image_meta_stats().unwrap(),
+            ImageMetaStats {
+                images: 3,
+                with_dimensions: 2,
+                with_taken: 1,
+                unreadable_headers: 1
+            }
+        );
+        // A non-image row never reports metadata, even though it is indexed.
+        let note_row: i64 = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM files WHERE path='note.md' AND kind='note'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_row, 1, "the note row is in the index");
+        assert_eq!(index.image_meta("note.md").unwrap(), None);
+    }
+
+    /// An index with no images at all is all zeros, not an error: an empty
+    /// library has no unknown headers to count.
+    #[test]
+    fn image_meta_stats_on_an_empty_index_are_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        assert_eq!(
+            index.image_meta_stats().unwrap(),
+            ImageMetaStats {
+                images: 0,
+                with_dimensions: 0,
+                with_taken: 0,
+                unreadable_headers: 0
+            }
+        );
     }
 }

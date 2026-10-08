@@ -12,14 +12,17 @@
 //! - [`note`]: front matter and note properties (FORMAT §3),
 //! - [`links`]: extract and resolve `![[...]]`, `[[]]`, `![]()` and canvas
 //!   file nodes (FORMAT §5.1, §6),
+//! - [`image_meta`]: per-image header facts for the index refresh,
+//! - [`index`]: write one scan into the SQLite index,
 //! - [`check`]: findings for `dimagine check`,
 //! - [`scan`]: summary for `dimagine scan`.
 //!
-//! The HLD's `index`, `preview`, `import` and `serve` modules are out of scope
-//! for 0.1; this layout leaves them somewhere natural to slot in.
+//! The HLD's `preview`, `import` and `serve` modules live in their own
+//! crates; this layout leaves them somewhere natural to slot in.
 
 pub mod check;
 pub mod format;
+pub mod image_meta;
 pub mod index;
 pub mod library;
 pub mod links;

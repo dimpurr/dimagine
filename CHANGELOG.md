@@ -20,11 +20,28 @@ All notable changes to this project are documented here. The format follows
 - Viewer: `/raw/<path>` serves a note as its source view — the bytes as
   written, `text/plain`, never a content type a browser could interpret as a
   page of the viewer's origin. Images on `/raw` are unchanged.
+- Index: per-image width, height and the EXIF "taken" time
+  (`DateTimeOriginal` with `OffsetTimeOriginal`, `SubSecTimeOriginal`
+  refining below the second) in every image row, read from the image
+  header and EXIF block during the refresh — no pixel decode. Schema v7
+  migrates v6 databases in place, keeping every row; the first refresh
+  backfills the new columns because it hashes each unread file once and
+  after that reuses everything (dimensions, taken time and digest) while
+  size and nanosecond mtime stand. Identical content is cached by its
+  SHA-256 digest the way previews are, so a duplicate, a moved file or a
+  touched file never parses twice. Unreadable headers record `NULL` —
+  an unknown, never a zero — and are counted on every scan in
+  `dimagine scan`'s human and JSON output (`index.images`,
+  `index.with_dimensions`, `index.with_taken`,
+  `index.unreadable_image_headers`; the JSON key is absent when the
+  refresh did not happen). The read API: `Index::image_meta` for one
+  image's metadata, `Index::view_by_taken` for a page ordered by taken
+  time (NULLs last in both directions, ties broken by path).
 - Viewer Phase 1: the library is the home. `/` shows every image with the
   scope in the query string (`in`, `sub`, `c`, `tag`, `q`, `sort`, `dir`,
   `size`, `p`, and the `untagged` and `recent` lenses), and `/folders`,
-  `/collections` and `/search` are its siblings. Every view is a URL, and the
-  same query drives `/api/view` and `/api/sidebar`.
+  `/collections` and `/search` are its siblings. Every view is a URL, and
+  the same query drives `/api/view` and `/api/sidebar`.
 - Viewer: one layout at three widths — a bottom tab bar on a phone, an icon
   rail on a tablet, a pinned sidebar and inspector on a desktop — with the
   stylesheet and one small script shipped inside the binary and served from a

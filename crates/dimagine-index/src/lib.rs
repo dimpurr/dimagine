@@ -15,10 +15,20 @@ use unicode_normalization::UnicodeNormalization;
 
 pub use view::{
     collection_is_listed, note_is_collection, note_rating, CollectionEvidence, CollectionInfo,
-    SortKey, ViewItem, ViewPage, ViewQuery,
+    ImageMetaStats, SortKey, ViewItem, ViewPage, ViewQuery,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+/// The schema version immediately below [`SCHEMA_VERSION`]. A database at
+/// this version migrates in place: columns and tables it lacks are added,
+/// every existing row is kept, and the first refresh backfills the new
+/// per-image columns. Anything older stays on the rebuild path — a migration
+/// only ever steps forward one version.
+const MIGRATABLE_FROM: i64 = 6;
+/// The `files` columns one migration step adds. All three hold the values a
+/// refresh read from the image header; `NULL` is an honest "unknown", never
+/// a zero (FORMAT §0: an unknown is not empty).
+const MIGRATION_COLUMNS: [&str; 3] = ["width", "height", "taken_ns"];
 static OPEN_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 /// The move pairings [`Index::finish_scan`] tries, strongest key first. Each
@@ -129,6 +139,34 @@ pub struct FileRecord {
     /// (FORMAT §3.1). Stored on the image row so sorting and filtering never
     /// have to read the note's properties.
     pub rating: Option<u8>,
+    /// Pixel width after EXIF orientation, read from the image header, or
+    /// `None` when the header could not be read. `None` is "unknown", never 0.
+    pub width: Option<u32>,
+    /// Pixel height after EXIF orientation; `None` under the same terms as
+    /// [`FileRecord::width`].
+    pub height: Option<u32>,
+    /// The EXIF `DateTimeOriginal` (with `OffsetTimeOriginal` when present)
+    /// as nanoseconds since the Unix epoch, or `None` when the image has no
+    /// readable one. A missing date is an unknown, never a zero instant.
+    pub taken_ns: Option<i64>,
+}
+
+/// Per-image metadata extracted from the image header, cached by the SHA-256
+/// digest of the file content the way previews are keyed (HLD `preview`):
+/// content that already exists in the cache is never parsed twice, whatever
+/// path or mtime it arrives under. `None` fields are honest unknowns; a row
+/// with all three `None` is the recorded fact that this particular content
+/// has no readable header, so a duplicate or a later refresh neither re-reads
+/// it nor mistakes the unknown for a value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ImageMeta {
+    /// Pixel width after EXIF orientation.
+    pub width: Option<u32>,
+    /// Pixel height after EXIF orientation.
+    pub height: Option<u32>,
+    /// EXIF `DateTimeOriginal` (with `OffsetTimeOriginal` when present) in
+    /// ns since the Unix epoch.
+    pub taken_ns: Option<i64>,
 }
 
 /// Parsed note fields. Body text is supplied separately with [`Index::set_note_body`].
@@ -367,6 +405,10 @@ impl Index {
     /// changed by an update; `added_ns` is the note's own "added" time (note
     /// `added`, else `imported`) with `first_seen_ns` as the fallback, kept in
     /// step with it by [`Index::finish_scan`] after a move is applied.
+    /// Image metadata is stored as given, unlike `note_added_ns`: the
+    /// refresh reads it from the same bytes whose digest the row records, so
+    /// `None` is a fact about the content — later scans reuse it — and never
+    /// a way to say "keep the stored value".
     pub fn upsert_file(&mut self, record: &FileRecord) -> Result<(), IndexError> {
         self.ensure_scan_active()?;
         let result = (|| {
@@ -374,15 +416,16 @@ impl Index {
             let folder = folder_of(&record.path);
             let name_key = name_key(&record.path);
             self.conn()?.execute(
-                "INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating) \
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?7,?6),?8,?9,?10) \
-                 ON CONFLICT(path) DO UPDATE SET \
-                 sha256=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns \
-                   THEN COALESCE(excluded.sha256,files.sha256) ELSE excluded.sha256 END, \
-                 size=excluded.size,mtime_ns=excluded.mtime_ns,kind=excluded.kind, \
-                 note_added_ns=excluded.note_added_ns, \
-                 added_ns=COALESCE(excluded.note_added_ns,files.first_seen_ns), \
-                 folder=excluded.folder,name_key=excluded.name_key,rating=excluded.rating",
+                "INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating,width,height,taken_ns) \
+                  VALUES(?1,?2,?3,?4,?5,?6,?7,COALESCE(?7,?6),?8,?9,?10,?11,?12,?13) \
+                  ON CONFLICT(path) DO UPDATE SET \
+                  sha256=CASE WHEN files.size=excluded.size AND files.mtime_ns=excluded.mtime_ns \
+                    THEN COALESCE(excluded.sha256,files.sha256) ELSE excluded.sha256 END, \
+                  size=excluded.size,mtime_ns=excluded.mtime_ns,kind=excluded.kind, \
+                  note_added_ns=excluded.note_added_ns, \
+                  added_ns=COALESCE(excluded.note_added_ns,files.first_seen_ns), \
+                  folder=excluded.folder,name_key=excluded.name_key,rating=excluded.rating, \
+                  width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns",
                 params![
                     record.path,
                     record.size,
@@ -394,6 +437,9 @@ impl Index {
                     folder,
                     name_key,
                     record.rating.map(i64::from),
+                    record.width.map(i64::from),
+                    record.height.map(i64::from),
+                    record.taken_ns,
                 ],
             )?;
             self.conn()?.execute(
@@ -626,6 +672,104 @@ impl Index {
         )
     }
 
+    /// The image metadata a refresh can reuse because the file did not change:
+    /// the stored SHA-256 digest plus the per-image header columns, when the
+    /// row exists with the same size and nanosecond mtime and already carries
+    /// a valid digest (the digest is what proves a previous refresh read this
+    /// file's content; before it existed the columns are all `NULL` and the
+    /// caller must read the file once). `None` dimensions in a `Some` row are
+    /// the recorded fact that this content has no readable header, so they
+    /// are reused like any other value instead of triggering a re-read.
+    pub fn reusable_image_meta(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<Option<(String, ImageMeta)>, IndexError> {
+        /// One stored files row, before its digest is judged usable.
+        struct Stored {
+            sha256: Option<String>,
+            width: Option<i64>,
+            height: Option<i64>,
+            taken_ns: Option<i64>,
+        }
+        let previous: Option<Stored> = self
+            .conn()?
+            .query_row(
+                "SELECT sha256,width,height,taken_ns FROM files \
+                 WHERE path=?1 AND size=?2 AND mtime_ns=?3",
+                params![path, size as i64, mtime_ns],
+                |row| {
+                    Ok(Stored {
+                        sha256: row.get(0)?,
+                        width: row.get(1)?,
+                        height: row.get(2)?,
+                        taken_ns: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(previous.and_then(|stored| {
+            stored
+                .sha256
+                .filter(|hash| valid_sha256(hash))
+                .map(|sha256| {
+                    (
+                        sha256,
+                        ImageMeta {
+                            width: stored.width.and_then(|value| u32::try_from(value).ok()),
+                            height: stored.height.and_then(|value| u32::try_from(value).ok()),
+                            taken_ns: stored.taken_ns,
+                        },
+                    )
+                })
+        }))
+    }
+
+    /// The header metadata cached for one SHA-256 digest ([`ImageMeta`]).
+    /// `Some` of all-`NULL` is a hit: this content's header is known
+    /// unreadable, which is exactly what a duplicate should reuse.
+    pub fn cached_image_meta(&self, sha256: &str) -> Result<Option<ImageMeta>, IndexError> {
+        let cached: Option<(Option<i64>, Option<i64>, Option<i64>)> = self
+            .conn()?
+            .query_row(
+                "SELECT width,height,taken_ns FROM image_meta WHERE sha256=?1",
+                [sha256],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        Ok(cached.map(|(width, height, taken_ns)| ImageMeta {
+            width: width.and_then(|value| u32::try_from(value).ok()),
+            height: height.and_then(|value| u32::try_from(value).ok()),
+            taken_ns,
+        }))
+    }
+
+    /// Records the header metadata for one SHA-256 digest, so the same content
+    /// elsewhere in the library — a duplicate, a move, a touched file — never
+    /// parses it twice. The last writer for a digest wins; reads see rows
+    /// written earlier in the same scan, which is what lets one refresh
+    /// share work between identical files.
+    pub fn cache_image_meta(&mut self, sha256: &str, meta: &ImageMeta) -> Result<(), IndexError> {
+        self.ensure_scan_active()?;
+        let result = self
+            .conn()?
+            .execute(
+                "INSERT INTO image_meta(sha256,width,height,taken_ns) VALUES(?1,?2,?3,?4) \
+                 ON CONFLICT(sha256) DO UPDATE SET \
+                 width=excluded.width,height=excluded.height,taken_ns=excluded.taken_ns",
+                params![
+                    sha256,
+                    meta.width.map(i64::from),
+                    meta.height.map(i64::from),
+                    meta.taken_ns
+                ],
+            )
+            .map(|_| ())
+            .map_err(IndexError::from);
+        self.fail_scan_on_error(result)
+    }
+
     /// Finds all paths with the supplied SHA-256 digest.
     pub fn by_sha256(&self, sha256: &str) -> Result<Vec<String>, IndexError> {
         let mut stmt = self
@@ -719,7 +863,7 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
         })
         .optional()?;
     if let Some(version) = version {
-        if version != SCHEMA_VERSION {
+        if version != SCHEMA_VERSION && version != MIGRATABLE_FROM {
             return Err(IndexError::RebuildRequired(format!(
                 "schema version {version} does not match supported version {SCHEMA_VERSION}"
             )));
@@ -728,12 +872,13 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
     if version.is_none() {
         conn.execute_batch(
             "BEGIN IMMEDIATE;
-             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER);
+             CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER,width INTEGER,height INTEGER,taken_ns INTEGER);
              CREATE TABLE IF NOT EXISTS notes(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,image_path TEXT,id TEXT,title TEXT NOT NULL,tags TEXT NOT NULL,props_json TEXT NOT NULL,body TEXT NOT NULL DEFAULT '');
              CREATE TABLE IF NOT EXISTS links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,syntax TEXT NOT NULL DEFAULT 'wiki_link',PRIMARY KEY(src,raw));
              CREATE TABLE IF NOT EXISTS note_tags(image_path TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(image_path,tag));
              CREATE TABLE IF NOT EXISTS scan_seen(path TEXT PRIMARY KEY);
              CREATE TABLE IF NOT EXISTS moved_from(path TEXT PRIMARY KEY,id TEXT,sha256 TEXT,kind TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER);
              CREATE INDEX IF NOT EXISTS files_sha256_idx ON files(sha256);
              CREATE INDEX IF NOT EXISTS files_added_ns_idx ON files(added_ns);
              CREATE INDEX IF NOT EXISTS files_size_idx ON files(size);
@@ -741,6 +886,7 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
              CREATE INDEX IF NOT EXISTS files_folder_idx ON files(folder);
              CREATE INDEX IF NOT EXISTS files_kind_path_idx ON files(kind,path);
              CREATE INDEX IF NOT EXISTS files_rating_idx ON files(rating);
+             CREATE INDEX IF NOT EXISTS files_taken_ns_idx ON files(taken_ns);
              CREATE INDEX IF NOT EXISTS notes_id_idx ON notes(id);
              CREATE INDEX IF NOT EXISTS notes_image_path_idx ON notes(image_path);
              CREATE INDEX IF NOT EXISTS note_tags_tag_idx ON note_tags(tag);
@@ -756,12 +902,55 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
                INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
              END;
              DELETE FROM schema_version;
-             INSERT INTO schema_version(version) VALUES(6);
+             INSERT INTO schema_version(version) VALUES(7);
              COMMIT;",
         )?;
+    } else if version == Some(MIGRATABLE_FROM) {
+        upgrade_from_previous(conn)?;
     }
     validate_schema(conn)?;
     Ok(())
+}
+
+/// Bring a [`MIGRATABLE_FROM`] database up to [`SCHEMA_VERSION`] in place:
+/// add the columns and tables the newer schema has, keep every row, and bump
+/// the recorded version. All in one transaction, so a crash leaves the old
+/// schema fully intact. Adding only what is missing makes re-running the
+/// step harmless, which matters because an interrupted upgrade is never
+/// visible as a half-changed schema.
+fn upgrade_from_previous(conn: &Connection) -> Result<(), IndexError> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| {
+        for column in MIGRATION_COLUMNS {
+            if !table_has_column(conn, "files", column)? {
+                conn.execute(
+                    &format!("ALTER TABLE files ADD COLUMN {column} INTEGER"),
+                    [],
+                )?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS image_meta(sha256 TEXT PRIMARY KEY,width INTEGER,height INTEGER,taken_ns INTEGER);
+             CREATE INDEX IF NOT EXISTS files_taken_ns_idx ON files(taken_ns);
+             DELETE FROM schema_version;
+             INSERT INTO schema_version(version) VALUES(7);
+             COMMIT;",
+        )?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    result
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, IndexError> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name=?)",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    Ok(has)
 }
 
 fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
@@ -772,6 +961,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         "note_tags",
         "scan_seen",
         "moved_from",
+        "image_meta",
         "notes_fts",
     ];
     for table in required {
@@ -801,6 +991,9 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
                 "folder",
                 "name_key",
                 "rating",
+                "width",
+                "height",
+                "taken_ns",
             ][..],
         ),
         (
@@ -820,6 +1013,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         ("note_tags", &["image_path", "tag"][..]),
         ("scan_seen", &["path"][..]),
         ("moved_from", &["path", "id", "sha256", "kind"][..]),
+        ("image_meta", &["sha256", "width", "height", "taken_ns"][..]),
     ] {
         let columns: HashSet<String> = {
             let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
@@ -843,6 +1037,7 @@ fn validate_schema(conn: &Connection) -> Result<(), IndexError> {
         ("note_tags", vec!["image_path", "tag"]),
         ("scan_seen", vec!["path"]),
         ("moved_from", vec!["path"]),
+        ("image_meta", vec!["sha256"]),
     ] {
         let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
         let mut key_columns = stmt
@@ -990,6 +1185,9 @@ mod tests {
             kind: FileKind::Image,
             note_added_ns: None,
             rating: None,
+            width: None,
+            height: None,
+            taken_ns: None,
         }
     }
 
@@ -1545,6 +1743,160 @@ mod tests {
         assert!(index.rebuild_required());
     }
 
+    /// The schema of version 6 exactly as that code wrote it, so a database
+    /// built by the previous dimagine can be faked faithfully: no per-image
+    /// metadata columns, no probe cache, and rows written like the old
+    /// `upsert_file` did.
+    const V6_SCHEMA: &str = "CREATE TABLE schema_version(version INTEGER NOT NULL);
+             CREATE TABLE files(path TEXT PRIMARY KEY,size INTEGER NOT NULL,mtime_ns INTEGER NOT NULL,sha256 TEXT,kind TEXT NOT NULL,first_seen_ns INTEGER NOT NULL,note_added_ns INTEGER,added_ns INTEGER NOT NULL,folder TEXT NOT NULL DEFAULT '',name_key TEXT NOT NULL DEFAULT '',rating INTEGER);
+             CREATE TABLE notes(note_id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,image_path TEXT,id TEXT,title TEXT NOT NULL,tags TEXT NOT NULL,props_json TEXT NOT NULL,body TEXT NOT NULL DEFAULT '');
+             CREATE TABLE links(src TEXT NOT NULL,raw TEXT NOT NULL,target TEXT,state TEXT NOT NULL,syntax TEXT NOT NULL DEFAULT 'wiki_link',PRIMARY KEY(src,raw));
+             CREATE TABLE note_tags(image_path TEXT NOT NULL,tag TEXT NOT NULL,PRIMARY KEY(image_path,tag));
+             CREATE TABLE scan_seen(path TEXT PRIMARY KEY);
+             CREATE TABLE moved_from(path TEXT PRIMARY KEY,id TEXT,sha256 TEXT,kind TEXT NOT NULL);
+             CREATE INDEX files_sha256_idx ON files(sha256);
+             CREATE INDEX files_added_ns_idx ON files(added_ns);
+             CREATE INDEX files_size_idx ON files(size);
+             CREATE INDEX files_mtime_ns_idx ON files(mtime_ns);
+             CREATE INDEX files_folder_idx ON files(folder);
+             CREATE INDEX files_kind_path_idx ON files(kind,path);
+             CREATE INDEX files_rating_idx ON files(rating);
+             CREATE INDEX notes_id_idx ON notes(id);
+             CREATE INDEX notes_image_path_idx ON notes(image_path);
+             CREATE INDEX note_tags_tag_idx ON note_tags(tag);
+             CREATE VIRTUAL TABLE notes_fts USING fts5(title,tags,body,content='notes',content_rowid='note_id',tokenize='trigram');
+             CREATE TRIGGER notes_ai AFTER INSERT ON notes BEGIN
+               INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
+             END;
+             CREATE TRIGGER notes_ad AFTER DELETE ON notes BEGIN
+               INSERT INTO notes_fts(notes_fts,rowid,title,tags,body) VALUES('delete',old.note_id,old.title,old.tags,old.body);
+             END;
+             CREATE TRIGGER notes_au AFTER UPDATE OF title,tags,body ON notes BEGIN
+               INSERT INTO notes_fts(notes_fts,rowid,title,tags,body) VALUES('delete',old.note_id,old.title,old.tags,old.body);
+               INSERT INTO notes_fts(rowid,title,tags,body) VALUES(new.note_id,new.title,new.tags,new.body);
+             END;
+             INSERT INTO schema_version(version) VALUES(6);
+             INSERT INTO files(path,size,mtime_ns,sha256,kind,first_seen_ns,note_added_ns,added_ns,folder,name_key,rating) \
+               VALUES('refs/old.jpg',7,8,NULL,'image',1000,NULL,1000,'refs','old.jpg',3);";
+
+    /// W48: a database from schema version 6 — the version immediately before
+    /// the per-image metadata columns — opens, migrates in place, and keeps
+    /// every row. The FIRST SCAN afterwards fills the new columns, because a
+    /// v6 image row has no content digest to reuse and the refresh must read
+    /// the file once.
+    #[test]
+    fn previous_schema_version_migrates_in_place_keeping_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(V6_SCHEMA).unwrap();
+        drop(conn);
+
+        let mut index = Index::open(dir.path()).unwrap();
+        assert!(
+            !index.rebuild_required(),
+            "a v6 database must not require a rebuild"
+        );
+        let version: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 7, "the schema version was bumped");
+        let (size, rating, width, taken): (i64, Option<i64>, Option<i64>, Option<i64>) = index
+            .conn()
+            .unwrap()
+            .query_row(
+                "SELECT size,rating,width,taken_ns FROM files WHERE path='refs/old.jpg'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (size, rating, width, taken),
+            (7, Some(3), None, None),
+            "the old row is kept with its values, the new columns start unknown"
+        );
+
+        // The refresh that follows works exactly as on a fresh database: the
+        // fresh columns are written, and the next refresh reuses the digest
+        // now that the row has one.
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&FileRecord {
+                path: "refs/old.jpg".into(),
+                size: 7,
+                mtime_ns: 8,
+                sha256: Some("a".repeat(64)),
+                kind: FileKind::Image,
+                note_added_ns: None,
+                rating: Some(3),
+                width: Some(64),
+                height: Some(48),
+                taken_ns: Some(1_689_191_647_000_000_000),
+            })
+            .unwrap();
+        index.finish_scan(&["refs/old.jpg".into()]).unwrap();
+        assert_eq!(
+            index.reusable_image_meta("refs/old.jpg", 7, 8).unwrap(),
+            Some((
+                "a".repeat(64),
+                ImageMeta {
+                    width: Some(64),
+                    height: Some(48),
+                    taken_ns: Some(1_689_191_647_000_000_000),
+                },
+            )),
+            "after the first refresh the columns are reusable like any other row's"
+        );
+        drop(index);
+
+        // Idempotence: opening the migrated database again finds the current
+        // version and changes nothing.
+        let index = Index::open(dir.path()).unwrap();
+        assert!(!index.rebuild_required());
+        let version: i64 = index
+            .conn()
+            .unwrap()
+            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 7);
+    }
+
+    /// A v6 database that someone already hand-patched with some or all of
+    /// the new columns still migrates: the step only adds what is missing.
+    #[test]
+    fn migrating_a_partially_newer_v6_database_adds_only_missing_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".dimagine/cache/index.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(V6_SCHEMA).unwrap();
+        // A strange half-state: `width` already exists, the other two do not.
+        conn.execute("ALTER TABLE files ADD COLUMN width INTEGER", [])
+            .unwrap();
+        drop(conn);
+        let index = Index::open(dir.path()).unwrap();
+        assert!(!index.rebuild_required());
+        for (table, expected_key) in [("files", 11 + 3), ("image_meta", 4)] {
+            let columns: i64 = index
+                .conn()
+                .unwrap()
+                .query_row(
+                    &format!("SELECT count(*) FROM pragma_table_info('{table}')"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(columns, expected_key as i64, "{table} has all columns");
+        }
+    }
+
     #[test]
     fn newer_schema_returns_rebuild_signal() {
         let dir = tempfile::tempdir().unwrap();
@@ -1649,6 +2001,140 @@ mod tests {
             .unwrap();
         index.finish_scan(&[]).unwrap();
         assert!(index.needs_hash("hashless.jpg", 4, 8).unwrap());
+    }
+
+    /// W48: the reuse rule for per-image metadata is the incremental-hashing
+    /// rule — same size and nanosecond mtime plus a valid content digest —
+    /// and the digest pinned there is what makes the columns trustworthy: a
+    /// row that never got one (a migrated v6 row, a row the old scan wrote)
+    /// must be read once instead of reusing `NULL`.
+    #[test]
+    fn image_meta_reuse_requires_matching_facts_and_a_valid_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&FileRecord {
+                path: "a.jpg".into(),
+                size: 10,
+                mtime_ns: 20,
+                sha256: Some("b".repeat(64)),
+                kind: FileKind::Image,
+                note_added_ns: None,
+                rating: None,
+                width: Some(640),
+                height: Some(480),
+                taken_ns: Some(1_689_191_647_000_000_000),
+            })
+            .unwrap();
+        // The production shape of an old row: no digest, so nothing is known
+        // about the content and the caller must read the file.
+        index.upsert_file(&file("legacy.jpg", 4, 8, None)).unwrap();
+        index.finish_scan(&[]).unwrap();
+
+        assert_eq!(
+            index.reusable_image_meta("a.jpg", 10, 20).unwrap(),
+            Some((
+                "b".repeat(64),
+                ImageMeta {
+                    width: Some(640),
+                    height: Some(480),
+                    taken_ns: Some(1_689_191_647_000_000_000),
+                },
+            ))
+        );
+        assert!(
+            index
+                .reusable_image_meta("a.jpg", 11, 20)
+                .unwrap()
+                .is_none(),
+            "a changed size is not the same file"
+        );
+        assert!(
+            index
+                .reusable_image_meta("a.jpg", 10, 21)
+                .unwrap()
+                .is_none(),
+            "a changed mtime is not the same file"
+        );
+        assert!(
+            index
+                .reusable_image_meta("absent.jpg", 10, 20)
+                .unwrap()
+                .is_none(),
+            "a path the index never saw is a fresh read"
+        );
+        assert!(
+            index
+                .reusable_image_meta("legacy.jpg", 4, 8)
+                .unwrap()
+                .is_none(),
+            "a row without a valid digest has nothing reusable to say about its content"
+        );
+    }
+
+    /// W48: the content-hash probe cache. A digest seen for the first time is
+    /// parsed and recorded; the recording is visible inside the same scan, so
+    /// a duplicate content shares it at once; and a recorded unreadable
+    /// header is a hit stating "unknown", which is what stops a broken file
+    /// from being re-read on every refresh.
+    #[test]
+    fn the_probe_cache_is_keyed_by_content_digest_and_reused_within_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        let digest = "c".repeat(64);
+        assert!(index.cached_image_meta(&digest).unwrap().is_none());
+        index
+            .cache_image_meta(
+                &digest,
+                &ImageMeta {
+                    width: Some(12),
+                    height: Some(1),
+                    taken_ns: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            index.cached_image_meta(&digest).unwrap(),
+            Some(ImageMeta {
+                width: Some(12),
+                height: Some(1),
+                taken_ns: None,
+            }),
+            "read back inside the same scan"
+        );
+        index
+            .cache_image_meta(
+                &digest,
+                &ImageMeta {
+                    width: None,
+                    height: None,
+                    taken_ns: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            index.cached_image_meta(&digest).unwrap(),
+            Some(ImageMeta {
+                width: None,
+                height: None,
+                taken_ns: None,
+            }),
+            "the last writer for a digest wins"
+        );
+        index.finish_scan(&[]).unwrap();
+        assert!(matches!(
+            index.cache_image_meta(
+                "d".repeat(64).as_str(),
+                &ImageMeta {
+                    width: None,
+                    height: None,
+                    taken_ns: None,
+                }
+            ),
+            Err(IndexError::ScanNotActive),
+        ));
     }
 
     #[test]
