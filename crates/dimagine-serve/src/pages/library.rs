@@ -12,9 +12,10 @@ use axum::{
 use dimagine_index::{ViewItem, ViewPage};
 use serde::Serialize;
 
-use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
+use crate::index_sync::{recent_label, recent_window, SidebarData, RECENT_LIMIT};
 use crate::ui::components;
 use crate::ui::escape_html;
+use crate::ui::filters;
 use crate::ui::shell::{Destination, Frame};
 use crate::view_query::{ViewParams, PAGE_SIZE};
 use crate::{acquire_admission, admission_denied, index_failure, AppState};
@@ -134,10 +135,35 @@ pub(crate) async fn library_page(
         ..Frame::new(
             view_name.as_deref().unwrap_or("Library"),
             Destination::Library,
-            body,
+            wrap_with_panel(&state, &params, &result.sidebar, body),
         )
     };
     Html(frame.render()).into_response()
+}
+
+/// The grid, or the collection page, with the filter panel beside it.
+///
+/// The panel's counts come from five grouped queries (one per facet, plus the
+/// lens), whatever the library holds: a facet's sixty values cost one query, not
+/// sixty. They are read per page render rather than cached, because they belong
+/// to the filters on screen and every chip changes all of them.
+///
+/// `None` from the index — the same index that just answered the grid, so this
+/// is a contradiction rather than a busy database — leaves the panel off the
+/// page. Numbers about the library are never invented (repository invariant 4).
+fn wrap_with_panel(
+    state: &AppState,
+    params: &ViewParams,
+    sidebar: &SidebarData,
+    results: String,
+) -> String {
+    let Ok(counts) = state
+        .index
+        .view_facet_counts(&params.to_index_query(), recent_window(params.recent))
+    else {
+        return results;
+    };
+    filters::with_panel(filters::filter_panel(sidebar, &counts, params), results)
 }
 
 /// The body every non-collection view uses: the heading and the grid, or

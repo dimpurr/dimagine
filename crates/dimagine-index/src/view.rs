@@ -10,6 +10,7 @@
 
 use crate::{ImageMeta, Index, IndexError};
 use rusqlite::OptionalExtension;
+use std::collections::BTreeMap;
 
 /// The highest `rating` FORMAT §3.1 allows.
 const MAX_RATING: u8 = 5;
@@ -649,6 +650,291 @@ fn row_at(index: &Index, query: &ViewQuery, offset: u64) -> Result<Option<String
 fn order_by_taken(q: &ViewQuery) -> String {
     let direction = if q.descending { "DESC" } else { "ASC" };
     format!(" ORDER BY (f.taken_ns IS NULL), f.taken_ns {direction}, f.path ASC")
+}
+
+// === W47 · the filter panel's facet counts ==================================
+//
+// The panel beside the grid asks one question per row: *how many images would
+// this value show, given the filters that are already on?* A row that
+// replaces its filter — a folder, a collection, a lens — counts beside every
+// other filter with its own stepped out; a tag row adds its tag to the tags
+// already on (the one repeatable filter), so with `tag=eagle&tag=urban` on,
+// the row for `portrait` counts what adding `portrait` to eagle and urban
+// would show, not the nothing that all three together would. Every value of
+// a facet comes back from one grouped query: a facet with sixty tags costs
+// one query, not sixty.
+
+/// Which facet of the filter panel a count answers for. The Recent lens is not
+/// among them: its window is not another value beside the chosen one, it *is*
+/// the value the row names ([`RecentWindow`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Facet {
+    Tags,
+    Folders,
+    Collections,
+    Untagged,
+}
+
+impl Facet {
+    /// The view this facet's counts run over: the view on screen with the
+    /// filter this facet answers for handled the way the panel's rows toggle
+    /// it. A count is not a page, so the page and the order a page needs come
+    /// off too.
+    ///
+    /// A folder, collection or lens row *replaces* its filter — the one
+    /// folder, the one collection, the one lens — so those counts leave the
+    /// filter out entirely: the count for `refs` beside `tag=nature` is what
+    /// `in=refs&tag=nature` shows. A tag row *adds* its tag to the tags
+    /// already on, so the tag counts keep them: the count for `beta` beside
+    /// `tag=alpha` is what `tag=alpha&tag=beta` shows, which is the row's
+    /// own link. The chosen tag's row then counts the view as it stands —
+    /// where the reader is, the same as every other group's chosen row —
+    /// rather than the view its way-out link opens.
+    fn view_for_counts(self, view: &ViewQuery) -> ViewQuery {
+        let mut narrowed = view.clone();
+        match self {
+            Self::Tags => {}
+            Self::Folders => narrowed.folder = None,
+            Self::Collections => narrowed.collection = None,
+            Self::Untagged => narrowed.untagged = false,
+        }
+        narrowed.offset = 0;
+        narrowed.limit = 0;
+        narrowed
+    }
+}
+
+/// The Recent lens, as a caller that counts facets has to state it: the lens is
+/// the `N` newest added images and `N` is the viewer's number, not the index's
+/// (the same way [`Index::view_neighbours`] takes its cap from the caller).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecentWindow {
+    /// The lens is off, so only the Recent row looks inside the window: it says
+    /// what clicking it would narrow the view to.
+    Off { limit: u64 },
+    /// The lens is on, so every facet's count is capped at the window:
+    /// the grid the lens shows stops at the newest `limit` images of
+    /// the set on screen, and a count beside it never promises more
+    /// than the grid can show.
+    On { limit: u64 },
+}
+
+impl RecentWindow {
+    /// How far the lens reaches.
+    fn limit(self) -> u64 {
+        match self {
+            Self::Off { limit } | Self::On { limit } => limit,
+        }
+    }
+
+    /// Whether the lens caps the counts of the other facets.
+    fn active(self) -> bool {
+        matches!(self, Self::On { .. })
+    }
+}
+
+/// Every facet value the view's filters leave, counted: the number the filter
+/// panel puts beside each row. A value the map does not carry has no match
+/// among those images — that is zero, a fact, and not an unknown.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FacetCounts {
+    /// Tag, in the index's folded spelling, to images carrying it.
+    pub tags: BTreeMap<String, u64>,
+    /// Folder, library-relative, to images inside it and its subfolders —
+    /// what a recursive view counts, and the same thing a folder row
+    /// means in the sidebar; a `sub=0` view counts a folder's direct
+    /// members only, which is what its own rows link to. The library
+    /// root is not a row of its own, so it never appears here.
+    pub folders: BTreeMap<String, u64>,
+    /// Collection note path to the members of it that remain.
+    pub collections: BTreeMap<String, u64>,
+    /// Images that carry no tag.
+    pub untagged: u64,
+    /// Images the Recent window reaches.
+    pub recent: u64,
+}
+
+impl Index {
+    /// The counts one filter panel needs, in five grouped queries.
+    ///
+    /// `view` is the view on screen: every filter in it narrows every
+    /// facet except the one that answers for it ([`FacetCounts`]). Its
+    /// `sort`, `offset` and `limit` are ignored, as they are for any
+    /// count. A count never pages, so no page is read.
+    ///
+    /// The Recent lens cannot ride in a [`ViewQuery`] — a window is not
+    /// a filter — so `recent` states it. The lens caps what the grid
+    /// shows: its pages stop at the newest `limit` images of the set
+    /// on screen, never at the library's newest `limit`, so every count
+    /// beside the lens is capped at `limit` too. Capping — not cutting
+    /// the counts to the library-wide window — is what makes a count
+    /// say what its own row's link shows on any library the filters
+    /// narrow: a filter whose images are all older than the window
+    /// counts what it leaves, not a phantom zero.
+    pub fn view_facet_counts(
+        &self,
+        view: &ViewQuery,
+        recent: RecentWindow,
+    ) -> Result<FacetCounts, IndexError> {
+        let conn = self.conn()?;
+        let window = recent.limit();
+        let lens_on = recent.active();
+
+        let mut tags = facet_sql(view, Facet::Tags);
+        tags.and("note_tags.image_path=f.path");
+        let mut tags = facet_values(conn, &tags, "note_tags.tag", ", note_tags")?;
+
+        let folders = facet_sql(view, Facet::Folders);
+        let direct = facet_values(conn, &folders, "f.folder", "")?;
+        // A `sub=0` view shows a folder's direct members only, and a
+        // folder row's own link keeps `sub=0`, so the counts keep the
+        // view's own reach: the rollup to every parent is what a
+        // recursive view means, and only that view rolls up.
+        let mut folders = if view.recursive {
+            folder_tree(direct)
+        } else {
+            direct
+        };
+
+        // Every collection at once, so the one collection the view may be
+        // narrowed to leaves the statement entirely — its `WITH members` CTE
+        // would ask the question of a single note. The member rule is the view's
+        // own (`view_sql_with_order`): a strong embed (`syntax<>'wiki_link'`)
+        // that resolves to an image and is not the note's own image
+        // (FORMAT §3.2), and `count(DISTINCT f.path)` is the collection page's
+        // rule that an image embedded twice shows once. A facet row and
+        // `/?c=<that note>` can therefore never disagree about membership.
+        let mut collections = facet_sql(view, Facet::Collections);
+        collections.and(
+            "links.syntax<>'wiki_link' AND links.target IS NOT NULL \
+             AND links.target<>COALESCE(own.image_path,'')",
+        );
+        let mut collections = facet_values(
+            conn,
+            &collections,
+            "links.src",
+            " JOIN links ON links.target=f.path LEFT JOIN notes own ON own.path=links.src",
+        )?;
+
+        // "No tags" is not a tag, so the untagged row is the one facet whose
+        // condition is written rather than grouped over a column — and the one
+        // the view's own untagged lens has to step out of first.
+        let mut untagged = facet_sql(view, Facet::Untagged);
+        untagged.and("NOT EXISTS(SELECT 1 FROM note_tags WHERE note_tags.image_path=f.path)");
+        let mut untagged = facet_count(conn, &untagged)?;
+
+        // The Recent row counts what the lens would leave of the other
+        // filters, capped at the window whether the lens is on or off:
+        // the window is what that row names, and the lens can never
+        // show more than it.
+        let recent_sql = view_sql(&{
+            let mut whole = view.clone();
+            whole.offset = 0;
+            whole.limit = 0;
+            whole
+        });
+        let recent = facet_count(conn, &recent_sql)?.min(window);
+
+        if lens_on {
+            // The lens is on, so the grid stops at the newest `window`
+            // images of the set on screen: every count beside it stops
+            // there too, or it would promise images the grid cannot show.
+            cap_counts(&mut tags, window);
+            cap_counts(&mut folders, window);
+            cap_counts(&mut collections, window);
+            untagged = untagged.min(window);
+        }
+
+        Ok(FacetCounts {
+            tags,
+            folders,
+            collections,
+            untagged,
+            recent,
+        })
+    }
+}
+
+/// The statement one facet's counts run over: the view the facet
+/// answers beside ([`Facet::view_for_counts`]), in the shape
+/// [`Index::view`] builds its own query in — so a count and the grid
+/// beside it can never disagree about what a filter means, because
+/// they are the same builder.
+fn facet_sql(view: &ViewQuery, facet: Facet) -> ViewSql {
+    view_sql(&facet.view_for_counts(view))
+}
+
+/// Cap every value's count at the Recent lens's reach: the lens's pages
+/// stop at the newest `window` images of the set on screen, so a count
+/// beside the lens never promises more than the lens can show.
+fn cap_counts(counts: &mut BTreeMap<String, u64>, window: u64) {
+    for count in counts.values_mut() {
+        *count = (*count).min(window);
+    }
+}
+
+/// How many rows a facet's statement leaves.
+fn facet_count(conn: &rusqlite::Connection, sql: &ViewSql) -> Result<u64, IndexError> {
+    let counted: i64 = conn.query_row(&sql.count(), bound(&sql.params), |row| row.get(0))?;
+    Ok(counted.max(0) as u64)
+}
+
+/// Every value of one facet with how many rows carry it, in one grouped query:
+/// `value` names the column the value lives in, `join` brings in the table that
+/// holds it (empty when it is a column of the image row itself).
+///
+/// `count(DISTINCT f.path)` counts images, not rows: one image embedded twice
+/// is one member of a collection, and a value that never arrives as an empty
+/// string is no value at all, so that row is dropped.
+fn facet_values(
+    conn: &rusqlite::Connection,
+    sql: &ViewSql,
+    value: &str,
+    join: &str,
+) -> Result<BTreeMap<String, u64>, IndexError> {
+    let statement = format!(
+        "{with}SELECT {value}, count(DISTINCT f.path) {from}{join} \
+         WHERE {where_sql} GROUP BY {value}",
+        with = sql.with,
+        value = value,
+        from = sql.count_from,
+        join = join,
+        where_sql = sql.where_sql,
+    );
+    let mut stmt = conn.prepare(&statement)?;
+    let rows = stmt.query_map(bound(&sql.params), |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+        ))
+    })?;
+    Ok(rows
+        .collect::<Result<BTreeMap<_, _>, _>>()?
+        .into_iter()
+        .filter(|(value, _)| !value.is_empty())
+        .collect())
+}
+
+/// Turn "images in this folder" into "images in this folder and everything
+/// below it", which is what a folder row means in the panel and the sidebar
+/// alike (and the same reach [`Index::folder_counts`] counts with): each image
+/// is added to its own folder and to every parent of that folder, so a folder
+/// with nothing of its own but a full subfolder counts the subfolder and shows.
+fn folder_tree(direct: BTreeMap<String, u64>) -> BTreeMap<String, u64> {
+    let mut tree: BTreeMap<&str, u64> = BTreeMap::new();
+    for (folder, count) in &direct {
+        let mut prefix = folder.as_str();
+        loop {
+            *tree.entry(prefix).or_insert(0) += count;
+            match prefix.rfind('/') {
+                Some(at) => prefix = &prefix[..at],
+                None => break,
+            }
+        }
+    }
+    tree.into_iter()
+        .map(|(folder, count)| (folder.to_owned(), count))
+        .collect()
 }
 
 /// The columns that decide whether a note is a collection (FORMAT §5): its
@@ -2244,5 +2530,373 @@ mod tests {
                 unreadable_headers: 0
             }
         );
+    }
+
+    // === W47 · the filter panel's facet counts ==============================
+
+    fn facet_map(values: &[(&str, u64)]) -> BTreeMap<String, u64> {
+        values
+            .iter()
+            .map(|(value, count)| ((*value).to_owned(), *count))
+            .collect()
+    }
+
+    fn facet_embed(src: &str, target: &str, raw: &str) -> crate::LinkRecord {
+        crate::LinkRecord {
+            src: src.to_owned(),
+            raw: raw.to_owned(),
+            target: Some(target.to_owned()),
+            state: crate::LinkState::Resolved,
+            syntax: crate::LinkSyntax::WikiEmbed,
+        }
+    }
+
+    /// A library whose facet answers are worked out by hand: five images over
+    /// three folders (`refs`, `refs/ui`, `other`), tags `red` / `big` / `blue`
+    /// and one image with no tag at all, `added` times far apart so a Recent
+    /// window of three cuts between `d` and `e`, two listed collections (one of
+    /// which embeds `b` twice, in two spellings) and one image note that embeds
+    /// a sibling — a collection whose own image is not its member (FORMAT §3.2).
+    fn facet_library() -> (tempfile::TempDir, Index) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str, added_ns: i64| FileRecord {
+            path: path.to_owned(),
+            size: 10,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: Some(added_ns),
+            rating: None,
+            width: None,
+            height: None,
+            taken_ns: None,
+        };
+        let note = |path: &str, image_path: Option<&str>, tags: &[&str], props: &str| NoteRecord {
+            path: path.to_owned(),
+            image_path: image_path.map(str::to_owned),
+            id: None,
+            title: path.to_owned(),
+            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            props_json: props.to_owned(),
+        };
+        index.begin_scan().unwrap();
+        for (path, added_ns) in [
+            ("refs/a.png", 5_000),
+            ("refs/b.png", 4_000),
+            ("refs/ui/c.png", 3_000),
+            ("refs/ui/d.png", 2_000),
+            ("other/e.png", 1_000),
+        ] {
+            index.upsert_file(&image(path, added_ns)).unwrap();
+        }
+        for (path, tags) in [
+            ("refs/a.png", ["big", "red"].as_slice()),
+            ("refs/b.png", ["red"].as_slice()),
+            ("refs/ui/c.png", ["blue"].as_slice()),
+            // An image whose note carries no tag: `untagged` is its row.
+            ("refs/ui/d.png", [].as_slice()),
+            ("other/e.png", ["big"].as_slice()),
+        ] {
+            let note_path = format!("{path}.md");
+            index
+                .upsert_note(&note(&note_path, Some(path), tags, "{}"))
+                .unwrap();
+        }
+        index
+            .replace_links(
+                "refs/a.png.md",
+                &[
+                    facet_embed("refs/a.png.md", "refs/a.png", "![[a.png]]"),
+                    facet_embed("refs/a.png.md", "refs/ui/c.png", "![[ui/c.png]]"),
+                ],
+            )
+            .unwrap();
+        index
+            .upsert_note(&note(
+                "set.md",
+                None,
+                &[],
+                r#"{"kind":"collection","title":"Set"}"#,
+            ))
+            .unwrap();
+        index
+            .replace_links(
+                "set.md",
+                &[
+                    facet_embed("set.md", "refs/a.png", "![[refs/a.png]]"),
+                    facet_embed("set.md", "refs/ui/c.png", "![[refs/ui/c.png]]"),
+                    facet_embed("set.md", "other/e.png", "![[other/e.png]]"),
+                ],
+            )
+            .unwrap();
+        index
+            .upsert_note(&note(
+                "dupe.md",
+                None,
+                &[],
+                r#"{"kind":"collection","title":"Dupe"}"#,
+            ))
+            .unwrap();
+        index
+            .replace_links(
+                "dupe.md",
+                &[
+                    facet_embed("dupe.md", "refs/b.png", "![[refs/b.png]]"),
+                    facet_embed("dupe.md", "refs/b.png", "![[b.png]]"),
+                    facet_embed("dupe.md", "refs/a.png", "![[refs/a.png]]"),
+                ],
+            )
+            .unwrap();
+        index
+            .finish_scan(&[
+                "refs/a.png".into(),
+                "refs/b.png".into(),
+                "refs/ui/c.png".into(),
+                "refs/ui/d.png".into(),
+                "other/e.png".into(),
+                "refs/a.png.md".into(),
+                "refs/b.png.md".into(),
+                "refs/ui/c.png.md".into(),
+                "refs/ui/d.png.md".into(),
+                "other/e.png.md".into(),
+                "set.md".into(),
+                "dupe.md".into(),
+            ])
+            .unwrap();
+        (dir, index)
+    }
+
+    /// Nothing narrowed: every facet counts the library, a folder row counts
+    /// its subfolders, and a collection counts members — once each, with a
+    /// note's own image not a member of itself.
+    #[test]
+    fn an_uncharted_facet_panel_counts_the_whole_library() {
+        let (_dir, index) = facet_library();
+        let counts = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::Off { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            counts.tags,
+            facet_map(&[("big", 2), ("blue", 1), ("red", 2)]),
+            "{:?}",
+            counts.tags
+        );
+        assert_eq!(
+            counts.folders,
+            facet_map(&[("other", 1), ("refs", 4), ("refs/ui", 2)]),
+            "a parent counts what its subfolder holds, the root is no row"
+        );
+        assert_eq!(
+            counts.collections,
+            facet_map(&[("dupe.md", 2), ("refs/a.png.md", 1), ("set.md", 3)]),
+            "dupe.md embeds b twice and still counts it once; a.png's own note \
+             is a collection of c alone, not of a"
+        );
+        assert_eq!(counts.untagged, 1);
+        assert_eq!(counts.recent, 3);
+    }
+
+    /// One filter is on — the folder scope — and it narrows every facet except
+    /// the folder facet, whose own filter steps out. Otherwise its rows would
+    /// answer "what is inside the folder you already chose", which is always
+    /// the number the toolbar already shows.
+    #[test]
+    fn one_active_filter_narrows_every_facet_but_its_own() {
+        let (_dir, index) = facet_library();
+        let view = ViewQuery {
+            folder: Some("refs".to_owned()),
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::Off { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            counts.tags,
+            facet_map(&[("big", 1), ("blue", 1), ("red", 2)]),
+            "other/e.png is the second `big` image and it is not in refs"
+        );
+        assert_eq!(
+            counts.folders,
+            facet_map(&[("other", 1), ("refs", 4), ("refs/ui", 2)]),
+            "the folder facet ignores `in`: its rows are the choices, not the view"
+        );
+        assert_eq!(
+            counts.collections,
+            facet_map(&[("dupe.md", 2), ("refs/a.png.md", 1), ("set.md", 2)]),
+            "set.md's member `other/e.png` leaves the folder"
+        );
+        assert_eq!(counts.untagged, 1);
+        assert_eq!(
+            counts.recent, 3,
+            "the three newest are a, b, c, and all three are in refs"
+        );
+    }
+
+    /// Two filters are on — a tag and a collection — and every facet that is
+    /// neither of them counts their intersection, while each of the two counts
+    /// the other one.
+    #[test]
+    fn two_active_filters_narrow_the_facets_that_are_neither_of_them() {
+        let (_dir, index) = facet_library();
+        let view = ViewQuery {
+            tags: vec!["red".to_owned()],
+            collection: Some("set.md".to_owned()),
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::Off { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            counts.tags,
+            facet_map(&[("big", 1), ("red", 1)]),
+            "the tag facet keeps `tag=red` and counts set.md's members \
+             that carry it: a alone, so `blue` is no row at all"
+        );
+        assert_eq!(
+            counts.folders,
+            facet_map(&[("refs", 1)]),
+            "a is the only set.md member that carries `red`"
+        );
+        assert_eq!(
+            counts.collections,
+            facet_map(&[("dupe.md", 2), ("set.md", 1)]),
+            "the collection facet drops `c=set.md` and counts the `red` images a, b"
+        );
+        assert_eq!(
+            counts.untagged, 0,
+            "an untagged image cannot carry `red`: an honest zero, not a missing row"
+        );
+        assert_eq!(counts.recent, 1);
+    }
+
+    /// A third filter is on as well, and it is the one no tag can express:
+    /// `untagged` beside `red` leaves nothing, and every facet says zero rather
+    /// than pretending otherwise.
+    #[test]
+    fn a_filter_that_leaves_nothing_leaves_every_facet_at_zero() {
+        let (_dir, index) = facet_library();
+        let view = ViewQuery {
+            tags: vec!["red".to_owned()],
+            untagged: true,
+            folder: Some("refs".to_owned()),
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::Off { limit: 3 })
+            .unwrap();
+        assert!(counts.tags.is_empty(), "{:?}", counts.tags);
+        assert!(counts.folders.is_empty(), "{:?}", counts.folders);
+        assert!(counts.collections.is_empty(), "{:?}", counts.collections);
+        assert_eq!(counts.untagged, 0);
+        assert_eq!(counts.recent, 0);
+
+        // The untagged facet is the exception that proves the rule: with only
+        // `untagged` on it counts the images no tag touches.
+        let only_lens = ViewQuery {
+            untagged: true,
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&only_lens, RecentWindow::Off { limit: 3 })
+            .unwrap();
+        assert_eq!(counts.untagged, 1, "the lens steps out of its own row");
+        assert!(counts.tags.is_empty(), "no tagged image is untagged");
+        assert_eq!(counts.folders, facet_map(&[("refs", 1), ("refs/ui", 1)]));
+    }
+
+    /// The Recent lens on: every other facet's count is capped at the
+    /// window — the newest `limit` images of the set on screen, not
+    /// the library — so a row says what its own link shows, and the
+    /// lens's own row says what it leaves of the filters that are on,
+    /// which is the grid on screen.
+    #[test]
+    fn the_recent_lens_caps_the_counts_at_its_window_and_says_what_it_reaches() {
+        let (_dir, index) = facet_library();
+        let view = ViewQuery {
+            folder: Some("refs".to_owned()),
+            ..ViewQuery::default()
+        };
+        let off = index
+            .view_facet_counts(&view, RecentWindow::Off { limit: 3 })
+            .unwrap();
+        let on = index
+            .view_facet_counts(&view, RecentWindow::On { limit: 3 })
+            .unwrap();
+
+        // The three newest are a, b, c. `d` — the one untagged image in refs —
+        // is the fourth, so it is inside the folder and outside the lens. Its
+        // row's link (`in=refs&recent=1&untagged=1`) still shows it — the
+        // newest three of one image is that one image — so the lens caps the
+        // count at the window instead of cutting `d` out of it.
+        assert_eq!((off.untagged, on.untagged), (1, 1));
+        // `other/e.png` is the fifth: the folder keeps it out, the lens would
+        // too, so the `big` tag reads the same either way.
+        assert_eq!((off.tags["big"], on.tags["big"]), (1, 1));
+        // What is on screen is the same either way, so the lens's own row is
+        // too: it names the view it is already part of.
+        assert_eq!((off.recent, on.recent), (3, 3));
+
+        // With the lens on, the folder facet counts the window too, so a folder
+        // the window does not reach drops out — `other` is `e.png` alone.
+        let all = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            all.folders,
+            facet_map(&[("other", 1), ("refs", 3), ("refs/ui", 2)]),
+            "other/e.png is the fifth newest, so `other` keeps its one image \
+             and `refs/ui` keeps both of its own"
+        );
+        assert_eq!(all.recent, 3);
+    }
+
+    /// The window is the newest N rows in the grid's own order (the path
+    /// breaking a tie), not a threshold on `added` that an equal instant would
+    /// widen past the N the lens shows.
+    #[test]
+    fn a_tie_across_the_window_edge_cuts_between_rows_not_at_an_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        for path in ["m.png", "n.png", "o.png"] {
+            index
+                .upsert_file(&FileRecord {
+                    path: path.to_owned(),
+                    size: 10,
+                    mtime_ns: 1,
+                    sha256: None,
+                    kind: crate::FileKind::Image,
+                    note_added_ns: Some(1_000),
+                    rating: None,
+                    width: None,
+                    height: None,
+                    taken_ns: None,
+                })
+                .unwrap();
+        }
+        index
+            .finish_scan(&["m.png".into(), "n.png".into(), "o.png".into()])
+            .unwrap();
+
+        let counts = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 2 })
+            .unwrap();
+        assert_eq!(
+            counts.recent, 2,
+            "three images added at one instant, and the window is still two rows"
+        );
+    }
+
+    /// An empty library has no facet values, which is a panel with nothing in
+    /// it — not a failure to count.
+    #[test]
+    fn facet_counts_on_an_empty_index_are_empty_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = Index::open(dir.path()).unwrap();
+        let counts = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 200 })
+            .unwrap();
+        assert_eq!(counts, FacetCounts::default());
     }
 }

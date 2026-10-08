@@ -7,6 +7,26 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer Phase 2a, the filter panel: the facet list beside the grid (K27 motion
+  3), where every tag, folder, collection and lens carries the number of images
+  it would show *beside the filters already on* — a folder row counts what the
+  tags leave, and a tag row counts what the folders and the tags already on
+  leave, so a reader who has narrowed three thousand pictures to fourteen can
+  still see where the rest went. Every row is a link to the same view with that
+  one filter toggled, so the panel works with scripting off and every row is a
+  real tab stop. A value the filters leave nothing for keeps its place, dimmed
+  and unlinked, because a value missing from the list would read as the library
+  having changed; the value that is on is never dimmed, since its row is the
+  way to turn it off. A list longer than eight rows opens through `more=<facet>`
+  rather than a click handler, and names `/search`, `/folders` or `/collections`
+  when even the opened list has to stop. On a phone and a tablet the panel is
+  one 44 px row above the grid, folded until it is tapped, with the number of
+  filters on riding on the button; at ≥ 1200 px the same lists stand open in a
+  sticky 208 px column and the grid keeps the tile sizes its three settings were
+  chosen for. `Index::view_facet_counts` answers the five groups in five grouped
+  queries — the Recent lens capping every count at its own window, and a
+  `sub=0` view counting a folder's direct members — read once per HTML page and
+  never for `/api/view` or `/api/sidebar`, whose shapes are untouched.
 - Viewer Phase 2a, the image page: the picture and its facts side by side.
   Prev/next walk the view the picture was reached from — the sort, folder,
   tag, collection, search or Recent-lens `v=` a tile carries; the neighbours

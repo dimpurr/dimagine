@@ -2636,3 +2636,311 @@ html.js .tree-triangle {
     display: none;
   }
 }
+
+/* === W47: the filter panel ==================================== */
+
+/* The facet list beside the grid (W47, K27 motion 3): every value the viewer can
+   filter by, each with the number of images it would show *beside the filters
+   already on*. On a phone and a tablet it is one row above the grid, folded
+   behind its heading until it is opened; on a desktop the same lists stand open
+   in a column of their own. The page carries both mounts and this sheet shows
+   one of them per width, because a closed `<details>` cannot be forced open from
+   the stylesheet — measured in Chrome 155, where its content is not hidden by
+   `display` on the children but simply not projected, so there is nothing for
+   `display` to act on. Two mounts, one list of rows, no script either way.
+   Appended last, as the W42 block was, so parallel batches merge cleanly and
+   these rules win over the earlier sections they extend. */
+
+/* The one token this block adds, by its DESIGN.md name and value: §2.1's
+   `--text-tertiary` — the ink for disabled labels, 4.9:1 on light and 5.2:1 on
+   dark, so a dimmed row is quiet without becoming illegible. Stated the way the
+   W43 theme block states them, so a chosen theme holds against the OS. */
+html {
+  --text-tertiary: #626c7b;
+  --panel-w: 208px;
+}
+
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    --text-tertiary: #818c9d;
+  }
+}
+
+html[data-theme="light"] {
+  --text-tertiary: #626c7b;
+}
+
+html[data-theme="dark"] {
+  --text-tertiary: #818c9d;
+}
+
+.refine-layout {
+  min-width: 0;
+}
+
+.filter-aside {
+  min-width: 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--separator);
+}
+
+/* The column, not the fold, appears at the desktop width — and here it is the
+   fold that stands down entirely, heading and body together. */
+.filter-static {
+  display: none;
+}
+
+.filter-fold-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  padding: 8px 16px;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  /* The chevron below, not the UA marker. */
+  list-style: none;
+}
+
+.filter-fold-summary::-webkit-details-marker {
+  display: none;
+}
+
+.filter-glyph {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+}
+
+.filter-fold-summary::after {
+  content: "";
+  flex: 0 0 auto;
+  margin-left: auto;
+  width: 0;
+  height: 0;
+  border-top: 5px solid currentColor;
+  border-right: 4px solid transparent;
+  border-left: 4px solid transparent;
+  color: var(--text-muted);
+  transition: transform var(--dur-fast) var(--ease-out);
+}
+
+.filter-fold[open] .filter-fold-summary::after {
+  transform: rotate(180deg);
+}
+
+/* How many filters are on: the phone reads the number with the fold shut, so a
+   narrowed grid is never mistaken for the whole library. */
+.filter-fold-count {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.filter-fold-body {
+  padding: 0 16px 12px;
+}
+
+.filter-hint {
+  margin-bottom: 8px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+.filter-group {
+  margin-bottom: 12px;
+}
+
+.filter-group:last-of-type {
+  margin-bottom: 0;
+}
+
+.filter-group-title {
+  margin: 8px 0 2px;
+  padding: 0 8px;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  text-transform: uppercase;
+}
+
+.filter-rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* The row is the sidebar row (§4.1) with a count that means something else:
+   same 28px, same 13px ink, same ellipsis with the whole value one hover away. */
+.filter-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1.4;
+}
+
+a.filter-row:hover {
+  background: var(--surface-alt);
+  color: var(--text);
+  text-decoration: none;
+}
+
+a.filter-row:active {
+  transform: scale(0.99);
+}
+
+.filter-row-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filter-row-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.filter-row.is-active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.filter-row.is-active .filter-row-count {
+  color: var(--accent);
+}
+
+/* A value the filters on leave nothing for: dimmed, and no link. The one
+   convention, in every group alike — its own zero already says what clicking it
+   would show, so the row keeps its place in the list (a value that vanished
+   would read as the library having changed) and gives up the click. */
+.filter-row.is-empty,
+.filter-row.is-empty .filter-row-count {
+  color: var(--text-tertiary);
+  cursor: default;
+}
+
+.filter-more,
+.filter-clear {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: var(--accent);
+  font-size: 0.75rem;
+}
+
+.filter-clear {
+  margin-top: 6px;
+  font-size: 0.8125rem;
+}
+
+.filter-more:hover,
+.filter-clear:hover {
+  background: var(--accent-soft);
+  text-decoration: none;
+}
+
+.filter-more-end,
+.filter-group-empty {
+  margin: 2px 0 0;
+  padding: 0 8px;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+
+/* Touch targets (§3): 44px rows under a finger, 28px under a pointer. */
+@media (pointer: coarse) {
+  .filter-row {
+    min-height: 44px;
+  }
+}
+
+@media (min-width: 1200px) {
+  .refine-layout {
+    display: flex;
+    align-items: flex-start;
+  }
+
+  .refine-results {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+
+  .filter-aside {
+    position: sticky;
+    top: var(--topbar-h);
+    align-self: flex-start;
+    flex: 0 0 var(--panel-w);
+    max-height: calc(100vh - var(--topbar-h) - 16px);
+    max-height: calc(100dvh - var(--topbar-h) - 16px);
+    overflow-y: auto;
+    padding: 4px 8px 16px;
+    background: transparent;
+    border-right: 1px solid var(--separator);
+    border-bottom: 0;
+  }
+
+  /* The two mounts trade places here: the fold (button and all) stands down and
+     the column takes its place, open by construction because a `<div>` has
+     nothing to be closed. */
+  .filter-fold {
+    display: none;
+  }
+
+  .filter-static {
+    display: block;
+  }
+
+  .filter-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 24px;
+    margin: 8px 0 2px;
+    padding: 6px 8px 2px;
+    color: var(--text-muted);
+    font-size: 0.6875rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    line-height: 1.3;
+    text-transform: uppercase;
+  }
+
+  /* The grid keeps the tile sizes its three settings were chosen for: the panel
+     takes 208px off the content column, so one fewer column at each setting
+     rather than five narrower tiles. */
+  .refine-layout .grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+
+  .refine-layout .grid.size-s {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+  }
+
+  .refine-layout .grid.size-l {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

@@ -103,6 +103,66 @@ fn big_library() -> TempDir {
     dir
 }
 
+/// 210 images whose `added` times straddle the Recent lens's 200-image
+/// window: `oldtag` sits on the ten oldest images — every one of them
+/// outside the newest 200 — and `newtag` on the ten newest, all inside
+/// it. The 190 between carry no note, so they are untagged and their
+/// `added` time is the scan's own, which lands between the two tagged
+/// tens. `refs` also holds a subfolder with ten images, so a `sub=0`
+/// view has direct members to count beside the recursive one, and
+/// `album.md` collects two old and three middle images, so a collection
+/// row can disagree with its link the same way the tag and folder rows
+/// can.
+fn window_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, bytes: &str| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    };
+
+    // The ten oldest: outside the lens's window, tagged `oldtag`.
+    for index in 0..10 {
+        let name = format!("old-{index:02}.jpg");
+        write(&format!("refs/{name}"), PNG_BYTES);
+        write(
+            &format!("refs/{name}.md"),
+            &format!(
+                "---\ntags:\n  - oldtag\nadded: 2020-01-01T00:{index:02}:00+00:00\n---\nOld.\n",
+            ),
+        );
+    }
+    // The 190 the window is full of: no note, so untagged, and an
+    // `added` time of the scan's own — between the two tagged tens.
+    for index in 0..180 {
+        write(&format!("refs/mid-{index:03}.jpg"), PNG_BYTES);
+    }
+    for index in 0..10 {
+        write(&format!("refs/sub/deep-{index:02}.jpg"), PNG_BYTES);
+    }
+    // The ten newest: inside the lens's window, tagged `newtag`.
+    for index in 0..10 {
+        let name = format!("new-{index:02}.jpg");
+        write(&format!("refs/{name}"), PNG_BYTES);
+        write(
+            &format!("refs/{name}.md"),
+            &format!(
+                "---\ntags:\n  - newtag\nadded: 2030-01-01T00:{index:02}:00+00:00\n---\nNew.\n",
+            ),
+        );
+    }
+    // A collection straddling the window's edge: two members the lens
+    // does not reach and three it does.
+    write(
+        "album.md",
+        "---\nkind: collection\ntitle: Album\n---\n\
+         ![[refs/old-00.jpg]]\n![[refs/old-01.jpg]]\n\
+         ![[refs/mid-000.jpg]]\n![[refs/mid-001.jpg]]\n![[refs/mid-002.jpg]]\n",
+    );
+    dir
+}
+
 async fn login(router: axum::Router) -> (axum::Router, String) {
     let response = router
         .clone()
@@ -2044,4 +2104,546 @@ async fn a_broken_embed_is_reported_and_its_line_is_kept_in_the_note_text() {
     assert!(html.contains("matches several files"), "{html}");
     assert!(html.contains("twin-a/photo.png"), "{html}");
     assert!(html.contains("twin-b/photo.png"), "{html}");
+}
+
+// === W47: the filter panel beside the grid ===================================
+
+/// One panel row as the reader sees it: a label, a number, and whether it links
+/// (a dimmed row shows a number and offers no click; an active row links to the
+/// view with that filter let go).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PanelRow {
+    label: String,
+    href: Option<String>,
+    count: u64,
+    active: bool,
+}
+
+impl PanelRow {
+    /// The row as a test writes it: `label count state`, with `on` for the filter
+    /// that is on, `…` for a dimmed zero and an empty state for a plain link.
+    fn shape(&self) -> (String, u64, &'static str) {
+        (
+            self.label.clone(),
+            self.count,
+            if self.active {
+                "on"
+            } else if self.href.is_none() {
+                "dim"
+            } else {
+                "link"
+            },
+        )
+    }
+}
+
+/// The panel's groups, in the order the page puts them: title, then its rows in
+/// the order it ranks them.
+fn panel_groups(html: &str) -> Vec<(String, Vec<PanelRow>)> {
+    let open = html
+        .find("<aside class=\"filter-aside\"")
+        .expect("the library page carries a filter panel");
+    let close = html[open..]
+        .find("</aside>")
+        .map(|at| open + at + "</aside>".len())
+        .expect("a closed panel");
+    let panel = &html[open..close];
+
+    panel
+        .split("<h3 class=\"filter-group-title\">")
+        .skip(1)
+        .map(|chunk| {
+            let title = chunk[..chunk.find('<').unwrap()].to_owned();
+            let rows = chunk
+                .split("<li>")
+                .skip(1)
+                .map(|cell| {
+                    let cell = &cell[..cell.find("</li>").unwrap()];
+                    let label = between(cell, "<span class=\"filter-row-label\">");
+                    let count = between(cell, "<span class=\"filter-row-count\">")
+                        .parse()
+                        .expect("a count is a number");
+                    PanelRow {
+                        href: cell
+                            .starts_with("<a class=\"filter-row")
+                            .then(|| between(cell, "href=\"").replace("&amp;", "&")),
+                        active: cell.starts_with("<a class=\"filter-row is-active\""),
+                        label,
+                        count,
+                    }
+                })
+                .collect();
+            (title, rows)
+        })
+        .collect()
+}
+
+/// The text between an opening attribute/tag and the next quote or tag.
+fn between(haystack: &str, open: &str) -> String {
+    let after = &haystack[haystack.find(open).unwrap() + open.len()..];
+    let stop = after.find(['"', '<']).unwrap();
+    after[..stop].to_owned()
+}
+
+/// Every row of one group, as `(label, count, state)`, in the page's own order.
+fn shapes(html: &str, group: &str) -> Vec<(String, u64, &'static str)> {
+    panel_groups(html)
+        .into_iter()
+        .find(|(title, _)| title == group)
+        .unwrap_or_else(|| panic!("no {group} group in the panel"))
+        .1
+        .iter()
+        .map(PanelRow::shape)
+        .collect()
+}
+
+/// The same rows, sorted, for when a test is about the numbers and not the order.
+fn sorted_shapes(html: &str, group: &str) -> Vec<(String, u64, &'static str)> {
+    let mut shapes = shapes(html, group);
+    shapes.sort();
+    shapes
+}
+
+/// What `/api/view` says a view holds — the promise read back from the endpoint
+/// that serves it.
+async fn view_total(app: &axum::Router, href: &str, cookie: &str) -> u64 {
+    let uri = match href.find('?') {
+        Some(_) => href.replacen('/', "/api/view", 1),
+        None => "/api/view".to_owned(),
+    };
+    json(app, &uri, cookie).await["total"].as_u64().unwrap()
+}
+
+/// The strongest thing that can be said about a facet count: it is the
+/// number of images the page it links to actually holds. Checked for
+/// every row of every group, on views with no filters, one, and two —
+/// and on the two shapes a real-size library adds: the Recent lens's
+/// 200-image window cutting through the counts, and `sub=0` narrowing
+/// a folder to its direct members.
+///
+/// A row that is off counts the view its own link opens, whatever
+/// group it is in — a tag row's link adds its tag to the tags already
+/// on, so its count is that AND, not the tag alone. A row that is on
+/// counts the view as it stands — the filter that is on, beside the
+/// other filters — which is the same number in every group: the row's
+/// link is the way out, and the number beside a way-out row says where
+/// the reader is, not where the link goes.
+#[tokio::test]
+async fn every_panel_number_is_the_total_of_the_view_its_row_promises() {
+    for (dir, views) in [
+        (
+            library(),
+            vec![
+                String::new(),
+                "in=refs".into(),
+                "tag=nature".into(),
+                "untagged=1".into(),
+                "recent=1".into(),
+                "c=browse.md".into(),
+                "in=refs&tag=nature".into(),
+                "in=refs&sort=title&tag=ui".into(),
+                "untagged=1&recent=1".into(),
+            ],
+        ),
+        (
+            window_library(),
+            vec![
+                String::new(),
+                "tag=oldtag".into(),
+                "tag=newtag".into(),
+                "tag=oldtag&tag=newtag".into(),
+                "recent=1".into(),
+                "recent=1&tag=oldtag".into(),
+                "recent=1&tag=newtag".into(),
+                "recent=1&untagged=1".into(),
+                "recent=1&c=album.md".into(),
+                "in=refs".into(),
+                "in=refs&sub=0".into(),
+                "in=refs&sub=0&recent=1".into(),
+                "in=refs&sub=0&tag=oldtag".into(),
+                "in=refs/sub&sub=0".into(),
+                "untagged=1".into(),
+                "c=album.md".into(),
+                "c=album.md&tag=oldtag".into(),
+            ],
+        ),
+    ] {
+        let (app, cookie) = login(app(&dir)).await;
+        let mut compared = 0;
+        for view in views {
+            let uri = if view.is_empty() {
+                "/".to_owned()
+            } else {
+                format!("/?{view}")
+            };
+            let html = text(&app, &uri, &cookie).await;
+            // The view on screen: what a chosen row's number says,
+            // and the grid every other row's link opens beside.
+            let on_screen = view_total(&app, &uri, &cookie).await;
+            let mut seen = 0;
+            for (group, rows) in panel_groups(&html) {
+                for row in rows {
+                    match (row.active, row.href.as_deref()) {
+                        (true, _) => assert_eq!(
+                            row.count, on_screen,
+                            "on {uri} the {group} row {row:?} is on, \
+                             and the view on screen holds {on_screen}"
+                        ),
+                        // A dimmed row promises the empty view, and
+                        // says so as a number rather than a link.
+                        (false, None) => {
+                            assert_eq!(row.count, 0, "on {uri}: {row:?} in {group}")
+                        }
+                        (false, Some(href)) => {
+                            let total = view_total(&app, href, &cookie).await;
+                            assert_eq!(
+                                row.count, total,
+                                "on {uri} the {group} row {row:?} promises {} \
+                                 and {href} holds {total}",
+                                row.count
+                            );
+                        }
+                    }
+                    seen += 1;
+                    compared += 1;
+                }
+            }
+            // Every view has rows worth checking; a view whose panel had
+            // nothing to compare would let the whole test pass without
+            // having read anything.
+            assert!(seen >= 2, "{uri} had only {seen} comparable rows");
+        }
+        assert!(
+            compared >= 30,
+            "only {compared} rows checked across all views"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_panel_counts_what_the_grid_shows_on_a_library_larger_than_the_window() {
+    let dir = window_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // A tag only on old images: the grid holds the ten oldest, every
+    // one of them outside the lens's 200-image window. The Recent row
+    // is its own link (`tag=oldtag&recent=1`), which holds the same
+    // ten — the library-wide window used to count it as 0 and dim it
+    // away, and the `newtag` row used to count ten and link to the
+    // empty view the two tags AND into.
+    let old = text(&app, "/?tag=oldtag", &cookie).await;
+    assert_eq!(view_total(&app, "/?tag=oldtag", &cookie).await, 10);
+    assert_eq!(
+        shapes(&old, "Views"),
+        vec![("Recent".into(), 10, "link"), ("Untagged".into(), 0, "dim"),]
+    );
+    assert_eq!(
+        shapes(&old, "Folders"),
+        vec![("refs".into(), 10, "link"), ("sub".into(), 0, "dim"),]
+    );
+    assert_eq!(
+        shapes(&old, "Tags"),
+        vec![("oldtag".into(), 10, "on"), ("newtag".into(), 0, "dim"),]
+    );
+    assert_eq!(
+        shapes(&old, "Collections"),
+        vec![("Album".into(), 2, "link")]
+    );
+
+    // The lens on: the grid still shows those ten, so the panel says
+    // ten — the Recent row (chosen, the view as it stands) and the
+    // `refs` row, which the library-wide window used to dim at 0
+    // although every image on screen is in `refs`.
+    let lensed = text(&app, "/?recent=1&tag=oldtag", &cookie).await;
+    assert_eq!(view_total(&app, "/?recent=1&tag=oldtag", &cookie).await, 10);
+    assert_eq!(
+        shapes(&lensed, "Views"),
+        vec![("Recent".into(), 10, "on"), ("Untagged".into(), 0, "dim"),]
+    );
+    assert_eq!(
+        shapes(&lensed, "Folders"),
+        vec![("refs".into(), 10, "link"), ("sub".into(), 0, "dim"),]
+    );
+
+    // The lens alone: its window is the ten `newtag` and the 190
+    // untagged images, so every row counts what its own link shows —
+    // capped at the window, never at the library.
+    let recent = text(&app, "/?recent=1", &cookie).await;
+    assert_eq!(view_total(&app, "/?recent=1", &cookie).await, 200);
+    assert_eq!(
+        shapes(&recent, "Views"),
+        vec![
+            ("Recent".into(), 200, "on"),
+            ("Untagged".into(), 190, "link"),
+        ]
+    );
+    assert_eq!(
+        shapes(&recent, "Folders"),
+        vec![("refs".into(), 200, "link"), ("sub".into(), 10, "link"),]
+    );
+    assert_eq!(
+        shapes(&recent, "Tags"),
+        vec![("newtag".into(), 10, "link"), ("oldtag".into(), 10, "link"),]
+    );
+    assert_eq!(
+        shapes(&recent, "Collections"),
+        vec![("Album".into(), 5, "link")]
+    );
+
+    // `sub=0`: the grid shows `refs`'s 200 direct members, and the
+    // folder rows count direct membership too — `refs` no longer
+    // rolls its subfolder up into its own number.
+    let direct = text(&app, "/?in=refs&sub=0", &cookie).await;
+    assert_eq!(view_total(&app, "/?in=refs&sub=0", &cookie).await, 200);
+    assert_eq!(
+        shapes(&direct, "Folders"),
+        vec![("refs".into(), 200, "on"), ("sub".into(), 10, "link"),]
+    );
+    assert_eq!(
+        shapes(&direct, "Tags"),
+        vec![("newtag".into(), 10, "link"), ("oldtag".into(), 10, "link"),]
+    );
+    assert_eq!(
+        shapes(&direct, "Views"),
+        vec![
+            ("Recent".into(), 200, "link"),
+            ("Untagged".into(), 180, "link"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_panel_reads_the_library_and_narrows_as_the_filters_go_on() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // Nothing on: four images, two in `refs`, one of them in `refs/ui`, one in
+    // `refs2`; tags nature + wide on one, ui on another; two notes-less images;
+    // `browse.md` collecting two of them. Ranked by count, and by label where the
+    // counts tie.
+    let plain = text(&app, "/", &cookie).await;
+    assert_eq!(
+        shapes(&plain, "Views"),
+        vec![("Recent".into(), 4, "link"), ("Untagged".into(), 2, "link")]
+    );
+    assert_eq!(
+        shapes(&plain, "Folders"),
+        vec![
+            ("refs".into(), 2, "link"),
+            ("refs2".into(), 1, "link"),
+            ("ui".into(), 1, "link"),
+        ]
+    );
+    assert_eq!(
+        shapes(&plain, "Collections"),
+        vec![("Browse".into(), 2, "link")]
+    );
+    assert_eq!(
+        shapes(&plain, "Tags"),
+        vec![
+            ("nature".into(), 1, "link"),
+            ("ui".into(), 1, "link"),
+            ("wide".into(), 1, "link"),
+        ]
+    );
+    assert!(
+        !plain.contains("Clear all filters") && !plain.contains("filter-fold-count"),
+        "with nothing on, the panel says nothing about filters being on"
+    );
+
+    // One tag on. The folders and the collection honour it; the tag
+    // rows count beside it, so a row says what adding it would show —
+    // `wide` shares landscape.png with `nature`, while `ui` shares no
+    // image with it and falls to the honest zero the panel shows as a
+    // dimmed number instead of hiding it.
+    let one = text(&app, "/?tag=nature", &cookie).await;
+    assert_eq!(
+        shapes(&one, "Views"),
+        vec![("Recent".into(), 1, "link"), ("Untagged".into(), 0, "dim")]
+    );
+    assert_eq!(
+        shapes(&one, "Folders"),
+        vec![
+            ("refs".into(), 1, "link"),
+            ("refs2".into(), 0, "dim"),
+            ("ui".into(), 0, "dim"),
+        ]
+    );
+    assert_eq!(
+        shapes(&one, "Collections"),
+        vec![("Browse".into(), 1, "link")]
+    );
+    assert_eq!(
+        shapes(&one, "Tags"),
+        vec![
+            ("nature".into(), 1, "on"),
+            ("wide".into(), 1, "link"),
+            ("ui".into(), 0, "dim"),
+        ]
+    );
+
+    // Two filters on: everything but their own groups narrows to the one image.
+    let both = text(&app, "/?in=refs&tag=nature", &cookie).await;
+    assert_eq!(
+        sorted_shapes(&both, "Folders"),
+        vec![
+            ("refs".into(), 1, "on"),
+            ("refs2".into(), 0, "dim"),
+            ("ui".into(), 0, "dim"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&both, "Tags"),
+        vec![
+            ("nature".into(), 1, "on"),
+            ("ui".into(), 0, "dim"),
+            ("wide".into(), 1, "link"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&both, "Views"),
+        vec![("Recent".into(), 1, "link"), ("Untagged".into(), 0, "dim")]
+    );
+
+    // The untagged lens is the case the panel was argued for: it empties the tag
+    // group completely (so every tag row dims) while `refs2` — the folder of
+    // notes-less images — stays at its one image.
+    let untagged = text(&app, "/?untagged=1", &cookie).await;
+    assert_eq!(
+        sorted_shapes(&untagged, "Tags"),
+        vec![
+            ("nature".into(), 0, "dim"),
+            ("ui".into(), 0, "dim"),
+            ("wide".into(), 0, "dim"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&untagged, "Folders"),
+        vec![
+            ("refs".into(), 0, "dim"),
+            ("refs2".into(), 1, "link"),
+            ("ui".into(), 0, "dim"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&untagged, "Views"),
+        vec![("Recent".into(), 2, "link"), ("Untagged".into(), 2, "on")]
+    );
+
+    // A collection narrows the other groups to its members: `ui` (button.png) is
+    // outside `browse.md`, so it dims, while the collection's own row stands open.
+    let collected = text(&app, "/?c=browse.md", &cookie).await;
+    assert_eq!(
+        sorted_shapes(&collected, "Tags"),
+        vec![
+            ("nature".into(), 1, "link"),
+            ("ui".into(), 0, "dim"),
+            ("wide".into(), 1, "link"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&collected, "Folders"),
+        vec![
+            ("refs".into(), 1, "link"),
+            ("refs2".into(), 0, "dim"),
+            ("ui".into(), 0, "dim"),
+        ]
+    );
+    assert_eq!(
+        sorted_shapes(&collected, "Collections"),
+        vec![("Browse".into(), 2, "on")]
+    );
+}
+
+#[tokio::test]
+async fn the_panel_acts_through_links_alone_and_folds_without_a_script() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let page = text(&app, "/", &cookie).await;
+    let open = page.find("<aside class=\"filter-aside\"").unwrap();
+    let panel = &page[open..open + page[open..].find("</aside>").unwrap() + "</aside>".len()];
+    assert!(!panel.contains("<script"), "{panel}");
+    assert!(!panel.contains("onclick"), "{panel}");
+    assert!(!panel.contains("style="), "{panel}");
+    // The fold is a real `<details>`; the heading is the desktop's, and the
+    // stylesheet keeps one of the two at a width.
+    assert!(panel.contains("<details class=\"filter-fold\">"), "{panel}");
+    assert!(
+        panel.contains("<summary class=\"filter-fold-summary\">"),
+        "{panel}"
+    );
+    assert!(
+        panel.contains("<h2 class=\"filter-title\">Filters<"),
+        "{panel}"
+    );
+    // A panel beside the grid adds and removes no tiles: the grid is the grid.
+    assert_eq!(html_paths(panel), Vec::<String>::new());
+    assert_eq!(
+        page_paths(&app, "tag=ui", &cookie).await,
+        json_paths(&app, "tag=ui", &cookie).await
+    );
+
+    // The fold's button is a phone's row and it carries the number of filters on
+    // — the only part of the panel a collapsed phone can see.
+    assert!(!panel.contains("filter-fold-count"), "nothing on: {panel}");
+    let on = text(&app, "/?tag=ui", &cookie).await;
+    assert!(
+        on.contains("<span class=\"filter-fold-count\">1</span>"),
+        "the fold says one filter is on"
+    );
+    assert_eq!(
+        on.matches("filter-fold-count").count(),
+        2,
+        "heading and fold"
+    );
+    // One filter on: the chip beside the search field is already the way out, so
+    // the panel does not offer a second one (the rule W43 settled).
+    assert!(!on.contains("Clear all filters"), "{on}");
+    // And the row that is on is the way back out.
+    let ui = panel_groups(&on)
+        .into_iter()
+        .find(|(title, _)| title == "Tags")
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|row| row.label == "ui")
+        .unwrap();
+    assert_eq!(ui.href.as_deref(), Some("/"));
+    assert!(ui.active);
+    // Two filters: the number grows, and one link clears both.
+    // Two filters on: now the panel offers what no single chip can, which is to
+    // let go of both at once.
+    let two = text(&app, "/?tag=ui&in=refs", &cookie).await;
+    assert!(
+        two.contains(
+            "<h2 class=\"filter-title\">Filters<span class=\"filter-fold-count\">2</span></h2>"
+        ),
+        "{two}"
+    );
+    assert!(
+        two.contains("<a class=\"filter-clear\" href=\"/\">Clear all filters</a>"),
+        "{two}"
+    );
+}
+
+#[tokio::test]
+async fn a_facet_list_over_the_cap_opens_through_a_second_query_parameter() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // The fixture has four tags and three folders, so nothing is capped; the
+    // parameter still round-trips, and a page with it reads the same grid.
+    let page = text(&app, "/?more=tags", &cookie).await;
+    assert!(!page.contains(">Show "), "nothing to show: {page}");
+    assert_eq!(
+        html_paths(&page),
+        html_paths(&text(&app, "/", &cookie).await)
+    );
+
+    // A facet list the URL does not know is ignored with a notice, the way every
+    // unusable parameter is, and the panel still arrives.
+    let odd = text(&app, "/?more=ratings", &cookie).await;
+    assert!(odd.contains("Ignored unknown facet list"), "{odd}");
+    assert!(odd.contains("<aside class=\"filter-aside\""), "{odd}");
 }

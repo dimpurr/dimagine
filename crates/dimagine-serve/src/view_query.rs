@@ -154,9 +154,19 @@ pub struct ViewParams {
     /// however old they are (`recent=1`, spec §3 `VIEWS`). A count, not a
     /// window (W34 audit #10).
     pub recent: bool,
+    /// The filter panel's facet lists the URL has asked to see whole
+    /// (`more=<facet>`, W47). Every list is capped so the panel stays one
+    /// glanceable column; the link that lifts a cap is a URL rather than a
+    /// click handler, so the longer list arrives without a script.
+    pub more: Vec<String>,
     /// Notices for invalid query parameters that were safely ignored.
     pub notices: Vec<String>,
 }
+
+/// The facet lists [`ViewParams::more`] may name. A value outside this list is
+/// ignored with a notice, like every other parameter the viewer cannot use, and
+/// a generated URL writes them in this order, so one view has one spelling.
+pub const FACET_LISTS: [&str; 3] = ["tags", "folders", "collections"];
 
 /// Percent-encode a value for use inside a query string, with the same rules
 /// [`ViewParams::to_query_string`] uses, so a hand-built link and a generated
@@ -196,6 +206,7 @@ impl Default for ViewParams {
             page: 1,
             untagged: false,
             recent: false,
+            more: Vec::new(),
             notices: Vec::new(),
         }
     }
@@ -314,6 +325,28 @@ impl ViewParams {
                         "Ignored invalid '{key}' parameter '{other}' (expected 0 or 1)"
                     )),
                 },
+                // `more=<facet>` lifts the cap on one filter-panel list. It
+                // names a facet, so a name of no facet is worth a notice: the
+                // panel below the link would otherwise look unchanged.
+                "more" => match decode_query_value(raw_val) {
+                    Ok(decoded) => {
+                        let facet = decoded.trim().to_lowercase();
+                        if FACET_LISTS.contains(&facet.as_str()) {
+                            if !params.more.contains(&facet) {
+                                params.more.push(facet);
+                            }
+                        } else {
+                            params.notices.push(format!(
+                                "Ignored unknown facet list '{facet}' (expected tags, folders, collections)"
+                            ));
+                        }
+                    }
+                    Err(_) => {
+                        params
+                            .notices
+                            .push("Ignored 'more': invalid UTF-8".to_string());
+                    }
+                },
                 unknown => {
                     params
                         .notices
@@ -422,6 +455,14 @@ impl ViewParams {
 
         if self.recent {
             pairs.push("recent=1".to_string());
+        }
+
+        // The expanded facet lists, in the list's own order rather than the
+        // order the URL happened to spell them in: one view, one URL.
+        for facet in FACET_LISTS {
+            if self.more.iter().any(|shown| shown == facet) {
+                pairs.push(format!("more={facet}"));
+            }
         }
 
         pairs.join("&")
@@ -542,7 +583,13 @@ impl ViewParams {
     /// New instance without tag filter.
     pub fn without_tag(&self, tag: &str) -> Self {
         let mut next = self.clone();
-        next.tags.retain(|t| t != tag);
+        // The index stores and matches tags folded (`dimagine_index::searchable`),
+        // so `?tag=Eagle` and `?tag=eagle` are the one filter: removing a tag
+        // removes every spelling of it, or the ✕ would leave a chip behind that
+        // reads as a filter still narrowing the grid.
+        let folded = dimagine_index::searchable(tag);
+        next.tags
+            .retain(|active| dimagine_index::searchable(active) != folded);
         next.page = 1;
         next
     }
@@ -557,11 +604,96 @@ impl ViewParams {
         next
     }
 
+    /// New instance with the collection set (`c`), or cleared by `None` — the
+    /// one mutator a filter-panel row needs, because a collection row toggles
+    /// between choosing its note and giving it back.
+    pub fn with_collection(&self, collection: Option<String>) -> Self {
+        let mut next = self.clone();
+        next.collection = collection;
+        next.page = 1;
+        next
+    }
+
+    /// New instance with the untagged lens set or cleared, keeping everything
+    /// else on screen. The sidebar's [`ViewParams::only_untagged`] is the other
+    /// gesture: a row in a navigation list starts a fresh view, a row in the
+    /// filter panel narrows the one being looked at.
+    pub fn with_untagged(&self, untagged: bool) -> Self {
+        let mut next = self.clone();
+        next.untagged = untagged;
+        next.page = 1;
+        next
+    }
+
+    /// New instance with the recent lens set or cleared, keeping everything
+    /// else on screen (see [`ViewParams::with_untagged`]).
+    pub fn with_recent(&self, recent: bool) -> Self {
+        let mut next = self.clone();
+        next.recent = recent;
+        next.page = 1;
+        next
+    }
+
+    /// New instance with one facet list shown whole instead of capped
+    /// (`more=<facet>`). A cap is a reading aid, not a position in the library,
+    /// so the page the grid is on stays where it was.
+    pub fn with_more_of(&self, facet: &str) -> Self {
+        let mut next = self.clone();
+        if !next.more.iter().any(|shown| shown == facet) {
+            next.more.push(facet.to_owned());
+        }
+        next
+    }
+
+    /// New instance with one facet list capped again — the other half of the
+    /// round trip [`ViewParams::with_more_of`] opens.
+    pub fn without_more_of(&self, facet: &str) -> Self {
+        let mut next = self.clone();
+        next.more.retain(|shown| shown != facet);
+        next
+    }
+
+    /// Whether one facet list is currently shown whole.
+    pub fn shows_more_of(&self, facet: &str) -> bool {
+        self.more.iter().any(|shown| shown == facet)
+    }
+
+    /// How many of the view's filters are on: what the panel's own heading
+    /// counts, so a collapsed panel on a phone still says that something is
+    /// narrowing the grid and what is on screen cannot be mistaken for all of
+    /// it. The page number, the sort and the tile size are not filters, and
+    /// neither is a facet list shown whole.
+    pub fn active_filter_count(&self) -> usize {
+        usize::from(self.folder.is_some())
+            + usize::from(self.collection.is_some())
+            + self.tags.len()
+            + usize::from(self.q.is_some())
+            + usize::from(self.untagged)
+            + usize::from(self.recent)
+    }
+
     /// New instance without search query (`q`).
     pub fn without_q(&self) -> Self {
         let mut next = self.clone();
         next.q = None;
         next.page = 1;
+        next
+    }
+
+    /// New instance with every filter off — folder, collection, tags,
+    /// search text and both lenses — and everything else the reader
+    /// chose kept: the sort and its direction, the tile size, the page
+    /// and the expanded facet lists. The panel's "Clear all filters"
+    /// is this view, because the label promises filters and nothing
+    /// else; `active_filter_count` is the list of what it clears.
+    pub fn without_filters(&self) -> Self {
+        let mut next = self.clone();
+        next.folder = None;
+        next.collection = None;
+        next.tags.clear();
+        next.q = None;
+        next.untagged = false;
+        next.recent = false;
         next
     }
 
@@ -826,7 +958,7 @@ mod tests {
             page: 2,
             untagged: false,
             recent: false,
-            notices: Vec::new(),
+            ..ViewParams::default()
         };
 
         let iq = params.to_index_query();
@@ -1016,5 +1148,143 @@ mod tests {
         let p5 = p4.with_page(2).without_tag("newtag");
         assert_eq!(p5.page, 1);
         assert!(p5.tags.is_empty());
+    }
+
+    /// W47: a filter-panel row toggles. The URL it links to is the whole
+    /// mechanism, so every row's two states have to round-trip through the
+    /// query string — on, off, and back on — with the rest of the view intact.
+    #[test]
+    fn every_panel_toggle_round_trips_and_keeps_the_rest_of_the_view() {
+        let on = ViewParams::parse("in=refs&sub=0&tag=eagle&q=street&size=l&p=2");
+
+        // Folder row: choosing it keeps the tags, the words and the size.
+        let folder_on = on.without_folder().with_folder(Some("refs/ui".to_owned()));
+        assert_eq!(folder_on.folder.as_deref(), Some("refs/ui"));
+        assert_eq!(folder_on.tags, on.tags);
+        assert_eq!(folder_on.q, on.q);
+        assert_eq!(folder_on.size, ThumbnailSize::L);
+        assert!(!folder_on.recursive);
+        assert_eq!(folder_on.page, 1, "a new narrowing starts at page one");
+        assert_eq!(
+            folder_on
+                .without_folder()
+                .without_folder()
+                .to_query_string(),
+            ViewParams::parse("sub=0&tag=eagle&q=street&size=l").to_query_string(),
+            "giving the folder back lands on the view before it"
+        );
+
+        // Collection row: one mutator, both directions.
+        let collection_on = on.with_collection(Some("set.md".to_owned()));
+        assert_eq!(
+            collection_on.to_query_string(),
+            "in=refs&sub=0&c=set.md&tag=eagle&q=street&size=l",
+            "page one is the default, so it never rides in a URL"
+        );
+        let collection_off = collection_on.with_collection(None);
+        assert_eq!(collection_off.collection, None);
+        assert_eq!(
+            collection_off.to_query_string(),
+            on.with_page(1).to_query_string(),
+            "the round trip is the same URL, not merely the same filters"
+        );
+
+        // Tag row, twice over: the second tag is the one already chosen.
+        let second = on.with_tag("urban".to_owned());
+        assert_eq!(second.tags, vec!["eagle", "urban"]);
+        assert_eq!(second.with_tag("urban".to_owned()).tags, second.tags);
+        assert_eq!(second.without_tag("urban").tags, vec!["eagle"]);
+
+        // The lenses toggle beside everything else, which is what makes their
+        // counts meaningful (an untagged image inside a folder is a question
+        // the panel asks in one click).
+        let lenses = on.with_untagged(true).with_recent(true);
+        assert!(lenses.untagged && lenses.recent);
+        assert_eq!(
+            lenses
+                .with_untagged(false)
+                .with_recent(false)
+                .to_query_string(),
+            on.with_page(1).to_query_string()
+        );
+    }
+
+    /// The index folds a tag's case (`dimagine_index::searchable`), so one tag
+    /// spelled two ways is one filter. A ✕ that matched bytes exactly would
+    /// leave the other spelling on the screen, still narrowing the grid.
+    #[test]
+    fn removing_a_tag_removes_every_spelling_of_it() {
+        let params = ViewParams::parse("tag=Eagle&tag=URBAN");
+        assert_eq!(params.without_tag("eagle").tags, vec!["URBAN"]);
+        assert_eq!(
+            params.without_tag("eagle").without_tag("urban").tags,
+            Vec::<String>::new()
+        );
+        assert_eq!(params.without_tag("nope").tags, vec!["Eagle", "URBAN"]);
+    }
+
+    /// W47: the panel caps each facet list and the *Show more* link is a URL,
+    /// so the longer list has to survive a round trip and a *Show fewer* has to
+    /// give the cap back exactly.
+    #[test]
+    fn a_shown_facet_list_round_trips_through_the_url() {
+        let expanded = ViewParams::parse("in=refs").with_more_of("tags");
+        assert!(expanded.shows_more_of("tags"));
+        assert!(!expanded.shows_more_of("folders"));
+        assert_eq!(expanded.to_query_string(), "in=refs&more=tags");
+        assert_eq!(
+            ViewParams::parse(&expanded.to_query_string()),
+            expanded,
+            "the link a reader bookmarks is the page they get"
+        );
+
+        // Spelled in any order, deduped, and written in one order: one view,
+        // one URL.
+        let both = ViewParams::parse("more=collections&more=tags&more=tags");
+        assert_eq!(both.to_query_string(), "more=tags&more=collections");
+        assert_eq!(
+            both.without_more_of("tags")
+                .without_more_of("collections")
+                .to_query_string(),
+            ""
+        );
+
+        // A name of no facet list is ignored, and says so: a link that did
+        // nothing would look like a broken control.
+        let junk = ViewParams::parse("more=ratings");
+        assert!(junk.more.is_empty());
+        assert_eq!(
+            junk.notices,
+            vec![
+                "Ignored unknown facet list 'ratings' (expected tags, folders, collections)"
+                    .to_owned()
+            ]
+        );
+        // And it never reaches the index query, which knows nothing of caps.
+        assert!(ViewParams::parse("more=tags&q=street")
+            .to_index_query()
+            .text
+            .is_some());
+    }
+
+    /// The panel's heading counts the filters on, so a phone reading a
+    /// collapsed panel still knows the grid is narrowed — and the page number,
+    /// the sort and the tile size are not filters.
+    #[test]
+    fn the_panel_counts_the_filters_and_nothing_else() {
+        assert_eq!(ViewParams::default().active_filter_count(), 0);
+        assert_eq!(
+            ViewParams::parse("size=l&sort=name&p=4").active_filter_count(),
+            0
+        );
+        assert_eq!(ViewParams::parse("in=refs").active_filter_count(), 1);
+        assert_eq!(
+            ViewParams::parse("in=refs&tag=a&tag=b&q=x&untagged=1&recent=1&c=s.md")
+                .active_filter_count(),
+            7,
+            "folder, collection, two tags, words, and the two lenses"
+        );
+        // A facet list shown whole is a longer list, not a narrower view.
+        assert_eq!(ViewParams::parse("more=tags").active_filter_count(), 0);
     }
 }

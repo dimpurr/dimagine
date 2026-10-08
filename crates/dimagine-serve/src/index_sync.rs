@@ -12,7 +12,9 @@
 
 use dimagine_core::library::Library;
 use dimagine_core::sync_index;
-use dimagine_index::{AppearsIn, Index, IndexError, Neighbours, ViewPage, ViewQuery};
+use dimagine_index::{
+    AppearsIn, FacetCounts, Index, IndexError, Neighbours, RecentWindow, ViewPage, ViewQuery,
+};
 use serde::Serialize;
 use std::{
     fmt, fs,
@@ -33,6 +35,22 @@ pub const RECENT_LIMIT: u64 = 200;
 /// the definition, so it cannot drift from the number the lens keeps.
 pub fn recent_label() -> String {
     format!("Recent — last {RECENT_LIMIT} added")
+}
+
+/// The Recent lens as the index asks for it: the window the grid is cut by, and
+/// whether the lens is on. [`RECENT_LIMIT`] is the viewer's number — the index
+/// keeps no number of its own — so the grid, the neighbour walk and the filter
+/// panel's counts are all cut by the same one.
+pub fn recent_window(active: bool) -> RecentWindow {
+    if active {
+        RecentWindow::On {
+            limit: RECENT_LIMIT,
+        }
+    } else {
+        RecentWindow::Off {
+            limit: RECENT_LIMIT,
+        }
+    }
 }
 
 /// A folder row for `/api/sidebar`, with its recursive image count.
@@ -202,6 +220,23 @@ impl IndexHandle {
     pub fn view(&self, query: &ViewQuery) -> Result<ViewPage, IndexError> {
         match &*self.lock()? {
             Slot::Open(index) => index.view(query),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
+    }
+
+    /// The counts behind one filter panel: for every facet value, how many
+    /// images it would show given the view's other filters.
+    ///
+    /// Five grouped queries, whatever the library holds — the panel never asks
+    /// one question per tag or folder. Nothing is cached, because the answer
+    /// belongs to the filters on screen and changes with every one of them.
+    pub fn view_facet_counts(
+        &self,
+        query: &ViewQuery,
+        recent: RecentWindow,
+    ) -> Result<FacetCounts, IndexError> {
+        match &*self.lock()? {
+            Slot::Open(index) => index.view_facet_counts(query, recent),
             Slot::Closed(reason) => Err(reason.clone().into()),
         }
     }

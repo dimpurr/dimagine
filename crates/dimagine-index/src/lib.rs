@@ -15,7 +15,8 @@ use unicode_normalization::UnicodeNormalization;
 
 pub use view::{
     collection_is_listed, note_is_collection, note_rating, AppearsIn, CollectionEvidence,
-    CollectionInfo, ImageMetaStats, Neighbours, SortKey, ViewItem, ViewPage, ViewQuery,
+    CollectionInfo, FacetCounts, ImageMetaStats, Neighbours, RecentWindow, SortKey, ViewItem,
+    ViewPage, ViewQuery,
 };
 
 const SCHEMA_VERSION: i64 = 7;
@@ -1156,7 +1157,12 @@ fn name_key(path: &str) -> String {
     name.case_fold().collect()
 }
 
-fn searchable(text: &str) -> String {
+/// The fold every stored search value carries: case-folded, then NFC. Tags are
+/// stored and matched under it, so it is also the one rule that decides whether
+/// two spellings name the same tag — which is why it is public: a viewer that
+/// marks the tag a URL asks for as the active row folds the same way, rather
+/// than keeping a second, drifting rule.
+pub fn searchable(text: &str) -> String {
     text.case_fold().nfc().collect()
 }
 

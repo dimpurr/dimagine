@@ -1,6 +1,7 @@
 //! UI rendering helpers and components.
 
 pub mod components;
+pub mod filters;
 pub mod shell;
 
 use ammonia::Builder;
