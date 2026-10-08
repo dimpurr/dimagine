@@ -2226,12 +2226,18 @@ mod tests {
             let rows = index.search_text("synthetic").unwrap().len();
             (elapsed, rows)
         }
-        // The two sizes run interleaved and each one's median is
-        // compared: a loaded machine slows both runs the same way,
-        // and a load spike that hits a single round is not the
-        // median. The ratio is what the test guards — the FTS
-        // upkeep must scale with the note count, not its square,
-        // and 10x notes at quadratic cost is 100x time.
+        // Both sizes are measured in every round, so the sequence
+        // interleaves them and each size's own median is compared: a
+        // loaded machine slows both, and a spike that hits a single
+        // round is not the median. The order inside a round is fixed,
+        // with the 1,000-note run first. Alternating it, the way the
+        // previews timing test alternates its two settings, was tried
+        // here and is the worse choice for this ratio: across the same
+        // loads this order stayed at 9.9x–13.2x, while alternating
+        // reached 18x and once 22.5x — within sight of the allowance
+        // below. The ratio is what the test guards — the FTS upkeep
+        // must scale with the note count, not its square, and 10x
+        // notes at quadratic cost is 100x time.
         let mut small_times = Vec::new();
         let mut large_times = Vec::new();
         let (mut small_rows, mut large_rows) = (0, 0);

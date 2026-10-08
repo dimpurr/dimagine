@@ -241,6 +241,10 @@ THEMES=("dark" "light")
 # Routes against the no-login library server, and against the account server.
 declare -a LIBRARY_ROUTES=(
     "/|library"
+    # The taken-ordered grid: the only route where the "no taken time" mark is
+    # drawn, so its rows and its marks are in the 390 px overflow check too
+    # (RW49 L-7).
+    "/?sort=taken|library-taken"
     "/?in=refs/ui|folder-in"
     "/?c=collections/featured-picks.md|collection"
     "/folders|folders"

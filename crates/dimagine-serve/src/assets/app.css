@@ -866,8 +866,11 @@ html[data-theme="light"] .tile-badge {
   /* The ratio is clamped, but a tall row height can still ask for
      more width than the column has (a phone's large step asks a
      panorama for 525px of a 358px column), and a flex item never
-     shrinks. The capped tile simply takes a line of its own and the
-     picture stays whole inside it, so no row ever overflows. */
+     shrinks. The capped tile simply takes a line of its own, so no
+     row ever overflows. Inside it an ordinary picture is whole
+     (`object-fit: contain` below); the extreme shapes are the
+     exception the `data-fit` rules already make, cropping with
+     `cover` and badging that — which has nothing to do with the cap. */
   max-width: 100%;
 }
 

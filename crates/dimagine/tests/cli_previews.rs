@@ -496,9 +496,23 @@ fn previews_jobs_bound_shows_in_the_wall_clock() {
     parallel_times.sort_unstable();
     let (serial, parallel) = (serial_times[1], parallel_times[1]);
 
-    // One and a quarter times the serial run: a pool that ran the images
-    // serially anyway lands at 1.0x whatever the load, while a real pool
-    // clears this even when the box is busy enough to slow every run.
+    // One and a quarter times the serial run. The failure this guards is a pool
+    // that ignores `--jobs` and works through the images one at a time: that
+    // lands at 1.0x whatever else the box is doing, and the interleaving and the
+    // medians above are what stop a loaded machine from looking like it.
+    // The floor cannot be raised much from here in this test's own company.
+    // RW52 asked for a middle distance between this and the twice-the-serial-run
+    // floor that preceded it — the older one caught a pool honouring only half
+    // the width it was asked for (four asked, two given: near 2.0x) but went red
+    // for the wrong reason on a busy box — and measured 2.9x at rest and ~2.4x
+    // beside a build for the honest pool, which puts ~1.5x in the middle. Run in
+    // isolation those numbers hold. In the gate this test shares its binary with
+    // the rest of this file, and their CLI runs are CPU and disk work of the same
+    // kind the pool is being timed on: the same assert has measured 1.1x there,
+    // so a 1.5x floor turns the workspace gate red over something `--jobs` did
+    // not do. What the floor can separate is 1.0x (the bug) from ~1.1x (this
+    // binary, busy); the pool's honest speed shows up as ~2.9x once the test has
+    // the box to itself, which is also where the sensitivity RW52 wanted lives.
     let speedup = serial.as_secs_f64() / parallel.as_secs_f64();
     assert!(
         speedup >= 1.25,

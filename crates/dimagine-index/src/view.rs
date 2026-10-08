@@ -2006,6 +2006,299 @@ mod tests {
             .is_none());
     }
 
+    /// An index shaped for the taken walk: four images with instants (two of
+    /// them the same second, so the path tiebreak is in play), two with a
+    /// recorded reason and no instant, one image in another folder a folder case
+    /// can leave out, and a collection whose embed order is neither direction of
+    /// the taken order.
+    fn taken_neighbour_library() -> (tempfile::TempDir, Index) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str, taken_ns: Option<i64>| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+            width: None,
+            height: None,
+            taken_ns,
+            taken_reason: taken_ns.map_or(Some(TakenReason::NoExif), |_| None),
+        };
+        index.begin_scan().unwrap();
+        for (path, taken) in [
+            ("x/newest.jpg", Some(3_000)),
+            ("x/tie-b.jpg", Some(2_000)),
+            ("x/tie-a.jpg", Some(2_000)),
+            ("x/oldest.jpg", Some(1_000)),
+            ("x/no-exif.jpg", None),
+            ("x/zero-date.jpg", None),
+            ("y/far.jpg", Some(2_500)),
+        ] {
+            index.upsert_file(&image(path, taken)).unwrap();
+        }
+        // The tag picks one instant, one side of the tie and one unknown, so the
+        // narrowed walk has an interior as well as two ends.
+        for (image_path, tags) in [
+            ("x/newest.jpg", vec!["dated"]),
+            ("x/tie-a.jpg", vec!["dated"]),
+            ("x/no-exif.jpg", vec!["dated"]),
+        ] {
+            index
+                .upsert_note(&NoteRecord {
+                    path: format!("{image_path}.md"),
+                    image_path: Some(image_path.to_owned()),
+                    id: None,
+                    title: image_path.to_owned(),
+                    tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+                    props_json: "{}".to_owned(),
+                })
+                .unwrap();
+        }
+        let embed = |target: &str, raw: &str| crate::LinkRecord {
+            src: "set.md".to_owned(),
+            raw: raw.to_owned(),
+            target: Some(target.to_owned()),
+            state: crate::LinkState::Resolved,
+            syntax: crate::LinkSyntax::WikiEmbed,
+        };
+        index
+            .upsert_note(&NoteRecord {
+                path: "set.md".to_owned(),
+                image_path: None,
+                id: None,
+                title: "set.md".to_owned(),
+                tags: Vec::new(),
+                props_json: r#"{"kind":"collection","title":"Set"}"#.to_owned(),
+            })
+            .unwrap();
+        index
+            .replace_links(
+                "set.md",
+                &[
+                    embed("x/zero-date.jpg", "![[zero-date.jpg]]"),
+                    embed("x/oldest.jpg", "![[oldest.jpg]]"),
+                    embed("x/newest.jpg", "![[newest.jpg]]"),
+                    embed("x/no-exif.jpg", "![[no-exif.jpg]]"),
+                    embed("x/tie-b.jpg", "![[tie-b.jpg]]"),
+                    embed("x/tie-a.jpg", "![[tie-a.jpg]]"),
+                ],
+            )
+            .unwrap();
+        index
+            .finish_scan(&[
+                "x/newest.jpg".into(),
+                "x/tie-b.jpg".into(),
+                "x/tie-a.jpg".into(),
+                "x/oldest.jpg".into(),
+                "x/no-exif.jpg".into(),
+                "x/zero-date.jpg".into(),
+                "y/far.jpg".into(),
+                "x/newest.jpg.md".into(),
+                "x/tie-a.jpg.md".into(),
+                "x/no-exif.jpg.md".into(),
+                "set.md".into(),
+            ])
+            .unwrap();
+        (dir, index)
+    }
+
+    /// RW49 M-2: the taken walk is ordering code of its own — [`order_by_taken`]
+    /// and [`taken_offsets`], over the nulls-last comparison that puts an
+    /// unknown instant at the end in both directions — and nothing tested any of
+    /// it. So: for every image of a taken-ordered view, the neighbours, the
+    /// position and the total are exactly the rows the taken grid showed around
+    /// it, in both directions, under a folder and a tag, and with a collection
+    /// still walking its own embed order.
+    #[test]
+    fn the_taken_walk_follows_the_taken_grid_on_every_side_of_every_image() {
+        let (_dir, index) = taken_neighbour_library();
+        let cases: Vec<(&str, ViewQuery)> = vec![
+            (
+                "taken descending",
+                ViewQuery {
+                    limit: 100,
+                    descending: true,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "taken ascending",
+                ViewQuery {
+                    limit: 100,
+                    descending: false,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "taken descending inside one folder",
+                ViewQuery {
+                    folder: Some("x".into()),
+                    limit: 100,
+                    descending: true,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "taken ascending narrowed by a tag",
+                ViewQuery {
+                    tags: vec!["dated".into()],
+                    limit: 100,
+                    descending: false,
+                    ..ViewQuery::default()
+                },
+            ),
+            (
+                "a collection keeps its embed order",
+                ViewQuery {
+                    collection: Some("set.md".into()),
+                    limit: 100,
+                    descending: true,
+                    ..ViewQuery::default()
+                },
+            ),
+        ];
+        let mut interior = 0;
+        for (name, query) in cases {
+            let page = index.view_by_taken(&query).unwrap();
+            assert!(
+                !page.items.is_empty(),
+                "{name}: a case whose view shows nothing compares nothing"
+            );
+            let mut asked = std::collections::HashSet::new();
+            for (first, item) in page.items.iter().enumerate() {
+                if !asked.insert(item.path.clone()) {
+                    continue;
+                }
+                let first = first as u64;
+                let last = page
+                    .items
+                    .iter()
+                    .rposition(|row| row.path == item.path)
+                    .unwrap() as u64;
+                let walk = index
+                    .view_neighbours_by_taken(&query, &item.path, None)
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .unwrap_or_else(|| panic!("{name}: {} has no place", item.path));
+                assert_eq!(
+                    walk.previous,
+                    first
+                        .checked_sub(1)
+                        .map(|before| page.items[before as usize].path.clone()),
+                    "{name}: previous of {}",
+                    item.path
+                );
+                assert_eq!(
+                    walk.next,
+                    page.items
+                        .get(last as usize + 1)
+                        .cloned()
+                        .map(|row| row.path),
+                    "{name}: next of {}",
+                    item.path
+                );
+                assert_eq!(walk.position, first + 1, "{name}: {}", item.path);
+                assert_eq!(
+                    walk.total, page.total,
+                    "{name}: the total is the grid's own"
+                );
+                if walk.previous.is_some() && walk.next.is_some() {
+                    interior += 1;
+                }
+            }
+        }
+        assert!(
+            interior >= 12,
+            "only {interior} images had a neighbour on both sides across every case"
+        );
+    }
+
+    /// The same walk read against the order it is supposed to be: the two images
+    /// with no taken time are the last two in **both** directions, and their
+    /// neighbours say so. An unknown instant is neither oldest nor newest, so an
+    /// image that has one has the end of the timeline before it and nothing
+    /// after the last of them — which is the misreading the viewer's "no taken
+    /// time" mark exists to prevent, and what an off-by-one in
+    /// [`taken_offsets`] would quietly introduce.
+    #[test]
+    fn the_taken_walk_holds_the_unknowns_at_the_end_in_both_directions() {
+        let (_dir, index) = taken_neighbour_library();
+        let walk = |descending: bool, image: &str| {
+            index
+                .view_neighbours_by_taken(
+                    &ViewQuery {
+                        limit: 100,
+                        descending,
+                        ..ViewQuery::default()
+                    },
+                    image,
+                    None,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{image} is in the view either way"))
+        };
+
+        let newest = walk(true, "x/newest.jpg");
+        assert_eq!(
+            (newest.position, newest.total, newest.previous.as_deref()),
+            (1, 7, None),
+            "newest first has nothing before it"
+        );
+        assert_eq!(newest.next.as_deref(), Some("y/far.jpg"));
+        let first_up = walk(false, "x/oldest.jpg");
+        assert_eq!(
+            (
+                first_up.position,
+                first_up.total,
+                first_up.previous.as_deref()
+            ),
+            (1, 7, None),
+            "oldest first has nothing before it either"
+        );
+        assert_eq!(first_up.next.as_deref(), Some("x/tie-a.jpg"));
+
+        // The unknowns: last in the newest-first view…
+        let no_exif_down = walk(true, "x/no-exif.jpg");
+        assert_eq!(
+            (
+                no_exif_down.position,
+                no_exif_down.previous.as_deref(),
+                no_exif_down.next.as_deref()
+            ),
+            (6, Some("x/oldest.jpg"), Some("x/zero-date.jpg")),
+            "the known times end where the unknowns begin"
+        );
+        let zero_down = walk(true, "x/zero-date.jpg");
+        assert_eq!((zero_down.position, zero_down.next.as_deref()), (7, None));
+
+        // …and last in the oldest-first one too, in the same path order, with a
+        // different image on their left because the known part reversed.
+        let no_exif_up = walk(false, "x/no-exif.jpg");
+        assert_eq!(
+            (
+                no_exif_up.position,
+                no_exif_up.previous.as_deref(),
+                no_exif_up.next.as_deref()
+            ),
+            (6, Some("x/newest.jpg"), Some("x/zero-date.jpg"))
+        );
+        let zero_up = walk(false, "x/zero-date.jpg");
+        assert_eq!((zero_up.position, zero_up.next.as_deref()), (7, None));
+
+        // The tie is broken by path in both directions, and the walk agrees.
+        assert_eq!(
+            walk(true, "x/tie-a.jpg").next.as_deref(),
+            Some("x/tie-b.jpg"),
+            "a tie keeps one order for both the grid and the arrows"
+        );
+        assert_eq!(
+            walk(false, "x/tie-a.jpg").previous.as_deref(),
+            Some("x/oldest.jpg")
+        );
+    }
+
     #[test]
     fn rating_is_an_integer_between_zero_and_five() {
         assert_eq!(note_rating(&props(r#"{"rating":5}"#)), Some(5));

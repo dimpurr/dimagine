@@ -270,6 +270,14 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: "Back to view" out of a collection no longer asks the collection for a
+  page number (RW51). Which page holds a tile is worked out from the image's
+  place in the view — right for every view that pages — but a collection lists
+  all of its members at once and tells the reader a `p` beside `c` was ignored,
+  so on a collection longer than one page the way back arrived with a
+  status line announcing a page nobody asked for. A collection's own view now
+  travels back exactly as it was written, anchor included; every view that
+  really does page still gets the page its position says the tile is on.
 - Index: the review follow-ups on the taken-time round (RW50). A date property
   that a file's XMP merely *mentions* — a caption spelling
   `exif:DateTimeOriginal='2019-…'` inside a `dc:description` — no longer speaks
@@ -279,6 +287,22 @@ All notable changes to this project are documented here. The format follows
   count they name: an image whose reason nobody recorded is counted under
   `reason not recorded` rather than left out of a sum that disagreed with its
   own total.
+- Viewer: the review follow-ups on the justified-rows and taken-sort round
+  (RW49). A tile "Load more" appends carries the "no taken time" mark the page
+  gives its own tiles: the script asked the tile — which was still unappended, so
+  it had no grid above it to ask — whether the view was ordered by the taken
+  time, the answer was always no, and every dateless image past the first page of
+  a library went unmarked and read as the oldest picture there. That mark's own
+  words no longer claim a cause the index did not record, either: the index keeps
+  five kinds of missing taken time, and the tooltip now states the one thing true
+  of all five. The image page and `/api/view` say *which* kind a row is — the
+  image page in words, the JSON in the same one word `dimagine scan` prints
+  (`no-exif`, `date-unreadable`, …) — so an unknown stays the specific unknown the
+  scan wrote down all the way to the reader and to the agent (invariant 4). And a
+  note that records the picture's `width`/`height` is no longer asked to state
+  them a second time under Properties once the Image section has printed that
+  exact pair from the index; a pair that disagrees with the index is still shown,
+  because two readings of one picture are two facts.
 - Index: the review follow-ups on the image-metadata round (RW48). An
   `OffsetTimeOriginal` that parses but names no zone — `+25:00`, `+99:99`, an
   hour past 23 or a minute past 59 — is refused rather than applied: a corrupt

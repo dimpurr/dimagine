@@ -9,7 +9,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
-use dimagine_index::{ImageMeta, ViewItem, ViewPage};
+use dimagine_index::{ImageMeta, TakenReason, ViewItem, ViewPage};
 use serde::Serialize;
 
 use crate::index_sync::{recent_label, recent_window, SidebarData, RECENT_LIMIT};
@@ -41,23 +41,26 @@ pub struct ViewItemJson {
     /// an agent can see why a row sits where it does — an image with no taken
     /// time is last in both directions, not the oldest.
     pub taken_ns: Option<i64>,
-}
-
-impl From<&ViewItem> for ViewItemJson {
-    fn from(item: &ViewItem) -> Self {
-        Self::from_meta(item, None)
-    }
+    /// Which kind of unknown a `null` [`ViewItemJson::taken_ns`] is, in the one
+    /// word `dimagine scan` and its JSON use — [`TakenReason::as_str`] is the
+    /// list of them. `null` when there is a taken time to report, and `null`
+    /// when the index holds the instant's absence but no recorded reason for it
+    /// (a row written before reasons were recorded, or edited since). The five
+    /// kinds are the index's own distinction and the page keeps them (invariant
+    /// 4, RW49 L-2); the image page says the same fact in words.
+    pub taken_reason: Option<&'static str>,
 }
 
 impl ViewItemJson {
     /// The item joined with the header facts the index holds for it.
     ///
-    /// These three are the viewer's own addition to the page shape: the index's
+    /// These are the viewer's own addition to the page shape: the index's
     /// [`ViewItem`] deliberately does not carry them (its `image_meta` is a
     /// companion read), so this is the one place they join the row an agent
-    /// reads — the dimensions the grid laid out by and the taken time the
-    /// "Taken" sort ordered by.
+    /// reads — the dimensions the grid laid out by, and the taken time the
+    /// "Taken" sort ordered by together with the kind of unknown it can be.
     pub fn from_meta(item: &ViewItem, meta: Option<&ImageMeta>) -> Self {
+        let taken_ns = meta.and_then(|meta| meta.taken_ns);
         Self {
             path: item.path.clone(),
             size: item.size,
@@ -68,7 +71,19 @@ impl ViewItemJson {
             note_path: item.note_path.clone(),
             width: meta.and_then(|meta| meta.width),
             height: meta.and_then(|meta| meta.height),
-            taken_ns: meta.and_then(|meta| meta.taken_ns),
+            taken_ns,
+            // A reason explains a missing instant, so it travels only with a
+            // missing instant. The index pairs the two (`taken_reason` is
+            // `None` exactly when `taken_ns` is `Some`); a hand-edited row that
+            // carries both reports the instant — the value the sort used — and
+            // has nothing left to explain.
+            taken_reason: taken_ns.map_or_else(
+                || {
+                    meta.and_then(|meta| meta.taken_reason)
+                        .map(TakenReason::as_str)
+                },
+                |_| None,
+            ),
         }
     }
 }
@@ -83,17 +98,6 @@ pub struct ViewPageJson {
     /// Images per page.
     pub page_size: u32,
     pub items: Vec<ViewItemJson>,
-}
-
-impl From<&ViewPage> for ViewPageJson {
-    fn from(page: &ViewPage) -> Self {
-        Self {
-            total: page.total,
-            page: 1,
-            page_size: PAGE_SIZE,
-            items: page.items.iter().map(ViewItemJson::from).collect(),
-        }
-    }
 }
 
 impl ViewPageJson {
@@ -409,13 +413,81 @@ mod tests {
     use super::*;
     use crate::index_sync::SidebarCollection;
 
+    fn item(path: &str) -> ViewItem {
+        ViewItem {
+            path: path.to_owned(),
+            size: 10,
+            mtime_ns: 1,
+            added_ns: 1,
+            title: None,
+            rating: None,
+            note_path: None,
+        }
+    }
+
+    fn meta(taken_ns: Option<i64>, taken_reason: Option<TakenReason>) -> ImageMeta {
+        ImageMeta {
+            width: Some(4),
+            height: Some(3),
+            taken_ns,
+            taken_reason,
+        }
+    }
+
+    /// RW49 L-2: the page JSON is what an agent reads, so the five kinds of
+    /// "no taken time" reach it as the index recorded them rather than
+    /// collapsing into one null — and the reason travels only with the absence
+    /// it explains.
+    #[test]
+    fn the_json_reports_which_kind_of_missing_taken_time_a_row_is() {
+        let instant = 1_689_191_647_000_000_000;
+        let reason_of = |reason: Option<TakenReason>| {
+            ViewItemJson::from_meta(&item("a.jpg"), Some(&meta(None, reason))).taken_reason
+        };
+        assert_eq!(reason_of(Some(TakenReason::NoExif)), Some("no-exif"));
+        assert_eq!(
+            reason_of(Some(TakenReason::ExifWithoutDate)),
+            Some("exif-without-date")
+        );
+        assert_eq!(
+            reason_of(Some(TakenReason::UnreadableExif)),
+            Some("exif-unreadable")
+        );
+        assert_eq!(
+            reason_of(Some(TakenReason::UnreadableDate)),
+            Some("date-unreadable")
+        );
+        assert_eq!(
+            reason_of(Some(TakenReason::UnreadableFile)),
+            Some("file-unreadable")
+        );
+        assert_eq!(reason_of(None), None, "an unrecorded reason says nothing");
+        assert_eq!(
+            ViewItemJson::from_meta(&item("a.jpg"), None).taken_reason,
+            None,
+            "a row the index does not hold has no reason to name"
+        );
+
+        // A reason explains a missing instant and never rides with one, not even
+        // on a row a hand edited into that shape.
+        let both = ViewItemJson::from_meta(
+            &item("a.jpg"),
+            Some(&meta(Some(instant), Some(TakenReason::NoExif))),
+        );
+        assert_eq!(both.taken_ns, Some(instant));
+        assert_eq!(both.taken_reason, None);
+        let valued = ViewItemJson::from_meta(&item("a.jpg"), Some(&meta(Some(instant), None)));
+        assert_eq!(valued.taken_ns, Some(instant));
+        assert_eq!(valued.taken_reason, None);
+    }
+
     #[test]
     fn the_json_page_reports_the_page_it_was_asked_for() {
         let page = ViewPage {
             total: 300,
             items: Vec::new(),
         };
-        let json = ViewPageJson::from(&page);
+        let json = ViewPageJson::from_metas(&page, &TileMetas::new());
         assert_eq!(json.total, 300);
         assert_eq!(json.page_size, 120);
     }

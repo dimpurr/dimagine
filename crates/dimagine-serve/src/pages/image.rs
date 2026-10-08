@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use chrono::{DateTime, NaiveDate, NaiveDateTime};
-use dimagine_index::{AppearsIn, ImageMeta, Neighbours};
+use dimagine_index::{AppearsIn, ImageMeta, Neighbours, TakenReason};
 use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -30,10 +30,10 @@ use crate::{catalog_error_page, error_page, error_response, AppState};
 /// The destination of "Back to view".
 const DESTINATION: crate::ui::shell::Destination = crate::ui::shell::Destination::Library;
 
-/// The aspect-ratio thresholds that crop a tile or a stage (DESIGN.md §5.4),
-/// the same pair the stylesheet's `data-fit` rules use and the tile reads
-/// (`crate::ui::components`).
-use crate::ui::components::{TALL_BELOW, WIDE_ABOVE};
+/// Where a shape becomes extreme and gets cropped for it (DESIGN.md §5.4). The
+/// stage's `data-fit` reads the same decision the tile's does, from the tile's
+/// own module, so the two cannot drift apart.
+use crate::ui::components::fit_of_ratio;
 
 /// A left chevron, the glyph of the prev link. A 16-unit grid and currentColor
 /// strokes, like every glyph in the shell.
@@ -151,11 +151,27 @@ impl ViewContext {
     /// page boundary would otherwise anchor the link to a tile that is not in
     /// the page it opens (RW45 M-2). Without a position — a stale `v`, an index
     /// that did not answer — the carried view travels as it was written.
+    ///
+    /// A collection is the one view that has no pages to ask for: its page
+    /// lists every member at once (`pages/collections.rs`), and a `p` beside
+    /// `c` is reported to the reader as ignored (`view_query`). Writing one
+    /// from the position would therefore hand the reader back the view they
+    /// came from *with a status line about a page they never asked for*
+    /// (RW51 M-1), so the carried view travels as written there too. The
+    /// anchor still resolves, because every member is on the page. The narrow
+    /// case this gives up is a `c=` whose note the index still holds members
+    /// for but which cannot be read just now, and so renders as the paginated
+    /// library: there the tile can sit past the first page, and the way back
+    /// lands on the grid's top instead of on the tile — a walk to re-open,
+    /// against a page that misstates what it is showing to every reader of a
+    /// collection that is merely long.
     fn back_href(&self, image: &str, position: Option<u64>) -> String {
         let anchor = tile_anchor(image);
         let query = match position {
-            Some(position) => with_page(&self.query, page_of_position(position)),
-            None => self.query.clone(),
+            Some(position) if self.params.collection.is_none() => {
+                with_page(&self.query, page_of_position(position))
+            }
+            _ => self.query.clone(),
         };
         if query.is_empty() {
             format!("/#{anchor}")
@@ -266,6 +282,9 @@ fn image_body(
 ) -> String {
     let path = encode_path(&detail.path);
     let title = title_of(detail);
+    // The dimensions the Image section states from the index, read once: the
+    // Properties list needs to know which numbers the page has already said.
+    let indexed = indexed_dimensions(meta);
     let mut out = String::from("<div class=\"image-page\">");
     // The header: the way back, the walk through the view, and the original
     // file — one line per region, in the order a person reads them.
@@ -339,7 +358,7 @@ fn image_body(
             escape_html(error)
         ));
     }
-    out.push_str(&properties_section(detail));
+    out.push_str(&properties_section(detail, indexed));
     out.push_str(&format!(
         "<section class=\"image-section\"><h2>Raw source files</h2><ul>{}</ul></section>",
         detail
@@ -361,29 +380,25 @@ fn image_body(
 /// neither has both dimensions the fit is unknown and the stage says nothing:
 /// it does not guess (invariant 4).
 fn stage_fit(detail: &ImageDetail, meta: Option<ImageMeta>) -> Option<&'static str> {
-    if let Some(ImageMeta {
-        width: Some(width),
-        height: Some(height),
-        ..
-    }) = meta
-    {
-        if width > 0 && height > 0 {
-            return Some(fit_of(f64::from(width) / f64::from(height)));
-        }
+    if let Some((width, height)) = indexed_dimensions(meta) {
+        return Some(fit_of_ratio(f64::from(width) / f64::from(height)));
     }
     known_fit(&detail.properties)
 }
 
-/// The crop a shape gets (DESIGN.md §5.4): below 0.4 tall, above 2.5 wide,
-/// both boundaries exclusive.
-fn fit_of(ratio: f64) -> &'static str {
-    if ratio < TALL_BELOW {
-        "tall"
-    } else if ratio > WIDE_ABOVE {
-        "wide"
-    } else {
-        "normal"
-    }
+/// The picture's own shape as the index recorded it: both dimensions, neither
+/// zero. `None` is the honest unknown — no row, half a pair, or a pair of
+/// zeroes — and nothing downstream guesses a shape from it (invariant 4).
+fn indexed_dimensions(meta: Option<ImageMeta>) -> Option<(u32, u32)> {
+    let ImageMeta {
+        width: Some(width),
+        height: Some(height),
+        ..
+    } = meta?
+    else {
+        return None;
+    };
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// The arrows and the position: prev/next within the view the page was
@@ -454,7 +469,7 @@ fn leaf_name(path: &str) -> &str {
 fn known_fit(properties: &Value) -> Option<&'static str> {
     let width = numeric_property(properties, "width")?;
     let height = numeric_property(properties, "height")?;
-    Some(fit_of(width / height))
+    Some(fit_of_ratio(width / height))
 }
 
 /// A property as a usable number: `3429`, `"3429"` and `1.5` all count.
@@ -491,23 +506,44 @@ fn image_facts_section(meta: Option<ImageMeta>) -> String {
     let Some(meta) = meta else {
         return String::new();
     };
-    let dimensions = match (meta.width, meta.height) {
-        (Some(width), Some(height)) if width > 0 && height > 0 => {
-            format!("<dd>{width} × {height}</dd>")
-        }
+    let dimensions = match indexed_dimensions(Some(meta)) {
+        Some((width, height)) => format!("<dd>{width} × {height}</dd>"),
         // One dimension without the other is no shape at all, so the pair is
         // the unknown rather than half a number.
-        _ => "<dd>Unknown</dd>".to_owned(),
+        None => "<dd>Unknown</dd>".to_owned(),
     };
     let taken = match meta.taken_ns.and_then(taken_value) {
         Some(taken) => taken,
-        None => "<dd>Unknown</dd>".to_owned(),
+        // An unknown instant is not one fact but five, and the index recorded
+        // which one this is; the page says which (RW49 L-2, and what
+        // `Index::image_meta` promises a "Taken" detail).
+        None => format!("<dd>{}</dd>", taken_unknown(meta.taken_reason)),
     };
     format!(
         "<section class=\"image-section\"><h2>Image</h2><dl class=\"property-list\">\
          <div class=\"property\"><dt>Dimensions</dt>{dimensions}</div>\
          <div class=\"property\"><dt>Taken</dt>{taken}</div></dl></section>"
     )
+}
+
+/// The kind of unknown a missing taken time is, in the words a person reads.
+///
+/// The index distinguishes these five because they need different answers
+/// ([`dimagine_index::TakenReason`]), and it keeps the distinction all the way
+/// out of the database; the page is where the distinction is either kept or
+/// dropped, and dropping it is what invariant 4 forbids. `None` is the sixth
+/// state — the row records no reason at all, which is what a database written
+/// before the reason existed, or hand-edited since, carries — and it says only
+/// what it knows: that there is no taken time here.
+fn taken_unknown(reason: Option<TakenReason>) -> &'static str {
+    match reason {
+        Some(TakenReason::NoExif) => "Unknown — the file carries no EXIF",
+        Some(TakenReason::ExifWithoutDate) => "Unknown — its EXIF names no date",
+        Some(TakenReason::UnreadableExif) => "Unknown — its EXIF could not be read",
+        Some(TakenReason::UnreadableDate) => "Unknown — the date it carries is unreadable",
+        Some(TakenReason::UnreadableFile) => "Unknown — the file is not a readable image",
+        None => "Unknown",
+    }
 }
 
 /// The EXIF taken time, as a machine-readable `<time>` beside the words a
@@ -538,12 +574,15 @@ fn taken_value(taken_ns: i64) -> Option<String> {
 /// §3.1 properties first, in show order, then any property
 /// an import added, by name. The whole front matter stays
 /// reachable, collapsed, as the raw JSON.
-fn properties_section(detail: &ImageDetail) -> String {
+///
+/// `indexed` is the dimensions pair the Image section above printed, so a note
+/// that carries the identical pair is not asked to say it again.
+fn properties_section(detail: &ImageDetail, indexed: Option<(u32, u32)>) -> String {
     if detail.properties.is_null() {
         return String::new();
     }
     let mut out = String::from("<section class=\"image-section\"><h2>Properties</h2>");
-    let rows = property_rows(&detail.properties);
+    let rows = property_rows(&detail.properties, indexed);
     if !rows.is_empty() {
         out.push_str("<dl class=\"property-list\">");
         for (term, definition) in rows {
@@ -579,7 +618,7 @@ const PROPERTY_ORDER: &[&str] = &[
 
 /// The property rows: `(label, rendered value)` pairs,
 /// known properties first, then the unknown ones by name.
-fn property_rows(properties: &Value) -> Vec<(String, String)> {
+fn property_rows(properties: &Value, indexed: Option<(u32, u32)>) -> Vec<(String, String)> {
     let Some(object) = properties.as_object() else {
         return Vec::new();
     };
@@ -597,7 +636,9 @@ fn property_rows(properties: &Value) -> Vec<(String, String)> {
     }
     let mut unknown: Vec<&str> = object
         .keys()
-        .filter(|key| !shown.contains(key.as_str()))
+        .filter(|key| {
+            !shown.contains(key.as_str()) && !repeats_indexed_pair(properties, key, indexed)
+        })
         .map(String::as_str)
         .collect();
     unknown.sort_unstable();
@@ -611,6 +652,32 @@ fn property_rows(properties: &Value) -> Vec<(String, String)> {
         rows.push((escape_html(key), property_value(key, value)));
     }
     rows
+}
+
+/// Whether this note property repeats the number the Image section has just
+/// printed from the index.
+///
+/// An import that writes `width`/`height` into the note records the picture's
+/// shape a second time, and when the two agree they are one fact in two places
+/// with nothing to tell the reader they are the same pair (RW49 L-5). The page
+/// states it once, in the section that owns facts about the bytes; the raw
+/// front matter below still carries the note's own copy verbatim.
+///
+/// A pair that *disagrees* with the index is two claims rather than one — a
+/// note can carry the shape before EXIF orientation while the index read the
+/// one after — so both rows stay, where the reader can see them disagree.
+/// Nothing is dropped on the way: the note's numbers are only left out when
+/// the page has already said those exact numbers.
+fn repeats_indexed_pair(properties: &Value, key: &str, indexed: Option<(u32, u32)>) -> bool {
+    let Some((width, height)) = indexed else {
+        return false;
+    };
+    let expected = match key {
+        "width" => width,
+        "height" => height,
+        _ => return false,
+    };
+    numeric_property(properties, key) == Some(f64::from(expected))
 }
 
 /// Whether a property has nothing to show: a `null`, or
@@ -939,6 +1006,40 @@ mod tests {
         assert_eq!(
             carried.back_href(image, None),
             format!("/?tag=eagle&amp;p=3#{anchor}")
+        );
+    }
+
+    /// RW51 M-1: a collection page lists all of its members at once, so the
+    /// position settles nothing about paging there — and a `p` written onto the
+    /// way back hands the reader the view they came from *plus* a status line
+    /// about a page they never asked for ("Ignored page number: a collection
+    /// lists all of its members at once"). The view travels as it was written;
+    /// the anchor still resolves, every member being on the page.
+    #[test]
+    fn the_way_back_from_a_collection_asks_for_no_page() {
+        let image = "refs/猫.png";
+        let anchor = tile_anchor(image);
+        let collection = view_context(Some("v=c%3Dalbum.md"));
+        for position in [1, 121, 205] {
+            assert_eq!(
+                collection.back_href(image, Some(position)),
+                format!("/?c=album.md#{anchor}"),
+                "position {position} of a view that has no pages"
+            );
+        }
+        // A `p` the reader arrived with is their own, and the page answers it
+        // rather than the back link quietly rewriting it.
+        let carried = view_context(Some("v=c%3Dalbum.md%26p%3D3"));
+        assert_eq!(
+            carried.back_href(image, Some(151)),
+            format!("/?c=album.md&amp;p=3#{anchor}")
+        );
+        // A folder view, which really does page, keeps the page the position
+        // says the tile is on.
+        let folder = view_context(Some("v=in%3Drefs"));
+        assert_eq!(
+            folder.back_href(image, Some(151)),
+            format!("/?in=refs&amp;p=2#{anchor}")
         );
     }
 
@@ -1490,6 +1591,122 @@ mod tests {
         let unindexed = image_body(&detail(), Some(&[]), &context, None, None);
         assert!(!unindexed.contains("<h2>Image</h2>"), "{unindexed}");
         assert!(!unindexed.contains("<dt>Taken</dt>"), "{unindexed}");
+    }
+
+    /// RW49 L-2: the index records five kinds of "no taken time" and the page
+    /// is where they are either kept or dropped. A screenshot with no EXIF and
+    /// a file that is not an image at all are both a missing instant, but they
+    /// are not the same fact, and one word for both is invariant 4 failing at
+    /// the last step. A row that recorded no reason is not given one either.
+    #[test]
+    fn the_page_names_which_kind_of_missing_taken_time_it_shows() {
+        let facts = |reason: Option<TakenReason>| {
+            image_facts_section(Some(ImageMeta {
+                width: Some(1),
+                height: Some(1),
+                taken_ns: None,
+                taken_reason: reason,
+            }))
+        };
+        for (reason, words) in [
+            (Some(TakenReason::NoExif), "the file carries no EXIF"),
+            (Some(TakenReason::ExifWithoutDate), "its EXIF names no date"),
+            (
+                Some(TakenReason::UnreadableExif),
+                "its EXIF could not be read",
+            ),
+            (
+                Some(TakenReason::UnreadableDate),
+                "the date it carries is unreadable",
+            ),
+            (
+                Some(TakenReason::UnreadableFile),
+                "the file is not a readable image",
+            ),
+        ] {
+            let html = facts(reason);
+            assert!(
+                html.contains(&format!("<dt>Taken</dt><dd>Unknown — {words}</dd>")),
+                "{reason:?}: {html}"
+            );
+            assert!(
+                !html.contains("<time"),
+                "an unknown instant is never dressed as a date: {html}"
+            );
+        }
+
+        // Nothing recorded about why: the bare unknown, with no cause invented.
+        let unrecorded = facts(None);
+        assert!(
+            unrecorded.contains("<dt>Taken</dt><dd>Unknown</dd>"),
+            "{unrecorded}"
+        );
+
+        // The dimensions row is unchanged by any of this.
+        assert!(
+            facts(Some(TakenReason::NoExif)).contains("<dt>Dimensions</dt><dd>1 × 1</dd>"),
+            "the pair the index does know is still stated: {}",
+            facts(Some(TakenReason::NoExif))
+        );
+    }
+
+    /// RW49 L-5: an import that writes `width`/`height` into the note records
+    /// the picture's shape a second time, and the page said the same two
+    /// numbers twice with nothing to say they were the same pair. Now the
+    /// Properties list keeps silent about a pair the Image section has just
+    /// printed — and keeps both rows when the two disagree, because two
+    /// readings of one picture are two facts (invariant 4). The note's own
+    /// numbers are never hidden: the raw front matter still carries them.
+    #[test]
+    fn the_note_does_not_repeat_the_dimensions_the_image_section_just_stated() {
+        let mut note = detail();
+        note.properties = json!({"title": "Copy", "width": 3024, "height": 4032});
+        let page = |meta: ImageMeta| image_body(&note, Some(&[]), &plain().0, None, Some(meta));
+        let indexed = |width: u32, height: u32| ImageMeta {
+            width: Some(width),
+            height: Some(height),
+            taken_ns: None,
+            taken_reason: None,
+        };
+
+        let same = page(indexed(3024, 4032));
+        assert!(
+            same.contains("<dt>Dimensions</dt><dd>3024 × 4032</dd>"),
+            "{same}"
+        );
+        assert!(
+            !same.contains("<dt>width</dt>") && !same.contains("<dt>height</dt>"),
+            "one fact, stated once: {same}"
+        );
+        assert!(
+            same.contains("&quot;width&quot;: 3024"),
+            "the note's own copy stays reachable in the raw front matter: {same}"
+        );
+
+        // The note carries the shape before EXIF orientation, the index the one
+        // after: both readings are news, and both are shown.
+        let rotated = page(indexed(4032, 3024));
+        assert!(
+            rotated.contains("<dt>Dimensions</dt><dd>4032 × 3024</dd>"),
+            "{rotated}"
+        );
+        assert!(
+            rotated.contains("<dt>width</dt>") && rotated.contains("<dt>height</dt>"),
+            "a pair that disagrees with the index is a second fact: {rotated}"
+        );
+
+        // No indexed pair means nothing was stated above, so the note's own
+        // numbers are the only ones the reader gets.
+        let no_pair = page(ImageMeta {
+            width: None,
+            height: Some(4032),
+            taken_ns: None,
+            taken_reason: None,
+        });
+        assert!(
+            no_pair.contains("<dt>width</dt>") && no_pair.contains("<dt>height</dt>"),
+            "the note is the only source here: {no_pair}"
+        );
     }
 
     /// The stored instant is an instant, so it is shown in UTC — the camera's

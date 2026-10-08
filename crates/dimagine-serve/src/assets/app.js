@@ -424,7 +424,7 @@
             return;
           }
           page.items.forEach(function (item) {
-            grid.appendChild(tileElement(item));
+            grid.appendChild(tileElement(item, grid));
           });
           watchTiles(grid);
           // The whole document again, not the grid: querySelectorAll never
@@ -448,7 +448,13 @@
     });
   }
 
-  function tileElement(item) {
+  // `inGrid` is the grid the tile is about to be appended to. The tile cannot
+  // find it by itself: the builder runs before the append, so the tile has no
+  // parent yet and a `closest('.grid')` from here is always `null` — which is
+  // how a tile "Load more" appended came to miss the mark its own page gives
+  // it (RW49 M-1). The grid is passed in, and it is the one thing that knows
+  // whether this view is ordered by the taken time.
+  function tileElement(item, inGrid) {
     var label = item.title || item.path.split('/').pop();
     var tile = document.createElement('a');
     tile.className = 'tile';
@@ -477,7 +483,7 @@
     // an image with no taken time while this view is ordered by it.
     if (item.width && item.height) {
       tile.style.setProperty('--ar', String(clampedRatio(item.width, item.height)));
-      var fit = knownFit(item.width, item.height);
+      var fit = tileFit(item.width, item.height);
       if (fit) {
         tile.dataset.fit = fit;
         tile.appendChild(badgeElement(fit));
@@ -485,7 +491,7 @@
     } else {
       tile.style.setProperty('--ar', '1');
     }
-    if (item.taken_ns === null && gridOrdersByTaken(tile)) {
+    if (item.taken_ns === null && gridOrdersByTaken(inGrid)) {
       tile.appendChild(noTimeElement());
     }
 
@@ -552,12 +558,6 @@
     return 'normal';
   }
 
-  // The fit for dimensions the index already read, written on the tile the
-  // same way the measurement writes it.
-  function knownFit(width, height) {
-    return tileFit(width, height);
-  }
-
   // The ratio a justified row is laid out by: the picture's own shape, clamped
   // to the same 0.4…2.5 the crop uses, so a panorama cannot be wider than the
   // column and a portrait cannot be thinner. A shape nobody knows is 1 — the
@@ -597,8 +597,13 @@
   // The mark on an image with no taken time, in a view ordered by it (the
   // server writes the same mark, and the same wording, on the tiles it
   // rendered). An unknown instant is never shown as a date.
+  //
+  // It says the one thing that is true of every image it lands on — there is
+  // no readable taken time here — and not *why*: the index distinguishes five
+  // kinds of unknown, and a tile has no room to tell them apart. The image
+  // page names the kind it holds (RW49 L-2).
   var NO_TIME_TITLE =
-    'No taken time — this image carries no EXIF date, so it sorts last';
+    'No taken time — this image has no readable taken date, so it sorts last';
 
   function noTimeElement() {
     var mark = document.createElement('span');
@@ -608,11 +613,10 @@
     return mark;
   }
 
-  // Whether the grid it belongs to is ordered by the EXIF taken time — the
-  // `data-taken` the server marks such a grid with. Only there does "no taken
-  // time" need saying: in any other order it is not on screen to be misread.
-  function gridOrdersByTaken(tile) {
-    var grid = tile.closest ? tile.closest('.grid') : null;
+  // Whether a grid is ordered by the EXIF taken time — the `data-taken` the
+  // server marks such a grid with. Only there does "no taken time" need
+  // saying: in any other order it is not on screen to be misread.
+  function gridOrdersByTaken(grid) {
     return !!(grid && grid.hasAttribute('data-taken'));
   }
 

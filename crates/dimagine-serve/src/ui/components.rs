@@ -446,12 +446,28 @@ fn aspect_ratio(meta: TileMeta) -> String {
     format!("--ar:{ratio:.3}")
 }
 
-/// `tall`, `wide` or `normal` for an indexed shape, `None` when there is none.
+/// The crop a shape gets, from its width over its height: DESIGN.md §5.4's
+/// thresholds, both boundaries exclusive, so an aspect ratio of exactly 0.4 or
+/// exactly 2.5 is an ordinary picture.
 ///
-/// The thresholds are DESIGN.md §5.4's and both boundaries are exclusive: an
-/// aspect ratio of exactly 0.4 or exactly 2.5 is an ordinary picture. An
-/// extreme picture is cropped to its cell the way the square tile cropped it,
-/// with the badge that says so.
+/// This is the one place that decision is written (RW49 L-4). The tile's
+/// `data-fit` and badge ([`known_fit`]), the image page's stage and the two
+/// thresholds above all read it here, so a tile, a stage and a justified row
+/// cannot drift apart on where "extreme" starts.
+pub fn fit_of_ratio(ratio: f64) -> &'static str {
+    if ratio < TALL_BELOW {
+        "tall"
+    } else if ratio > WIDE_ABOVE {
+        "wide"
+    } else {
+        "normal"
+    }
+}
+
+/// `tall`, `wide` or `normal` for an indexed shape, `None` when the index
+/// recorded no usable pair. An extreme picture is cropped to its cell the way
+/// the square tile cropped it, with the badge that says so; where a shape
+/// counts as extreme is [`fit_of_ratio`]'s.
 fn known_fit(meta: TileMeta) -> Option<&'static str> {
     let ImageMeta {
         width: Some(width),
@@ -464,14 +480,7 @@ fn known_fit(meta: TileMeta) -> Option<&'static str> {
     if width == 0 || height == 0 {
         return None;
     }
-    let ratio = f64::from(width) / f64::from(height);
-    Some(if ratio < TALL_BELOW {
-        "tall"
-    } else if ratio > WIDE_ABOVE {
-        "wide"
-    } else {
-        "normal"
-    })
+    Some(fit_of_ratio(f64::from(width) / f64::from(height)))
 }
 
 /// The `width`/`height` attributes of the thumbnail, when the index knows them.
@@ -522,8 +531,15 @@ const BADGE_WIDE: &str = r##"<svg viewBox="0 0 12 12" fill="none" stroke="curren
 /// names the unknown. Never a date nobody recorded (invariant 4), and only in
 /// the one order where "unknown" would otherwise be misread as an end of the
 /// timeline.
+///
+/// The words state what is missing, not why it is: the index keeps five kinds
+/// of unknown ([`dimagine_index::TakenReason`]) and a tile tooltip is not where
+/// they are told apart — the image page names the kind its own row records
+/// (RW49 L-2). "No EXIF date" used to be said here while the same mark also
+/// landed on a file that is not an image at all. `app.js` writes this string
+/// verbatim on a tile "Load more" appends, and its test pins it.
 fn no_time_marker() -> String {
-    "<span class=\"tile-notime\" title=\"No taken time — this image carries no EXIF date, so it sorts last\" \
+    "<span class=\"tile-notime\" title=\"No taken time — this image has no readable taken date, so it sorts last\" \
      aria-hidden=\"true\"></span>"
         .to_owned()
 }

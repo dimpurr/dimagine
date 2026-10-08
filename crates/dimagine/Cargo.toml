@@ -36,4 +36,8 @@ serde_json = "1"
 [dev-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
 dimagine-index = { path = "../dimagine-index" }
-tempfile = "3.27.0"
+# The previews tests build their library in the system temp dir and remove it
+# themselves, so they take it out of tempfile's cleanup with `TempDir::keep` —
+# first in 3.20.0, where that was renamed from `into_path`. The floor names what
+# the code needs and no more.
+tempfile = "3.20.0"

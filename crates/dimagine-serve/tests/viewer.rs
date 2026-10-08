@@ -103,6 +103,19 @@ fn big_library() -> TempDir {
     dir
 }
 
+/// `big_library` with one more thing: a collection note that embeds every image
+/// in its own order, so the collection view is longer than the page size while
+/// being the one view that has no pages to show (`/?c=` lists all members).
+fn big_collection_library() -> TempDir {
+    let dir = big_library();
+    let mut note = String::from("---\nkind: collection\ntitle: Album\n---\n");
+    for index in 0..205 {
+        note.push_str(&format!("![[refs/rec-{index:03}.jpg]]\n"));
+    }
+    fs::write(dir.path().join("album.md"), note).unwrap();
+    dir
+}
+
 /// 210 images whose `added` times straddle the Recent lens's 200-image
 /// window: `oldtag` sits on the ten oldest images — every one of them
 /// outside the newest 200 — and `newtag` on the ten newest, all inside
@@ -215,6 +228,33 @@ async fn json(app: &axum::Router, uri: &str, cookie: &str) -> Value {
     let response = get(app, uri, cookie).await;
     assert_eq!(response.status(), StatusCode::OK, "{uri}");
     serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap()
+}
+
+/// The script the page actually serves — the one it names by hash, so a test
+/// cannot pass against a stale asset. This repository has no JavaScript harness,
+/// so a claim about what the client does is a claim about these bytes.
+async fn served_script(app: &axum::Router, cookie: &str, page: &str) -> String {
+    let hash = page
+        .split("src=\"/assets/app-")
+        .nth(1)
+        .expect("the page loads the script")
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+    let response = get(app, &format!("/assets/app-{hash}"), cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/javascript; charset=utf-8"
+    );
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
 }
 
 /// The paths `/api/view` lists for a query, in the order it lists them.
@@ -1544,6 +1584,56 @@ async fn the_way_back_asks_for_the_page_the_tile_is_on() {
     );
 }
 
+/// RW51 Medium-1: the page the position writes must not be written onto a view
+/// that has no pages. A collection lists every member at once, and a `p` beside
+/// `c` is reported to the reader as ignored — so the position-derived page made
+/// the way back arrive with a `role="status"` line about a page nobody asked
+/// for, on a library whose collection is longer than one page.
+#[tokio::test]
+async fn the_way_back_from_a_collection_never_asks_it_for_a_page() {
+    let dir = big_collection_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // Position 151 of the collection, well past the page boundary every
+    // *paginated* view has: that is exactly the position that earned a `p=2`.
+    let html = text(
+        &app,
+        &format!("/image/refs/rec-150.jpg?v={}", v_param("c=album.md")),
+        &cookie,
+    )
+    .await;
+    assert!(html.contains(&position(151, 205, "c=album.md")), "{html}");
+    assert!(
+        html.contains("href=\"/?c=album.md#img-refs/rec-150.jpg\">← Back to view"),
+        "the carried view, as written, with no page bolted on: {html}"
+    );
+
+    // The page that link names really does hold the tile — every member is on
+    // the one page — and it says nothing about pages.
+    let collection = text(&app, "/?c=album.md", &cookie).await;
+    assert!(
+        collection.contains("id=\"img-refs/rec-150.jpg\""),
+        "the anchor resolves on the page the link names"
+    );
+    assert!(
+        !collection.contains("Ignored page number"),
+        "the reader never asked: {collection}"
+    );
+
+    // And the half of RW45 M-2 this must not undo: a view that does page still
+    // gets the page its position says the tile is on.
+    let html = text(
+        &app,
+        &format!("/image/refs/rec-150.jpg?v={}", v_param("sort=name")),
+        &cookie,
+    )
+    .await;
+    assert!(
+        html.contains("href=\"/?sort=name&amp;p=2#img-refs/rec-150.jpg\">← Back to view"),
+        "{html}"
+    );
+}
+
 /// "Appears in" with many collections: each named by what the collection
 /// calls itself — a title, or its file name when it has none — linked to its
 /// view, and a hostile title reaches the page only escaped (RW37's rule,
@@ -1715,29 +1805,7 @@ async fn the_pull_up_sheet_states_itself_on_its_own_button() {
         "the markup starts collapsed: {page}"
     );
 
-    let script = {
-        let hash = page
-            .split("src=\"/assets/app-")
-            .nth(1)
-            .expect("the page loads the script")
-            .split('"')
-            .next()
-            .unwrap()
-            .to_owned();
-        let response = get(&app, &format!("/assets/app-{hash}"), &cookie).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers()["content-type"],
-            "text/javascript; charset=utf-8"
-        );
-        String::from_utf8(
-            to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap()
-    };
+    let script = served_script(&app, &cookie, &page).await;
     assert!(
         script.contains("handle.setAttribute('aria-expanded'"),
         "the button carries the state"
@@ -3038,6 +3106,22 @@ async fn the_api_reports_the_header_facts_the_grid_laid_out_by() {
     }
     assert_eq!(by_path("refs/f-pixel.png")["width"], 1);
     assert_eq!(by_path("refs/f-pixel.png")["height"], 1);
+
+    // RW49 L-2: a `null` taken time is not one fact but five, and the agent's
+    // view of the library keeps the distinction the index recorded — in the
+    // same one word `dimagine scan` prints — rather than collapsing every
+    // unknown into the same null (invariant 4). The image page says the same
+    // pair of facts in words.
+    assert_eq!(
+        dated["taken_reason"],
+        Value::Null,
+        "a row that has an instant has nothing to explain"
+    );
+    assert_eq!(
+        by_path("refs/e-zeros.jpg")["taken_reason"],
+        "date-unreadable"
+    );
+    assert_eq!(by_path("refs/f-pixel.png")["taken_reason"], "no-exif");
 }
 
 #[tokio::test]
@@ -3112,12 +3196,70 @@ async fn the_image_page_shows_the_taken_time_and_the_dimensions() {
         "{html}"
     );
 
-    // An image with no EXIF date: the row is there and says so, rather than
-    // inventing a date (invariant 4).
+    // An image with no EXIF date: the row is there and says both that there is
+    // no taken time and which kind of unknown that is. The index recorded which
+    // of its five kinds this is, and the page is where that distinction is kept
+    // (invariant 4, RW49 L-2). No date is invented either way.
     let html = text(&app, "/image/refs/f-pixel.png", &cookie).await;
-    assert!(html.contains("<dt>Taken</dt><dd>Unknown</dd>"), "{html}");
+    assert!(
+        html.contains("<dt>Taken</dt><dd>Unknown — the file carries no EXIF</dd>"),
+        "{html}"
+    );
     assert!(
         !html.contains("1970") && !html.contains("1 Jan"),
         "an epoch is not a taken time: {html}"
+    );
+
+    // A different kind of unknown off a real header: the date tag is there and
+    // names no moment. It is not the same fact as "no EXIF", and does not read
+    // as it.
+    let html = text(&app, "/image/refs/e-zeros.jpg", &cookie).await;
+    assert!(
+        html.contains("<dt>Taken</dt><dd>Unknown — the date it carries is unreadable</dd>"),
+        "{html}"
+    );
+}
+
+/// RW49 M-1: the "no taken time" mark has to reach the tiles "Load more"
+/// appends too, and say what the server's own mark says. There is no JavaScript
+/// harness in this repository, so the pin is on the bytes the page serves: the
+/// grid — never the tile still under construction, which has no parent yet and
+/// so could not find one — is what the mark is decided against, and the words
+/// are the ones the rendered tile carries.
+#[tokio::test]
+async fn a_tile_the_script_appends_is_marked_the_way_a_rendered_tile_is() {
+    let dir = header_library();
+    let (app, cookie) = login(app(&dir)).await;
+    let page = text(&app, "/?sort=taken", &cookie).await;
+    assert!(
+        page.contains("data-justify data-taken"),
+        "the grid states the order the mark depends on: {page}"
+    );
+    let mark = grid_section(&page)
+        .split("<span class=\"tile-notime\" title=\"")
+        .nth(1)
+        .expect("the taken grid marks the images with no taken time")
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert!(mark.starts_with("No taken time"), "{mark}");
+
+    let script = served_script(&app, &cookie, &page).await;
+    assert!(
+        script.contains("appendChild(tileElement(item, grid))"),
+        "the grid travels into the builder, so the tile is built knowing it"
+    );
+    assert!(
+        script.contains("gridOrdersByTaken(inGrid)"),
+        "and the mark is decided by that grid, not by the detached tile"
+    );
+    assert!(
+        !script.contains("tile.closest('.grid')"),
+        "a tile under construction has no ancestor to ask"
+    );
+    assert!(
+        script.contains(&format!("'{mark}'")),
+        "the script writes the server's own sentence, not a second wording"
     );
 }

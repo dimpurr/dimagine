@@ -86,7 +86,9 @@ python3 scripts/dev/demo-library.py --selftest
   - `light`: `--blink-settings=preferredColorScheme=1`
 - **Routes & Slugs**:
   - `/` -> `library`
+  - `/?sort=taken` -> `library-taken`
   - `/?in=refs/ui` -> `folder-in`
+  - `/?c=collections/featured-picks.md` -> `collection`
   - `/folders` -> `folders`
   - `/collections` -> `collections`
   - `/search` -> `search`
@@ -96,7 +98,7 @@ python3 scripts/dev/demo-library.py --selftest
 
 ### Output Files
 
-Files are named `<width>-<theme>-<slug>.png` (3 widths × 2 themes × 8 routes = 48 files total), e.g.:
+Files are named `<width>-<theme>-<slug>.png` (3 widths × 2 themes × 10 routes = 60 files total), e.g.:
 - `390-dark-library.png`
 - `390-light-library.png`
 - `834-dark-folders.png`
