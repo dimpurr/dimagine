@@ -270,6 +270,27 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: the review follow-ups on the polish round (W55), from RW54. The order
+  bubble — the sentence a one-word order label stands for — now opens inside
+  the viewport at every width it can open in: below ~550 px it anchors at the
+  label's left edge, because a bubble grown leftwards from the label's right
+  one ran ~178 px off the left edge of a 390 px window with the row wrapped,
+  and clipped until ~550 px unwrapped. Nothing hides it on touch either: a tap
+  that focuses the label reveals it for no row width, where the old
+  `(hover: none)` rule's `display: none` left a sighted keyboard user on a
+  touch device with no visible sentence and took the text out of the screen
+  reader's tree with it. And a login refused because both in-flight slots are
+  busy now answers `Retry-After: 6` — the whole hold a busy slot can impose,
+  the escalating delay plus the argon2 check after it, rounded up to the next
+  whole second — where `5` could still send a client back into one refused
+  attempt.
+- Viewer: the image page's Properties list decides the note's `width`/`height`
+  pair together (RW53 review Low-1). A note whose two numbers both agree with
+  the index stays silent — the Image section has just said those exact numbers
+  — but a note that disagrees in one number of the pair now keeps both rows:
+  half a match used to drop only the agreeing row and leave a lone `height`,
+  which read as a note that carried a height and no width at all, beside the
+  pair it disagreed with two lines up.
 - Viewer: the review follow-ups on the older-Low round (W54), serve side. A login
   refused because both in-flight slots are busy now answers `Retry-After: 5` —
   the longest a held slot can last — instead of `1`, so a client is not sent

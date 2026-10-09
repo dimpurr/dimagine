@@ -257,6 +257,68 @@ async fn served_script(app: &axum::Router, cookie: &str, page: &str) -> String {
     .unwrap()
 }
 
+/// The stylesheet the page actually serves — the one it names by hash, so a
+/// test cannot pass against a stale asset. There is no CSS harness either:
+/// a claim about what the stylesheet does is a claim about these bytes.
+async fn served_stylesheet(app: &axum::Router, cookie: &str, page: &str) -> String {
+    let hash = page
+        .split("href=\"/assets/app-")
+        .nth(1)
+        .expect("the page loads the stylesheet")
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+    let response = get(app, &format!("/assets/app-{hash}"), cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/css; charset=utf-8"
+    );
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// Every `@media (hover: none)` block of the stylesheet, as text — brace
+/// counted, so a rule hidden inside one is found wherever it sits.
+fn hover_none_blocks(css: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut at = 0;
+    while let Some(found) = css[at..].find("@media (hover: none)") {
+        let start = at + found;
+        let Some(open_rel) = css[start..].find('{') else {
+            break;
+        };
+        let open = start + open_rel;
+        let mut depth = 0usize;
+        let mut close = None;
+        for (offset, character) in css[open..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        blocks.push(&css[start..=close]);
+        at = close + 1;
+    }
+    blocks
+}
+
 /// The paths `/api/view` lists for a query, in the order it lists them.
 async fn json_paths(app: &axum::Router, query: &str, cookie: &str) -> Vec<String> {
     let uri = if query.is_empty() {
@@ -1797,6 +1859,60 @@ async fn the_assets_are_served_once_with_a_content_hash() {
     // A stale hash is not served, so a cached page cannot load the wrong file.
     let stale = get(&app, "/assets/app-000000000000.css", &cookie).await;
     assert_eq!(stale.status(), StatusCode::NOT_FOUND);
+}
+
+/// RW54 review Medium #1: the order bubble opens inside the viewport it
+/// opens in. Above ~550 px the label sits at the toolbar's right end and
+/// `right: 0` grows the bubble leftwards into the row; below that the
+/// anchor cannot hold — the row wraps at 520 px and `space-between` parks
+/// the label mid-row (its right edge measured at x 102 of a 390 px
+/// viewport), where a 280 px bubble opened ~178 px outside the viewport's
+/// left edge. The narrow band anchors the bubble at the label's left
+/// instead. There is no CSS harness: the claim is about the bytes the page
+/// links, as the script pins are.
+#[tokio::test]
+async fn the_order_bubble_is_anchored_where_the_viewport_can_show_it() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+    let page = text(&app, "/?recent=1", &cookie).await;
+    let css = served_stylesheet(&app, &cookie, &page).await;
+    assert!(
+        css.contains(
+            "@media (max-width: 550px) {\n  .sort-tip {\n    right: auto;\n    left: 0;\n  }\n}"
+        ),
+        "below ~550 px the bubble grows rightwards from the label's left edge: {css}"
+    );
+}
+
+/// RW54 review Low #2: nothing hides the bubble on touch. The old
+/// `@media (hover: none)` rule answered "no hover" with `display: none`,
+/// which takes the sentence out of the accessibility tree with the bubble —
+/// a hidden subtree is not read, so the comment that promised a screen
+/// reader still would was false — and left a sighted keyboard user on a
+/// touch device with no visible sentence at all, which is the reader W39b
+/// review L1 was for. The bubble is absolutely positioned, so revealing it
+/// costs the toolbar row no width.
+#[tokio::test]
+async fn the_order_bubble_is_not_hidden_on_touch() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+    let page = text(&app, "/?recent=1", &cookie).await;
+    let css = served_stylesheet(&app, &cookie, &page).await;
+    let blocks = hover_none_blocks(&css);
+    assert!(
+        !blocks.is_empty(),
+        "the stylesheet's other touch rules exist, so they are scanned: {css}"
+    );
+    let hiding: Vec<&str> = blocks
+        .iter()
+        .copied()
+        .filter(|block| block.contains(".sort-tip"))
+        .collect();
+    assert!(
+        hiding.is_empty(),
+        "no touch rule takes the bubble out of the accessibility tree: {}",
+        hiding.join("\n")
+    );
 }
 
 /// RW45 M-1: the pull-up sheet's open/closed state is a disclosure, and a

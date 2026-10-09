@@ -655,7 +655,7 @@ fn property_rows(properties: &Value, indexed: Option<(u32, u32)>) -> Vec<(String
 }
 
 /// Whether this note property repeats the number the Image section has just
-/// printed from the index.
+/// printed from the index — decided on the pair, not on the key.
 ///
 /// An import that writes `width`/`height` into the note records the picture's
 /// shape a second time, and when the two agree they are one fact in two places
@@ -665,19 +665,22 @@ fn property_rows(properties: &Value, indexed: Option<(u32, u32)>) -> Vec<(String
 ///
 /// A pair that *disagrees* with the index is two claims rather than one — a
 /// note can carry the shape before EXIF orientation while the index read the
-/// one after — so both rows stay, where the reader can see them disagree.
+/// one after — so both rows stay, where the reader can see them disagree. That
+/// holds even when only half the pair disagrees (RW53 review Low-1): a note
+/// whose `width` matches and whose `height` does not keeps both rows, because
+/// suppressing the agreeing half alone would leave a lone `height` that reads
+/// as a note carrying a height and no width, beside the pair it disagrees with.
 /// Nothing is dropped on the way: the note's numbers are only left out when
-/// the page has already said those exact numbers.
+/// the page has already said the exact pair.
 fn repeats_indexed_pair(properties: &Value, key: &str, indexed: Option<(u32, u32)>) -> bool {
+    if !matches!(key, "width" | "height") {
+        return false;
+    }
     let Some((width, height)) = indexed else {
         return false;
     };
-    let expected = match key {
-        "width" => width,
-        "height" => height,
-        _ => return false,
-    };
-    numeric_property(properties, key) == Some(f64::from(expected))
+    numeric_property(properties, "width") == Some(f64::from(width))
+        && numeric_property(properties, "height") == Some(f64::from(height))
 }
 
 /// Whether a property has nothing to show: a `null`, or
@@ -1693,6 +1696,25 @@ mod tests {
         assert!(
             rotated.contains("<dt>width</dt>") && rotated.contains("<dt>height</dt>"),
             "a pair that disagrees with the index is a second fact: {rotated}"
+        );
+
+        // Half an agreement is decided with the pair (RW53 review Low-1): the
+        // note's width matches the index and its height does not, and dropping
+        // only the agreeing row would leave a lone `height` — read as a note
+        // that carried a height and no width at all, beside the pair two lines
+        // up that the disagreement is with.
+        let mut uneven = detail();
+        uneven.properties = json!({"title": "Copy", "width": 3024, "height": 4033});
+        let uneven = image_body(
+            &uneven,
+            Some(&[]),
+            &plain().0,
+            None,
+            Some(indexed(3024, 4032)),
+        );
+        assert!(
+            uneven.contains("<dt>width</dt>") && uneven.contains("<dt>height</dt>"),
+            "one number of a pair agreeing keeps the pair whole: {uneven}"
         );
 
         // No indexed pair means nothing was stated above, so the note's own

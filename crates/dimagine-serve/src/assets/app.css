@@ -552,13 +552,34 @@ a.search-pill-container:hover {
   opacity: 1;
 }
 
-@media (hover: none) {
-  /* Nothing to hover, so the bubble stays hidden — but the text
-     stays in the DOM, so a screen reader still reads it. */
+/* Below ~550 px the right anchor cannot hold. Above the wrap the label
+ * sits near the toolbar's right end — the flexible search pill pushes
+ * the controls right — so `right: 0` grows the bubble leftwards into
+ * the row; the row wraps at 520 px and `space-between` parks the label
+ * mid-row, where at 390 px its right edge is x 102 and ~178 px of the
+ * 280 px box opened outside the viewport's left edge (RW54 review
+ * Medium #1). The unwrapped arithmetic clips by ~31 px at 520 px and
+ * only clears at ~550 px, so the whole band anchors at the label's
+ * left edge instead, growing into the row the label sits in — the cap
+ * above keeps the far edge inside the phone width the toolbar is
+ * designed for (390 px, W39 review M1). */
+@media (max-width: 550px) {
   .sort-tip {
-    display: none;
+    right: auto;
+    left: 0;
   }
 }
+
+/* No touch rule hides the bubble (RW54 review Low #2): a `hover: none`
+ * device answers focus like any other — a tap on the label focuses it
+ * and the bubble fades in, for no row width since it is absolutely
+ * positioned. Hiding it there with `display: none` would take the
+ * sentence out of the accessibility tree with it (a hidden subtree is
+ * not read, whatever a comment claiming otherwise said) and would
+ * leave a sighted keyboard user on a touch device — external keyboard,
+ * tap-focus, DevTools emulation — with no visible sentence at all,
+ * which is the reader W39b review L1 was for. The label's `aria-label`
+ * carries the same sentence to a screen reader either way. */
 
 /* --- the members, with the captions the note gives them ----------------- */
 

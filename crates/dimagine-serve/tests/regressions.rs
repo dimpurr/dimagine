@@ -5,7 +5,6 @@ use axum::{
 use dimagine_serve::{
     router, Catalog, CatalogError, Collection, CollectionPage, FsCatalog, ImageDetail, ImageEntry,
     OriginalPreview, ServeConfig, LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
-    LOGIN_MAX_DELAY_SECS,
 };
 use std::{
     fs,
@@ -206,14 +205,19 @@ async fn concurrent_wrong_guesses_are_bounded_before_comparison() {
             "a refused login attempt must say when to retry"
         );
         // The hint is the worst case, not a best case: a busy
-        // slot holds an attempt for the whole escalating delay,
-        // so a shorter `Retry-After` would send the client
-        // straight back into a refused attempt (RW19b review
-        // Low).
+        // slot holds an attempt for the whole escalating delay
+        // and the argon2 check that follows it, so the refusal
+        // rounds the whole hold up to the next whole second
+        // (RW19b review Low; RW54 review Low #4 — the delay
+        // alone let a client that came back at its end be
+        // refused once more). The value is pinned as one
+        // literal: lowering the delay below what a busy slot
+        // can impose — or dropping the rounding — turns this
+        // red (RW54 review Low #3).
         let retry = retry_after.as_ref().and_then(|value| value.to_str().ok());
         assert_eq!(
             retry,
-            Some(LOGIN_MAX_DELAY_SECS.to_string()).as_deref(),
+            Some("6"),
             "a refused attempt waits out the longest slot hold"
         );
         assert!(body.is_empty(), "a refused attempt reveals nothing");

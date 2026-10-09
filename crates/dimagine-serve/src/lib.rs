@@ -234,10 +234,12 @@ pub const LOGIN_CONCURRENCY_LIMIT: usize = 2;
 /// The longest one login attempt holds an in-flight slot: the
 /// escalating delay caps here, and the argon2 check that follows
 /// is shorter. An attempt refused because the slots are busy is
-/// told to come back no sooner than this worst case, so
+/// told to come back after the delay plus that check, so
 /// `Retry-After` never promises a slot a slow attempt still holds
 /// (RW19b review Low: `1` was shorter than the wait a busy slot
-/// could impose).
+/// could impose; RW54 review Low #4: the check still holds the
+/// slot after the delay ends, so the refusal hint rounds the
+/// whole hold up to the next whole second).
 pub const LOGIN_MAX_DELAY_SECS: u64 = 5;
 
 /// Attempts one client may spend inside `LOGIN_BUDGET_WINDOW_SECS`
@@ -993,10 +995,12 @@ async fn login(
     // Bound how many guesses are in flight before anything else: a
     // parallel wave of guesses is refused without the passcode ever
     // being compared. The hint says how long a busy slot can still
-    // hold, not a best case.
+    // hold, not a best case — and the slot outlives the delay: it is
+    // held through the argon2 check that follows, so the hint rounds
+    // the hold up to the next whole second (RW54 review Low #4).
     let _slot = match state.login_slots.clone().try_acquire_owned() {
         Ok(slot) => slot,
-        Err(_) => return login_refused(LOGIN_MAX_DELAY_SECS),
+        Err(_) => return login_refused(LOGIN_MAX_DELAY_SECS + 1),
     };
     // Then charge the attempt to the per-client and the global budget,
     // still before comparing, so an exhausted budget refuses without
