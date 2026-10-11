@@ -270,6 +270,29 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- Viewer: a busy server no longer breaks random thumbnails for good (W70). A
+  grid page asks for dozens of thumbnails at once, and every one of them —
+  revalidated on every reload, since rendition URLs cannot cache immutably —
+  used to take one of eight admission permits as its very first step and hold
+  it until the last byte, with the ninth request onward answered 503
+  immediately; `<img>` does not retry, so those tiles became "Unavailable"
+  permanently, a different set on every reload, while every preview sat intact
+  on disk. Media admission is now two classes, decided before either permit is
+  taken: serving an existing preview (or a note's source view) is light — 64
+  permits, waited for up to 2 s, held only around the file open — and anything
+  that may generate a preview, stream an original as a fallback, or answer
+  `/raw` of an image is heavy — the same 8 permits, but queued: up to 256
+  waiters may wait up to 10 s for their turn, and the next request past that,
+  or one that waits its 10 s out, is refused with an honest `Retry-After: 10`
+  (the whole wait a fresh attempt could still face; a refused light request
+  says 2). A missing thumb preview is never answered by streaming the multi-MB
+  original outside the heavy class. The client retries with it: a tile image
+  that fails to load tries again up to three times — 1 s, 2 s, 4 s plus
+  0–500 ms of jitter, each attempt a fresh `?r=N` the routes ignore — and only
+  the last failure takes the tile's "Unavailable" form; a 404 is caught by a
+  cheap probe before it can waste the schedule, since a missing image is the
+  one answer a retry cannot change. Directory listings keep the immediate
+  refusal they always had.
 - Viewer: the review follow-ups on the polish round (W55), from RW54. The order
   bubble — the sentence a one-word order label stands for — now opens inside
   the viewport at every width it can open in: below ~550 px it anchors at the

@@ -127,7 +127,7 @@ pub(crate) async fn library_page(
 ) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     let params = ViewParams::parse(query.as_deref().unwrap_or(""));
     let Some(result) = read(&state, &params) else {
@@ -238,7 +238,7 @@ pub(crate) async fn view_json(
 ) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     let params = ViewParams::parse(query.as_deref().unwrap_or(""));
     let Some(result) = read(&state, &params) else {
@@ -255,7 +255,7 @@ pub(crate) async fn view_json(
 pub(crate) async fn sidebar_json(State(state): State<AppState>) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     match state.index.sidebar_data() {
         Ok(sidebar) => Json(sidebar.as_ref()).into_response(),

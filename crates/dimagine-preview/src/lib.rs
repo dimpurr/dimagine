@@ -775,6 +775,36 @@ fn cache_path(root: &Path, hash: &str, kind: Kind, format: RenditionFormat) -> P
         .join(format!("{hash}-{kind}-{RENDITION_GENERATION}.{ext}"))
 }
 
+/// Locate a rendition that `ensure` already published, without reading
+/// or generating anything: the exact name shape of [`cache_path`],
+/// probed in both encoded formats because the format is decided by
+/// transparency that only a decode can know. `None` when the entry is
+/// absent, unreadable, or empty. Presence is all the viewer's cheap
+/// admission class needs (W70): what it serves, the serving path
+/// re-opens and re-validates itself. `pub` so sibling tools classify
+/// cache entries by the same key shape as the renderer.
+pub fn existing_rendition(root: &Path, hash: &str, kind: Kind) -> Option<PathBuf> {
+    // A cache key that is not exactly a lowercase hex digest cannot have
+    // been published by `ensure`; refusing it also keeps the shard and
+    // the name free of path characters before they reach `cache_path`.
+    if hash.len() != 64 || !hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    [RenditionFormat::Jpeg, RenditionFormat::Png]
+        .into_iter()
+        .find_map(|format| {
+            let path = cache_path(root, hash, kind, format);
+            let metadata = fs::metadata(&path).ok()?;
+            // The cache publishes by atomic rename, so a complete entry is
+            // the only thing that can ever be found here; the depth check
+            // `valid_cache_hit` runs stays a property of the generating
+            // path. A follow-the-link `metadata` is enough for the probe
+            // for the same reason: the directory chain is written, and
+            // re-validated, symlink-free.
+            (metadata.is_file() && metadata.len() > 0).then_some(path)
+        })
+}
+
 /// A cache entry location. On unix the containing directory is pinned by an
 /// `O_NOFOLLOW`-opened descriptor, so later path component swaps cannot
 /// redirect reads or writes outside the containing directory. On windows

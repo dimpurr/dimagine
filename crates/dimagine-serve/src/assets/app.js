@@ -10,6 +10,7 @@
 //   * "Load more" fetches the next page from /api/view and appends it
 //   * tiles lay out in justified rows by the indexed dimensions
 //   * tiles crop only an extreme aspect ratio, and say so with a badge
+//   * a failed image retries itself with backoff before it gives up (W70)
 //   * recent views, kept on this device only
 //   * the theme is a choice on this device: Auto, Light or Dark
 //   * the chips inside the search capsule scroll, and the tag list filters
@@ -648,7 +649,11 @@
     if (!image) return;
     if (!image.complete) return; // still on its way; the skeleton stays
     if (!image.naturalWidth) {
-      markBroken(tile);
+      // A completed picture with no pixels is a failed load — often one
+      // that failed before this script could see the error event. It
+      // joins the retry schedule like any other (W70); the tile is
+      // marked broken from there, only once the retries are spent.
+      retryFailedImage(image);
       return;
     }
     tile.classList.remove('loading');
@@ -677,11 +682,220 @@
       image.addEventListener('load', function () {
         fitTile(tile);
       });
-      image.addEventListener('error', function () {
-        markBroken(tile);
-      });
+      // A failed load is not handled here: the document-wide retry
+      // wiring below owns every image error (W70), including this
+      // one, so nothing is marked broken before the retries ran.
     });
   }
+
+  /* ------------------------------------------ image retries (W70) */
+
+  // A 503 is "come back later", not "this picture is gone": the grid
+  // asks for dozens of /thumb at once, revalidations included, and a
+  // busy server refuses the overflow for a moment — an <img> that
+  // does not retry turns that into a permanently "Unavailable" tile
+  // (different tiles on every reload, the previews all present on
+  // disk). So a failed image retries itself: at most 3 attempts, a
+  // step backoff (1 s, 2 s, 4 s) with jitter so a grid's tiles do not
+  // retry as one synchronised wave, each attempt a fresh ?r=N the
+  // server ignores, and only the last failure takes the tile's
+  // broken form. A genuine 404 is caught by a probe before it wastes
+  // the schedule: a missing image answers the probe with no admission
+  // permit at all, exactly the requests that should stop, stop first.
+
+  // The schedule is data, not code: attempt N waits its step plus the
+  // caller's jitter. Three attempts, the spec's 1/2/4 second steps.
+  var RETRY_BACKOFF_MS = [1000, 2000, 4000];
+  // Spread so a storm's retries do not land together: 0-500 ms on top
+  // of each step.
+  var RETRY_JITTER_MS = 500;
+  // How long the 404 probe may take before it decides nothing (it
+  // shares the same congestion the retries are for; when it cannot
+  // say, the unchanged schedule keeps its turn).
+  var PROBE_TIMEOUT_MS = 2000;
+
+  // The three policy functions below are deliberate about being
+  // DOM-free and side-effect-free apart from the URL parser's base —
+  // unit-testable the day this crate ships a JS test harness. None
+  // ships today (no package.json, no jest/vitest anywhere in the
+  // repo; verified for W70), so until then the Rust test
+  // `app_js_ships_the_w70_retry_policy` (assets/mod.rs) pins the
+  // constants meanwhile, and this note is the required record.
+
+  // Which retry attempt a URL already carries: ?r=N, 0 when none. The
+  // URL is the budget — the same image reached from a fresh page (no
+  // ?r=) starts over, and r=3 can try exactly no more.
+  function retryAttemptOf(url) {
+    var parsed;
+    try {
+      parsed = new URL(url, 'http://dimagine.invalid');
+    } catch (error) {
+      return 0;
+    }
+    var marked = parsed.searchParams.get('r');
+    if (marked === null) return 0;
+    var attempt = parseInt(marked, 10);
+    return isNaN(attempt) || attempt < 0 ? 0 : attempt;
+  }
+
+  // The wait before attempt `attempt` (1-based) sets src again: the
+  // table's step plus the caller's jitter clamped into range — or
+  // null when no attempt is left to schedule.
+  function retryDelayFor(attempt, jitterMs) {
+    if (attempt < 1 || attempt > RETRY_BACKOFF_MS.length) return null;
+    return (
+      RETRY_BACKOFF_MS[attempt - 1] +
+      Math.max(0, Math.min(jitterMs, RETRY_JITTER_MS))
+    );
+  }
+
+  // The address attempt `attempt` will be asked for: the same URL with
+  // any old r replaced by the new one, so every attempt is a distinct
+  // request and each failure carries its own place in the sequence.
+  // The server ignores the parameter; the fresh query only makes the
+  // attempt unskippable.
+  function retryUrlFor(url, attempt) {
+    var parsed = new URL(url, window.location.href);
+    parsed.searchParams.set('r', String(attempt));
+    return parsed.href;
+  }
+
+  // Whether an <img> address is one of this viewer's media routes and
+  // therefore retryable: grid thumbs, the image page's picture, a
+  // collection cover, a note embed, the inspector preview. Everything
+  // else (a foreign image, a data: URI) is never touched.
+  function isViewerMedia(url) {
+    var parsed;
+    try {
+      parsed = new URL(url, window.location.href);
+    } catch (error) {
+      return false;
+    }
+    if (parsed.origin !== window.location.origin) return false;
+    return (
+      parsed.pathname.indexOf('/thumb/') === 0 ||
+      parsed.pathname.indexOf('/media/') === 0 ||
+      parsed.pathname.indexOf('/raw/') === 0
+    );
+  }
+
+  // What remains when every attempt is spent and the probe knew
+  // nothing better: the tile's own broken form — exactly the
+  // "Unavailable" surface the grid always had — for an image inside a
+  // grid tile; and for the pictures that are not (the image page's
+  // stage, the inspector preview, a collection cover, a note embed)
+  // the browser's own broken-image rendering, keeping the link around
+  // them the only honest thing to say.
+  function giveUpOn(image) {
+    // A picture that raced back to life (another tile asked for it
+    // first, the shared disk cache answered) is left showing.
+    if (image.complete && image.naturalWidth) return;
+    var tile = image.closest ? image.closest('.tile[data-path]') : null;
+    if (tile) markBroken(tile);
+  }
+
+  // The 404 probe. Only failed loads reach it, so a healthy grid asks
+  // for nothing extra — and the just-missing image answers before any
+  // admission permit, so the "stop retrying" answers are also the
+  // fastest ones to get. A probe that cannot say (refused, slow,
+  // offline) decides nothing: the schedule keeps its own turn.
+  function probeNotFound(url, onMissing) {
+    var controller = window.AbortController ? new AbortController() : null;
+    if (controller) {
+      window.setTimeout(function () {
+        controller.abort();
+      }, PROBE_TIMEOUT_MS);
+    }
+    window
+      .fetch(url, {
+        method: 'HEAD',
+        credentials: 'same-origin',
+        signal: controller ? controller.signal : undefined,
+      })
+      .then(function (response) {
+        if (response && response.status === 404) onMissing();
+      })
+      .catch(function () {
+        // A probe that never answered decides nothing.
+      });
+  }
+
+  // One failed load: schedule the next attempt — or, when the budget
+  // in the URL is spent, take the broken form. The state lives in two
+  // places on purpose: the ?r=N in src is the budget that survives
+  // anything, and the single pending timer property is the live one
+  // that a probe (or a late success) can still cancel. A failure is
+  // never handled twice — the sweep can meet the same failed picture
+  // the fit measurement rechecks — which is also why a probe is sent
+  // only when a timer is actually being armed.
+  function retryFailedImage(image) {
+    if (!image || image.tagName !== 'IMG') return;
+    if (image.dimagineRetryTimer) return; // its retry is already scheduled
+    var src = image.getAttribute('src');
+    if (!src || !isViewerMedia(src)) return;
+    var next = retryAttemptOf(src) + 1;
+    var delay = retryDelayFor(
+      next,
+      Math.floor(Math.random() * (RETRY_JITTER_MS + 1))
+    );
+    if (delay === null) {
+      giveUpOn(image);
+      return;
+    }
+    // A 404 is forever; three retries of it is a retry loop on the
+    // one answer that cannot change (W70: no retry loop on 404).
+    probeNotFound(src, function () {
+      if (image.dimagineRetryTimer) {
+        window.clearTimeout(image.dimagineRetryTimer);
+        image.dimagineRetryTimer = 0;
+      }
+      giveUpOn(image);
+    });
+    image.dimagineRetryTimer = window.setTimeout(function () {
+      image.dimagineRetryTimer = 0;
+      // The tile may have been torn down while the timer ran (a view
+      // change, its own broken form): a removed image has nothing
+      // left to ask for.
+      if (!image.parentNode) return;
+      image.src = retryUrlFor(src, next);
+    }, delay);
+  }
+
+  // One capture-phase listener for every image the document ever
+  // holds — error events on <img> do not bubble, and the document is
+  // the one place that also sees the images that arrive later ("Load
+  // more" tiles, the inspector's preview) without re-wiring each.
+  document.addEventListener(
+    'error',
+    function (event) {
+      retryFailedImage(event.target);
+    },
+    true
+  );
+
+  // A success cancels the retry nobody needs any more.
+  document.addEventListener(
+    'load',
+    function (event) {
+      var image = event.target;
+      if (
+        image &&
+        image.tagName === 'IMG' &&
+        image.dimagineRetryTimer
+      ) {
+        window.clearTimeout(image.dimagineRetryTimer);
+        image.dimagineRetryTimer = 0;
+      }
+    },
+    true
+  );
+
+  // This script loads deferred, so a fast failure can beat the
+  // wiring above and never fire another error. Sweep once at
+  // registration and re-enter exactly those through the same door.
+  Array.prototype.forEach.call(document.querySelectorAll('img'), function (image) {
+    if (image.complete && !image.naturalWidth) retryFailedImage(image);
+  });
 
   /* -------------------------------------------- justified rows (W49) */
 

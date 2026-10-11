@@ -33,7 +33,7 @@ pub(crate) struct FolderData {
 pub(crate) async fn folders_page(State(state): State<AppState>) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     let Ok(sidebar) = state.index.sidebar_data() else {
         return index_failure(&state, false);
@@ -120,7 +120,7 @@ fn carry_query(query: Option<&str>) -> String {
 pub(crate) async fn folder_root_json(State(state): State<AppState>) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     folder_data_blocking(state, String::new()).await
 }
@@ -132,7 +132,7 @@ pub(crate) async fn folder_json(
 ) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     folder_data_blocking(state, path).await
 }

@@ -84,4 +84,36 @@ mod tests {
         assert_ne!(hash("a"), hash("b"));
         assert_eq!(hash("a").len(), HASH_LEN);
     }
+
+    /// The W70 retry policy, pinned where the crate has no JS harness —
+    /// this repo ships none (no package.json, no jest/vitest anywhere),
+    /// so until one exists this test stands in for it: the schedule the
+    /// fix specifies (3 attempts, 1/2/4 s steps, jitter capped at
+    /// 500 ms), the DOM-free functions a future harness should exercise
+    /// (`retryAttemptOf` / `retryDelayFor` / `retryUrlFor`, kept pure
+    /// for exactly that day — the note their section carries), and the
+    /// 404 probe that keeps a retry loop from running on a missing
+    /// image. String-pinning is the honest limit of a test that cannot
+    /// execute the file; a harness that can execute it replaces this.
+    #[test]
+    fn app_js_ships_the_w70_retry_policy() {
+        assert!(
+            APP_JS.contains("var RETRY_BACKOFF_MS = [1000, 2000, 4000];"),
+            "the 1/2/4 second backoff table"
+        );
+        assert!(
+            APP_JS.contains("var RETRY_JITTER_MS = 500;"),
+            "jitter bounded to half a second"
+        );
+        for name in ["retryAttemptOf", "retryDelayFor", "retryUrlFor"] {
+            assert!(
+                APP_JS.contains(&format!("function {name}(")),
+                "the pure policy function {name}"
+            );
+        }
+        assert!(
+            APP_JS.contains("method: 'HEAD'"),
+            "the 404 probe before its schedule is spent"
+        );
+    }
 }

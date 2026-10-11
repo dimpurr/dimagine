@@ -3,12 +3,15 @@ use axum::{
     http::{Request, StatusCode},
 };
 use dimagine_serve::{
-    router, Catalog, CatalogError, Collection, CollectionPage, FsCatalog, ImageDetail, ImageEntry,
-    OriginalPreview, ServeConfig, LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
+    router, CachedPreview, Catalog, CatalogError, Collection, CollectionPage, FsCatalog,
+    ImageDetail, ImageEntry, OriginalPreview, PreviewKind, PreviewProvider, ServeConfig,
+    LOGIN_CONCURRENCY_LIMIT, LOGIN_FAILURE_BUDGET,
 };
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
@@ -811,4 +814,333 @@ async fn image_note_self_embed_is_not_collection_membership_and_extension_mismat
         .unwrap();
     assert_eq!(response.headers()["content-type"], "image/png");
     assert_eq!(response.headers()["x-dimagine-extension-mismatch"], "true");
+}
+
+/* ============================== W70: admission classes + client retries */
+
+// A real 1x1 PNG: the preview generator must be able to decode it, so
+// warm-ups really produce rendition files on disk (the fake synths the
+// other tests use would make every /thumb a generation-then-fallback).
+const TINY_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0xda, 0x63, 0xfc, 0xcf, 0xc0, 0x50,
+    0x0f, 0x00, 0x04, 0x85, 0x01, 0x80, 0x84, 0xa9, 0x8c, 0x21, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+/// A gate preview rendering waits behind. Closed, every image request
+/// that must generate parks inside `preview_path` — holding its
+/// admission permit exactly as a real preview generation does. The
+/// parks are on a `Condvar` inside `spawn_blocking`, so reopening the
+/// gate drains the parked requests instead of cancelling them.
+struct Gate {
+    open: Mutex<bool>,
+    resumed: Condvar,
+}
+
+impl Gate {
+    fn new(open: bool) -> Self {
+        Self {
+            open: Mutex::new(open),
+            resumed: Condvar::new(),
+        }
+    }
+
+    fn close(&self) {
+        *self.open.lock().unwrap() = false;
+    }
+
+    fn reopen(&self) {
+        let mut open = self.open.lock().unwrap();
+        *open = true;
+        self.resumed.notify_all();
+    }
+
+    fn wait_open(&self) {
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.resumed.wait(open).unwrap();
+        }
+    }
+}
+
+/// [`CachedPreview`] with its heavy half parked on a [`Gate`]: the
+/// probe (`existing_preview`) stays the real one, so the light class
+/// has real renditions to find — and a misclassified thumbnail becomes
+/// fatal, because it parks behind the eight heavy permits for its
+/// whole 10 s wait and comes back a 503.
+struct GatedCachedPreview {
+    inner: CachedPreview,
+    gate: Arc<Gate>,
+}
+
+impl PreviewProvider for GatedCachedPreview {
+    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        self.gate.wait_open();
+        self.inner.preview_path(image, kind)
+    }
+
+    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        self.inner.existing_preview(image, kind)
+    }
+}
+
+/// [`OriginalPreview`]'s shape (the original *is* the rendition) gated
+/// the same way, for the tests that only need the heavy class busy:
+/// every request generates, so every request is heavy.
+struct GatedPreview {
+    root: PathBuf,
+    gate: Arc<Gate>,
+}
+
+impl PreviewProvider for GatedPreview {
+    fn preview_path(&self, image: &str, _kind: PreviewKind) -> Option<PathBuf> {
+        self.gate.wait_open();
+        Some(self.root.join(image))
+    }
+}
+
+/// The fix's own headline (W70): a grid's worth of thumbnails whose
+/// previews are already on disk answers while every heavy permit sits
+/// on a preview generation. Before the fix the ninth request onward
+/// got an immediate 503 and `<img>`'s one-error handling marked the
+/// tiles "Unavailable" — different ones on every reload, the previews
+/// undamaged the whole time.
+#[tokio::test]
+async fn w70_a_grid_of_cached_thumbnails_answers_while_every_heavy_permit_is_busy() {
+    const IMAGES: usize = 200;
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..IMAGES {
+        fs::write(root.path().join(format!("img-{index:03}.png")), TINY_PNG).unwrap();
+    }
+    let catalog = FsCatalog::new(root.path()).unwrap();
+    let gate = Arc::new(Gate::new(true));
+    let previews = GatedCachedPreview {
+        inner: CachedPreview::new(root.path()),
+        gate: gate.clone(),
+    };
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog, previews, config);
+    let cookie = login(&app, "2333").await;
+
+    // Warm every thumbnail once: the renditions now exist on disk (a
+    // content-addressed cache, and the images share bytes, so the
+    // first request renders and the rest hit).
+    for index in 0..IMAGES {
+        let response = app
+            .clone()
+            .oneshot(request(
+                &format!("/thumb/img-{index:03}.png"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // Park every heavy permit: eight view renditions that do not exist
+    // yet, each generating behind a closed gate.
+    gate.close();
+    let mut heavy = Vec::new();
+    for index in 0..8 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        heavy.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(request(
+                    &format!("/media/img-{index:03}.png"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            response.status()
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The grid: two hundred thumbnails at once. Every one must answer
+    // — the light class never queues behind a preview generator — and
+    // none may come back a 503.
+    let started = Instant::now();
+    let mut storm = Vec::new();
+    for index in 0..IMAGES {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        storm.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(request(
+                    &format!("/thumb/img-{index:03}.png"),
+                    Some(&cookie),
+                ))
+                .await
+                .unwrap();
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            (response.status(), retry_after)
+        }));
+    }
+    let mut answered = 0;
+    let mut refused = 0;
+    for task in storm {
+        let (status, retry_after) = task.await.unwrap();
+        match status {
+            StatusCode::OK => {
+                assert!(retry_after.is_none());
+                answered += 1;
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                refused += 1;
+                if let Some(hint) = retry_after {
+                    eprintln!("a tile got the busy-server 503 with Retry-After: {hint}");
+                }
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+    assert_eq!(refused, 0, "{refused} tiles got the busy-server 503");
+    assert_eq!(answered, IMAGES);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "answered within the light class's own wait, not the heavy budget: {:?}",
+        started.elapsed()
+    );
+
+    // Let the parked generations finish and confirm they all serve.
+    gate.reopen();
+    for task in heavy {
+        assert_eq!(task.await.unwrap(), StatusCode::OK);
+    }
+}
+
+/// W70's heavy class, end to end: over the serving bound, requests
+/// queue and are answered within the wait; past the queue's own bound,
+/// the next request is refused without queueing at all, and the
+/// refusal carries an honest `Retry-After` — the whole wait budget a
+/// fresh attempt could still face, as the literal the test pins.
+#[tokio::test]
+async fn w70_heavy_queue_answers_within_the_wait_and_refuses_the_next_beyond_it() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("img.png"), PNG).unwrap();
+    let catalog = FsCatalog::new(root.path()).unwrap();
+    let gate = Arc::new(Gate::new(false));
+    let previews = GatedPreview {
+        root: root.path().to_path_buf(),
+        gate: gate.clone(),
+    };
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        ..ServeConfig::default()
+    };
+    let app = router(catalog, previews, config);
+    let cookie = login(&app, "2333").await;
+
+    // Eight requests hold the permits (parked inside generation) and
+    // a full queue waits behind them: 8 + 256, every one of them
+    // within its wait budget.
+    let serving = 8;
+    let queue = 256;
+    let mut parked = Vec::new();
+    for _ in 0..serving + queue {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        parked.push(tokio::spawn(async move {
+            let response = app
+                .oneshot(request("/thumb/img.png", Some(&cookie)))
+                .await
+                .unwrap();
+            let status = response.status();
+            let _ = to_bytes(response.into_body(), usize::MAX).await;
+            status
+        }));
+    }
+    // Give the whole wave time to reach the queue; the parked holders
+    // cannot drain on their own, so the queue stays full until the
+    // gate opens.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    // Request 8 + 256 + 1: refused without taking a queue place, and
+    // honestly told to come back after the whole wait budget (the
+    // literal, so lowering the constant fails this test — the RW54
+    // lesson).
+    let started = Instant::now();
+    let probe = app
+        .clone()
+        .oneshot(request("/thumb/img.png", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        probe.headers()["retry-after"].to_str().unwrap(),
+        "10",
+        "the whole heavy wait budget, never a best case"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "refused without queueing: {:?}",
+        started.elapsed()
+    );
+
+    // Reopen: the eight holders and the whole queue answer — every
+    // waiter was served within the wait it entered (the drain is
+    // millisecond-sized once the gate opens, and ~1.5 s of the ten
+    // are already spent).
+    gate.reopen();
+    let mut served = 0;
+    for task in parked {
+        assert_eq!(task.await.unwrap(), StatusCode::OK);
+        served += 1;
+    }
+    assert_eq!(served, serving + queue);
+}
+
+/// The retry parameter the client (!r=N) adds is the client's own
+/// bookkeeping: the routes answer the same rendition the same way with
+/// or without it — including the terminal 404 a probe treats as
+/// "never again" (W70: no retry loop on 404).
+#[tokio::test]
+async fn w70_the_retry_query_parameter_the_client_adds_is_ignored_by_the_media_routes() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("cat.png"), PNG).unwrap();
+    let app = app_for(&root, ServeConfig::default());
+    let cookie = login(&app, "2333").await;
+    let base = app
+        .clone()
+        .oneshot(request("/thumb/cat.png", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(base.status(), StatusCode::OK);
+    let base_etag = base.headers()["etag"].to_str().unwrap().to_owned();
+    let base_bytes = bytes(base).await;
+
+    for attempt in [1, 2, 3] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                &format!("/thumb/cat.png?r={attempt}"),
+                Some(&cookie),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["etag"].to_str().unwrap(), base_etag);
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            base_bytes
+        );
+    }
+
+    // A missing image stays the one answer a retry cannot change.
+    let missing = app
+        .oneshot(request("/thumb/absent.png?r=1", Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert!(missing.headers().get("retry-after").is_none());
 }

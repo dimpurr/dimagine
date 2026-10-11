@@ -144,8 +144,25 @@ pub trait Catalog: Send + Sync + 'static {
 
 /// Preview path provider contract. The fallback uses the original image.
 pub trait PreviewProvider: Send + Sync + 'static {
-    /// Find a rendition for an image, or return `None` to use the original.
+    /// Find a rendition for an image, or return `None` to use the
+    /// original. May generate: [`CachedPreview`] renders missing
+    /// renditions here, synchronously.
     fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf>;
+    /// Find a rendition that is already on disk, without generating
+    /// anything — the check the media route's light admission class is
+    /// made of (W70): it runs before any permit is taken, so a cached
+    /// preview must never pay for, or hold up, the heavy class.
+    ///
+    /// `None` — the default — means absent or unknown, and the caller
+    /// must take the heavy class, whose `preview_path` may generate.
+    /// The default also keeps providers whose "rendition" *is* the
+    /// original (e.g. [`OriginalPreview`]) out of the light class: an
+    /// original is exactly the heavyweight thing the light class
+    /// exists to avoid streaming.
+    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        let _ = (image, kind);
+        None
+    }
 }
 
 /// Requested image rendition.
@@ -588,10 +605,14 @@ impl CachedPreview {
             logged: Arc::new(Mutex::new(HashSet::new())),
         }
     }
-}
 
-impl PreviewProvider for CachedPreview {
-    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+    /// Resolve the source image an image path refers to: canonicalised,
+    /// inside the library root and an existing file — with the NFC/NFD
+    /// fallback for names whose unicode form differs between systems.
+    /// Both `preview_path` and `existing_preview` key a rendition by
+    /// this resolution, so a rendition found by the cheap probe is the
+    /// one the generating path would make.
+    fn resolved_source(&self, image: &str) -> Option<PathBuf> {
         let relative = FsPath::new(image);
         if relative.is_absolute()
             || relative
@@ -601,8 +622,8 @@ impl PreviewProvider for CachedPreview {
             return None;
         }
         let candidate = self.root.join(relative);
-        let source = match fs::canonicalize(&candidate) {
-            Ok(c) if c.starts_with(&self.root) && c.is_file() => c,
+        match fs::canonicalize(&candidate) {
+            Ok(c) if c.starts_with(&self.root) && c.is_file() => Some(c),
             _ => {
                 // Try resolving with NFC/NFD normalization if exact byte match failed
                 let mut matched = self.root.clone();
@@ -636,16 +657,26 @@ impl PreviewProvider for CachedPreview {
                     return None;
                 };
                 if c.starts_with(&self.root) && c.is_file() {
-                    c
+                    Some(c)
                 } else {
-                    return None;
+                    None
                 }
             }
-        };
-        let preview_kind = match kind {
-            PreviewKind::Thumb => dimagine_preview::Kind::Thumb,
-            PreviewKind::View => dimagine_preview::Kind::View,
-        };
+        }
+    }
+}
+
+fn rendition_kind(kind: PreviewKind) -> dimagine_preview::Kind {
+    match kind {
+        PreviewKind::Thumb => dimagine_preview::Kind::Thumb,
+        PreviewKind::View => dimagine_preview::Kind::View,
+    }
+}
+
+impl PreviewProvider for CachedPreview {
+    fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        let source = self.resolved_source(image)?;
+        let preview_kind = rendition_kind(kind);
         let _guard = self.concurrency.acquire();
         match dimagine_preview::ensure(&self.root, &source, &[preview_kind]) {
             Ok(renditions) => renditions
@@ -660,6 +691,21 @@ impl PreviewProvider for CachedPreview {
                 None
             }
         }
+    }
+
+    /// The cheap probe, run before any admission permit (W70): the
+    /// content hash a rendition is keyed by, then the published cache
+    /// entry, without decoding or writing anything. This is no more
+    /// I/O than the generating path pays on a cache *hit* — `ensure`
+    /// reads and hashes the whole source before it looks for the
+    /// entry, and then decodes it — and far less on the way to a
+    /// served preview. The index already stores the same SHA-256 per
+    /// file (keyed on size+mtime); reusing it instead of re-hashing
+    /// is a recorded follow-up, not part of this fix.
+    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
+        let source = self.resolved_source(image)?;
+        let hash = dimagine_preview::sha256_file(&source).ok()?;
+        dimagine_preview::existing_rendition(&self.root, &hash, rendition_kind(kind))
     }
 }
 

@@ -1,4 +1,9 @@
-//! Media streaming and caching handler with byte-level ETag and MIME detection.
+//! Media streaming and caching handler with byte-level ETag and MIME
+//! detection. Admission is two classes (W70), decided before any permit
+//! is taken: a cached preview or a note's source view is light — 64
+//! permits held around the file open; anything that may generate a
+//! preview, stream an original, or answer `/raw` of an image is heavy —
+//! 8 permits, a bounded queue, held until the last byte.
 
 use axum::{
     body::Body,
@@ -11,11 +16,14 @@ use std::{
     fs,
     io::{Read, Seek, SeekFrom},
     path::Path as FsPath,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::catalog::{is_image, CatalogError, PreviewKind};
-use crate::{acquire_admission, admission_denied, error_response, AppState};
+use crate::{
+    admission_denied, error_response, AppState, HEAVY_RETRY_AFTER_SECS, LIGHT_RETRY_AFTER_SECS,
+};
 
 pub(crate) async fn media(
     State(state): State<AppState>,
@@ -23,10 +31,6 @@ pub(crate) async fn media(
     uri: axum::http::Uri,
     headers: HeaderMap,
 ) -> Response {
-    let permit = match acquire_admission(&state) {
-        Some(permit) => permit,
-        None => return admission_denied(),
-    };
     let kind = if uri.path().starts_with("/thumb/") {
         Some(PreviewKind::Thumb)
     } else if uri.path().starts_with("/raw/") {
@@ -34,39 +38,221 @@ pub(crate) async fn media(
     } else {
         Some(PreviewKind::View)
     };
+    // Class first, pay later: the decision is a resolve and a stat (a
+    // preview key needs the source's content hash — the same read the
+    // generating path itself pays before its cache lookup), so a grid's
+    // revalidations can tell "already on disk" from "may generate"
+    // without touching either class's permits. A request that will only
+    // ever read a cached preview never waits behind, and never holds
+    // up, a preview generator (W70).
     let catalog = state.catalog.clone();
     let previews = state.previews.clone();
     let root = state.catalog.root().to_path_buf();
-    let headers = headers.clone();
+    let classify_path = path.clone();
+    let classified = tokio::task::spawn_blocking(move || {
+        classify(&catalog, &previews, &root, &classify_path, kind)
+    })
+    .await;
+    let class = match classified {
+        Ok(Ok(class)) => class,
+        Ok(Err(error)) => return error_response(error),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    match class {
+        MediaClass::Missing => StatusCode::NOT_FOUND.into_response(),
+        MediaClass::NoteSource(original) => serve_note_source(&state, original, &headers).await,
+        MediaClass::ExistingPreview(preview) => {
+            match serve_cached_preview(&state, preview, &headers).await {
+                LightOutcome::Answered(response) => response,
+                // The entry existed at classification and not at open.
+                // Not answered: re-run the request in the heavy class,
+                // the only class allowed to generate a rendition or
+                // stream an original (W70's "no multi-MB thumb without
+                // the heavy permit" runs both directions).
+                LightOutcome::Vanished => serve_heavy(&state, path, kind, &headers).await,
+            }
+        }
+        MediaClass::Heavy => serve_heavy(&state, path, kind, &headers).await,
+    }
+}
+
+/// Which admission class a media request belongs to.
+enum MediaClass {
+    /// Nothing to serve — not an image, and not a note under `/raw`:
+    /// answered 404 before any permit is taken.
+    Missing,
+    /// A note's own bytes as `text/plain` (the "Open note" source
+    /// view): small and side-effect free — light.
+    NoteSource(std::path::PathBuf),
+    /// A thumb or view rendition already on disk — light.
+    ExistingPreview(std::path::PathBuf),
+    /// Anything that may generate a preview, fall back to streaming
+    /// the original, or answer `/raw` of an image — heavy.
+    Heavy,
+}
+
+/// The cheap half of W70: sort one request into an admission class.
+/// No permit is held, and nothing is generated; the call is a
+/// resolve, an extension/note check, and — for renditions — the
+/// provider's `existing_preview`, which reads the source only to key
+/// the cache (no decode; strictly less work than the generating
+/// path's own cache hit, which also decodes).
+fn classify(
+    catalog: &Arc<dyn crate::catalog::Catalog>,
+    previews: &Arc<dyn crate::catalog::PreviewProvider>,
+    root: &FsPath,
+    path: &str,
+    kind: Option<PreviewKind>,
+) -> Result<MediaClass, CatalogError> {
+    let original = catalog.resolve_path(path)?;
+    if !is_image(&original) {
+        // `/raw` is also the source view of a file the page links to as
+        // "Open note": the bytes as written. Served as `text/plain`, so a
+        // browser shows the note's markup as text and never runs it as a
+        // page of this origin — the media path's counterpart of the
+        // sanitiser the rendered notes go through. Rendition routes
+        // (`/media`, `/thumb`) stay for images only.
+        //
+        // The gate is the note test, not "everything that is not an image":
+        // a library also holds raw source JSON, canvases and whatever else
+        // an importer left, and a route whose comment calls itself the
+        // source view of a note should not become a reader for all of them.
+        // Same classes `collection_note` accepts for a collection
+        // (`FileClass::Note | FileClass::ImageNote`, FORMAT §3). A note is
+        // light: small, and its ETag comes from metadata, not a hash.
+        if kind.is_none() && is_note(&original) {
+            return Ok(MediaClass::NoteSource(original));
+        }
+        return Ok(MediaClass::Missing);
+    }
+    match kind {
+        // `/raw` of an image streams the original itself, which is the
+        // multi-MB object the classes exist to keep scarce: heavy.
+        None => Ok(MediaClass::Heavy),
+        Some(requested) => {
+            // The same inside-root, regular-file shape the serving path
+            // has always accepted for a preview path; a rendition that
+            // fails it falls to the heavy class, which re-runs the full
+            // decision under a permit.
+            let found = previews
+                .existing_preview(path, requested)
+                .and_then(|preview| fs::canonicalize(preview).ok())
+                .filter(|preview| preview.starts_with(root) && preview.is_file());
+            match found {
+                Some(preview) => Ok(MediaClass::ExistingPreview(preview)),
+                // No published rendition: generating one — or falling
+                // back to the original — is exactly the work the heavy
+                // permit exists for.
+                None => Ok(MediaClass::Heavy),
+            }
+        }
+    }
+}
+
+/// A light-class answer, or the one race a light request can lose.
+enum LightOutcome {
+    Answered(Response),
+    /// The rendition vanished between the classification stat and the
+    /// open. The caller re-runs the request in the heavy class.
+    Vanished,
+}
+
+/// Serve a note's source view: light. The permit is held around the
+/// open only; the stream flows from the file handle without it —
+/// a note is a small text file, and the ETag comes from its
+/// metadata, so there is no hashing under the permit either.
+async fn serve_note_source(
+    state: &AppState,
+    original: std::path::PathBuf,
+    request_headers: &HeaderMap,
+) -> Response {
+    let Some(permit) = state.admission.acquire_light().await else {
+        return admission_denied(LIGHT_RETRY_AFTER_SECS);
+    };
+    let opened = tokio::task::spawn_blocking(move || open_source_view(&original)).await;
+    match opened {
+        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
+            // Light policy: the permit covered the open; the stream
+            // flows from the file handle without it (W70).
+            drop(permit);
+            stream_image(file, metadata, etag, mime, mismatch, request_headers, None).await
+        }
+        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+/// Serve a rendition that classification found on disk: light. The
+/// permit is held around the open and the byte-hash ETag (the ETag
+/// covers the whole preview, which is the one bounded-size file this
+/// server serves) and released before the stream, which keeps
+/// flowing from the open file handle — documented as the light
+/// policy, because a preview can never become the multi-MB object
+/// the heavy class exists for.
+async fn serve_cached_preview(
+    state: &AppState,
+    preview: std::path::PathBuf,
+    request_headers: &HeaderMap,
+) -> LightOutcome {
+    let Some(permit) = state.admission.acquire_light().await else {
+        return LightOutcome::Answered(admission_denied(LIGHT_RETRY_AFTER_SECS));
+    };
+    let opened = tokio::task::spawn_blocking(move || open_hashed_file(&preview)).await;
+    match opened {
+        Ok(Ok((file, metadata, etag, mime, mismatch))) => {
+            // Light policy, stated where it is chosen: the permit
+            // covered open-to-hash; the stream does not need it.
+            drop(permit);
+            LightOutcome::Answered(
+                stream_image(file, metadata, etag, mime, mismatch, request_headers, None).await,
+            )
+        }
+        // `open_hashed_file` reports only I/O; a catalogue error
+        // here cannot occur (the class was decided by a resolve under
+        // no permit), but an answer beats a panic if it ever does.
+        Ok(Err(ServeImageError::Catalog(_))) => {
+            LightOutcome::Answered(StatusCode::INTERNAL_SERVER_ERROR.into_response())
+        }
+        Ok(Err(ServeImageError::Io)) => LightOutcome::Vanished,
+        Err(_) => LightOutcome::Answered(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    }
+}
+
+/// The heavy class: everything that may generate a preview, fall back
+/// to the original, or answer `/raw` of an image. Queues bounded
+/// (256) and waits (up to 10 s) for a permit before refusing; the
+/// permit is held until the last streamed byte, as it always was —
+/// here the bodies can be genuinely expensive, and slow readers
+/// count against the bound.
+async fn serve_heavy(
+    state: &AppState,
+    path: String,
+    kind: Option<PreviewKind>,
+    request_headers: &HeaderMap,
+) -> Response {
+    let Some(permit) = state.admission.acquire_heavy().await else {
+        return admission_denied(HEAVY_RETRY_AFTER_SECS);
+    };
+    let catalog = state.catalog.clone();
+    let previews = state.previews.clone();
+    let root = state.catalog.root().to_path_buf();
     let prepared = tokio::task::spawn_blocking(move || {
         let original = catalog
             .resolve_path(&path)
             .map_err(ServeImageError::Catalog)?;
+        // Rendition routes are for images; a note reaches this class
+        // only if it stopped being one between the classification and
+        // the permit, so it is answered like any other missing image.
         if !is_image(&original) {
-            // `/raw` is also the source view of a file the page links to as
-            // "Open note": the bytes as written. Served as `text/plain`, so a
-            // browser shows the note's markup as text and never runs it as a
-            // page of this origin — the media path's counterpart of the
-            // sanitiser the rendered notes go through. Rendition routes
-            // (`/media`, `/thumb`) stay for images only.
-            //
-            // The gate is the note test, not "everything that is not an image":
-            // a library also holds raw source JSON, canvases and whatever else
-            // an importer left, and a route whose comment calls itself the
-            // source view of a note should not become a reader for all of them.
-            // Same classes `collection_note` accepts for a collection
-            // (`FileClass::Note | FileClass::ImageNote`, FORMAT §3).
-            if kind.is_none() && is_note(&original) {
-                return open_source_view(&original);
-            }
             return Err(ServeImageError::Catalog(CatalogError::NotFound));
         }
         let served = match kind {
-            Some(k) => previews
-                .preview_path(&path, k)
+            Some(requested) => previews
+                .preview_path(&path, requested)
                 .and_then(|p| fs::canonicalize(p).ok())
                 .filter(|p| p.starts_with(&root) && p.is_file())
                 .unwrap_or_else(|| original.clone()),
+            // `/raw` of an image: the bytes as written.
             None => original.clone(),
         };
         open_hashed_file(&served)
@@ -74,7 +260,16 @@ pub(crate) async fn media(
     .await;
     match prepared {
         Ok(Ok((file, metadata, etag, mime, mismatch))) => {
-            stream_image(file, metadata, etag, mime, mismatch, &headers, permit).await
+            stream_image(
+                file,
+                metadata,
+                etag,
+                mime,
+                mismatch,
+                request_headers,
+                Some(permit),
+            )
+            .await
         }
         Ok(Err(ServeImageError::Catalog(error))) => error_response(error),
         Ok(Err(ServeImageError::Io)) => StatusCode::NOT_FOUND.into_response(),
@@ -168,10 +363,13 @@ fn open_hashed_file(
     Ok((file, metadata, etag, mime, mime != extension_mime))
 }
 
-/// A streamed file that keeps its admission permit until the last byte.
+/// A streamed file. The admission permit, when one is held (the heavy
+/// class), lives until the last byte; the light class releases its
+/// permit after the open and streams with `None` — both policies are
+/// chosen in [`serve_cached_preview`] and [`serve_heavy`].
 struct AdmittedFile {
     inner: tokio::fs::File,
-    _admission: tokio::sync::OwnedSemaphorePermit,
+    _admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl tokio::io::AsyncRead for AdmittedFile {
@@ -191,11 +389,13 @@ async fn stream_image(
     mime: &'static str,
     mismatch: bool,
     request_headers: &HeaderMap,
-    admission: tokio::sync::OwnedSemaphorePermit,
+    admission: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     let file = tokio::fs::File::from_std(file);
-    // The admission permit lives for the whole stream, so slow
-    // readers count against the concurrency bound while streaming.
+    // The heavy class holds its permit for the whole stream, so slow
+    // readers count against the concurrency bound while streaming; the
+    // light class passed `None` and streams on the open file handle
+    // alone, bounded by the preview's own small size.
     let stream = tokio_util::io::ReaderStream::new(AdmittedFile {
         inner: file,
         _admission: admission,

@@ -38,7 +38,10 @@ use std::{
     collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
@@ -211,7 +214,7 @@ pub(crate) struct AppState {
     pub(crate) setup_lock: Arc<Mutex<()>>,
     pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
     pub(crate) throttles: Arc<Mutex<ThrottleState>>,
-    pub(crate) admission: Arc<tokio::sync::Semaphore>,
+    pub(crate) admission: Arc<Admission>,
     pub(crate) login_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) index: Arc<IndexHandle>,
 }
@@ -264,19 +267,137 @@ pub const LOGIN_BUDGET_WINDOW_SECS: u64 = 15 * 60;
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
 /// Bound on concurrently expensive requests: directory listings and
-/// media streaming (which may generate previews). Excess requests get
-/// a 503 with Retry-After instead of queueing without limit.
-const ADMISSION_LIMIT: usize = 8;
+/// the media routes' heavy class — anything that may generate a
+/// preview, stream an original as a fallback, or answer `/raw` of an
+/// image. The listing pages keep the fast-fail behaviour this bound
+/// always had; the media heavy class queues beneath it (W70).
+const HEAVY_ADMISSION_LIMIT: usize = 8;
 
-pub(crate) fn acquire_admission(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
-    state.admission.clone().try_acquire_owned().ok()
+/// How long a heavy-class request may wait for a permit before it is
+/// refused. The wait, not a promise of service: what a slow request
+/// buys under load is a bounded place in line, never the right to be
+/// rendered next.
+const HEAVY_ADMISSION_WAIT: Duration = Duration::from_secs(10);
+
+/// How many requests may be parked in the heavy queue at once;
+/// one more is refused without waiting at all. The bound keeps
+/// overload from turning into an unbounded pile of waiters — each
+/// holding a connection and a future — that would all time out
+/// together.
+const HEAVY_QUEUE_LIMIT: usize = 256;
+
+/// How many cheap requests may hold a light permit at once: serving
+/// an existing preview (small, opened read-only) or a note's source
+/// view. The permit is taken only around the open, so a grid's worth
+/// of revalidations ends up bounded by I/O, not by the eight preview
+/// generators — request 9+ answers instead of 503 (W70's storm).
+const LIGHT_ADMISSION_LIMIT: usize = 64;
+
+/// How long a light-class request may wait for a permit. A light hold
+/// is one file open, so minutes-long saturation is not the shape this
+/// waits through; the cap keeps a wedged disk from parking requests
+/// forever.
+const LIGHT_ADMISSION_WAIT: Duration = Duration::from_secs(2);
+
+/// The light class's `Retry-After`: the whole wait a fresh attempt can
+/// still face, so the hint never promises less. Never below 1.
+pub(crate) const LIGHT_RETRY_AFTER_SECS: u64 = LIGHT_ADMISSION_WAIT.as_secs();
+
+/// The heavy class's `Retry-After`, on a timed-out wait and on a
+/// queue-full refusal alike: a fresh attempt may spend the whole wait
+/// budget before it gives up, so honesty is the whole budget — the
+/// same cover-the-entire-hold reasoning as the login hint
+/// (RW54 Low #4 / W55). Never below 1.
+pub(crate) const HEAVY_RETRY_AFTER_SECS: u64 = HEAVY_ADMISSION_WAIT.as_secs();
+
+/// The viewer's admission gate: one heavy class and one light class,
+/// decided before either permit is taken (the media route's cheap
+/// classification, W70).
+pub(crate) struct Admission {
+    /// The heavy class: preview generation, original streaming, `/raw`
+    /// of an image.
+    heavy: Arc<tokio::sync::Semaphore>,
+    /// The light class: existing previews and note source views.
+    light: Arc<tokio::sync::Semaphore>,
+    /// Requests parked in the heavy queue, entering and leaving it
+    /// only through [`QueuePlace`], whose `Drop` runs on every path out
+    /// — acquired, timed out, or the request future cancelled by a
+    /// client that hung up. An unguarded count would leak a phantom
+    /// waiter per disconnect and close the queue for good.
+    heavy_waiters: AtomicUsize,
 }
 
-pub(crate) fn admission_denied() -> Response {
+impl Admission {
+    fn new() -> Self {
+        Self {
+            heavy: Arc::new(tokio::sync::Semaphore::new(HEAVY_ADMISSION_LIMIT)),
+            light: Arc::new(tokio::sync::Semaphore::new(LIGHT_ADMISSION_LIMIT)),
+            heavy_waiters: AtomicUsize::new(0),
+        }
+    }
+
+    /// Fast-fail acquire on the heavy permits, for the directory
+    /// listing pages: the behaviour they have always had — refuse
+    /// immediately with a short hint rather than queue — kept while
+    /// the media route queues (W70). Listings are short holds, so
+    /// they also rarely contend with a queue that is draining.
+    pub(crate) fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.heavy.clone().try_acquire_owned().ok()
+    }
+
+    /// A light permit, waited for up to [`LIGHT_ADMISSION_WAIT`].
+    /// The caller holds it only around the open of the file it serves
+    /// and streams without it — a preview is small, and the handle
+    /// keeps the bytes flowing — a policy the media route documents.
+    pub(crate) async fn acquire_light(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        tokio::time::timeout(LIGHT_ADMISSION_WAIT, self.light.clone().acquire_owned())
+            .await
+            .ok()
+            .and_then(|acquired| acquired.ok())
+    }
+
+    /// A heavy permit: enter the bounded queue, then wait up to
+    /// [`HEAVY_ADMISSION_WAIT`] for a permit. `None` means refused —
+    /// queue full at arrival, or the wait ran out — and the caller
+    /// answers 503 with [`HEAVY_RETRY_AFTER_SECS`].
+    pub(crate) async fn acquire_heavy(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if self.heavy_waiters.fetch_add(1, Ordering::SeqCst) >= HEAVY_QUEUE_LIMIT {
+            self.heavy_waiters.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        let _place = QueuePlace(self);
+        match tokio::time::timeout(HEAVY_ADMISSION_WAIT, self.heavy.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            // `acquire_owned` fails only on a closed semaphore, which
+            // this struct never closes; treat it as the timeout does.
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+}
+
+/// One place in the heavy queue, held from arrival until the wait
+/// ends one way or another (see [`Admission::heavy_waiters`]).
+struct QueuePlace<'a>(&'a Admission);
+
+impl Drop for QueuePlace<'_> {
+    fn drop(&mut self) {
+        self.0.heavy_waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// The listing pages' fast-fail admission: unchanged by W70's queued
+/// media classes.
+pub(crate) fn acquire_admission(state: &AppState) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    state.admission.try_acquire()
+}
+
+/// The 503 every admission refusal answers with: `Retry-After` is the
+/// caller's honest floor, never below 1.
+pub(crate) fn admission_denied(retry_after: u64) -> Response {
     let mut response = StatusCode::SERVICE_UNAVAILABLE.into_response();
-    response
-        .headers_mut()
-        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }
 
@@ -576,7 +697,7 @@ pub fn router_from(
         setup_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
-        admission: Arc::new(tokio::sync::Semaphore::new(ADMISSION_LIMIT)),
+        admission: Arc::new(Admission::new()),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
         index,
     };
@@ -1246,6 +1367,141 @@ fn default_passcode_warning(config: &ServeConfig, address: SocketAddr) -> bool {
 #[cfg(test)]
 mod regression_unit_tests {
     use super::*;
+
+    /// W70: the heavy queue hands out exactly its places, refuses the
+    /// next request when full, and — the property client disconnects
+    /// make critical — returns a place when its waiter is cancelled
+    /// mid-queue. A place that leaked per cancellation would close
+    /// the queue for good after a few hung-up clients.
+    #[tokio::test(start_paused = true)]
+    async fn heavy_admission_queue_is_bounded_and_places_survive_cancellation() {
+        let admission = Arc::new(Admission::new());
+        // Every heavy permit held, as eight preview generations would.
+        let mut held: Vec<_> = (0..HEAVY_ADMISSION_LIMIT)
+            .map(|_| admission.try_acquire().unwrap())
+            .collect();
+
+        // Park exactly a full queue of waiters. Each reports how it
+        // left the queue — `true` acquired a permit, `false` was
+        // refused without a place — and an acquired permit is
+        // forgotten, not returned: a served request would free its
+        // permit only when it finishes streaming, and this test is
+        // about the queue, not about cycling permits.
+        let (served, mut reports) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let mut waiters = Vec::new();
+        for _ in 0..HEAVY_QUEUE_LIMIT {
+            let admission = admission.clone();
+            let served = served.clone();
+            waiters.push(tokio::spawn(async move {
+                let Some(permit) = admission.acquire_heavy().await else {
+                    let _ = served.send(false);
+                    return;
+                };
+                std::mem::forget(permit);
+                let _ = served.send(true);
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The queue is full: the next request is refused outright.
+        let refused = admission.acquire_heavy().await;
+        assert!(refused.is_none(), "a full queue must refuse outright");
+
+        // One permit freed: exactly one queued waiter takes it, inside
+        // the wait (W70: "within wait ⇒ eventually"), and no other
+        // does — the paused clock shows nothing else completing.
+        drop(held.remove(0));
+        match tokio::time::timeout(Duration::from_secs(1), reports.recv()).await {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => panic!("the first waiter must be served, not refused"),
+            Ok(None) => panic!("a waiter must take the freed permit"),
+            Err(_) => panic!("the freed permit is taken within the wait"),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), reports.recv())
+                .await
+                .is_err(),
+            "the one freed permit serves exactly one waiter"
+        );
+
+        // One waiter cancelled mid-queue: a client that hung up while
+        // parked. `select!` dropping the future is the same drop the
+        // connection teardown performs; the cancelled waiter's place
+        // must come back, proven by what the next two requests see.
+        let mut cancelled = {
+            let admission = admission.clone();
+            Box::pin(async move { admission.acquire_heavy().await })
+        };
+        let timer = tokio::time::sleep(Duration::from_millis(100));
+        tokio::pin!(timer);
+        tokio::select! {
+            permit = &mut cancelled => panic!("nothing to acquire yet: {permit:?}"),
+            _ = &mut timer => {}
+        }
+        drop(cancelled);
+
+        // The queue counts one place short again: a fresh waiter parks
+        // (it reports nothing — a parked request neither serves nor
+        // refuses), proving the cancelled waiter's place came back.
+        let admission_park = admission.clone();
+        let served_park = served.clone();
+        waiters.push(tokio::spawn(async move {
+            let Some(permit) = admission_park.acquire_heavy().await else {
+                let _ = served_park.send(false);
+                return;
+            };
+            std::mem::forget(permit);
+            let _ = served_park.send(true);
+        }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), reports.recv())
+                .await
+                .is_err(),
+            "the returned place parks a fresh waiter instead of refusing it"
+        );
+
+        // With the queue full again, the refuse-only path is intact.
+        let admission_refusal = admission.clone();
+        let served_refusal = served.clone();
+        waiters.push(tokio::spawn(async move {
+            let outcome = admission_refusal.acquire_heavy().await.is_some();
+            let _ = served_refusal.send(outcome);
+        }));
+        match tokio::time::timeout(Duration::from_secs(1), reports.recv()).await {
+            Ok(Some(false)) => {}
+            other => panic!("a full queue refuses the next waiter: {other:?}"),
+        }
+    }
+
+    /// W70: the light class waits for its own permits instead of
+    /// failing immediately, and only a saturated light section
+    /// refuses — the hint itself is asserted against the literal
+    /// header values by the route-level regression tests, so this
+    /// pins only the mechanics.
+    #[tokio::test(start_paused = true)]
+    async fn light_admission_waits_for_its_own_permits_instead_of_failing() {
+        let admission = Admission::new();
+        let mut held = Vec::new();
+        for _ in 0..LIGHT_ADMISSION_LIMIT {
+            held.push(admission.acquire_light().await.unwrap());
+        }
+
+        // All light permits held: the next request must wait — and
+        // once its whole wait budget is spent (instant on the paused
+        // clock), it is refused rather than parked forever.
+        assert!(
+            admission.acquire_light().await.is_none(),
+            "a spent wait refuses instead of parking without bound"
+        );
+
+        // One permit back: the waiting request answers immediately,
+        // inside the wait, which is the whole point of the class — a
+        // grid's revalidations queue briefly behind each other.
+        drop(held.remove(0));
+        let answered =
+            tokio::time::timeout(Duration::from_millis(100), admission.acquire_light()).await;
+        assert!(answered.is_ok_and(|permit| permit.is_some()));
+    }
 
     #[test]
     fn session_storage_prunes_expired_tokens_and_stays_bounded() {

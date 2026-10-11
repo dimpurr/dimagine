@@ -37,7 +37,7 @@ use crate::{
 pub(crate) async fn collections_page(State(state): State<AppState>) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     let Ok(sidebar) = state.index.sidebar_data() else {
         return index_failure(&state, false);
@@ -343,7 +343,7 @@ pub(crate) async fn collection_json(
 ) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
-        None => return admission_denied(),
+        None => return admission_denied(1),
     };
     let catalog = state.catalog.clone();
     match tokio::task::spawn_blocking(move || catalog.collection(&path)).await {
