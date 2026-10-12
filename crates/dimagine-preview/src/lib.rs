@@ -51,6 +51,23 @@ const MINIFICATION_BOX_RATIO: u64 = 4;
 /// generations of scaling. Public so sibling tools classify cache
 /// entries by the same name shape.
 pub const RENDITION_GENERATION: &str = "g2";
+
+/// The generation as the number its `g<N>` spelling carries, parsed from
+/// [`RENDITION_GENERATION`] rather than written a second time so a URL tag and
+/// a cache entry name can never disagree.
+///
+/// A content-addressed preview URL (`/p/<sha256>/thumb.g2`) spells the
+/// generation so a browser cannot keep serving a previous generation's pixels
+/// under a URL that only promised the content. `Some` is the number; `None` is
+/// a constant that has been renamed into a shape the URL grammar rejects, which
+/// the module's own test rejects at build time.
+pub fn generation_number() -> Option<u32> {
+    RENDITION_GENERATION
+        .strip_prefix('g')
+        .and_then(|digits| digits.parse::<u32>().ok())
+        .filter(|number| *number > 0)
+}
+
 const VIEW_EDGE: u32 = 1568;
 const VIEW_AREA: u64 = 1_150_000;
 const DEFAULT_PIXEL_LIMIT: u64 = 200_000_000;
@@ -1478,6 +1495,18 @@ mod tests {
     use image::{ImageBuffer, Rgb, Rgba};
     use std::sync::{Arc, Barrier};
     use tempfile::Builder;
+
+    /// The generation a content-addressed URL spells is the one the cache
+    /// entry names carry: the tag and the number come from the same constant,
+    /// so a bump moves the URL and the cache together. A constant that stopped
+    /// being spelled `g<N>` is a build error here rather than a URL that
+    /// silently routes to no generation at all.
+    #[test]
+    fn the_generation_number_is_the_one_the_cache_names_and_urls_spell() {
+        let number = generation_number().expect("RENDITION_GENERATION must be g<N>");
+        assert!(number > 0);
+        assert_eq!(RENDITION_GENERATION, format!("g{number}"));
+    }
 
     #[test]
     fn plan_table_obeys_limits_and_never_upscales() {

@@ -24,7 +24,7 @@ use axum::{
 use dimagine_index::{IndexError, ViewItem, ViewQuery};
 use std::collections::{HashMap, HashSet};
 
-use crate::catalog::DiagnosticKind;
+use crate::catalog::{DiagnosticKind, PreviewKind};
 use crate::index_sync::SidebarData;
 use crate::ui::components::{self, CollectionTile, TileMetas};
 use crate::ui::shell::{Destination, Frame};
@@ -56,6 +56,10 @@ pub(crate) async fn collections_page(State(state): State<AppState>) -> Response 
 ///
 /// One query per collection, each capped at a single row: a cover is the first
 /// embed, never the whole list.
+///
+/// The cover is also a preview, so it is addressed by its content whenever the
+/// index holds a digest for it (ADR-020): the same URL the collection page's
+/// tile would ask for, not a second spelling of the same picture.
 fn covers(state: &AppState, sidebar: &SidebarData) -> Vec<Option<String>> {
     sidebar
         .collections
@@ -68,9 +72,23 @@ fn covers(state: &AppState, sidebar: &SidebarData) -> Vec<Option<String>> {
                     ..ViewQuery::default()
                 })
                 .ok()
-                .and_then(|page| page.items.first().map(|item| item.path.clone()))
+                .and_then(|page| page.items.first().map(|item| cover_src(state, item)))
         })
         .collect()
+}
+
+/// Where one cover's bytes are read from: the content URL when the index holds
+/// a digest for it, and the path URL that redirects to the same answer when it
+/// does not — the digest is the row's own, keyed by the size and mtime this
+/// very query returned (W71 M1).
+fn cover_src(state: &AppState, item: &ViewItem) -> String {
+    match state
+        .index
+        .content_hash(&item.path, item.size, item.mtime_ns)
+    {
+        Some(hash) => crate::content::preview_url(&hash, PreviewKind::Thumb),
+        None => format!("/thumb/{}", crate::ui::encode_path(&item.path)),
+    }
 }
 
 fn collection_body(sidebar: &SidebarData, covers: &[Option<String>]) -> String {
@@ -158,16 +176,13 @@ pub(crate) async fn collection_page_parts(
         || params.q.is_some()
         || params.untagged
         || params.recent;
-    // The header facts of the members, so a collection's tiles are laid out by
-    // the same indexed dimensions as the library grid's (and a member the
-    // index never saw still shows, in a square cell).
-    let metas = crate::pages::library::tile_metas(
-        state,
-        page.collection
-            .members
-            .iter()
-            .map(|member| member.path.as_str()),
-    );
+    // The header facts and the content digests of the members, so a
+    // collection's tiles are laid out by the same indexed dimensions as the
+    // library grid's and address their previews the same way (ADR-020) — and
+    // a member the index never saw still shows, in a square cell behind the
+    // path URL that redirects.
+    let rows: Vec<ViewItem> = known.values().cloned().collect();
+    let metas = crate::pages::library::tile_metas(state, rows.iter());
     let items = member_tiles(&page.collection.members, &known, &metas, narrowed);
     let count = items.len();
     Some(CollectionPageParts {
@@ -217,7 +232,7 @@ fn member_tiles(
             },
         };
         tiles.push(CollectionTile {
-            meta: metas.get(&item.path).copied(),
+            fact: metas.get(&item.path).cloned(),
             item,
             caption: member.caption.clone(),
         });

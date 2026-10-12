@@ -7,6 +7,23 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer: previews are addressed by their content. `/p/<sha256>/thumb.g2` and
+  `/p/<sha256>/view.g2` serve the rendition of one content, answered from the
+  URL and cacheable for a year (`private, max-age=31536000, immutable`, an
+  ETag of the digest, the size class and the generation) — because a different
+  image is a different digest and a different URL, so a rename or a move keeps
+  the address and its cached bytes, and changed bytes are a new address. The
+  generation rides in the variant, so a URL from an older rendition policy is
+  a `302` to the current one rather than a year of stale pixels. Every page and
+  every JSON body emits these URLs: tiles, collection covers and members, the
+  image page's stage, `/api/view` and `/api/image` (each row carrying the
+  `sha256` its URL is built from). An unknown digest, an unknown size class, an
+  unknown variant spelling and a digest that is not 64 hexadecimal characters
+  are all `404`, and an unknown digest never triggers a render. `dimagine
+  check` reports the renditions the cache is missing ("missing previews: N
+  thumb, M view of K indexed images") — counted from the index, not a finding,
+  and absent when there is no index to count from — and the viewer works the
+  same gap in the background, without waiting for a request.
 - Viewer Phase 2a, the filter panel: the facet list beside the grid (K27 motion
   3), where every tag, folder, collection and lens carries the number of images
   it would show *beside the filters already on* — a folder row counts what the
@@ -189,6 +206,22 @@ All notable changes to this project are documented here. The format follows
   documentation index.
 
 ### Changed
+- Viewer: `/thumb/<path>` and `/media/<path>` now answer `302 Found` to the
+  content URL when the index holds a digest for the bytes, with `private,
+  no-cache` on the hop itself — a cached `301` would pin a path to one digest
+  for as long as the browser kept it, and a path can be reused for other bytes.
+  A path the index has no digest for keeps the answer it always had: the
+  rendition itself, light when it is already on disk and heavy when it must be
+  generated. `/raw/` is unchanged.
+- Viewer: classifying a media request no longer reads and hashes the source
+  image (W70 review M1). The digest a rendition is keyed by comes from the
+  index, keyed by the file's own size and nanosecond mtime — a stat and one
+  indexed lookup — and the file is read only when the index holds no digest for
+  those facts. A grid's revalidations now cost no image I/O at all.
+- Viewer: signing out also answers `Clear-Site-Data: "cache"`, beside the
+  `no-store` and the cleared cookie it already sent. A preview is cached for a
+  year, so the next person at this machine would otherwise read one back out of
+  the browser's disk cache.
 - Viewer: a collection view states its order instead of offering one it does
   not keep ("Note order", the counterpart of the Recent lens's arrow — a
   collection is ordered by the embeds in its note, FORMAT §5), and a `sort`

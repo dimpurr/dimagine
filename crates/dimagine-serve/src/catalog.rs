@@ -149,18 +149,24 @@ pub trait PreviewProvider: Send + Sync + 'static {
     /// renditions here, synchronously.
     fn preview_path(&self, image: &str, kind: PreviewKind) -> Option<PathBuf>;
     /// Find a rendition that is already on disk, without generating
-    /// anything — the check the media route's light admission class is
-    /// made of (W70): it runs before any permit is taken, so a cached
-    /// preview must never pay for, or hold up, the heavy class.
+    /// anything — the check the light admission class is made of (W70): it
+    /// runs before any permit is taken, so a cached preview must never pay
+    /// for, or hold up, the heavy class.
     ///
-    /// `None` — the default — means absent or unknown, and the caller
-    /// must take the heavy class, whose `preview_path` may generate.
-    /// The default also keeps providers whose "rendition" *is* the
-    /// original (e.g. [`OriginalPreview`]) out of the light class: an
-    /// original is exactly the heavyweight thing the light class
-    /// exists to avoid streaming.
-    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
-        let _ = (image, kind);
+    /// The key is the content digest the caller has already resolved — from
+    /// the index, which stores one SHA-256 per file, and only then by
+    /// reading the file (W71 M1: a request that is only going to read a
+    /// cached preview must not hash the source on the way). A provider that
+    /// cannot answer by digest has no business answering at all here: the
+    /// caller must take the heavy class, whose `preview_path` may generate.
+    ///
+    /// `None` — the default — means absent or unknown, and the caller must
+    /// take the heavy class. The default also keeps providers whose
+    /// "rendition" *is* the original (e.g. [`OriginalPreview`]) out of the
+    /// light class: an original is exactly the heavyweight thing the light
+    /// class exists to avoid streaming.
+    fn existing_preview(&self, hash: &str, kind: PreviewKind) -> Option<PathBuf> {
+        let _ = (hash, kind);
         None
     }
 }
@@ -693,19 +699,19 @@ impl PreviewProvider for CachedPreview {
         }
     }
 
-    /// The cheap probe, run before any admission permit (W70): the
-    /// content hash a rendition is keyed by, then the published cache
-    /// entry, without decoding or writing anything. This is no more
-    /// I/O than the generating path pays on a cache *hit* — `ensure`
-    /// reads and hashes the whole source before it looks for the
-    /// entry, and then decodes it — and far less on the way to a
-    /// served preview. The index already stores the same SHA-256 per
-    /// file (keyed on size+mtime); reusing it instead of re-hashing
-    /// is a recorded follow-up, not part of this fix.
-    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
-        let source = self.resolved_source(image)?;
-        let hash = dimagine_preview::sha256_file(&source).ok()?;
-        dimagine_preview::existing_rendition(&self.root, &hash, rendition_kind(kind))
+    /// The cheap probe, run before any admission permit (W70): the content
+    /// digest the rendition is keyed by, then the published cache entry,
+    /// without decoding or writing anything. This is no more I/O than the
+    /// generating path pays on a cache *hit* — `ensure` reads and hashes the
+    /// whole source before it looks for the entry, and then decodes it — and
+    /// far less on the way to a served preview.
+    ///
+    /// The digest is the caller's to resolve, and the index already holds it
+    /// per file: a path route reuses the stored SHA-256 and only reads the
+    /// image when the index has none, and a content route carries the digest
+    /// in its URL (W71 M1, ADR-020).
+    fn existing_preview(&self, hash: &str, kind: PreviewKind) -> Option<PathBuf> {
+        dimagine_preview::existing_rendition(&self.root, hash, rendition_kind(kind))
     }
 }
 

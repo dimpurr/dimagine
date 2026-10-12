@@ -71,6 +71,33 @@ pub struct CheckReport {
     pub read_warning: Option<&'static str>,
     pub unreadable_dirs: Vec<crate::library::UnreadableEntry>,
     pub findings: Vec<Finding>,
+    /// Preview renditions the viewer's cache does not hold yet, when the
+    /// caller could look (ADR-020 item 6).
+    ///
+    /// This is a count and not a finding: a rendition is derived data that the
+    /// viewer rebuilds on demand and in the background, so its absence is never
+    /// a problem in the library and never moves the exit code. `None` is "not
+    /// looked at" — no index to count from, or a build without the preview
+    /// plugin — which is a different fact from a library that is fully
+    /// rendered (invariant 4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_gaps: Option<PreviewGaps>,
+}
+
+/// How many of the images the index knows are missing a cached rendition.
+///
+/// The population is stated with the counts, because these numbers only mean
+/// something beside the images they were counted over: an index that holds no
+/// digest for an image cannot name the cache key that image's rendition would
+/// have, so such an image is left out rather than counted as missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PreviewGaps {
+    /// Images the index holds a content digest for, in nanosecond facts.
+    pub images: u64,
+    /// How many of them have no `thumb` rendition in the cache.
+    pub thumb: u64,
+    /// How many of them have no `view` rendition in the cache.
+    pub view: u64,
 }
 
 impl CheckReport {
@@ -119,6 +146,10 @@ pub fn run_with_limit(library: &Library, max_note_bytes: u64) -> CheckReport {
             .then_some("Reading did not finish; missing and ambiguous results prove nothing."),
         unreadable_dirs: library.unreadable_dirs.clone(),
         findings: Vec::new(),
+        // Left as "not looked at": counting renditions needs the preview cache
+        // and the index, neither of which this crate holds. The caller that
+        // has both fills it in.
+        preview_gaps: None,
     };
     let resolver = Resolver::new(&library.files);
     // Image notes pair with same-folder images (FORMAT §3).

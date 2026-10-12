@@ -116,4 +116,65 @@ mod tests {
             "the 404 probe before its schedule is spent"
         );
     }
+
+    /// W71 / ADR-020, pinned where the crate has no JS harness: the script
+    /// builds a content URL for every picture it renders itself — the tiles a
+    /// "Load more" appends, the inspector's preview — spells it with the
+    /// generation the page states rather than a copy of the policy, and asks
+    /// without a generation when the page states none (the route answers that
+    /// with a redirect to the current one).
+    #[test]
+    fn app_js_ships_the_content_addressed_preview_urls() {
+        assert!(
+            APP_JS.contains("function contentThumbSrc("),
+            "the one place a tile's content URL is spelled"
+        );
+        assert!(
+            APP_JS.contains("dataset.previewGeneration"),
+            "the generation is read off the page, not carried here"
+        );
+        assert!(
+            APP_JS.contains("function previewGenerationOf(element)"),
+            "the reader of that attribute"
+        );
+        // No second copy of the generation policy: a bump in
+        // `dimagine_preview::RENDITION_GENERATION` must not need an edit here,
+        // so no generation may appear as a string literal (a comment naming
+        // one is the one place worth spelling out).
+        for stale in ["'.g2'", "\".g2\"", "'g2'", "thumb.' +"] {
+            assert!(
+                !APP_JS.contains(stale),
+                "the script must not name a generation itself: {stale}"
+            );
+        }
+        // A content route is a viewer media route, so the W70 retry policy
+        // covers the URLs W71 introduced.
+        assert!(
+            APP_JS.contains("parsed.pathname.indexOf('/p/') === 0"),
+            "a /p/ URL takes the same retry path as /thumb/ and /media/"
+        );
+    }
+
+    /// W70 review L2, in the same string-pinning form: the 404 probe must not
+    /// take a tile's broken form while a retry for that very picture is still
+    /// in flight, and the probe's own abort timer is cleared whichever way the
+    /// fetch settles.
+    #[test]
+    fn app_js_keeps_a_retry_in_flight_and_clears_the_probe_timer() {
+        assert!(
+            APP_JS.contains("if (!image.complete) return;"),
+            "a load still in flight is not a failure that has happened yet"
+        );
+        assert!(
+            APP_JS.contains("timer = window.setTimeout("),
+            "the probe keeps its timer to clear"
+        );
+        assert_eq!(
+            APP_JS
+                .matches("if (timer) window.clearTimeout(timer);")
+                .count(),
+            2,
+            "both ways the probe settles clear its own timeout"
+        );
+    }
 }

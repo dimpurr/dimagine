@@ -218,7 +218,16 @@ fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let report = check::run_with_limit(&library, max_note_bytes);
+    let mut report = check::run_with_limit(&library, max_note_bytes);
+    // The rendition gap (ADR-020 item 6): counted from the index the viewer
+    // reads, when this build has the preview plugin and the library has been
+    // indexed. Absent is "not counted", which is not the same answer as a
+    // cache that holds everything (`check` never creates an index, so a
+    // library that has never been scanned reports nothing here).
+    #[cfg(feature = "previews")]
+    {
+        report.preview_gaps = previews::gaps(library_dir);
+    }
     if json {
         print_check_json(&report);
     } else {
@@ -460,5 +469,18 @@ fn print_check_human(report: &CheckReport) {
             "reading incomplete: some library content could not be read, \
              so missing and ambiguous link findings prove nothing"
         );
+    }
+    // The rendition gap (ADR-020 item 6): a count, not a finding — a missing
+    // preview is derived data the viewer rebuilds on demand, so it never makes
+    // `check` exit non-zero. A run that could not count (no index to read, and
+    // `check` never creates one) says so rather than claiming a full cache.
+    match report.preview_gaps {
+        Some(gaps) => println!(
+            "missing previews: {thumb} thumb, {view} view of {images} indexed images",
+            thumb = gaps.thumb,
+            view = gaps.view,
+            images = gaps.images
+        ),
+        None => println!("missing previews: not counted (no index to read)"),
     }
 }

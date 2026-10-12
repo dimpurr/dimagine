@@ -893,6 +893,32 @@ impl Index {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every image the index holds, with the size and nanosecond mtime of the
+    /// row, ordered by path.
+    ///
+    /// The paths a content hash resolves to come from [`Self::by_sha256`]; this
+    /// is the other direction, for a reader that walks the library once to plan
+    /// derived data — the preview backfill, `dimagine check`'s rendition gap.
+    /// It reads rows only: nothing is hashed, decoded or written, and an image
+    /// whose digest the index does not hold is listed with `None` rather than
+    /// skipped, because "no digest yet" and "not in the index" are different
+    /// facts.
+    pub fn image_rows(&self) -> Result<Vec<(String, u64, i64)>, IndexError> {
+        let mut stmt = self
+            .conn()?
+            .prepare("SELECT path,size,mtime_ns FROM files WHERE kind='image' ORDER BY path")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?.max(0) as u64,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Returns possible moves keyed by a note ID or image SHA-256 digest.
     pub fn moved_candidates(&self) -> Result<Vec<MoveCandidate>, IndexError> {
         let mut stmt = self.conn()?.prepare(
@@ -1350,6 +1376,54 @@ mod tests {
             tags: tags.iter().map(|s| (*s).into()).collect(),
             props_json: "{}".into(),
         }
+    }
+
+    /// `image_rows` is the reader that walks a library once to plan derived
+    /// data: images only, in path order, with the size and mtime the row was
+    /// written from — no digest, so a caller that needs one reads it from the
+    /// files and never gets one invented here.
+    #[test]
+    fn image_rows_lists_images_with_their_facts_and_no_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("refs/b.jpg", 12, 34, Some(&"b".repeat(64))))
+            .unwrap();
+        index
+            .upsert_file(&file("refs/a.jpg", 5, 6, Some(&"a".repeat(64))))
+            .unwrap();
+        index
+            .upsert_note(&note("refs/a.jpg.md", Some("id"), "title", &[]))
+            .unwrap();
+        index
+            .finish_scan(&[
+                "refs/a.jpg".into(),
+                "refs/b.jpg".into(),
+                "refs/a.jpg.md".into(),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            index.image_rows().unwrap(),
+            vec![
+                ("refs/a.jpg".to_owned(), 5, 6),
+                ("refs/b.jpg".to_owned(), 12, 34),
+            ]
+        );
+        // The facts the digest is re-hashed against: a moved row reuses the
+        // digest it already carries, an absent one is hashed once.
+        assert_eq!(
+            index
+                .reusable_image_meta("refs/a.jpg", 5, 6)
+                .unwrap()
+                .map(|(hash, _)| hash),
+            Some("a".repeat(64))
+        );
+        assert!(index
+            .reusable_image_meta("refs/a.jpg", 6, 6)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -2,6 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use dimagine_preview::{sha256_file, RENDITION_GENERATION};
 use dimagine_serve::{
     router, CachedPreview, Catalog, CatalogError, Collection, CollectionPage, FsCatalog,
     ImageDetail, ImageEntry, OriginalPreview, PreviewKind, PreviewProvider, ServeConfig,
@@ -508,6 +509,11 @@ fn hex_sha256(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The ETag of a response whose URL cannot promise its own content is the
+/// SHA-256 of the very bytes it streams, hashed from the handle that is
+/// streamed. A rendition *request* by path is a hop to its content URL now
+/// (ADR-020), whose ETag is the URL's own facts instead, so this is pinned
+/// where bytes are still served under a path: `/raw/`.
 #[tokio::test]
 async fn etag_and_streamed_bytes_come_from_the_same_opened_file() {
     let root = tempfile::tempdir().unwrap();
@@ -516,7 +522,7 @@ async fn etag_and_streamed_bytes_come_from_the_same_opened_file() {
     let cookie = login(&app, "2333").await;
     let first = app
         .clone()
-        .oneshot(request("/media/pic.png", Some(&cookie)))
+        .oneshot(request("/raw/pic.png", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(first.status(), StatusCode::OK);
@@ -534,7 +540,7 @@ async fn etag_and_streamed_bytes_come_from_the_same_opened_file() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/media/pic.png")
+                .uri("/raw/pic.png")
                 .header("cookie", &cookie)
                 .header("if-none-match", &first_etag)
                 .body(Body::empty())
@@ -701,6 +707,11 @@ async fn secure_cookie_and_cache_policies_are_explicit() {
 }
 
 #[tokio::test]
+/// The streamed *original*: its MIME comes from its bytes, its ETag from a hash
+/// of them, and a replacement under the same path does not validate against the
+/// old one. `/raw/` is where the bytes as written are served — a rendition
+/// request by path is a hop to its content URL (ADR-020), whose answer is the
+/// rendition and whose ETag is the URL's own facts.
 async fn direct_children_only_and_streamed_original_has_byte_derived_etag_and_mime() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("root.png"), PNG).unwrap();
@@ -712,7 +723,7 @@ async fn direct_children_only_and_streamed_original_has_byte_derived_etag_and_mi
     assert_eq!(catalog.list_folder("").unwrap().len(), 1);
     let response = app
         .clone()
-        .oneshot(request("/media/root.png", Some(&cookie)))
+        .oneshot(request("/raw/root.png", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(response.headers()["content-type"], "image/png");
@@ -727,7 +738,7 @@ async fn direct_children_only_and_streamed_original_has_byte_derived_etag_and_mi
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/media/root.png")
+                .uri("/raw/root.png")
                 .header("cookie", &cookie)
                 .header("if-none-match", etag)
                 .body(Body::empty())
@@ -741,7 +752,7 @@ async fn direct_children_only_and_streamed_original_has_byte_derived_etag_and_mi
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/media/root.png")
+                .uri("/raw/root.png")
                 .header("cookie", &cookie)
                 .header("if-none-match", format!("W/{new_etag}, \"other\""))
                 .body(Body::empty())
@@ -753,7 +764,7 @@ async fn direct_children_only_and_streamed_original_has_byte_derived_etag_and_mi
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/media/root.png")
+                .uri("/raw/root.png")
                 .header("cookie", &cookie)
                 .header("if-none-match", "*")
                 .body(Body::empty())
@@ -791,6 +802,9 @@ async fn front_matter_handles_crlf_reports_errors_and_saphyr_preserves_yaml_valu
 }
 
 #[tokio::test]
+/// A file whose bytes and whose extension disagree is reported as the mismatch
+/// it is, by the route that serves the file as written (`/raw/`; a rendition by
+/// path is a hop to its content URL, ADR-020).
 async fn image_note_self_embed_is_not_collection_membership_and_extension_mismatch_is_reported() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("photo.png"), PNG).unwrap();
@@ -809,7 +823,7 @@ async fn image_note_self_embed_is_not_collection_membership_and_extension_mismat
     let app = app_for(&root, ServeConfig::default());
     let cookie = login(&app, "2333").await;
     let response = app
-        .oneshot(request("/media/misnamed.jpg", Some(&cookie)))
+        .oneshot(request("/raw/misnamed.jpg", Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(response.headers()["content-type"], "image/png");
@@ -881,8 +895,18 @@ impl PreviewProvider for GatedCachedPreview {
         self.inner.preview_path(image, kind)
     }
 
-    fn existing_preview(&self, image: &str, kind: PreviewKind) -> Option<PathBuf> {
-        self.inner.existing_preview(image, kind)
+    fn existing_preview(&self, hash: &str, kind: PreviewKind) -> Option<PathBuf> {
+        // A *view* rendition is never "already on disk" as far as this test is
+        // concerned, so a view request always has to generate — and parks. The
+        // thumbnails are the real cache's answer, which is what makes the
+        // grid's storm a set of light hits. Without this the background preview
+        // backfill (ADR-020 item 6), which runs at router build, would have
+        // built the very rendition the eight parked requests are supposed to be
+        // generating.
+        match kind {
+            PreviewKind::View => None,
+            PreviewKind::Thumb => self.inner.existing_preview(hash, kind),
+        }
     }
 }
 
@@ -927,36 +951,29 @@ async fn w70_a_grid_of_cached_thumbnails_answers_while_every_heavy_permit_is_bus
     let app = router(catalog, previews, config);
     let cookie = login(&app, "2333").await;
 
-    // Warm every thumbnail once: the renditions now exist on disk (a
-    // content-addressed cache, and the images share bytes, so the
-    // first request renders and the rest hit).
-    for index in 0..IMAGES {
-        let response = app
-            .clone()
-            .oneshot(request(
-                &format!("/thumb/img-{index:03}.png"),
-                Some(&cookie),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-    }
+    // Every image here holds the same bytes, so the grid asks one address —
+    // and a tile's address is its content, not its path (ADR-020). The
+    // rendition is warmed once: it now exists on disk.
+    let digest = sha256_file(root.path().join("img-000.png")).unwrap();
+    let thumb = format!("/p/{digest}/thumb.{RENDITION_GENERATION}");
+    let view = format!("/p/{digest}/view.{RENDITION_GENERATION}");
+    let response = app
+        .clone()
+        .oneshot(request(&thumb, Some(&cookie)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 
     // Park every heavy permit: eight view renditions that do not exist
     // yet, each generating behind a closed gate.
     gate.close();
     let mut heavy = Vec::new();
-    for index in 0..8 {
+    for _ in 0..8 {
         let app = app.clone();
         let cookie = cookie.clone();
+        let view = view.clone();
         heavy.push(tokio::spawn(async move {
-            let response = app
-                .oneshot(request(
-                    &format!("/media/img-{index:03}.png"),
-                    Some(&cookie),
-                ))
-                .await
-                .unwrap();
+            let response = app.oneshot(request(&view, Some(&cookie))).await.unwrap();
             response.status()
         }));
     }
@@ -967,17 +984,12 @@ async fn w70_a_grid_of_cached_thumbnails_answers_while_every_heavy_permit_is_bus
     // none may come back a 503.
     let started = Instant::now();
     let mut storm = Vec::new();
-    for index in 0..IMAGES {
+    for _ in 0..IMAGES {
         let app = app.clone();
         let cookie = cookie.clone();
+        let thumb = thumb.clone();
         storm.push(tokio::spawn(async move {
-            let response = app
-                .oneshot(request(
-                    &format!("/thumb/img-{index:03}.png"),
-                    Some(&cookie),
-                ))
-                .await
-                .unwrap();
+            let response = app.oneshot(request(&thumb, Some(&cookie))).await.unwrap();
             let retry_after = response
                 .headers()
                 .get("retry-after")
@@ -1041,6 +1053,12 @@ async fn w70_heavy_queue_answers_within_the_wait_and_refuses_the_next_beyond_it(
     let app = router(catalog, previews, config);
     let cookie = login(&app, "2333").await;
 
+    // The address a page asks, which is the image's content (ADR-020). Every
+    // request below has to generate — the provider reports no rendition on
+    // disk — so every one of them is heavy.
+    let digest = sha256_file(root.path().join("img.png")).unwrap();
+    let url = format!("/p/{digest}/thumb.{RENDITION_GENERATION}");
+
     // Eight requests hold the permits (parked inside generation) and
     // a full queue waits behind them: 8 + 256, every one of them
     // within its wait budget.
@@ -1050,11 +1068,9 @@ async fn w70_heavy_queue_answers_within_the_wait_and_refuses_the_next_beyond_it(
     for _ in 0..serving + queue {
         let app = app.clone();
         let cookie = cookie.clone();
+        let url = url.clone();
         parked.push(tokio::spawn(async move {
-            let response = app
-                .oneshot(request("/thumb/img.png", Some(&cookie)))
-                .await
-                .unwrap();
+            let response = app.oneshot(request(&url, Some(&cookie))).await.unwrap();
             let status = response.status();
             let _ = to_bytes(response.into_body(), usize::MAX).await;
             status
@@ -1072,7 +1088,7 @@ async fn w70_heavy_queue_answers_within_the_wait_and_refuses_the_next_beyond_it(
     let started = Instant::now();
     let probe = app
         .clone()
-        .oneshot(request("/thumb/img.png", Some(&cookie)))
+        .oneshot(request(&url, Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(probe.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1110,9 +1126,12 @@ async fn w70_the_retry_query_parameter_the_client_adds_is_ignored_by_the_media_r
     fs::write(root.path().join("cat.png"), PNG).unwrap();
     let app = app_for(&root, ServeConfig::default());
     let cookie = login(&app, "2333").await;
+    // The address a tile asks, and the one it retries: its content (ADR-020).
+    let digest = sha256_file(root.path().join("cat.png")).unwrap();
+    let url = format!("/p/{digest}/thumb.{RENDITION_GENERATION}");
     let base = app
         .clone()
-        .oneshot(request("/thumb/cat.png", Some(&cookie)))
+        .oneshot(request(&url, Some(&cookie)))
         .await
         .unwrap();
     assert_eq!(base.status(), StatusCode::OK);
@@ -1122,10 +1141,7 @@ async fn w70_the_retry_query_parameter_the_client_adds_is_ignored_by_the_media_r
     for attempt in [1, 2, 3] {
         let response = app
             .clone()
-            .oneshot(request(
-                &format!("/thumb/cat.png?r={attempt}"),
-                Some(&cookie),
-            ))
+            .oneshot(request(&format!("{url}?r={attempt}"), Some(&cookie)))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);

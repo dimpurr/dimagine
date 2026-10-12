@@ -20,7 +20,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode};
 use serde_json::Value;
 use std::collections::HashSet;
 
-use crate::catalog::ImageDetail;
+use crate::catalog::{ImageDetail, PreviewKind};
 use crate::index_sync::RECENT_LIMIT;
 use crate::ui::shell::Frame;
 use crate::ui::{encode_path, escape_html, markdown_html, tile_anchor};
@@ -103,12 +103,17 @@ pub(crate) async fn image_page(
     // them unknown and the page shows nothing about them, rather than
     // inventing a shape or a date (invariant 4).
     let meta = state.index.image_meta(&detail.path).ok().flatten();
+    // The stage's own address: the image's content when the index holds a
+    // digest for its bytes, and the path URL that redirects to the same
+    // rendition when it does not (ADR-020).
+    let stage_src = crate::content::image_src(&state, &detail.path, PreviewKind::View).await;
     let body = image_body(
         &detail,
         appears_in.as_deref(),
         &context,
         neighbours.as_ref(),
         meta,
+        &stage_src,
     );
     let frame = Frame {
         banner: state.banner(),
@@ -279,6 +284,7 @@ fn image_body(
     context: &ViewContext,
     neighbours: Option<&Neighbours>,
     meta: Option<ImageMeta>,
+    stage_src: &str,
 ) -> String {
     let path = encode_path(&detail.path);
     let title = title_of(detail);
@@ -307,8 +313,9 @@ fn image_body(
     // nobody knows keeps the whole picture.
     out.push_str(&format!(
         "<div class=\"image-detail-layout\"><figure class=\"image-stage\"{}>\
-         <img src=\"/media/{path}\" alt=\"{}\"></figure>",
+         <img src=\"{}\" alt=\"{}\"></figure>",
         fit_attribute(stage_fit(detail, meta)),
+        escape_html(stage_src),
         escape_html(&title)
     ));
     out.push_str("<div class=\"image-panel\" id=\"image-panel\">");
@@ -894,23 +901,74 @@ fn source_link(detail: &ImageDetail) -> Option<String> {
     ))
 }
 
-/// `GET /api/image/<path>` — unchanged, for agents.
+/// `GET /api/image/<path>` — one image's detail, for agents and for the
+/// inspector's own script.
+///
+/// `sha256` is the viewer's addition: the content digest of the file's bytes,
+/// `null` when the index holds none for them. It is what a reader needs to ask
+/// `/p/<sha256>/thumb.g2` — the same address the page's own tiles and stage use
+/// — instead of the path URL that redirects there (ADR-020).
+#[derive(serde::Serialize)]
+struct ImageDetailJson {
+    #[serde(flatten)]
+    detail: ImageDetail,
+    sha256: Option<String>,
+}
+
 pub(crate) async fn image_json(
     State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Response {
     let catalog = state.catalog.clone();
-    match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
-        Ok(Ok(detail)) => Json(detail).into_response(),
-        Ok(Err(error)) => error_response(error),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    }
+    let detail = match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
+        Ok(Ok(detail)) => detail,
+        Ok(Err(error)) => return error_response(error),
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let sha256 = digest_of(&state, &detail.path);
+    Json(ImageDetailJson { detail, sha256 }).into_response()
+}
+
+/// The digest the index holds for one image's bytes, keyed by the file's own
+/// size and mtime: a read, not a hash (W71 M1).
+fn digest_of(state: &AppState, path: &str) -> Option<String> {
+    let resolved = state.catalog.resolve_path(path).ok()?;
+    let facts = std::fs::metadata(&resolved).ok()?;
+    let modified = facts
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    state.index.content_hash(path, facts.len(), modified)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The image page's body for a test: [`image_body`] with a stage address
+    /// supplied, because what these tests read is the header, the panel and the
+    /// note rather than the picture's own URL. The spelling stands for the path
+    /// route's answer — the address an image the index holds no digest for is
+    /// served from (ADR-020).
+    fn page_html(
+        detail: &ImageDetail,
+        appears_in: Option<&[AppearsIn]>,
+        context: &ViewContext,
+        neighbours: Option<&Neighbours>,
+        meta: Option<ImageMeta>,
+    ) -> String {
+        image_body(
+            detail,
+            appears_in,
+            context,
+            neighbours,
+            meta,
+            "/media/refs/%E7%8C%AB.png",
+        )
+    }
 
     fn detail() -> ImageDetail {
         ImageDetail {
@@ -947,7 +1005,7 @@ mod tests {
         let image = "refs/猫.png";
         // A tile carries the view query without its `?`.
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(&detail(), Some(&[]), &context, None, None);
+        let html = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(
             html.contains(&format!("href=\"/?tag=eagle#{}\"", tile_anchor(image))),
             "{html}"
@@ -963,7 +1021,7 @@ mod tests {
             plain.back_href(image, None),
             format!("/#{}", tile_anchor(image))
         );
-        let html = image_body(&detail(), Some(&[]), &plain, None, None);
+        let html = page_html(&detail(), Some(&[]), &plain, None, None);
         assert!(
             html.contains(&format!("href=\"/#{}\">← Back to view", tile_anchor(image))),
             "{html}"
@@ -1052,7 +1110,7 @@ mod tests {
     #[test]
     fn a_collection_answer_that_did_not_arrive_is_not_called_an_empty_one() {
         let (context, _) = plain();
-        let silent = image_body(&detail(), None, &context, None, None);
+        let silent = page_html(&detail(), None, &context, None, None);
         assert!(
             silent.contains(
                 "<p class=\"appears-in-empty\">The collections could not be read right now.</p>"
@@ -1064,7 +1122,7 @@ mod tests {
             "an unknown is not an empty row: {silent}"
         );
         // The answered "none" keeps its own sentence, unchanged.
-        let answered = image_body(&detail(), Some(&[]), &context, None, None);
+        let answered = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(answered.contains("Not in any collection."), "{answered}");
         assert!(!answered.contains("could not be read"), "{answered}");
     }
@@ -1111,7 +1169,7 @@ mod tests {
     #[test]
     fn the_arrows_walk_the_view_and_the_position_names_it() {
         let context = view_context(Some("v=tag%3Deagle"));
-        let html = image_body(
+        let html = page_html(
             &detail(),
             Some(&[]),
             &context,
@@ -1140,7 +1198,7 @@ mod tests {
         );
         // The plain library needs no ?v= on its arrows ...
         let (plain, _) = plain();
-        let html = image_body(
+        let html = page_html(
             &detail(),
             Some(&[]),
             &plain,
@@ -1159,7 +1217,7 @@ mod tests {
         let (context, _) = plain();
         let mut neighbours = neighbours_at(1, 4);
         neighbours.previous = None;
-        let html = image_body(&detail(), Some(&[]), &context, Some(&neighbours), None);
+        let html = page_html(&detail(), Some(&[]), &context, Some(&neighbours), None);
         assert!(
             html.contains("<span class=\"image-nav-prev nav-end\" aria-hidden=\"true\">"),
             "{html}"
@@ -1179,7 +1237,7 @@ mod tests {
     #[test]
     fn an_image_the_view_does_not_show_walks_nowhere() {
         let context = view_context(Some("c=none.md"));
-        let html = image_body(&detail(), Some(&[]), &context, None, None);
+        let html = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(!html.contains("image-nav"), "{html}");
         assert!(html.contains("Back to view"), "{html}");
     }
@@ -1187,7 +1245,7 @@ mod tests {
     #[test]
     fn the_path_is_shown_and_copyable_and_the_note_is_sanitised() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None, None);
+        let html = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(html.contains("data-copy-text=\"refs/猫.png\""));
         assert!(html.contains("A <strong>quiet</strong> cat"));
         assert!(html.contains("&lt;script&gt;"));
@@ -1197,7 +1255,7 @@ mod tests {
     #[test]
     fn provenance_travels_with_the_picture() {
         let (context, _) = plain();
-        let html = image_body(
+        let html = page_html(
             &detail(),
             Some(&[
                 AppearsIn {
@@ -1242,7 +1300,7 @@ mod tests {
             note_path: None,
         };
         let (context, _) = plain();
-        let html = image_body(&bare, Some(&[]), &context, None, None);
+        let html = page_html(&bare, Some(&[]), &context, None, None);
         assert!(!html.contains("<h2>Tags</h2>"), "{html}");
         assert!(!html.contains("<h2>Note</h2>"), "{html}");
         assert!(html.contains("alt=\"plain.png\""), "{html}");
@@ -1258,7 +1316,7 @@ mod tests {
             note_path: "sets/x.md".into(),
             title: "\"><img onerror=alert(1)><svg><script>".into(),
         }];
-        let html = image_body(&detail(), Some(&appears_in), &context, None, None);
+        let html = page_html(&detail(), Some(&appears_in), &context, None, None);
         assert!(
             html.contains("Appears in</h2><ul class=\"appears-in\">"),
             "{html}"
@@ -1282,7 +1340,7 @@ mod tests {
     #[test]
     fn an_image_in_no_collection_says_so() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None, None);
+        let html = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(html.contains("<h2>Appears in</h2>"), "{html}");
         assert!(html.contains("Not in any collection."), "{html}");
     }
@@ -1290,7 +1348,7 @@ mod tests {
     #[test]
     fn the_sheet_handle_names_the_picture_and_controls_the_panel() {
         let (context, _) = plain();
-        let html = image_body(&detail(), Some(&[]), &context, None, None);
+        let html = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(
             html.contains(
                 "class=\"sheet-handle\" aria-expanded=\"false\" aria-controls=\"image-panel\""
@@ -1324,7 +1382,7 @@ mod tests {
         let mut detail = detail();
         detail.front_matter_error = Some("expected a list".into());
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
         assert!(html.contains("Front matter error: expected a list"));
     }
 
@@ -1345,7 +1403,7 @@ mod tests {
             "height": 3429,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
 
         // A definition list, not raw JSON.
         assert!(html.contains("<dl class=\"property-list\">"), "{html}");
@@ -1385,7 +1443,7 @@ mod tests {
             "imported": "2026-10-04T14:30:12+01:00",
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<dt>Created</dt><dd><span title=\"2021-10-15\">15 Oct 2021</span></dd>"),
             "{html}"
@@ -1401,7 +1459,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({ "created": "sometime last year" });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<span title=\"sometime last year\">sometime last year</span>"),
             "{html}"
@@ -1413,7 +1471,7 @@ mod tests {
         let mut detail = detail();
         detail.properties = json!({"title": "猫", "height": 3429});
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
         assert!(
             html.contains("<details class=\"properties-raw\"><summary>Raw properties</summary>"),
             "{html}"
@@ -1438,7 +1496,7 @@ mod tests {
             "height": null,
         });
         let (context, _) = plain();
-        let html = image_body(&detail, Some(&[]), &context, None, None);
+        let html = page_html(&detail, Some(&[]), &context, None, None);
         assert!(html.contains("<dt>Title</dt>"), "{html}");
         assert!(!html.contains("<dt>Tags</dt>"), "{html}");
         assert!(!html.contains("<dt>height</dt>"), "{html}");
@@ -1453,16 +1511,16 @@ mod tests {
         // A phone screenshot, and a panorama.
         detail.properties = json!({"width": 780, "height": 48000});
         assert!(
-            image_body(&detail, Some(&[]), &context, None, None)
+            page_html(&detail, Some(&[]), &context, None, None)
                 .contains("class=\"image-stage\" data-fit=\"tall\""),
             "a tall picture fills the column and scrolls"
         );
         detail.properties = json!({"width": 2400, "height": 800});
-        assert!(image_body(&detail, Some(&[]), &context, None, None)
+        assert!(page_html(&detail, Some(&[]), &context, None, None)
             .contains("class=\"image-stage\" data-fit=\"wide\""));
         // An ordinary picture, including one an importer wrote as text.
         detail.properties = json!({"width": "1200", "height": "800"});
-        assert!(image_body(&detail, Some(&[]), &context, None, None)
+        assert!(page_html(&detail, Some(&[]), &context, None, None)
             .contains("class=\"image-stage\" data-fit=\"normal\""));
     }
 
@@ -1484,7 +1542,7 @@ mod tests {
         let mut bare = detail();
         bare.properties = json!({});
         let (context, _) = plain();
-        let html = image_body(&bare, Some(&[]), &context, None, None);
+        let html = page_html(&bare, Some(&[]), &context, None, None);
         assert!(html.contains("<figure class=\"image-stage\">"), "{html}");
         assert!(!html.contains("data-fit"), "{html}");
     }
@@ -1518,7 +1576,7 @@ mod tests {
     #[test]
     fn the_page_shows_the_taken_time_and_the_dimensions_when_it_knows_them() {
         let (context, _) = plain();
-        let html = image_body(
+        let html = page_html(
             &detail(),
             Some(&[]),
             &context,
@@ -1551,7 +1609,7 @@ mod tests {
     #[test]
     fn an_unknown_header_fact_reads_as_unknown_never_as_a_value() {
         let (context, _) = plain();
-        let html = image_body(
+        let html = page_html(
             &detail(),
             Some(&[]),
             &context,
@@ -1575,7 +1633,7 @@ mod tests {
         );
 
         // A header the refresh could not read at all: both facts unknown.
-        let unreadable = image_body(
+        let unreadable = page_html(
             &detail(),
             Some(&[]),
             &context,
@@ -1591,7 +1649,7 @@ mod tests {
         assert_eq!(unreadable.matches("<dd>Unknown</dd>").count(), 2);
 
         // An image the index holds no row for says nothing about its header.
-        let unindexed = image_body(&detail(), Some(&[]), &context, None, None);
+        let unindexed = page_html(&detail(), Some(&[]), &context, None, None);
         assert!(!unindexed.contains("<h2>Image</h2>"), "{unindexed}");
         assert!(!unindexed.contains("<dt>Taken</dt>"), "{unindexed}");
     }
@@ -1664,7 +1722,7 @@ mod tests {
     fn the_note_does_not_repeat_the_dimensions_the_image_section_just_stated() {
         let mut note = detail();
         note.properties = json!({"title": "Copy", "width": 3024, "height": 4032});
-        let page = |meta: ImageMeta| image_body(&note, Some(&[]), &plain().0, None, Some(meta));
+        let page = |meta: ImageMeta| page_html(&note, Some(&[]), &plain().0, None, Some(meta));
         let indexed = |width: u32, height: u32| ImageMeta {
             width: Some(width),
             height: Some(height),
@@ -1705,7 +1763,7 @@ mod tests {
         // up that the disagreement is with.
         let mut uneven = detail();
         uneven.properties = json!({"title": "Copy", "width": 3024, "height": 4033});
-        let uneven = image_body(
+        let uneven = page_html(
             &uneven,
             Some(&[]),
             &plain().0,
@@ -1767,7 +1825,7 @@ mod tests {
         let (context, _) = plain();
         // The note claims an ordinary shape; the file is a panorama.
         detail.properties = json!({"width": 1000, "height": 1000});
-        let html = image_body(
+        let html = page_html(
             &detail,
             Some(&[]),
             &context,
@@ -1785,7 +1843,7 @@ mod tests {
         );
 
         // Half a shape from the index falls back to what the note records.
-        let html = image_body(
+        let html = page_html(
             &detail,
             Some(&[]),
             &context,

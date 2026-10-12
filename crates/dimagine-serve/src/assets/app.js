@@ -10,6 +10,7 @@
 //   * "Load more" fetches the next page from /api/view and appends it
 //   * tiles lay out in justified rows by the indexed dimensions
 //   * tiles crop only an extreme aspect ratio, and say so with a badge
+//   * a tile asks for its bytes by their content, not by their path (W71)
 //   * a failed image retries itself with backoff before it gives up (W70)
 //   * recent views, kept on this device only
 //   * the theme is a choice on this device: Auto, Light or Dark
@@ -224,6 +225,18 @@
       });
   }
 
+  // The inspector's preview address: the image's content when the row
+  // carries its digest, and the path URL that redirects to the same
+  // rendition when it does not (W71). The inspector's picture is asked for
+  // in the generation the page states, like a tile's — read off the grid
+  // beside it rather than from a copy of the policy kept here.
+  function inspectorPreviewSrc(path, detail) {
+    if (detail.sha256) {
+      return contentThumbSrc(detail.sha256, document.querySelector('.grid'));
+    }
+    return '/thumb/' + encodeURIComponent(path).replace(/%2F/g, '/');
+  }
+
   function inspectorHtml(path, detail) {
     var properties = detail.properties || {};
     var title =
@@ -238,8 +251,8 @@
     parts.push(
       '<a href="' +
         escapeAttribute(href) +
-        '"><img class="inspector-preview-img" src="/thumb/' +
-        escapeAttribute(path) +
+        '"><img class="inspector-preview-img" src="' +
+        escapeAttribute(inspectorPreviewSrc(path, detail)) +
         '" alt="' +
         escapeAttribute(title) +
         '"></a>'
@@ -449,6 +462,46 @@
     });
   }
 
+  // The generation the page's rendition URLs are spelled with, as the grid
+  // states it: the `data-preview-generation` attribute the server writes on
+  // the section. Empty is no answer, and the caller asks without one.
+  //
+  // The generation is read from the page rather than kept here, because the
+  // server is the only place that knows it: a rendition policy bump changes
+  // every URL, and this script must not carry a second copy to keep in step.
+  function previewGenerationOf(element) {
+    var dataset = element && element.dataset;
+    return dataset && dataset.previewGeneration
+      ? dataset.previewGeneration
+      : '';
+  }
+
+  // The content address of one image's thumbnail: /p/<sha256>/thumb.g2.
+  //
+  // The URL is the content, so a browser can keep the rendition for a year,
+  // and a rename does not move it (ADR-020). A caller with no generation to
+  // read — a page whose grid is not there — asks without one and the route
+  // answers with a redirect to the current one, never a guess at which
+  // generation is current.
+  function contentThumbSrc(sha256, element) {
+    var generation = previewGenerationOf(element);
+    return '/p/' + sha256 + '/thumb' + (generation ? '.' + generation : '');
+  }
+
+  // The address one tile's picture is loaded from.
+  //
+  // The row carries the file's SHA-256, so a tile "Load more" appends asks
+  // /p/<sha256>/thumb.g2 — the same address, and the same cacheable answer,
+  // the server rendered for the tiles already on the page. A row with no
+  // digest asks the path URL, which the media route answers with a 302 to
+  // the very same rendition.
+  function previewSrc(item, inGrid) {
+    if (item.sha256) {
+      return contentThumbSrc(item.sha256, inGrid);
+    }
+    return '/thumb/' + encodeURIComponent(item.path).replace(/%2F/g, '/');
+  }
+
   // `inGrid` is the grid the tile is about to be appended to. The tile cannot
   // find it by itself: the builder runs before the append, so the tile has no
   // parent yet and a `closest('.grid')` from here is always `null` — which is
@@ -498,7 +551,7 @@
 
     var image = document.createElement('img');
     image.loading = 'lazy';
-    image.src = '/thumb/' + encodeURIComponent(item.path).replace(/%2F/g, '/');
+    image.src = previewSrc(item, inGrid);
     image.alt = label;
     if (item.width && item.height) {
       image.width = item.width;
@@ -775,7 +828,8 @@
     return (
       parsed.pathname.indexOf('/thumb/') === 0 ||
       parsed.pathname.indexOf('/media/') === 0 ||
-      parsed.pathname.indexOf('/raw/') === 0
+      parsed.pathname.indexOf('/raw/') === 0 ||
+      parsed.pathname.indexOf('/p/') === 0
     );
   }
 
@@ -790,6 +844,14 @@
     // A picture that raced back to life (another tile asked for it
     // first, the shared disk cache answered) is left showing.
     if (image.complete && image.naturalWidth) return;
+    // A load still in flight is not a failure that has happened yet: the
+    // 404 probe answered while a retry for this very picture was already
+    // on its way (W70 review L2). Taking the broken form here would
+    // remove a tile whose retry is still running, so the picture is left
+    // alone and the request in flight speaks for itself — its success
+    // cancels nothing and changes nothing, and its own failure arrives
+    // as the next error event.
+    if (!image.complete) return;
     var tile = image.closest ? image.closest('.tile[data-path]') : null;
     if (tile) markBroken(tile);
   }
@@ -801,11 +863,17 @@
   // offline) decides nothing: the schedule keeps its own turn.
   function probeNotFound(url, onMissing) {
     var controller = window.AbortController ? new AbortController() : null;
+    var timer = 0;
     if (controller) {
-      window.setTimeout(function () {
+      timer = window.setTimeout(function () {
+        timer = 0;
         controller.abort();
       }, PROBE_TIMEOUT_MS);
     }
+    // Whichever way the probe settles, its own timeout is cleared: an
+    // abort that fires after the answer cancels a request that is
+    // already over, and a timer nothing else can reach is a handle that
+    // outlives its answer (W70 review L2).
     window
       .fetch(url, {
         method: 'HEAD',
@@ -813,9 +881,11 @@
         signal: controller ? controller.signal : undefined,
       })
       .then(function (response) {
+        if (timer) window.clearTimeout(timer);
         if (response && response.status === 404) onMissing();
       })
       .catch(function () {
+        if (timer) window.clearTimeout(timer);
         // A probe that never answered decides nothing.
       });
   }

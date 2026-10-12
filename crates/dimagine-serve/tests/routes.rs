@@ -2,6 +2,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use dimagine_preview::{sha256_file, RENDITION_GENERATION};
 use dimagine_serve::{router, CachedPreview, Catalog, FsCatalog, OriginalPreview, ServeConfig};
 use std::fs;
 use tempfile::TempDir;
@@ -37,6 +38,32 @@ fn library() -> (TempDir, axum::Router) {
     };
     let app = router(catalog, OriginalPreview, config);
     (temp, app)
+}
+
+/// One request, as the tests below write them.
+async fn get(app: &axum::Router, uri: &str, cookie: &str) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .uri(uri)
+                .header("cookie", cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Follow one redirect the way a browser does. A rendition request by path is a
+/// hop to the content URL that answers it (ADR-020), so a test about what is
+/// served asks for the answer and not the hop.
+async fn following(app: &axum::Router, uri: &str, cookie: &str) -> axum::response::Response {
+    let response = get(app, uri, cookie).await;
+    if response.status() != StatusCode::FOUND {
+        return response;
+    }
+    let target = response.headers()["location"].to_str().unwrap().to_owned();
+    get(app, &target, cookie).await
 }
 
 async fn body(response: axum::response::Response) -> String {
@@ -312,16 +339,18 @@ async fn raw_serves_a_notes_own_bytes_and_nothing_else() {
 async fn image_response_has_type_etag_and_last_modified() {
     let (_temp, app) = library();
     let (app, cookie) = login(app).await;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/media/art/%E7%8C%AB.png")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // The path route answers with the content URL (ADR-020), and that URL is
+    // where the picture is served from.
+    let hop = get(&app, "/media/art/%E7%8C%AB.png", &cookie).await;
+    assert_eq!(hop.status(), StatusCode::FOUND);
+    assert!(
+        hop.headers()["location"]
+            .to_str()
+            .unwrap()
+            .starts_with("/p/"),
+        "the hop names the content"
+    );
+    let response = following(&app, "/media/art/%E7%8C%AB.png", &cookie).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "image/png");
     assert!(response.headers().contains_key("etag"));
@@ -456,7 +485,15 @@ async fn special_character_and_unicode_urls_round_trip() {
     // Check the breadcrumb and the image links inside the folder
     assert!(folder_html.contains(">pixiv &amp; twitter</a>"));
     assert!(folder_html.contains("/image/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png"));
-    assert!(folder_html.contains("/thumb/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png"));
+    // The tile asks its picture by content now (ADR-020), so what the page
+    // states about the path is the way to the image page, above — and the
+    // address that carries the special characters is the one the hop below
+    // walks.
+    assert!(
+        folder_html.contains("src=\"/p/"),
+        "a tile whose digest the index holds asks the content URL"
+    );
+    assert!(!folder_html.contains("src=\"/thumb/"));
 
     // Request image page via generated link
     let image_resp = app
@@ -472,32 +509,28 @@ async fn special_character_and_unicode_urls_round_trip() {
         .unwrap();
     assert_eq!(image_resp.status(), StatusCode::OK);
 
-    // Request thumb and media for special character image
-    let thumb_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/thumb/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(thumb_resp.status(), StatusCode::OK);
-
-    let media_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/media/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(media_resp.status(), StatusCode::OK);
+    // Request thumb and media for the special character image: the path with
+    // `&`, `%`, `#` and `?` in it still reaches the route, which answers with
+    // the content URL — and that URL serves the picture.
+    for route in [
+        "/thumb/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png",
+        "/media/pixiv%20%26%20twitter/50%25%20off%20%231%3F.png",
+    ] {
+        let hop = get(&app, route, &cookie).await;
+        assert_eq!(hop.status(), StatusCode::FOUND, "{route}");
+        assert!(
+            hop.headers()["location"]
+                .to_str()
+                .unwrap()
+                .starts_with("/p/"),
+            "{route}"
+        );
+        assert_eq!(
+            following(&app, route, &cookie).await.status(),
+            StatusCode::OK,
+            "{route}"
+        );
+    }
 
     // Request collection via the link the root page generated
     let coll_resp = app
@@ -628,22 +661,32 @@ async fn real_preview_generation_and_caching_and_fallback() {
     assert_eq!(page_resp.status(), StatusCode::OK);
     let page_html = body(page_resp).await;
     assert!(page_html.contains("href=\"/raw/art/cat.png\""));
-    assert!(page_html.contains("src=\"/media/art/cat.png\""));
+    // The stage asks the view rendition by content (ADR-020): the page states
+    // the digest, so the picture is addressed by what it is.
+    let cat = sha256_file(root.join("art/cat.png")).unwrap();
+    let thumb_url = format!("/p/{cat}/thumb.{RENDITION_GENERATION}");
+    let view_url = format!("/p/{cat}/view.{RENDITION_GENERATION}");
+    assert!(
+        page_html.contains(&format!("src=\"{view_url}\"")),
+        "the stage asks the content URL: {page_html}"
+    );
 
-    // 2. Request thumb rendition -> generated on demand, cached with long cache headers
-    let thumb_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/thumb/art/cat.png")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // 2. A thumb request by path is a hop to that content URL, and the content
+    // URL answers it: generated on demand, immutable, with an ETag of its own.
+    let hop = get(&app, "/thumb/art/cat.png", &cookie).await;
+    assert_eq!(hop.status(), StatusCode::FOUND);
+    assert_eq!(hop.headers()["location"], thumb_url);
+    assert_eq!(
+        hop.headers()["cache-control"],
+        "private, no-cache",
+        "the hop itself is never cached"
+    );
+    let thumb_resp = following(&app, "/thumb/art/cat.png", &cookie).await;
     assert_eq!(thumb_resp.status(), StatusCode::OK);
-    assert_eq!(thumb_resp.headers()["cache-control"], "private, no-cache");
+    assert_eq!(
+        thumb_resp.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
     assert!(thumb_resp.headers().contains_key("etag"));
     let thumb_etag = thumb_resp.headers()["etag"].to_str().unwrap().to_owned();
     to_bytes(thumb_resp.into_body(), usize::MAX).await.unwrap();
@@ -652,28 +695,25 @@ async fn real_preview_generation_and_caching_and_fallback() {
     let cache_dir = root.join(".dimagine/cache/previews");
     assert!(cache_dir.is_dir());
 
-    // 3. Request view rendition -> generated on demand with long cache headers
-    let view_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/media/art/cat.png")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // 3. The view rendition, the same way.
+    assert_eq!(
+        get(&app, "/media/art/cat.png", &cookie).await.status(),
+        StatusCode::FOUND
+    );
+    let view_resp = following(&app, "/media/art/cat.png", &cookie).await;
     assert_eq!(view_resp.status(), StatusCode::OK);
-    assert_eq!(view_resp.headers()["cache-control"], "private, no-cache");
+    assert_eq!(
+        view_resp.headers()["cache-control"],
+        "private, max-age=31536000, immutable"
+    );
 
-    // 3b. Rendition URLs carry no content hash, so they revalidate
-    // through the content-hash ETag instead of caching immutably.
+    // 3b. The content URL is the content, so its ETag is the URL's own facts
+    // and a revalidation with it is a 304 — no hashing of what is served.
     let revalidated = app
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/thumb/art/cat.png")
+                .uri(&thumb_url)
                 .header("cookie", &cookie)
                 .header("if-none-match", &thumb_etag)
                 .body(Body::empty())
@@ -682,6 +722,10 @@ async fn real_preview_generation_and_caching_and_fallback() {
         .await
         .unwrap();
     assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        thumb_etag,
+        format!("\"{cat}.thumb.{RENDITION_GENERATION}\"")
+    );
 
     // 4. Request raw original -> serves original bytes with private, no-cache
     let raw_resp = app
@@ -705,18 +749,14 @@ async fn real_preview_generation_and_caching_and_fallback() {
         TINY_PNG
     );
 
-    // 5. Unsupported format (HEIC) falls back to original image
-    let heic_resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/thumb/art/photo.heic")
-                .header("cookie", &cookie)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // 5. Unsupported format (HEIC) falls back to the original image — served
+    // outside the URL's promise, so no `immutable` (ADR-020 item 6).
+    let heic = sha256_file(root.join("art/photo.heic")).unwrap();
+    assert_eq!(
+        get(&app, "/thumb/art/photo.heic", &cookie).await.headers()["location"],
+        format!("/p/{heic}/thumb.{RENDITION_GENERATION}")
+    );
+    let heic_resp = following(&app, "/thumb/art/photo.heic", &cookie).await;
     assert_eq!(heic_resp.status(), StatusCode::OK);
     assert_eq!(heic_resp.headers()["cache-control"], "private, no-cache");
     assert_eq!(

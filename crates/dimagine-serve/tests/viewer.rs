@@ -5,6 +5,7 @@ use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
 };
+use dimagine_preview::{sha256_file, RENDITION_GENERATION};
 use dimagine_serve::{router, FsCatalog, OriginalPreview, ServeConfig};
 use serde_json::Value;
 use std::fs;
@@ -1795,8 +1796,14 @@ async fn the_collections_page_shows_a_title_a_count_and_a_cover() {
     assert!(html.contains("href=\"/?c=browse.md\""));
     assert!(html.contains(">Browse</span>"));
     assert!(html.contains("2 items"));
-    // The cover is the first member, not the newest.
-    assert!(html.contains("src=\"/thumb/refs/landscape.png\""));
+    // The cover is the first member, not the newest — and it is asked for by
+    // its content, which is the address a tile uses (ADR-020).
+    let cover = sha256_file(dir.path().join("refs/landscape.png")).unwrap();
+    assert!(html.contains(&format!("src=\"/p/{cover}/thumb.{RENDITION_GENERATION}\"")));
+    assert!(
+        !html.contains("src=\"/thumb/"),
+        "a cover whose digest the index holds never asks by path: {html}"
+    );
 }
 
 #[tokio::test]

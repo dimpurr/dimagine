@@ -9,11 +9,11 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
-use dimagine_index::{ImageMeta, TakenReason, ViewItem, ViewPage};
+use dimagine_index::{TakenReason, ViewItem, ViewPage};
 use serde::Serialize;
 
 use crate::index_sync::{recent_label, recent_window, SidebarData, RECENT_LIMIT};
-use crate::ui::components::{self, TileMetas};
+use crate::ui::components::{self, TileFact, TileMetas};
 use crate::ui::escape_html;
 use crate::ui::filters;
 use crate::ui::shell::{Destination, Frame};
@@ -36,6 +36,11 @@ pub struct ViewItemJson {
     pub width: Option<u32>,
     /// Pixel height, under the terms of [`ViewItemJson::width`].
     pub height: Option<u32>,
+    /// The SHA-256 of the file's bytes, `null` when the index holds no digest
+    /// for them. It is the key the image's preview URL is addressed by
+    /// (ADR-020), so a reader can build `/p/<sha256>/thumb.g2` itself and know
+    /// it is asking for the content rather than for a path.
+    pub sha256: Option<String>,
     /// The EXIF taken time in ns since the Unix epoch, `null` when the image
     /// carries no readable one. The same fact the "Taken" sort orders by, so
     /// an agent can see why a row sits where it does — an image with no taken
@@ -59,10 +64,12 @@ impl ViewItemJson {
     /// companion read), so this is the one place they join the row an agent
     /// reads — the dimensions the grid laid out by, and the taken time the
     /// "Taken" sort ordered by together with the kind of unknown it can be.
-    pub fn from_meta(item: &ViewItem, meta: Option<&ImageMeta>) -> Self {
+    pub fn from_facts(item: &ViewItem, fact: Option<&TileFact>) -> Self {
+        let meta = fact.and_then(|fact| fact.meta);
         let taken_ns = meta.and_then(|meta| meta.taken_ns);
         Self {
             path: item.path.clone(),
+            sha256: fact.and_then(|fact| fact.sha256.clone()),
             size: item.size,
             mtime_ns: item.mtime_ns,
             added_ns: item.added_ns,
@@ -107,8 +114,8 @@ impl ViewPageJson {
             .items
             .iter()
             .map(|item| {
-                let meta = metas.get(item.path.as_str()).copied();
-                ViewItemJson::from_meta(item, meta.as_ref())
+                let fact = metas.get(item.path.as_str()).cloned();
+                ViewItemJson::from_facts(item, fact.as_ref())
             })
             .collect();
         Self {
@@ -295,7 +302,7 @@ fn read(state: &AppState, params: &ViewParams) -> Option<Page> {
     // The header facts of the images on this page: one indexed row each, no
     // file opened. A path the index does not hold simply has none, and its
     // tile falls back to the square cell.
-    let metas = tile_metas(state, page.items.iter().map(|item| item.path.as_str()));
+    let metas = tile_metas(state, page.items.iter());
     let sidebar = state.index.sidebar_data().ok()?;
     Some(Page {
         page,
@@ -310,15 +317,28 @@ fn read(state: &AppState, params: &ViewParams) -> Option<Page> {
 /// filled, so a page of a hundred and twenty costs a hundred and twenty
 /// primary-key reads rather than a scan; a failure is an unknown, never a
 /// guessed shape (invariant 4).
-pub(crate) fn tile_metas<'p>(state: &AppState, paths: impl Iterator<Item = &'p str>) -> TileMetas {
+pub(crate) fn tile_metas<'i>(
+    state: &AppState,
+    items: impl Iterator<Item = &'i ViewItem>,
+) -> TileMetas {
     let mut metas = TileMetas::new();
-    for path in paths {
-        // One read answers with the row or with `None` for a path the index
+    for item in items {
+        // Two reads: the header facts, and the content digest the row already
+        // carries. Each answers with a row or with `None` for a path the index
         // never saw; only a failing index is skipped, and it is skipped as the
         // unknown it is rather than failing the page.
-        if let Ok(Some(meta)) = state.index.image_meta(path) {
-            metas.insert(path.to_owned(), meta);
+        let meta = state.index.image_meta(&item.path).ok().flatten();
+        // The digest is the row's own, keyed by the size and mtime this very
+        // page was read with — the same reuse the media route makes (W71 M1).
+        // Reading it here is what lets every tile ask for its content instead
+        // of for a path.
+        let sha256 = state
+            .index
+            .content_hash(&item.path, item.size, item.mtime_ns);
+        if meta.is_none() && sha256.is_none() {
+            continue;
         }
+        metas.insert(item.path.clone(), TileFact { meta, sha256 });
     }
     metas
 }
@@ -412,6 +432,7 @@ fn leaf(path: &str) -> &str {
 mod tests {
     use super::*;
     use crate::index_sync::SidebarCollection;
+    use dimagine_index::ImageMeta;
 
     fn item(path: &str) -> ViewItem {
         ViewItem {
@@ -434,6 +455,13 @@ mod tests {
         }
     }
 
+    /// The index facts one JSON row carries, from a header alone: these tests
+    /// read the header facts a row states, and a row whose digest the index
+    /// does not hold carries no content URL (ADR-020).
+    fn facts(meta: Option<ImageMeta>) -> TileFact {
+        TileFact { meta, sha256: None }
+    }
+
     /// RW49 L-2: the page JSON is what an agent reads, so the five kinds of
     /// "no taken time" reach it as the index recorded them rather than
     /// collapsing into one null — and the reason travels only with the absence
@@ -442,7 +470,8 @@ mod tests {
     fn the_json_reports_which_kind_of_missing_taken_time_a_row_is() {
         let instant = 1_689_191_647_000_000_000;
         let reason_of = |reason: Option<TakenReason>| {
-            ViewItemJson::from_meta(&item("a.jpg"), Some(&meta(None, reason))).taken_reason
+            ViewItemJson::from_facts(&item("a.jpg"), Some(&facts(Some(meta(None, reason)))))
+                .taken_reason
         };
         assert_eq!(reason_of(Some(TakenReason::NoExif)), Some("no-exif"));
         assert_eq!(
@@ -463,20 +492,23 @@ mod tests {
         );
         assert_eq!(reason_of(None), None, "an unrecorded reason says nothing");
         assert_eq!(
-            ViewItemJson::from_meta(&item("a.jpg"), None).taken_reason,
+            ViewItemJson::from_facts(&item("a.jpg"), None).taken_reason,
             None,
             "a row the index does not hold has no reason to name"
         );
 
         // A reason explains a missing instant and never rides with one, not even
         // on a row a hand edited into that shape.
-        let both = ViewItemJson::from_meta(
+        let both = ViewItemJson::from_facts(
             &item("a.jpg"),
-            Some(&meta(Some(instant), Some(TakenReason::NoExif))),
+            Some(&facts(Some(meta(Some(instant), Some(TakenReason::NoExif))))),
         );
         assert_eq!(both.taken_ns, Some(instant));
         assert_eq!(both.taken_reason, None);
-        let valued = ViewItemJson::from_meta(&item("a.jpg"), Some(&meta(Some(instant), None)));
+        let valued = ViewItemJson::from_facts(
+            &item("a.jpg"),
+            Some(&facts(Some(meta(Some(instant), None)))),
+        );
         assert_eq!(valued.taken_ns, Some(instant));
         assert_eq!(valued.taken_reason, None);
     }

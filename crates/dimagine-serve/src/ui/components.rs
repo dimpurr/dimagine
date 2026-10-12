@@ -6,6 +6,7 @@
 use dimagine_index::{ImageMeta, ViewItem};
 use percent_encoding::utf8_percent_encode;
 
+use crate::catalog::PreviewKind;
 use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
@@ -448,6 +449,25 @@ pub const WIDE_ABOVE: f64 = 2.5;
 /// answer at all: the grid still renders.
 pub type TileMeta = Option<ImageMeta>;
 
+/// One image as the index describes it, for a tile and for the JSON the page's
+/// script reads: the header facts the tile is laid out by, and the content
+/// digest its preview URL is keyed by.
+///
+/// The digest is what makes a preview URL content-addressed (ADR-020): a tile
+/// whose image the index holds a digest for asks `/p/<sha256>/thumb.g2`, and
+/// only one whose digest the index does not hold — a file the scan has not
+/// reached, an image in a library whose index could not be opened — keeps the
+/// path URL, which redirects to the very same answer.
+#[derive(Clone, Debug, Default)]
+pub struct TileFact {
+    /// The header facts the index holds, `None` for a header it could not read
+    /// or an image it has never seen.
+    pub meta: TileMeta,
+    /// The SHA-256 of the file's bytes, `None` when the index holds no digest
+    /// for them.
+    pub sha256: Option<String>,
+}
+
 /// The layout ratio of one tile, as the `--ar` the stylesheet justifies rows
 /// by: the indexed width over the indexed height, and `1` for a square cell
 /// when the index knows no dimensions.
@@ -583,7 +603,14 @@ fn no_time_marker() -> String {
 /// dimensions; the script still measures a picture whose shape the index does
 /// not know, and a shape nobody knows keeps `contain` rather than becoming a
 /// crop.
-pub fn tile(item: &ViewItem, params: &ViewParams, meta: TileMeta) -> String {
+///
+/// The preview address is content-addressed (ADR-020): `/p/<sha256>/thumb.g2`
+/// for an image the index holds a digest for, and `/thumb/<path>` — which the
+/// media route answers with a 302 to the same place — for one it does not.
+/// Nothing about a rename, a move or a second copy of the same bytes changes
+/// the first form, and a changed file is a different address.
+pub fn tile(item: &ViewItem, params: &ViewParams, fact: Option<&TileFact>) -> String {
+    let meta = fact.and_then(|fact| fact.meta);
     let label = item
         .title
         .as_deref()
@@ -601,11 +628,12 @@ pub fn tile(item: &ViewItem, params: &ViewParams, meta: TileMeta) -> String {
         "<a class=\"tile\" data-path=\"{path}\" id=\"{anchor}\" style=\"{ar}\" \
          href=\"/image/{path_encoded}{view}\" title=\"{label}\"{fit}>\
          {badge}{no_time}\
-         <img loading=\"lazy\" decoding=\"async\" src=\"/thumb/{path_encoded}\" alt=\"{label}\"{size}>\
+         <img loading=\"lazy\" decoding=\"async\" src=\"{src}\" alt=\"{label}\"{size}>\
          <span class=\"tile-caption\">{label}</span></a>",
         path = escape_html(&item.path),
         anchor = escape_html(&crate::ui::tile_anchor(&item.path)),
         path_encoded = escape_html(&crate::ui::encode_path(&item.path)),
+        src = escape_html(&preview_src(fact, &item.path)),
         view = image_view_suffix(params),
         label = escape_html(&label),
         ar = aspect_ratio(meta),
@@ -614,6 +642,15 @@ pub fn tile(item: &ViewItem, params: &ViewParams, meta: TileMeta) -> String {
         no_time = no_time,
         size = size_attributes(meta),
     )
+}
+
+/// The address one tile's preview is loaded from: the content URL the index's
+/// digest names, or the path URL that redirects to it when there is none.
+fn preview_src(fact: Option<&TileFact>, path: &str) -> String {
+    match fact.and_then(|fact| fact.sha256.as_deref()) {
+        Some(hash) => crate::content::preview_url(hash, PreviewKind::Thumb),
+        None => format!("/thumb/{}", escape_html(&crate::ui::encode_path(path))),
+    }
 }
 
 /// The `data-fit="…"` attribute, or nothing when the shape is unknown.
@@ -634,6 +671,20 @@ fn image_view_suffix(params: &ViewParams) -> String {
     )
 }
 
+/// The `data-preview-generation` attribute of a grid: the generation the
+/// page's rendition URLs are spelled with, so the script appends tiles under
+/// the same addresses (ADR-020 item 8).
+///
+/// The server is the only place that knows the generation, and a script with
+/// its own copy of it would be a second thing to keep in step when the policy
+/// moves.
+fn generation_attribute() -> String {
+    format!(
+        "data-preview-generation=\"{}\"",
+        crate::content::preview_generation()
+    )
+}
+
 /// The `data-taken` marker on a grid whose order is the EXIF taken time.
 ///
 /// It is what lets the tiles say "no taken time" — the server writes that mark
@@ -647,12 +698,13 @@ fn taken_marker(params: &ViewParams) -> &'static str {
     }
 }
 
-/// The header facts of the images on one page, keyed by image path.
+/// What the index holds for the images on one page, keyed by image path.
 ///
 /// A path this map says nothing about has no known header, and its tile falls
 /// back to the square cell — an unknown recorded as an unknown, never as a
-/// size (invariant 4).
-pub type TileMetas = std::collections::HashMap<String, ImageMeta>;
+/// size (invariant 4). The same path also has no digest to name a content URL,
+/// and its tile keeps the path URL that redirects to one.
+pub type TileMetas = std::collections::HashMap<String, TileFact>;
 
 /// The grid of tiles for one page of results.
 ///
@@ -664,13 +716,18 @@ pub type TileMetas = std::collections::HashMap<String, ImageMeta>;
 /// one this is still a complete grid of links.
 pub fn grid(items: &[ViewItem], params: &ViewParams, metas: &TileMetas) -> String {
     format!(
-        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{}>{}</section>",
+        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{} {}>{}</section>",
         params.size.as_str(),
         items.len(),
+        // `data-justify` is the marker the stylesheet reads, and the two
+        // attributes a page writes beside it keep their places: the taken mark
+        // when the order brings an unknown into view, and the rendition
+        // generation every tile URL this page holds is spelled with.
         taken_marker(params),
+        generation_attribute(),
         items
             .iter()
-            .map(|item| tile(item, params, metas.get(item.path.as_str()).copied()))
+            .map(|item| tile(item, params, metas.get(item.path.as_str())))
             .collect::<String>()
     )
 }
@@ -685,10 +742,10 @@ pub struct CollectionTile {
     /// The line directly after the embed (FORMAT §5), as written; empty is
     /// no caption, a distinct fact that is not invented here.
     pub caption: String,
-    /// The header facts the index holds for the image, if it holds any: a
+    /// Everything the index holds for the image, if it holds anything: a
     /// member the index has never seen carries none and lands in a square
-    /// cell, like a member whose header could not be read.
-    pub meta: TileMeta,
+    /// cell behind a path URL, like a member whose header could not be read.
+    pub fact: Option<TileFact>,
 }
 
 /// The collection page's grid: the library's tiles, each with the caption
@@ -704,10 +761,15 @@ pub struct CollectionTile {
 /// any other name.
 pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String {
     format!(
-        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{}>{}</section>",
+        "<section class=\"grid size-{}\" data-total=\"{}\" data-justify{} {}>{}</section>",
         params.size.as_str(),
         items.len(),
+        // `data-justify` is the marker the stylesheet reads, and the two
+        // attributes a page writes beside it keep their places: the taken mark
+        // when the order brings an unknown into view, and the rendition
+        // generation every tile URL this page holds is spelled with.
         taken_marker(params),
+        generation_attribute(),
         items
             .iter()
             .map(|member| {
@@ -729,8 +791,8 @@ pub fn collection_grid(items: &[CollectionTile], params: &ViewParams) -> String 
                 // `--ar` inherits from here into the tile.
                 format!(
                     "<div class=\"grid-item\" style=\"{ar}\">{}{caption}</div>",
-                    tile(&member.item, params, member.meta),
-                    ar = aspect_ratio(member.meta)
+                    tile(&member.item, params, member.fact.as_ref()),
+                    ar = aspect_ratio(member.fact.as_ref().and_then(|fact| fact.meta))
                 )
             })
             .collect::<String>()
@@ -910,11 +972,15 @@ pub fn folder_card(path: &str, count: u64) -> String {
 }
 
 /// A collection card, for `/collections`.
+///
+/// The cover is a preview like any other, so it is addressed by its content
+/// when the caller has a digest for it (ADR-020) and by the path URL — which
+/// redirects to the same answer — when it has not.
 pub fn collection_card(path: &str, title: &str, count: u64, cover: Option<&str>) -> String {
     let cover_html = match cover {
-        Some(image) => format!(
-            "<img class=\"card-cover\" loading=\"lazy\" src=\"/thumb/{}\" alt=\"\">",
-            escape_html(&crate::ui::encode_path(image))
+        Some(src) => format!(
+            "<img class=\"card-cover\" loading=\"lazy\" src=\"{}\" alt=\"\">",
+            escape_html(src)
         ),
         // A collection with no members has no cover, only the glyph.
         None => format!("<span class=\"card-icon\">{COLLECTION_ICON}</span>"),
@@ -1162,6 +1228,17 @@ pub fn page(frame: Frame<'_>) -> String {
 mod tests {
     use super::*;
     use crate::index_sync::{SidebarCollection, SidebarFolder, SidebarTag};
+
+    /// One tile's index facts built from a header alone. The tests below are
+    /// about the layout a header decides, and a tile whose digest the index
+    /// does not hold is served from its path URL (ADR-020) — which is what
+    /// `sha256: None` stands for.
+    fn facts(meta: Option<ImageMeta>) -> Option<TileFact> {
+        meta.map(|meta| TileFact {
+            meta: Some(meta),
+            sha256: None,
+        })
+    }
 
     fn sidebar() -> SidebarData {
         SidebarData {
@@ -1611,7 +1688,7 @@ mod tests {
             taken_ns: Some(1_689_191_647_000_000_000),
             taken_reason: None,
         });
-        let html = tile(&item, &ViewParams::default(), landscape);
+        let html = tile(&item, &ViewParams::default(), facts(landscape).as_ref());
         assert!(
             html.contains("alt=\"a.png\" width=\"1200\" height=\"800\""),
             "{html}"
@@ -1634,7 +1711,7 @@ mod tests {
             taken_ns: None,
             taken_reason: None,
         });
-        let html = tile(&item, &ViewParams::default(), portrait);
+        let html = tile(&item, &ViewParams::default(), facts(portrait).as_ref());
         assert!(html.contains("style=\"--ar:0.667\""), "{html}");
         assert!(html.contains("width=\"600\" height=\"900\""), "{html}");
     }
@@ -1729,7 +1806,7 @@ mod tests {
             taken_ns: None,
             taken_reason: None,
         });
-        let html = tile(&item, &ViewParams::default(), tall);
+        let html = tile(&item, &ViewParams::default(), facts(tall).as_ref());
         assert!(html.contains("data-fit=\"tall\""), "{html}");
         assert!(html.contains("class=\"tile-badge\""), "{html}");
         assert!(html.contains("Tall image"), "{html}");
@@ -1749,7 +1826,7 @@ mod tests {
                 taken_ns: None,
                 taken_reason: None,
             });
-            let html = tile(&item, &ViewParams::default(), meta);
+            let html = tile(&item, &ViewParams::default(), facts(meta).as_ref());
             assert!(
                 html.contains("data-fit=\"normal\""),
                 "{width}/{height}: {html}"
@@ -1789,7 +1866,7 @@ mod tests {
             let params = ViewParams::parse(&format!("sort=taken&dir={direction}"));
             assert!(params.orders_by_taken(), "{direction}");
 
-            let html = tile(&item, &params, unknown);
+            let html = tile(&item, &params, facts(unknown).as_ref());
             assert!(
                 html.contains("class=\"tile-notime\""),
                 "{direction}: {html}"
@@ -1799,13 +1876,14 @@ mod tests {
                 "the tooltip names the unknown: {direction}: {html}"
             );
             assert!(
-                !tile(&item, &params, known).contains("tile-notime"),
+                !tile(&item, &params, facts(known).as_ref()).contains("tile-notime"),
                 "an image with a date is not marked: {direction}"
             );
             // The order is what brings the unknown into view, so any other
             // order stays quiet about it.
             assert!(
-                !tile(&item, &ViewParams::default(), unknown).contains("tile-notime"),
+                !tile(&item, &ViewParams::default(), facts(unknown).as_ref())
+                    .contains("tile-notime"),
                 "outside the taken order the mark would be noise"
             );
         }
@@ -1826,14 +1904,27 @@ mod tests {
             note_path: None,
         }];
         let plain = grid(&items, &ViewParams::default(), &TileMetas::new());
-        assert!(plain.contains("<section class=\"grid size-m\" data-total=\"1\" data-justify>"));
+        // The section states the generation its rendition URLs are spelled
+        // with, so a tile the script appends later asks the same address
+        // (ADR-020 item 8).
+        assert!(
+            plain.contains(&format!(
+                "<section class=\"grid size-m\" data-total=\"1\" data-justify \
+                 data-preview-generation=\"{}\">",
+                crate::content::preview_generation()
+            )),
+            "{plain}"
+        );
         assert!(
             !plain.contains("data-taken"),
             "only a taken-ordered grid is marked: {plain}"
         );
 
         let taken = grid(&items, &ViewParams::parse("sort=taken"), &TileMetas::new());
-        assert!(taken.contains("data-justify data-taken>"), "{taken}");
+        assert!(
+            taken.contains("data-justify data-taken data-preview-generation="),
+            "{taken}"
+        );
     }
 
     /// A grid of known shapes passes each tile its own facts: the ratio, the
@@ -1863,20 +1954,26 @@ mod tests {
         let mut metas = TileMetas::new();
         metas.insert(
             "refs/a.png".to_owned(),
-            ImageMeta {
-                width: Some(600),
-                height: Some(1200),
-                taken_ns: None,
-                taken_reason: None,
+            TileFact {
+                meta: Some(ImageMeta {
+                    width: Some(600),
+                    height: Some(1200),
+                    taken_ns: None,
+                    taken_reason: None,
+                }),
+                sha256: None,
             },
         );
         metas.insert(
             "refs/b.png".to_owned(),
-            ImageMeta {
-                width: Some(1600),
-                height: Some(900),
-                taken_ns: Some(1_689_191_647_000_000_000),
-                taken_reason: None,
+            TileFact {
+                meta: Some(ImageMeta {
+                    width: Some(1600),
+                    height: Some(900),
+                    taken_ns: Some(1_689_191_647_000_000_000),
+                    taken_reason: None,
+                }),
+                sha256: None,
             },
         );
         let html = grid(&items, &ViewParams::parse("sort=taken"), &metas);
@@ -1971,9 +2068,13 @@ mod tests {
     #[test]
     fn folder_and_collection_cards_link_to_the_view_they_represent() {
         assert!(folder_card("refs/ui", 124).contains("href=\"/?in=refs/ui\""));
-        let card = collection_card("browse.md", "browse", 16, Some("refs/a.png"));
+        // The cover is an address, not a path: the caller says where the bytes
+        // are read from — a content URL when the index holds a digest for them
+        // (ADR-020) — and the card builds no address of its own.
+        let cover = "/p/aaaa/thumb.g2";
+        let card = collection_card("browse.md", "browse", 16, Some(cover));
         assert!(card.contains("href=\"/?c=browse.md\""));
-        assert!(card.contains("src=\"/thumb/refs/a.png\""));
+        assert!(card.contains(&format!("src=\"{cover}\"")), "{card}");
         assert!(collection_card("empty.md", "", 0, None).contains("card-glyph"));
     }
 

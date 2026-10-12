@@ -254,6 +254,66 @@ impl IndexHandle {
     /// The counts behind one filter panel: for every facet value, how many
     /// images it would show given the view's other filters.
     ///
+    /// The content digest the index already holds for one image, or `None`
+    /// when it holds none for these facts.
+    ///
+    /// The reuse that keeps a preview URL off the disk: a rendition is keyed
+    /// by the file's SHA-256, the index stores that digest per file, and the
+    /// row's own size and nanosecond mtime prove the digest describes the
+    /// bytes now on disk. So a reader that must know the hash of an image it
+    /// already resolved asks here first and reads the file only when the
+    /// answer is "no digest for these facts" — the same reuse
+    /// `dimagine_index`'s refresh makes through
+    /// [`dimagine_index::Index::reusable_image_meta`].
+    ///
+    /// A closed index has no digest to give and says so; that is an unknown,
+    /// not an empty library.
+    pub fn content_hash(&self, path: &str, size: u64, mtime_ns: i64) -> Option<String> {
+        self.with_index(|index| {
+            index
+                .reusable_image_meta(path, size, mtime_ns)
+                .ok()
+                .flatten()
+                .map(|(sha256, _meta)| sha256)
+        })
+        .flatten()
+    }
+
+    /// The library-relative paths of every image the index holds, with the
+    /// size and nanosecond mtime of the row, in path order (ADR-020 item 6:
+    /// the gap a background preview backfill works from).
+    pub fn image_rows(&self) -> Vec<(String, u64, i64)> {
+        self.with_index(|index| index.image_rows().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// The library-relative paths that carry this content digest, in path
+    /// order. Empty means no file in this index has those bytes.
+    ///
+    /// This is the one question a content-addressed URL is answered by: the
+    /// bytes the URL names either exist or they do not, and nothing about a
+    /// path is inferred from them.
+    pub fn paths_for_content(&self, sha256: &str) -> Vec<String> {
+        self.with_index(|index| index.by_sha256(sha256).unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Run one read against the open index. `None` from outside is an index
+    /// that could not be opened — an unknown, never an empty answer — and the
+    /// caller decides what that means for its own question.
+    fn with_index<T>(&self, read: impl FnOnce(&Index) -> T) -> Option<T> {
+        match self.lock() {
+            Ok(slot) => match &*slot {
+                Slot::Open(index) => Some(read(index)),
+                Slot::Closed(_) => None,
+            },
+            Err(_) => None,
+        }
+    }
+
+    /// The counts behind one filter panel: for every facet value, how many
+    /// images it would show given the view's other filters.
+    ///
     /// Five grouped queries, whatever the library holds — the panel never asks
     /// one question per tag or folder. Nothing is cached, because the answer
     /// belongs to the filters on screen and changes with every one of them.

@@ -12,6 +12,7 @@
 pub mod accounts;
 pub mod assets;
 pub mod catalog;
+pub mod content;
 pub mod index_sync;
 pub(crate) mod media;
 pub mod pages;
@@ -39,7 +40,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -217,6 +218,10 @@ pub(crate) struct AppState {
     pub(crate) admission: Arc<Admission>,
     pub(crate) login_slots: Arc<tokio::sync::Semaphore>,
     pub(crate) index: Arc<IndexHandle>,
+    /// Whether the background preview backfill has been started for this
+    /// router (ADR-020 item 6). One task per router, so a process that builds
+    /// two (a tool, a test suite) does not share one flag.
+    pub(crate) backfill_started: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -700,7 +705,16 @@ pub fn router_from(
         admission: Arc::new(Admission::new()),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
         index,
+        backfill_started: Arc::new(AtomicBool::new(false)),
     };
+    // The background preview backfill (ADR-020 item 6). It runs on the
+    // shared state — the resources the router also uses are `Arc`s, so a
+    // clone of this state is the same index, the same catalog and the same
+    // preview cache — and starts nothing when no Tokio runtime is current,
+    // which is how the tests build a router on a plain thread.
+    let shared = Arc::new(state);
+    content::ensure_preview_backfill(&shared);
+    let state = AppState::clone(&shared);
     Ok(Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout).post(logout))
@@ -717,6 +731,10 @@ pub fn router_from(
         .route("/media/*path", get(media::media))
         .route("/thumb/*path", get(media::media))
         .route("/raw/*path", get(media::media))
+        // The content-addressed rendition routes (ADR-020): the URL is the
+        // content, so it can be cached for as long as it exists. The old
+        // routes above redirect here.
+        .route("/p/:sha256/:variant", get(content::content_preview))
         // The hashed stylesheet and script (spec §0). Only the current
         // hash resolves: a stale URL is a 404, which a cached page
         // cannot hit.
@@ -1246,6 +1264,14 @@ async fn logout(
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
+    // Expiring the session is also forgetting the library: a preview is cached
+    // for a year, so the next person at this machine could read one back out of
+    // the browser's disk cache. Only `"cache"`: the cookie is cleared above and
+    // nothing else this server stores is worth taking with it (ADR-020
+    // item 5).
+    response
+        .headers_mut()
+        .insert("clear-site-data", HeaderValue::from_static("\"cache\""));
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

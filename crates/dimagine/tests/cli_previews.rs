@@ -187,6 +187,72 @@ fn previews_json_document_shape() {
     assert_eq!(report["cached"], 2, "second run is a cache hit");
 }
 
+/// ADR-020 item 6: `check` reports how many renditions the viewer's cache does
+/// not hold — counted from the index, never counted by hashing the library —
+/// and the count is not a finding: a preview is derived data the viewer
+/// rebuilds, so a library with a hundred missing ones still exits zero.
+///
+/// A library with no index is "not counted", a different fact from a full
+/// cache, and `check` does not create the index it would need: it stays
+/// read-only, which the last assertion pins.
+#[test]
+fn check_reports_the_missing_preview_count() {
+    let tmp = tmp("gaps");
+    write(&tmp.0, "one.jpg", JPG);
+    write(&tmp.0, "sub/two.png", PNG);
+    let lib = tmp.0.to_str().unwrap();
+    let index = tmp.0.join(".dimagine/cache/index.sqlite");
+
+    // Never scanned: nothing to count from, and `check` says so rather than
+    // claiming a cache that holds everything.
+    let (code, stdout, stderr) = dimagine(&["check", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("missing previews: not counted (no index to read)"),
+        "{stdout}"
+    );
+    assert!(!index.is_file(), "check must not create the index");
+    let (code, stdout, stderr) = dimagine(&["check", "--json", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(
+        report.get("preview_gaps"),
+        None,
+        "an unknown is absent, never a zero"
+    );
+
+    // Indexed but never rendered: both renditions of both images are missing,
+    // and the count states the population it counted over.
+    let (code, stdout, stderr) = dimagine(&["scan", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(index.is_file(), "scan is what writes the index");
+    let (code, stdout, stderr) = dimagine(&["check", "--library", lib]);
+    assert_eq!(
+        code, 0,
+        "a missing preview is not a problem in the library: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("missing previews: 2 thumb, 2 view of 2 indexed images"),
+        "{stdout}"
+    );
+    let (code, stdout, _) = dimagine(&["check", "--json", "--library", lib]);
+    assert_eq!(code, 0);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["preview_gaps"]["images"], 2);
+    assert_eq!(report["preview_gaps"]["thumb"], 2);
+    assert_eq!(report["preview_gaps"]["view"], 2);
+
+    // Rendered: the gap closes, and the exit code was zero the whole way.
+    let (code, stdout, stderr) = dimagine(&["previews", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let (code, stdout, stderr) = dimagine(&["check", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("missing previews: 0 thumb, 0 view of 2 indexed images"),
+        "{stdout}"
+    );
+}
+
 /// Every rendition this library's cache holds.
 fn cache_files(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

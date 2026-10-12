@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use clap::{Arg, ArgMatches, Command};
+use dimagine_core::check::PreviewGaps;
 use dimagine_core::library::{FileClass, Library};
 use dimagine_preview::{ensure, Kind, PreviewError, Rendition};
 
@@ -138,6 +139,69 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     } else {
         ExitCode::from(0)
     }
+}
+
+/// The renditions the cache does not hold, counted from the index's own rows —
+/// `dimagine check`'s new item (ADR-020 item 6).
+///
+/// The count is a read of the index and a stat per candidate cache entry:
+/// nothing is decoded, generated or written, so it belongs in `check`, which
+/// never changes a file. The digest each rendition is keyed by is the one the
+/// index already stores for the image's size and nanosecond mtime — the same
+/// reuse the routes make (W71 M1) — and an image whose digest the index does
+/// not hold is left out of the population rather than counted as missing,
+/// because a digest no one has cannot name the entry to look for.
+///
+/// `None` is "not counted", never "nothing missing": no index to read (a
+/// library that has never been scanned), an index that could not be opened, or
+/// one that has to be rebuilt first. A library that is fully rendered answers
+/// `Some` with both counts at zero.
+pub fn gaps(library_dir: &Path) -> Option<PreviewGaps> {
+    // The index is a cache, and `check` may not create one: counting from a
+    // database that is not there yet is not this command's business, and
+    // opening it would write the library's first cache entry during a
+    // read-only run.
+    let database = library_dir
+        .join(".dimagine")
+        .join("cache")
+        .join("index.sqlite");
+    if !database.is_file() {
+        return None;
+    }
+    let root = fs::canonicalize(library_dir).unwrap_or_else(|_| library_dir.to_path_buf());
+    let index = dimagine_index::Index::open(&root).ok()?;
+    if index.rebuild_required() {
+        return None;
+    }
+    let rows = index.image_rows().ok()?;
+    if rows.is_empty() {
+        // No row at all is an index that has not seen this library yet, not a
+        // library with nothing in it — an empty answer here would read as
+        // "everything is rendered" (invariant 4).
+        return None;
+    }
+    let mut gaps = PreviewGaps {
+        images: 0,
+        thumb: 0,
+        view: 0,
+    };
+    for (path, size, mtime_ns) in &rows {
+        let Some(hash) = index
+            .reusable_image_meta(path, *size, *mtime_ns)
+            .ok()
+            .flatten()
+            .map(|(sha256, _meta)| sha256)
+        else {
+            continue;
+        };
+        gaps.images += 1;
+        for (kind, missing) in [(Kind::Thumb, &mut gaps.thumb), (Kind::View, &mut gaps.view)] {
+            if dimagine_preview::existing_rendition(&root, &hash, kind).is_none() {
+                *missing += 1;
+            }
+        }
+    }
+    Some(gaps)
 }
 
 fn build(root: &Path, rel: &str, path: &Path, cached: &HashSet<PathBuf>) -> ImageOutcome {
