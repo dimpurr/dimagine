@@ -21,6 +21,7 @@
 //! crates; this layout leaves them somewhere natural to slot in.
 
 pub mod check;
+pub mod fm_edit;
 pub mod format;
 pub mod image_meta;
 pub mod index;

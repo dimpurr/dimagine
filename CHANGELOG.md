@@ -7,6 +7,36 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The front-matter editor (Phase 3a): `dimagine-core::fm_edit` edits a note's
+  YAML properties as raw bytes, splicing exactly the range an edit intends
+  and leaving every other byte identical. `set_scalar`, `delete_key`,
+  `set_rating`, `add_tags`, `remove_tags`, `ensure_id` and
+  `ensure_self_embed` work on a closed subset of YAML — a plain or
+  double-quoted top-level key that occurs once, whose value is a single-line
+  scalar, a single-line flow list, or a block list of single-line items —
+  and refuse everything else with typed errors that never quote note
+  contents: duplicate keys, merge keys, anchors and aliases, multiline
+  values, nested structures, single-quoted keys, unterminated front matter
+  and anything the reader already reports broken. Every splice is re-parsed
+  with saphyr before it is returned and must read back as exactly the
+  intended value, with all other properties unchanged. Tags dedupe and match
+  case-insensitively keeping the first spelling, allow hierarchies, keep the
+  list's existing style (flow or block), and removing the last tag deletes
+  the key; ratings are always written unquoted so `rating: "4"` becomes
+  `rating: 5`; a `tags` key created from nothing is flow-style
+  (`tags: [a, b]`); new keys go as the last line inside the fences, and a
+  note without front matter grows a block in its own line-ending style with
+  its BOM kept. A checked-in fixture corpus asserts each edit's byte diff
+  equals exactly its intended range (quoted ratings, flow lists with quoted
+  commas, block lists, comments beside and on the edited line, CRLF + BOM,
+  bodies that begin with `---`, add-and-remove round trips, hierarchical and
+  case-variant tags), and an opt-in harness
+  (`DIMAGINE_ROUNDTRIP_LIBRARY`, run only against a scratch copy) walks every
+  note of a library copy, sets and restores one scalar key and reports byte
+  identity with refusal counts by reason. The `---` delimiter rule is now one shared rule for reading
+  and editing (`fm_edit::front_matter_range`): both fences accept
+  `---` followed by whitespace, where previously only the closing fence
+  did.
 - Viewer: previews are addressed by their content. `/p/<sha256>/thumb.g2` and
   `/p/<sha256>/view.g2` serve the rendition of one content, answered from the
   URL and cacheable for a year (`private, max-age=31536000, immutable`, an

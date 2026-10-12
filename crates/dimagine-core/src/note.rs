@@ -6,8 +6,14 @@
 //! caller reports as a finding. Unknown properties are preserved by simply
 //! keeping the text and the parsed mapping around — dimagine 0.1 reads more
 //! than it writes, and never rewrites a note on its own.
+//!
+//! The front matter delimiter rule is shared with the front-matter editor
+//! ([`crate::fm_edit::front_matter_range`]): a fence line is a `---` line
+//! possibly followed by whitespace.
 
 use saphyr::{LoadableYamlNode, Yaml};
+
+use crate::fm_edit::{front_matter_range, FmRange};
 
 /// An error in a note's front matter, with the location if the parser could
 /// report one.
@@ -49,7 +55,6 @@ pub struct ParsedNote {
 
 /// Parse a note file's text. `text` should be the whole file.
 pub fn parse_note(text: &str) -> ParsedNote {
-    let split = split_front_matter(text);
     let mut note = ParsedNote {
         has_front_matter: false,
         error: None,
@@ -58,23 +63,24 @@ pub fn parse_note(text: &str) -> ParsedNote {
         body: String::new(),
         body_line: 1,
     };
-    match split {
-        FmSplit::NoFrontMatter { body } => {
-            note.body = body.to_string();
+    match front_matter_range(text.as_bytes()) {
+        FmRange::NoFrontMatter { bom_len } => {
+            note.body = text[bom_len..].to_string();
         }
-        FmSplit::FrontMatter {
-            yaml,
-            body,
-            end_line,
+        FmRange::Closed {
+            yaml_start,
+            close_start,
+            close_line_no,
+            body_start,
+            ..
         } => {
             note.has_front_matter = true;
-            note.body = body.to_string();
-            note.body_line = end_line + 1;
-            read_properties(yaml, &mut note);
+            note.body = text[body_start..].to_string();
+            note.body_line = close_line_no + 1;
+            read_properties(&text[yaml_start..close_start], &mut note);
         }
-        FmSplit::Unterminated { body } => {
-            note.has_front_matter = false;
-            note.body = body.to_string();
+        FmRange::Unterminated { body_start } => {
+            note.body = text[body_start..].to_string();
             note.body_line = 2;
             note.error = Some(FrontMatterError {
                 line: None,
@@ -131,65 +137,16 @@ fn read_properties(yaml: &str, note: &mut ParsedNote) {
     }
 }
 
-enum FmSplit<'a> {
-    NoFrontMatter {
-        body: &'a str,
-    },
-    FrontMatter {
-        yaml: &'a str,
-        body: &'a str,
-        end_line: usize,
-    },
-    Unterminated {
-        body: &'a str,
-    },
-}
-
-/// Split a document into front matter and body. Handles a leading BOM,
-/// CRLF line endings and whitespace around the `---` delimiters, following
-/// Obsidian conventions.
-fn split_front_matter(text: &str) -> FmSplit<'_> {
-    let s = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let first_line_end = s.find('\n').unwrap_or(s.len());
-    if s[..first_line_end].trim_end_matches('\r') != "---" {
-        return FmSplit::NoFrontMatter { body: s };
-    }
-    // `first_line_end + 1` is past EOF for a three-byte `---` file. Keep the
-    // cursor inside the source before attempting to slice it below.
-    let mut body_start = (first_line_end + 1).min(s.len());
-    let mut line_no = 2usize;
-    let mut cursor = body_start;
-    loop {
-        let line_end = match s[cursor..].find('\n') {
-            Some(off_end) => cursor + off_end,
-            None => s.len(),
-        };
-        let line = s[cursor..line_end].trim_end_matches('\r');
-        if line.trim_end() == "---" {
-            let yaml = &s[body_start..cursor];
-            body_start = (line_end + 1).min(s.len());
-            return FmSplit::FrontMatter {
-                yaml,
-                body: &s[body_start..],
-                end_line: line_no,
-            };
-        }
-        if line_end == s.len() {
-            return FmSplit::Unterminated {
-                body: &s[body_start..],
-            };
-        }
-        line_no += 1;
-        cursor = line_end + 1;
-    }
-}
-
 /// The raw YAML text between the `---` fences, or `None` when the note has no
 /// front matter (or an unterminated block). Used by the index sync, which
 /// stores the front matter as JSON for the view queries.
 pub fn front_matter_text(text: &str) -> Option<&str> {
-    match split_front_matter(text) {
-        FmSplit::FrontMatter { yaml, .. } => Some(yaml),
+    match front_matter_range(text.as_bytes()) {
+        FmRange::Closed {
+            yaml_start,
+            close_start,
+            ..
+        } => Some(&text[yaml_start..close_start]),
         _ => None,
     }
 }

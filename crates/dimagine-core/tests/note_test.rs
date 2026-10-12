@@ -112,3 +112,18 @@ fn front_matter_error_still_yields_body_for_links() {
     assert!(note.error.is_some());
     assert!(note.body.contains("![[girl.jpg]]"));
 }
+
+#[test]
+fn fence_rule_is_the_same_for_both_fences() {
+    // `---` with trailing whitespace now opens front matter, exactly as it
+    // always closed it: both fences share one rule with the editor
+    // (fm_edit::front_matter_range).
+    let note = parse_note("--- \ntitle: Trailing space\n---\t\nbody\n");
+    assert!(note.has_front_matter);
+    assert!(note.error.is_none());
+    assert!(matches!(note.body.as_str(), "body\n"));
+    // Leading whitespace still means "this is not front matter".
+    let note = parse_note("  ---\ntitle: x\n---\nbody\n");
+    assert!(!note.has_front_matter);
+    assert!(note.error.is_none());
+}
