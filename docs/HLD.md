@@ -48,7 +48,7 @@ gate as every page:
 
 | Route | Answers |
 | --- | --- |
-| `/p/<sha256>/<variant>` | The rendition of one *content*. `<variant>` is a size class and the rendition generation (`thumb.g2`, `view.g2`). The URL is the content, so the answer is `private, max-age=31536000, immutable` and its ETag is the digest, the size class and the generation. A URL naming another generation redirects to the current one; a digest the index does not know is a `404` and never renders anything. |
+| `/p/<sha256>/<variant>` | The rendition of one *content*. `<variant>` is a size class and the rendition generation (`thumb.g2`, `view.g2`). The URL is the content, so the answer is `private, max-age=31536000, immutable` and its ETag is the digest, the size class and the generation. A URL naming another generation redirects to the current one; a digest the index does not know, or one whose rows are no image, is a `404` and never renders anything. |
 | `/thumb/<path>`, `/media/<path>` | `302 Found` to the content URL when the index holds a digest for the bytes, with `private, no-cache` on the hop. Otherwise the rendition itself, revalidated, because the content URL would be a `404` for a digest the index does not hold. |
 | `/raw/<path>` | The file as written: an image's original, or a note's source view as `text/plain`. Never a redirect, never immutable. |
 

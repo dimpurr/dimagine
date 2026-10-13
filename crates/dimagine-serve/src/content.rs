@@ -34,7 +34,7 @@ use axum::{
 };
 use std::sync::{atomic::Ordering, Arc};
 
-use crate::catalog::PreviewKind;
+use crate::catalog::{is_image, Catalog, PreviewKind};
 use crate::media::{self, CachePolicy, HeavyRequest};
 use crate::{admission_denied, AppState, LIGHT_RETRY_AFTER_SECS};
 
@@ -44,10 +44,16 @@ use crate::{admission_denied, AppState, LIGHT_RETRY_AFTER_SECS};
 /// because nothing can change what this URL means.
 pub(crate) const IMMUTABLE_CACHE_CONTROL: &str = "private, max-age=31536000, immutable";
 
-/// The generation the routes serve under, as `RENDITION_GENERATION` spells it.
-/// Written here rather than parsed at the call site so the route, its
-/// redirect and its test cannot disagree about which generation is current.
-const RENDITION_GENERATION_NUMBER: u32 = 2;
+/// The generation the routes serve under, as `RENDITION_GENERATION` spells it,
+/// read from that one constant rather than written a second time: a policy bump
+/// moves the URL, the redirect and the cache entry name together, because there
+/// is only one thing for them to follow.
+///
+/// A spelling the URL grammar cannot carry is a programming error rather than a
+/// request to answer, and the preview crate's own test rejects it at build time.
+fn current_generation() -> u32 {
+    dimagine_preview::generation_number().expect("RENDITION_GENERATION must be g<N>")
+}
 
 /// How many images one preview backfill pass works through between the
 /// `spawn_blocking` calls that make it interruptible. The provider has its
@@ -78,55 +84,89 @@ pub(crate) async fn content_preview(
     // index does not know is a 404 — it is never a request to generate
     // anything, because a URL with no path in it is not an authorised request
     // to spend decode time (ADR-020, attack review).
-    let paths = state.index.paths_for_content(&hash);
+    let paths = image_paths(&state.catalog, state.index.paths_for_content(&hash));
     if paths.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
     // A URL naming another generation of the same content: the current one is
     // the answer, and the redirect is a hop rather than the answer.
-    if requested.generation != RENDITION_GENERATION_NUMBER {
+    if requested.generation != current_generation() {
         return media::found_redirect(&preview_url(&hash, requested.kind));
     }
     let kind = requested.kind;
-    // Fast path: a published rendition is a light-class answer — one open,
-    // no permit while it streams, and no hashing of anything.
+    // Fast path: a published rendition is a light-class answer — one open, no
+    // permit while it streams, and no hashing of anything. `None` is the heavy
+    // class's turn: either nothing is published yet, or the entry the probe
+    // found was not there for the open.
     let root = state.catalog.root().to_path_buf();
     let published = state
         .previews
         .existing_preview(&hash, kind)
         .and_then(|preview| std::fs::canonicalize(preview).ok())
         .filter(|preview| preview.starts_with(&root) && preview.is_file());
-    let Some(preview) = published else {
-        // Not published: the heavy class generates it — bounded by the same
-        // eight permits and the provider's own decoders — and falls back to
-        // the original when the content cannot be rendered at all.
-        return media::serve_heavy(
-            &state,
-            HeavyRequest::Content { hash, paths, kind },
-            &headers,
-        )
-        .await;
-    };
-    let Some(permit) = state.admission.acquire_light().await else {
-        return admission_denied(LIGHT_RETRY_AFTER_SECS);
-    };
-    let opened = tokio::task::spawn_blocking(move || media::open_file(&preview)).await;
-    // Light policy (W70): the permit covered the open; the stream does not
-    // need it.
-    drop(permit);
-    match opened {
-        Ok(Ok(opened)) => {
-            media::stream_served(
-                opened,
-                CachePolicy::Content(etag(&hash, kind)),
+    let mut light = None;
+    if let Some(preview) = published {
+        let Some(permit) = state.admission.acquire_light().await else {
+            return admission_denied(LIGHT_RETRY_AFTER_SECS);
+        };
+        let opened = tokio::task::spawn_blocking(move || media::open_file(&preview)).await;
+        // Light policy (W70): the permit covered the open; the stream does not
+        // need it.
+        drop(permit);
+        match opened {
+            Ok(Ok(opened)) => {
+                light = Some(
+                    media::stream_served(
+                        opened,
+                        CachePolicy::Content(etag(&hash, kind)),
+                        &headers,
+                        None,
+                    )
+                    .await,
+                );
+            }
+            // The probe saw the entry and the open did not: the one race a light
+            // request can lose. The path route answers it by re-running the
+            // request in the heavy class (`LightOutcome::Vanished`), which is
+            // what a content URL does below as well — a 404 would be a dead end
+            // for exactly the client that retries (RW71 review L-2).
+            Ok(Err(_)) => {}
+            Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        }
+    }
+    // The heavy class generates what is missing — bounded by the same eight
+    // permits and the provider's own decoders — and falls back to the original
+    // when the content cannot be rendered, or cannot be read, at all.
+    match light {
+        Some(response) => response,
+        None => {
+            media::serve_heavy(
+                &state,
+                HeavyRequest::Content { hash, paths, kind },
                 &headers,
-                None,
             )
             .await
         }
-        Ok(Err(_)) => StatusCode::NOT_FOUND.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// The paths of one digest a rendition route may answer.
+///
+/// The index resolves a digest by bytes alone — `by_sha256` matches any `files`
+/// row, and a row can be a raw export or a note left by an importer rather than
+/// a picture — so the gate a path route classifies with is the one that decides
+/// what a rendition URL is allowed to serve. A digest that names no image is a
+/// 404, not the byte dump of `/raw` under a URL that promised a rendition
+/// (RW71 review L-1).
+fn image_paths(catalog: &Arc<dyn Catalog>, paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| {
+            catalog
+                .resolve_path(path)
+                .is_ok_and(|original| is_image(&original))
+        })
+        .collect()
 }
 
 /// The URL of one content's rendition, in the current generation: the address
@@ -256,7 +296,9 @@ pub(crate) fn normalise_hash(raw: &str) -> Option<String> {
 ///
 /// One pass, started once, and interruptible: the work is chunked through
 /// `spawn_blocking`, and each chunk hands control back to the runtime, so
-/// dropping this task stops it between images rather than mid-decode. It
+/// dropping this task stops it between chunks rather than mid-decode — a
+/// dropped future still lets the in-flight chunk of [`BACKFILL_BATCH`] images
+/// finish. It
 /// takes no admission permit — the provider's own concurrency bound is what
 /// keeps it from crowding out a request, and a permit held across a whole
 /// pass is exactly the starvation the light class exists to avoid. Images
@@ -289,25 +331,27 @@ async fn backfill_once(state: &Arc<AppState>) {
     if rows.is_empty() {
         return;
     }
-    let mut missing = 0usize;
+    let mut built = 0usize;
     for chunk in rows.chunks(BACKFILL_BATCH) {
         // Each chunk runs on a blocking worker, so a decode never parks the
-        // async executor and dropping the task between chunks is a clean stop.
+        // async executor, and the hand-back between chunks is where dropping
+        // this task stops the pass.
         let state = Arc::clone(state);
         let chunk = chunk.to_vec();
-        let built = tokio::task::spawn_blocking(move || gap_count(&state, &chunk))
+        built += tokio::task::spawn_blocking(move || gap_count(&state, &chunk))
             .await
             .unwrap_or(0);
-        missing += built;
     }
-    if missing > 0 {
-        eprintln!("dimagine: built {missing} missing preview renditions in the background");
+    if built > 0 {
+        eprintln!("dimagine: built {built} missing preview renditions in the background");
     }
 }
 
-/// How many renditions one batch of images had to build. Each image's digest
-/// comes from the index when the index holds it — a read, no file opened —
-/// and the provider does the rest under its own concurrency bound.
+/// How many renditions one batch of images was missing, and built. Each image's
+/// digest comes from the index when the index holds it — a read, no file opened
+/// — and the provider does the rest under its own concurrency bound. What the
+/// provider could not make is not counted, because the line this feeds says
+/// what was built (RW71 review L-4).
 fn gap_count(state: &AppState, rows: &[(String, u64, i64)]) -> usize {
     let mut built = 0usize;
     for (path, size, mtime_ns) in rows {
@@ -320,10 +364,12 @@ fn gap_count(state: &AppState, rows: &[(String, u64, i64)]) -> usize {
             if published {
                 continue;
             }
-            built += 1;
-            // `preview_path` is the provider's own `ensure`: it renders what
-            // the cache is missing and writes nothing when it is not.
-            let _ = state.previews.preview_path(path, kind);
+            // `preview_path` is the provider's own `ensure`: it renders what the
+            // cache is missing and answers `None` when nothing can be made of
+            // this content — one fewer rendition built, not one more.
+            if state.previews.preview_path(path, kind).is_some() {
+                built += 1;
+            }
         }
     }
     built
@@ -333,13 +379,21 @@ fn gap_count(state: &AppState, rows: &[(String, u64, i64)]) -> usize {
 mod tests {
     use super::*;
 
-    /// The routes serve one generation, and it is the one the cache entry
-    /// names carry. Written as a test rather than a const assertion, because
-    /// the value is read through a function that is not const.
+    /// There is one generation, and the number the route compares is the one
+    /// the URL spells and the cache entry name carries — read off
+    /// `RENDITION_GENERATION`, with no second copy to keep honest. Written as a
+    /// test rather than a const assertion, because the value comes from a
+    /// function that is not const.
     #[test]
     fn the_url_generation_is_the_one_the_cache_names_carry() {
+        let url = preview_url(&"a".repeat(64), PreviewKind::Thumb);
         assert_eq!(
-            RENDITION_GENERATION_NUMBER,
+            url.rsplit('.').next().expect("a URL names its generation"),
+            format!("g{}", current_generation()),
+            "the number the route compares is the one the URL spells"
+        );
+        assert_eq!(
+            current_generation(),
             dimagine_preview::generation_number().expect("RENDITION_GENERATION must be g<N>")
         );
     }
@@ -348,8 +402,9 @@ mod tests {
     fn a_variant_is_the_size_class_and_the_generation_it_names() {
         assert!(parse_variant("thumb").is_some());
         assert!(parse_variant("view").is_some());
-        let current = parse_variant("thumb.g2").unwrap();
-        assert_eq!(current.generation, RENDITION_GENERATION_NUMBER);
+        let current =
+            parse_variant(&format!("thumb.{}", dimagine_preview::RENDITION_GENERATION)).unwrap();
+        assert_eq!(current.generation, current_generation());
         assert_eq!(kind_name(current.kind), "thumb");
         // An older generation of the same size class parses, and the route
         // answers it with a redirect rather than serving it.
@@ -359,6 +414,11 @@ mod tests {
 
     #[test]
     fn anything_that_is_not_a_rendition_variant_is_refused() {
+        // The current spelling parses — stated first, so the list below cannot
+        // quietly grow to include a spelling the route serves.
+        assert!(
+            parse_variant(&format!("view.{}", dimagine_preview::RENDITION_GENERATION)).is_some()
+        );
         for spelling in [
             "",
             "thumbs",
@@ -374,10 +434,9 @@ mod tests {
             "..",
             ".",
             "thumb/",
-            "view.g2",
         ] {
             assert!(
-                spelling == "view.g2" || parse_variant(spelling).is_none(),
+                parse_variant(spelling).is_none(),
                 "{spelling:?} must not parse as a variant"
             );
         }

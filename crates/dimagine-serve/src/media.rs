@@ -163,11 +163,11 @@ fn classify(
                 Some(hash) if indexed => {
                     Ok(MediaClass::Redirect(content::preview_url(&hash, requested)))
                 }
-                // The bytes were read to key this request — the index has no
-                // digest for these facts, which is what a file added between
-                // two rescans, or a library whose scan has not reached it,
-                // looks like. The content URL would then answer 404, so the
-                // rendition is answered here: light when it is published,
+                // The digest came off the file rather than out of the index —
+                // the index has no digest for these facts, which is what a file
+                // added between two rescans, or a library whose scan has not
+                // reached it, looks like. The content URL would then answer 404,
+                // so the rendition is answered here: light when it is published,
                 // heavy when it has to be generated.
                 Some(hash) => match previews.existing_preview(&hash, requested) {
                     Some(preview) => Ok(MediaClass::ExistingPreview(preview)),
@@ -203,6 +203,13 @@ struct KeyedContent {
 /// an index that could not be opened). That is the whole of M1: before W71
 /// every `/thumb` and `/media` request hashed the source from the disk, with
 /// no admission control at all.
+///
+/// A file read that way is read once, not once per request: what its bytes
+/// hashed to is remembered on the handle, so the second request for the same
+/// path, size and mtime costs a stat again. The remembered digest is not
+/// `indexed`, because the index is still the one that knows the bytes — which
+/// is what keeps the path route answering directly rather than redirecting to
+/// a content URL the index would call a 404 (RW71 review M-1).
 fn keyed_content(
     index: &crate::IndexHandle,
     path: &str,
@@ -231,8 +238,20 @@ fn keyed_content(
             }
         }
     }
+    // The index has nothing, so the handle's own memory of this file is asked
+    // before its bytes are read.
+    if let Some(hash) = index.remembered_digest(path, size, mtime_ns) {
+        return Ok(KeyedContent {
+            hash: Some(hash),
+            indexed: false,
+        });
+    }
+    let hash = dimagine_preview::sha256_file(original).ok();
+    if let Some(hash) = &hash {
+        index.remember_digest(path, size, mtime_ns, hash);
+    }
     Ok(KeyedContent {
-        hash: dimagine_preview::sha256_file(original).ok(),
+        hash,
         indexed: false,
     })
 }

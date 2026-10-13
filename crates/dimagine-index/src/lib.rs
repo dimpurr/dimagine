@@ -899,10 +899,11 @@ impl Index {
     /// The paths a content hash resolves to come from [`Self::by_sha256`]; this
     /// is the other direction, for a reader that walks the library once to plan
     /// derived data — the preview backfill, `dimagine check`'s rendition gap.
-    /// It reads rows only: nothing is hashed, decoded or written, and an image
-    /// whose digest the index does not hold is listed with `None` rather than
-    /// skipped, because "no digest yet" and "not in the index" are different
-    /// facts.
+    /// It reads rows only: nothing is hashed, decoded or written, and no digest
+    /// is read — the answer is the path, the size and the mtime, and a reader
+    /// that needs the digest asks per row through [`Self::reusable_image_meta`].
+    /// An image the index holds no digest for is listed like any other, because
+    /// "no digest yet" and "not in the index" are different facts.
     pub fn image_rows(&self) -> Result<Vec<(String, u64, i64)>, IndexError> {
         let mut stmt = self
             .conn()?

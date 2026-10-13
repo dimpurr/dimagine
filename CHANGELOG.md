@@ -47,9 +47,10 @@ All notable changes to this project are documented here. The format follows
   a `302` to the current one rather than a year of stale pixels. Every page and
   every JSON body emits these URLs: tiles, collection covers and members, the
   image page's stage, `/api/view` and `/api/image` (each row carrying the
-  `sha256` its URL is built from). An unknown digest, an unknown size class, an
-  unknown variant spelling and a digest that is not 64 hexadecimal characters
-  are all `404`, and an unknown digest never triggers a render. `dimagine
+  `sha256` its URL is built from). An unknown digest, a digest that names no
+  image, an unknown size class, an unknown variant spelling and a digest that is
+  not 64 hexadecimal characters are all `404`, and an unknown digest never
+  triggers a render. `dimagine
   check` reports the renditions the cache is missing ("missing previews: N
   thumb, M view of K indexed images") — counted from the index, not a finding,
   and absent when there is no index to count from — and the viewer works the

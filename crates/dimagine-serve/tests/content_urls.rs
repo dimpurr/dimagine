@@ -882,3 +882,194 @@ async fn w71_a_cached_preview_request_does_not_read_the_source_file() {
 
     fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
 }
+
+/// RW71 review M-1: a file the index has no digest for is hashed once, not once
+/// per request. What its bytes hashed to is remembered, so the second request
+/// keys the rendition from a stat — and still answers with the rendition after
+/// the source has become unreadable, which is what proves nothing read it. A
+/// request that had to hash it again would fail on the permission and be
+/// answered 404, exactly as the request before the fix is.
+#[cfg(unix)]
+#[tokio::test]
+async fn w72_an_unindexed_file_is_hashed_once_and_not_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = library(&[("refs/one.png", PNG)]);
+    // No rescan, so the file written below stays one the index holds no digest
+    // for — the population M-1 is about, and the reason the index's own answer
+    // below never stops being "none".
+    let app = app_with(
+        &root,
+        TestPreview::new(root.path()),
+        ServeConfig {
+            rescan_interval: 0,
+            ..ServeConfig::default()
+        },
+    );
+    let cookie = login(&app, "2333").await;
+    fs::write(root.path().join("refs/two.png"), OTHER_PNG).unwrap();
+
+    let mut rendition = OTHER_PNG.to_vec();
+    rendition.extend_from_slice(RENDITION_TAIL);
+
+    // The first request has no digest to work from, so it reads the source. The
+    // rendition it keys is not on disk yet, so the heavy class generates it and
+    // the path route answers with it directly: a digest the index does not
+    // know is not an address the browser could be sent to.
+    let response = get(&app, "/thumb/refs/two.png", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_of(&response, "cache-control"), "private, no-cache");
+    assert_eq!(bytes(response).await, rendition);
+    assert!(
+        digest_now(&app, &cookie, "refs/two.png").await.is_none(),
+        "the index still holds no digest for it, so only the handle can answer"
+    );
+
+    let source = root.path().join("refs/two.png");
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o000)).unwrap();
+    let response = get(&app, "/thumb/refs/two.png", &cookie).await;
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the remembered digest keys the rendition; hashing the source again \
+         would have failed on the permission"
+    );
+    assert_eq!(
+        bytes(response).await,
+        rendition,
+        "the rendition, answered without touching the source"
+    );
+}
+
+/// A `files` row for each `(path, digest, kind)`, written before the viewer
+/// opens the library: a process holds one library's index at a time, so the
+/// state has to be there before the router is built.
+///
+/// This is the shape the scan does not write today (only an image row earns a
+/// digest) and the one `by_sha256` does not filter: a row that carries a digest
+/// without being an image.
+fn plant_rows(root: &Path, rows: &[(&str, &str, dimagine_index::FileKind)]) {
+    let mut index = dimagine_index::Index::open(root).unwrap();
+    index.begin_scan().unwrap();
+    for (rel, sha256, kind) in rows {
+        let facts = fs::metadata(root.join(rel)).unwrap();
+        let mtime_ns = facts
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        index
+            .upsert_file(&dimagine_index::FileRecord {
+                path: (*rel).to_owned(),
+                size: facts.len(),
+                mtime_ns,
+                sha256: Some((*sha256).to_owned()),
+                kind: (*kind).clone(),
+                note_added_ns: None,
+                rating: None,
+                width: None,
+                height: None,
+                taken_ns: None,
+                taken_reason: None,
+            })
+            .unwrap();
+    }
+    let seen: Vec<String> = rows.iter().map(|(rel, _, _)| (*rel).to_owned()).collect();
+    index.finish_scan(&seen).unwrap();
+}
+
+/// RW71 review L-1: a rendition route answers images. The index resolves a
+/// digest by its bytes alone, so a row that carries one without being a picture
+/// must not become the "original" a rendition URL serves. `/thumb/<note>` is a
+/// 404 by design, and `/p/<that note's digest>/thumb.g2` is the same answer.
+#[tokio::test]
+async fn w72_a_digest_that_names_no_image_answers_nothing() {
+    let note: &[u8] = b"# Notes\nText nobody asked a preview URL to serve.\n";
+    let root = library(&[("refs/one.png", PNG), ("note.md", note)]);
+    let image = dimagine_preview::sha256_file(root.path().join("refs/one.png")).unwrap();
+    let digest = dimagine_preview::sha256_file(root.path().join("note.md")).unwrap();
+    plant_rows(
+        root.path(),
+        &[
+            ("refs/one.png", &image, dimagine_index::FileKind::Image),
+            ("note.md", &digest, dimagine_index::FileKind::Note),
+        ],
+    );
+    // No rescan: the rows above are the library the routes are asked about.
+    let app = app_with(
+        &root,
+        TestPreview::new(root.path()),
+        ServeConfig {
+            rescan_interval: 0,
+            ..ServeConfig::default()
+        },
+    );
+    let cookie = login(&app, "2333").await;
+    let generation = generation();
+
+    // The control, so the 404 below is the kind and not the spelling: an image's
+    // digest is served, immutably.
+    let response = get(&app, &format!("/p/{image}/thumb.{generation}"), &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(header_of(&response, "cache-control").contains("immutable"));
+
+    // The note's digest names no image, so it names no rendition — the route
+    // answers nothing rather than the bytes behind the row.
+    for variant in [format!("thumb.{generation}"), format!("view.{generation}")] {
+        let response = get(&app, &format!("/p/{digest}/{variant}"), &cookie).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{variant}");
+    }
+
+    // And the note is still readable where it always was: `/raw` is the route
+    // that serves a note's own bytes, untouched by this gate.
+    let response = get(&app, "/raw/note.md", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(bytes(response).await, note);
+}
+
+/// RW71 review L-2: a rendition the probe found and the open could not is not a
+/// dead end. The path route re-runs exactly that race in the heavy class
+/// (`LightOutcome::Vanished`); the content route now does the same, so the
+/// answer is a rendition or — when none can be read or made — the original, and
+/// never the 404 the browser's own retry had to work around.
+#[cfg(unix)]
+#[tokio::test]
+async fn w72_a_rendition_that_cannot_be_opened_is_answered_by_the_heavy_class() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = library(&[("refs/one.png", PNG)]);
+    let app = app(&root, TestPreview::new(root.path()));
+    let cookie = login(&app, "2333").await;
+    let generation = generation();
+    let hash = digest_of(&app, &cookie, "refs/one.png").await;
+    let url = format!("/p/{hash}/thumb.{generation}");
+    let served = bytes(get(&app, &url, &cookie).await).await;
+    assert!(!served.is_empty(), "the rendition is there to be probed");
+
+    // The probe passes — the entry is still a file under the root — and the open
+    // fails, which is the state the entry being deleted leaves behind.
+    let rendition = root.path().join(format!(".test-renditions/{hash}-thumb"));
+    fs::set_permissions(&rendition, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let response = get(&app, &url, &cookie).await;
+    fs::set_permissions(&rendition, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let cache_control = header_of(&response, "cache-control");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the heavy class answers what the light open could not: {cache_control}"
+    );
+    assert!(
+        !cache_control.contains("immutable"),
+        "the answer is outside the URL's promise: {cache_control}"
+    );
+    assert_eq!(
+        bytes(response).await,
+        PNG,
+        "the original, because the rendition could not be read"
+    );
+}

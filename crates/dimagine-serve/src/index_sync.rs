@@ -18,6 +18,7 @@ use dimagine_index::{
 };
 use serde::Serialize;
 use std::{
+    collections::HashMap,
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
@@ -26,6 +27,36 @@ use std::{
     },
     time::Duration,
 };
+
+/// How many digests the handle remembers for files the index has none for.
+/// Two grid pages' worth of strangers — [`crate::view_query::PAGE_SIZE`] is
+/// 120 — so a page of images the scan has not reached stops re-reading its
+/// sources, while request traffic alone cannot grow the process without bound.
+const DIGEST_MEMO_LIMIT: usize = 256;
+
+/// What one remembered digest describes: the path as the request spelled it,
+/// and the size and nanosecond mtime the digest was read from.
+///
+/// The path is the URL's own spelling rather than a normalised one because two
+/// unicode forms of one name can be two distinct files on a
+/// normalisation-sensitive filesystem; keeping them apart is the same reason
+/// the media route asks the index for both forms.
+#[derive(PartialEq, Eq, Hash)]
+struct DigestKey {
+    path: String,
+    size: u64,
+    mtime_ns: i64,
+}
+
+impl DigestKey {
+    fn new(path: &str, size: u64, mtime_ns: i64) -> Self {
+        Self {
+            path: path.to_owned(),
+            size,
+            mtime_ns,
+        }
+    }
+}
 
 /// How many images the "Recent" lens reaches: the `RECENT_LIMIT` most
 /// recently added images, however old they are (W34 audit #10: a count, not
@@ -135,6 +166,10 @@ pub struct IndexHandle {
     /// Whether the index was already current at startup, which decides if a
     /// first background sync is worth running.
     needs_first_background_sync: bool,
+    /// The digests this handle read for files the index has none for, so the
+    /// next request for the same file asks nothing of it. See
+    /// [`Self::remembered_digest`] and [`Self::remember_digest`].
+    digest_memo: Mutex<HashMap<DigestKey, String>>,
 }
 
 impl IndexHandle {
@@ -159,6 +194,7 @@ impl IndexHandle {
             cached_sidebar: Mutex::new(None),
             rescan_started: AtomicBool::new(false),
             needs_first_background_sync: false,
+            digest_memo: Mutex::new(HashMap::new()),
         };
 
         let (index, was_rebuilt) = match open_usable_index(&handle.root, &db_path) {
@@ -251,9 +287,6 @@ impl IndexHandle {
         }
     }
 
-    /// The counts behind one filter panel: for every facet value, how many
-    /// images it would show given the view's other filters.
-    ///
     /// The content digest the index already holds for one image, or `None`
     /// when it holds none for these facts.
     ///
@@ -277,6 +310,44 @@ impl IndexHandle {
                 .map(|(sha256, _meta)| sha256)
         })
         .flatten()
+    }
+
+    /// A digest this handle already read for exactly these facts, or `None`
+    /// because it has not read this file — an unknown, never a claim that the
+    /// file has no digest.
+    ///
+    /// This is the second half of the reuse [`Self::content_hash`] starts. A
+    /// file the index holds no digest for (one added between two rescans, or
+    /// one a scan has not reached) would otherwise have its whole source read
+    /// and hashed once per request, which is the shape of W70 M1 narrowed to
+    /// that population (RW71 review M-1).
+    ///
+    /// The answer never leaves the handle: a content URL is resolved from the
+    /// index, so a remembered digest keeps the file's path route answering
+    /// directly instead of sending the browser to a `/p/` URL the index would
+    /// answer with a 404.
+    pub(crate) fn remembered_digest(&self, path: &str, size: u64, mtime_ns: i64) -> Option<String> {
+        let key = DigestKey::new(path, size, mtime_ns);
+        self.digest_memo
+            .lock()
+            .ok()
+            .and_then(|memo| memo.get(&key).cloned())
+    }
+
+    /// Records what one file's bytes hashed to, so the next request for the
+    /// same path, size and mtime asks nothing of the disk.
+    ///
+    /// The memo holds [`DIGEST_MEMO_LIMIT`] entries, and a sync drops it
+    /// ([`Self::invalidate`]) because a scan reads these digests into the index
+    /// anyway: it is a cache of one interval's worth of strangers, not a second
+    /// store of digests.
+    pub(crate) fn remember_digest(&self, path: &str, size: u64, mtime_ns: i64, sha256: &str) {
+        if let Ok(mut memo) = self.digest_memo.lock() {
+            if memo.len() >= DIGEST_MEMO_LIMIT {
+                memo.clear();
+            }
+            memo.insert(DigestKey::new(path, size, mtime_ns), sha256.to_owned());
+        }
     }
 
     /// The library-relative paths of every image the index holds, with the
@@ -516,11 +587,16 @@ impl IndexHandle {
         }
     }
 
-    /// Drop the cached counts so the next read recounts.
+    /// Drop the cached counts so the next read recounts, and the digests read
+    /// for files the index had none for: the sync that just ran hashed them
+    /// into the index, so the memo has nothing left to save.
     fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut cache) = self.cached_sidebar.lock() {
             *cache = None;
+        }
+        if let Ok(mut memo) = self.digest_memo.lock() {
+            memo.clear();
         }
     }
 
@@ -552,6 +628,7 @@ impl IndexHandle {
             cached_sidebar: Mutex::new(None),
             rescan_started: AtomicBool::new(false),
             needs_first_background_sync: false,
+            digest_memo: Mutex::new(HashMap::new()),
         }
     }
 }
