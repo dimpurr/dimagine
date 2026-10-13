@@ -1,0 +1,234 @@
+[
+ {
+  "file": "loc-root.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "setting",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-current.json",
+  "current": "refs",
+  "collection": "refs",
+  "collection_source": "current",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-current.json",
+  "current": ".obsidian",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-current.json",
+  "current": "../out",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-folder.json",
+  "current": "refs",
+  "collection": "assets",
+  "collection_source": "setting",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-folder-current.json",
+  "current": "refs",
+  "collection": "refs/sub",
+  "collection_source": "setting",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-folder-missing-path.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-folder-escapes.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "loc-unknown.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "empty.json",
+  "current": "refs/deep",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "broken.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "other-keys.json",
+  "current": "assets/keep",
+  "collection": "assets/keep",
+  "collection_source": "current",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-root.json",
+  "current": "refs/deep",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-current.json",
+  "current": "refs/deep",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "refs/deep",
+  "upload_source": "current"
+ },
+ {
+  "file": "attach-dot.json",
+  "current": "refs/deep",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "refs/deep",
+  "upload_source": "current"
+ },
+ {
+  "file": "attach-sub.json",
+  "current": "refs/deep",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "refs/deep/sub",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-sub.json",
+  "current": "",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "sub",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-plain.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "assets",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-backslash.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "assets/sub",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-case.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "refs",
+  "upload_source": "setting"
+ },
+ {
+  "file": "attach-through-parent.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-escapes.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-absolute.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-drive.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-dotfolder.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-trash.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-file.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-through-file.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ },
+ {
+  "file": "attach-null.json",
+  "current": "refs",
+  "collection": "",
+  "collection_source": "root-fallback",
+  "upload": "inbox",
+  "upload_source": "inbox-fallback"
+ }
+]

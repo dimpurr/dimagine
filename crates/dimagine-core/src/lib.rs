@@ -8,6 +8,8 @@
 //!
 //! Module map (HLD §"Modules" 0.1):
 //!
+//! - [`body_edit`]: write links and edit collection bodies (ADR-017 §4, §5, §6),
+//!   pure functions on bytes that the write crate calls,
 //! - [`library`]: walk and classify (FORMAT §2),
 //! - [`note`]: front matter and note properties (FORMAT §3),
 //! - [`links`]: extract and resolve `![[...]]`, `[[]]`, `![]()` and canvas
@@ -20,6 +22,7 @@
 //! The HLD's `preview`, `import` and `serve` modules live in their own
 //! crates; this layout leaves them somewhere natural to slot in.
 
+pub mod body_edit;
 pub mod check;
 pub mod fm_edit;
 pub mod format;

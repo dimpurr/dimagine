@@ -4,8 +4,8 @@ mod support;
 
 use dimagine_core::library::{FileClass, FileEntry};
 use dimagine_core::links::{
-    extract_canvas_refs, extract_markdown_links, key, target_class, LinkSyntax, Outcome, Resolver,
-    TargetClass,
+    extract_canvas_refs, extract_link_spans, extract_markdown_links, key, target_class,
+    unclosed_fence, LinkSyntax, Outcome, Resolver, TargetClass,
 };
 
 fn files(rels: &[&str]) -> Vec<FileEntry> {
@@ -472,4 +472,54 @@ fn note_relative_resolution_keeps_native_directory_bytes() {
         ),
         Outcome::Resolved(0)
     ));
+}
+
+#[test]
+fn spans_report_byte_ranges_and_display_parts() {
+    let text = "lead ![[refs/a/x.jpg#closeup|the girl]] tail\n![alt](refs/a/x.jpg \"Title\")\n";
+    let spans = extract_link_spans(text, "c.md", 1);
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[0].note, "c.md");
+    assert_eq!(
+        &text[spans[0].range.clone()],
+        "![[refs/a/x.jpg#closeup|the girl]]"
+    );
+    assert_eq!(spans[0].target, "refs/a/x.jpg");
+    assert_eq!(spans[0].alias.as_deref(), Some("the girl"));
+    assert_eq!(spans[0].heading.as_deref(), Some("closeup"));
+    assert_eq!(spans[0].block, None);
+    assert!(spans[0].embed);
+    assert_eq!(spans[0].line, 1);
+
+    assert_eq!(
+        &text[spans[1].range.clone()],
+        "![alt](refs/a/x.jpg \"Title\")"
+    );
+    assert_eq!(spans[1].target, "refs/a/x.jpg");
+    assert_eq!(spans[1].alias.as_deref(), Some("alt"));
+    assert_eq!(spans[1].markdown_title.as_deref(), Some("Title"));
+    assert_eq!(spans[1].line, 2);
+}
+
+#[test]
+fn spans_split_block_refs_and_keep_percent_encoded_targets() {
+    let spans = extract_link_spans("![[x.jpg#^ab12]]\n![](<my%20dir/a%20b.jpg>)\n", "c.md", 1);
+    assert_eq!(spans[0].block.as_deref(), Some("ab12"));
+    assert_eq!(spans[0].heading, None);
+    assert_eq!(spans[1].target, "my dir/a b.jpg");
+}
+
+#[test]
+fn spans_exclude_code_like_the_link_list() {
+    let text = "```\n![[a.jpg]]\n```\n`![[b.jpg]]`\n![[c.jpg]]\n";
+    let spans = extract_link_spans(text, "c.md", 1);
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].target, "c.jpg");
+}
+
+#[test]
+fn unclosed_fence_is_reported_by_its_offset() {
+    assert_eq!(unclosed_fence("a\n```js\nb\n"), Some(2));
+    assert_eq!(unclosed_fence("a\n```js\nb\n```\nc\n"), None);
+    assert_eq!(unclosed_fence("no fences at all"), None);
 }

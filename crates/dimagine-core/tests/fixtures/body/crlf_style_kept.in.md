@@ -1,0 +1,5 @@
+---
+kind: collection
+---
+
+text

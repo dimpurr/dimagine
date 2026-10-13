@@ -1,0 +1,343 @@
+[
+ {
+  "name": "caption_is_a_heading_kept",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "caption_is_a_heading_kept.in.md",
+  "desc": "a heading directly under the member line is a caption and stays",
+  "out": "caption_is_a_heading_kept.out.md",
+  "deleted": [
+   "![[girl.jpg]]\n"
+  ]
+ },
+ {
+  "name": "inline_two_embeds_one_line",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg",
+   "curl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "inline_two_embeds_one_line.in.md",
+  "desc": "two embeds inline: only the target link text is cut out",
+  "out": "inline_two_embeds_one_line.out.md",
+  "deleted": [
+   "![[girl.jpg]]"
+  ]
+ },
+ {
+  "name": "caption_on_embed_line_kept",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "caption_on_embed_line_kept.in.md",
+  "desc": "text sharing the embed's line is the user's, so only the link text is cut out",
+  "out": "caption_on_embed_line_kept.out.md",
+  "deleted": [
+   "![[girl.jpg]]"
+  ]
+ },
+ {
+  "name": "link_on_embed_line_kept",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg",
+   "other.md"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "link_on_embed_line_kept.in.md",
+  "desc": "a second link on the embed's line also keeps the line",
+  "out": "link_on_embed_line_kept.out.md",
+  "deleted": [
+   "![[girl.jpg]]"
+  ]
+ },
+ {
+  "name": "fenced_code_ignored",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "fenced_code_ignored.in.md",
+  "desc": "an embed inside a closed fenced block is code, not membership",
+  "out": "fenced_code_ignored.out.md",
+  "added_text": "![[girl.jpg]]\n"
+ },
+ {
+  "name": "inline_code_ignored",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "inline_code_ignored.in.md",
+  "desc": "only the embed outside the code span is the member line",
+  "out": "inline_code_ignored.out.md",
+  "deleted": [
+   "![[girl.jpg]]\n"
+  ]
+ },
+ {
+  "name": "no_trailing_newline_append",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "no_trailing_newline_append.in.md",
+  "desc": "a note that does not end in a newline gets one first",
+  "out": "no_trailing_newline_append.out.md",
+  "added_text": "![[girl.jpg]]\n"
+ },
+ {
+  "name": "no_trailing_newline_remove",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "no_trailing_newline_remove.in.md",
+  "desc": "the last line had no terminator, so the previous one goes with it",
+  "out": "no_trailing_newline_remove.out.md",
+  "deleted": [
+   "![[girl.jpg]]",
+   "\n"
+  ]
+ },
+ {
+  "name": "unclosed_fence_refuses",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "unclosed_fence_refuses.in.md",
+  "desc": "appending would land inside the code block",
+  "error": "unclosed code block starts at byte 5"
+ },
+ {
+  "name": "crlf_style_kept",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "crlf_style_kept.in.md",
+  "desc": "the note's own CRLF terminator is reused",
+  "out": "crlf_style_kept.out.md",
+  "added_text": "![[girl.jpg]]\r\n"
+ },
+ {
+  "name": "membership_spellings",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "my dir/girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "my dir/girl.jpg",
+  "in": "membership_spellings.in.md",
+  "desc": "alias, heading, block, percent-encoded and <>-wrapped links all count as membership",
+  "out": "membership_spellings.out.md",
+  "deleted": [
+   "![[my dir/girl.jpg|the girl]]\n",
+   "![[my dir/girl.jpg#closeup]]\n",
+   "![[my dir/girl.jpg#^ab12]]\n",
+   "![alt](my%20dir/girl.jpg)\n",
+   "![alt](<my dir/girl.jpg>)\n",
+   "\n",
+   "\n",
+   "\n"
+  ]
+ },
+ {
+  "name": "root_and_nested_same_basename_refuses",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg",
+   "refs/b/girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "root_and_nested_same_basename_refuses.in.md",
+  "desc": "a root image whose bare name is shared cannot be collected",
+  "error": "bare name girl.jpg matches 2 files: rename it or move it into a folder"
+ },
+ {
+  "name": "root_and_nested_same_basename_not_member",
+  "op": "member",
+  "library": [
+   "c.md",
+   "girl.jpg",
+   "refs/b/girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "root_and_nested_same_basename_not_member.in.md",
+  "desc": "an ambiguous bare name is never treated as membership",
+  "member": false
+ },
+ {
+  "name": "already_member_noop",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "already_member_noop.in.md",
+  "desc": "retrying the same intent adds nothing",
+  "out": "already_member_noop.out.md"
+ },
+ {
+  "name": "empty_note_append",
+  "op": "append",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "empty_note_append.in.md",
+  "desc": "an empty note takes the embed line and no leading newline",
+  "out": "empty_note_append.out.md",
+  "added_text": "![[girl.jpg]]\n"
+ },
+ {
+  "name": "same_image_twice_on_one_line",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "same_image_twice_on_one_line.in.md",
+  "desc": "both embeds of the target are on one line, so the emptied line goes with them",
+  "out": "same_image_twice_on_one_line.out.md",
+  "deleted": [
+   "![[girl.jpg]] ![[girl.jpg|alias]]\n"
+  ]
+ },
+ {
+  "name": "blank_line_collapse",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "blank_line_collapse.in.md",
+  "desc": "the blank line below goes only because two blanks would remain",
+  "out": "blank_line_collapse.out.md",
+  "deleted": [
+   "![[girl.jpg]]\n",
+   "\n"
+  ]
+ },
+ {
+  "name": "blank_line_kept",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "blank_line_kept.in.md",
+  "desc": "one blank below a removed member line stays when nothing is above it",
+  "out": "blank_line_kept.out.md",
+  "deleted": [
+   "![[girl.jpg]]\n"
+  ]
+ },
+ {
+  "name": "nested_full_path",
+  "op": "append",
+  "library": [
+   "c.md",
+   "refs/a/x.jpg"
+  ],
+  "note": "c.md",
+  "image": "refs/a/x.jpg",
+  "in": "nested_full_path.in.md",
+  "desc": "an image in a folder is embedded by its full library path",
+  "out": "nested_full_path.out.md",
+  "added_text": "![[refs/a/x.jpg]]\n"
+ },
+ {
+  "name": "not_a_member_remove_is_noop",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "not_a_member_remove_is_noop.in.md",
+  "desc": "nothing to take out",
+  "out": "not_a_member_remove_is_noop.out.md"
+ },
+ {
+  "name": "markdown_note_relative_path",
+  "op": "remove",
+  "library": [
+   "refs/c.md",
+   "refs/a/x.jpg"
+  ],
+  "note": "refs/c.md",
+  "image": "refs/a/x.jpg",
+  "in": "markdown_note_relative_path.in.md",
+  "desc": "a folder path relative to the note's own folder counts as membership",
+  "out": "markdown_note_relative_path.out.md",
+  "deleted": [
+   "![[a/x.jpg]]\n"
+  ]
+ },
+ {
+  "name": "only_one_blank_taken",
+  "op": "remove",
+  "library": [
+   "c.md",
+   "girl.jpg"
+  ],
+  "note": "c.md",
+  "image": "girl.jpg",
+  "in": "only_one_blank_taken.in.md",
+  "out": "only_one_blank_taken.out.md",
+  "deleted": [
+   "![[girl.jpg]]\n",
+   "\n"
+  ],
+  "desc": "at most one blank line below a member line is taken, never a run of them"
+ }
+]

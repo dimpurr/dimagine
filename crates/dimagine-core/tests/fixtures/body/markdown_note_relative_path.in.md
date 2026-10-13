@@ -1,0 +1,2 @@
+intro
+![[a/x.jpg]]

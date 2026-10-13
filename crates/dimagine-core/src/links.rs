@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
+use std::ops::Range;
 use std::path::{Component, Path};
 
 use percent_encoding::percent_decode_str;
@@ -113,12 +114,167 @@ pub fn target_class(target: &str) -> TargetClass {
     }
 }
 
+/// One link as it is written in the text, before it is turned into a
+/// [`Link`] or a [`SpanLink`].
+enum RawHit<'a> {
+    Wiki {
+        /// The text between `[[` and `]]` (alias, heading and block included).
+        content: &'a str,
+        /// Byte range of the whole link, brackets included.
+        range: Range<usize>,
+        embed: bool,
+        line: usize,
+    },
+    Markdown {
+        /// The `alt` text between `![` and `]`.
+        alt: &'a str,
+        /// The destination, before angle brackets, titles, escapes and
+        /// percent-decoding are handled.
+        dest: &'a str,
+        /// Everything after the destination up to the closing paren: the
+        /// optional title.
+        trailing: &'a str,
+        range: Range<usize>,
+        line: usize,
+    },
+}
+
 /// Extract image-relevant links from Markdown text. `first_line` is the
 /// 1-based line number of the first line of `body` in the enclosing file.
 ///
 /// Fenced code blocks and inline code spans are skipped, like Obsidian's
 /// renderer does.
 pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
+    scan_raw(body, first_line)
+        .into_iter()
+        .map(|hit| match hit {
+            RawHit::Wiki {
+                content,
+                embed,
+                line,
+                ..
+            } => Link {
+                syntax: if embed {
+                    LinkSyntax::WikiEmbed
+                } else {
+                    LinkSyntax::WikiLink
+                },
+                raw: content.to_string(),
+                target: strip_display_parts(content),
+                line,
+            },
+            RawHit::Markdown { dest, line, .. } => {
+                let mut link = Link {
+                    syntax: LinkSyntax::MarkdownImage,
+                    raw: dest.trim().to_string(),
+                    target: String::new(),
+                    line,
+                };
+                fill_markdown_dest(&mut link, dest);
+                link
+            }
+        })
+        .collect()
+}
+
+/// A link with the byte range it occupies in the note. This is what in-place
+/// edits (moving a file, editing collection membership) need: the range says
+/// exactly which bytes to replace, and the split-out display parts say what
+/// must be preserved when they are replaced (ADR-017 §8).
+///
+/// Links inside fenced code blocks or inline code spans are never reported,
+/// exactly as in [`extract_markdown_links`].
+#[derive(Clone, Debug)]
+pub struct SpanLink {
+    /// Library-relative path of the note the link was found in, as given by
+    /// the caller.
+    pub note: String,
+    /// Byte range of the whole link text in the note, brackets and `!`
+    /// included: `![[a/x.jpg|alt]]`, `![alt](a/x.jpg "t")`.
+    pub range: Range<usize>,
+    pub syntax: LinkSyntax,
+    /// `true` for `![[..]]` and `![..](..)`, `false` for a plain `[[..]]`.
+    pub embed: bool,
+    /// The file reference with alias, heading, block, title and percent
+    /// encoding removed — the string to hand to [`Resolver::resolve`].
+    pub target: String,
+    /// The `|label` part of a wikilink, or the `alt` text of a Markdown
+    /// image.
+    pub alias: Option<String>,
+    /// The `#heading` part, without the `#`.
+    pub heading: Option<String>,
+    /// The `#^block` part, without the `#^`.
+    pub block: Option<String>,
+    /// The quoted title of a Markdown image, without the quotes.
+    pub markdown_title: Option<String>,
+    /// 1-based line of the link in the note file.
+    pub line: usize,
+}
+
+/// Extract links with byte ranges. `note` is the library-relative path of the
+/// file `body` came from, recorded on every span for the caller's report.
+pub fn extract_link_spans(body: &str, note: &str, first_line: usize) -> Vec<SpanLink> {
+    scan_raw(body, first_line)
+        .into_iter()
+        .map(|hit| match hit {
+            RawHit::Wiki {
+                content,
+                range,
+                embed,
+                line,
+            } => {
+                let (heading, block) =
+                    split_heading_block(content.split('|').next().unwrap_or("").trim());
+                SpanLink {
+                    note: note.to_string(),
+                    range,
+                    syntax: if embed {
+                        LinkSyntax::WikiEmbed
+                    } else {
+                        LinkSyntax::WikiLink
+                    },
+                    embed,
+                    target: strip_display_parts(content),
+                    alias: wiki_alias(content),
+                    heading,
+                    block,
+                    markdown_title: None,
+                    line,
+                }
+            }
+            RawHit::Markdown {
+                alt,
+                dest,
+                trailing,
+                range,
+                line,
+            } => {
+                let mut link = Link {
+                    syntax: LinkSyntax::MarkdownImage,
+                    raw: dest.trim().to_string(),
+                    target: String::new(),
+                    line,
+                };
+                fill_markdown_dest(&mut link, dest);
+                let (heading, block) = split_heading_block(markdown_inner(dest));
+                SpanLink {
+                    note: note.to_string(),
+                    range,
+                    syntax: LinkSyntax::MarkdownImage,
+                    embed: true,
+                    target: link.target,
+                    alias: (!alt.is_empty()).then(|| alt.to_string()),
+                    heading,
+                    block,
+                    markdown_title: markdown_title(trailing),
+                    line,
+                }
+            }
+        })
+        .collect()
+}
+
+fn scan_raw(body: &str, first_line: usize) -> Vec<RawHit<'_>> {
     let bytes = body.as_bytes();
     let newline_at: Vec<usize> = body
         .bytes()
@@ -133,7 +289,7 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
     let fences = fenced_ranges(body);
     let mut fence_i = 0usize;
 
-    let mut links = Vec::new();
+    let mut hits = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         // Jump over fenced code blocks.
@@ -159,7 +315,12 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
             b'!' if i + 2 < bytes.len() && bytes[i + 1] == b'[' && bytes[i + 2] == b'[' => {
                 match find_sub(bytes, b"]]", i + 3) {
                     Some(close) => {
-                        push_wiki(&mut links, &body[i + 3..close], line_at(i), true);
+                        hits.push(RawHit::Wiki {
+                            content: &body[i + 3..close],
+                            range: i..close + 2,
+                            embed: true,
+                            line: line_at(i),
+                        });
                         i = close + 2;
                     }
                     None => i += 1,
@@ -170,7 +331,13 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
                     Some(alt_end) if alt_end + 1 < bytes.len() && bytes[alt_end + 1] == b'(' => {
                         match markdown_link_tail(bytes, alt_end + 2) {
                             Some((dest_start, dest_end, close)) => {
-                                push_markdown(&mut links, &body[dest_start..dest_end], line_at(i));
+                                hits.push(RawHit::Markdown {
+                                    alt: &body[i + 2..alt_end],
+                                    dest: &body[dest_start..dest_end],
+                                    trailing: &body[dest_end..close],
+                                    range: i..close + 1,
+                                    line: line_at(i),
+                                });
                                 i = close + 1;
                             }
                             None => i = alt_end + 1,
@@ -182,7 +349,12 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
             b'[' if i + 1 < bytes.len() && bytes[i + 1] == b'[' => {
                 match find_sub(bytes, b"]]", i + 2) {
                     Some(close) => {
-                        push_wiki(&mut links, &body[i + 2..close], line_at(i), false);
+                        hits.push(RawHit::Wiki {
+                            content: &body[i + 2..close],
+                            range: i..close + 2,
+                            embed: false,
+                            line: line_at(i),
+                        });
                         i = close + 2;
                     }
                     None => i += 1,
@@ -191,7 +363,7 @@ pub fn extract_markdown_links(body: &str, first_line: usize) -> Vec<Link> {
             _ => i += 1,
         }
     }
-    links
+    hits
 }
 
 /// Extract `file` targets from a parsed JSON Canvas document (FORMAT §6).
@@ -215,47 +387,84 @@ pub fn extract_canvas_refs(canvas: &serde_json::Value) -> Vec<CanvasRef> {
         .collect()
 }
 
-fn push_wiki(links: &mut Vec<Link>, content: &str, line: usize, embed: bool) {
-    links.push(Link {
-        syntax: if embed {
-            LinkSyntax::WikiEmbed
-        } else {
-            LinkSyntax::WikiLink
-        },
-        raw: content.to_string(),
-        target: strip_display_parts(content),
-        line,
-    });
+/// Fill `raw` and `target` of a Markdown image link from the destination text
+/// between the parentheses.
+fn fill_markdown_dest(link: &mut Link, path_raw: &str) {
+    let inner = markdown_inner(path_raw);
+    link.raw = inner.to_string();
+    let outer = strip_display_parts(inner)
+        .replace("\\(", "(")
+        .replace("\\)", ")");
+    link.target = percent_decode_str(&outer)
+        .decode_utf8()
+        .map(|cow| cow.into_owned().trim().to_string())
+        .unwrap_or_else(|_| outer.trim().to_string());
 }
 
-fn push_markdown(links: &mut Vec<Link>, path_raw: &str, line: usize) {
+/// The file reference inside a Markdown image destination: angle brackets
+/// unwrapped, otherwise cut at the first whitespace, because what follows is
+/// a title. Paths with spaces must be percent-encoded or angle-quoted.
+fn markdown_inner(path_raw: &str) -> &str {
     let path_raw = path_raw.trim();
-    let inner = if let Some(rest) = path_raw.strip_prefix('<') {
+    if let Some(rest) = path_raw.strip_prefix('<') {
         match rest.find('>') {
             Some(end) => &rest[..end],
             None => path_raw,
         }
     } else {
-        // A bare path is cut at the first whitespace; anything after is a
-        // title. Paths with spaces must be percent-encoded or angle-quoted.
         match path_raw.find(char::is_whitespace) {
             Some(end) => &path_raw[..end],
             None => path_raw,
         }
+    }
+}
+
+/// The `|label` part of a wikilink.
+fn wiki_alias(content: &str) -> Option<String> {
+    content
+        .split_once('|')
+        .map(|(_, alias)| alias.trim())
+        .filter(|alias| !alias.is_empty())
+        .map(str::to_string)
+}
+
+/// Split a file reference at its `#`: no heading or block when there is none,
+/// the block id when the part starts with `^`, the heading otherwise.
+fn split_heading_block(file_ref: &str) -> (Option<String>, Option<String>) {
+    let Some((_, rest)) = file_ref
+        .split('|')
+        .next()
+        .and_then(|file| file.split_once('#'))
+    else {
+        return (None, None);
     };
-    let outer = strip_display_parts(inner)
-        .replace("\\(", "(")
-        .replace("\\)", ")");
-    let decoded = percent_decode_str(&outer)
-        .decode_utf8()
-        .map(|cow| cow.into_owned().trim().to_string())
-        .unwrap_or(outer.trim().to_string());
-    links.push(Link {
-        syntax: LinkSyntax::MarkdownImage,
-        raw: inner.to_string(),
-        target: decoded,
-        line,
-    });
+    if let Some(block) = rest.strip_prefix('^') {
+        return (None, (!block.is_empty()).then(|| block.to_string()));
+    }
+    (!rest.is_empty())
+        .then(|| rest.to_string())
+        .map_or((None, None), |heading| (Some(heading), None))
+}
+
+/// The quoted title of a Markdown image: everything after the destination,
+/// with the surrounding quotes removed.
+fn markdown_title(trailing: &str) -> Option<String> {
+    let t = trailing.trim();
+    let bytes = t.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let close_pair = match bytes[0] {
+        b'"' => b'"',
+        b'\'' => b'\'',
+        b'(' => b')',
+        _ => return None,
+    };
+    if bytes[bytes.len() - 1] != close_pair {
+        return None;
+    }
+    let inner = t[1..t.len() - 1].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
 }
 
 /// Drop the alias (`|label`) and the heading / block part (`#target`) of a
@@ -425,6 +634,17 @@ fn title_ends_at(
 /// Byte ranges of fenced code blocks (``` and ~~~), including their fences.
 /// An unclosed fence swallows the rest of the file, like a renderer would.
 fn fenced_ranges(text: &str) -> Vec<(usize, usize)> {
+    fence_scan(text).0
+}
+
+/// The byte offset of the opening fence of an unclosed fenced code block, if
+/// the text has one. Everything after it renders as code, so a writer that
+/// appends an embed would put it inside a code block (ADR-017 §4: refuse).
+pub fn unclosed_fence(text: &str) -> Option<usize> {
+    fence_scan(text).1
+}
+
+fn fence_scan(text: &str) -> (Vec<(usize, usize)>, Option<usize>) {
     let opens_fence = |line: &str, c: u8| {
         let trimmed = line.trim_start_matches(' ').trim_end_matches(['\r', '\n']);
         trimmed.len() >= 3 && trimmed.as_bytes()[..3] == [c; 3]
@@ -454,10 +674,11 @@ fn fenced_ranges(text: &str) -> Vec<(usize, usize)> {
         }
         offset += line.len();
     }
+    let unclosed = fence_char.map(|_| start);
     if fence_char.is_some() {
         ranges.push((start, text.len()));
     }
-    ranges
+    (ranges, unclosed)
 }
 
 /// The comparison key for names and paths: NFC-normalised, lowercased.
@@ -666,6 +887,17 @@ impl Resolver {
         let parts = join_parts(base, target)?;
         let hits = self.path_index.get(&parts)?;
         Some(collapse(hits.iter().copied()))
+    }
+
+    /// Indexes of the files whose full name equals `name`, compared by
+    /// [`key`] (NFC + casefold, exactly as bare-name resolution does). More
+    /// than one hit means the bare name is ambiguous (FORMAT §5.1 rule 3), so
+    /// a writer must not use it.
+    pub fn bare_name_hits(&self, name: &str) -> &[usize] {
+        self.name_index
+            .get(&key(name))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 }
 
