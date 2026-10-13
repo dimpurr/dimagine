@@ -211,16 +211,98 @@ pub fn note_name_for(image_name: &str) -> String {
     format!("{image_name}.md")
 }
 
-/// Case-folded then NFC: the one identity used when two names must not
-/// collide (ADR-016 §10, ADR-017 §4). It matches the index's own fold, so the
-/// search layer and the write layer agree on what "same name" means.
-pub fn fold_key(text: &str) -> String {
-    text.case_fold().nfc().collect()
+/// One path a journal step names: a library path or a path
+/// inside `.trash/` — the only two doors a step may touch
+/// (ADR-016 §0, ADR-017 §7). The two are disjoint:
+/// [`RelPath`] refuses dot-prefixed components and
+/// [`TrashPath`] requires one, so a step path always says
+/// which door it uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepPath {
+    Library(RelPath),
+    Trash(TrashPath),
+}
+
+impl StepPath {
+    /// Parse a step path: `.trash/…` first, then a library
+    /// path. Anything else is refused.
+    pub fn parse(input: &str) -> Result<Self, Error> {
+        if let Ok(trash) = TrashPath::parse(input) {
+            return Ok(Self::Trash(trash));
+        }
+        RelPath::parse(input).map(Self::Library)
+    }
+
+    /// The path this step names, as a library path, if it is one.
+    pub fn as_library(&self) -> Option<&RelPath> {
+        match self {
+            Self::Library(path) => Some(path),
+            Self::Trash(_) => None,
+        }
+    }
+
+    /// The path this step names, as a trash path, if it is one.
+    pub fn as_trash(&self) -> Option<&TrashPath> {
+        match self {
+            Self::Trash(path) => Some(path),
+            Self::Library(_) => None,
+        }
+    }
+
+    /// `/`-separated text.
+    pub fn text(&self) -> String {
+        match self {
+            Self::Library(path) => path.text(),
+            Self::Trash(path) => path.text(),
+        }
+    }
+
+    /// Native path, relative to the library root.
+    pub fn to_path(&self) -> PathBuf {
+        match self {
+            Self::Library(path) => path.to_path(),
+            Self::Trash(path) => path.to_path(),
+        }
+    }
+
+    /// The final component.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Library(path) => path.name(),
+            Self::Trash(path) => path.name(),
+        }
+    }
+
+    /// Components of the directory holding this path, library
+    /// root first (`.trash` included for the trash door).
+    pub fn parent_components(&self) -> &[String] {
+        match self {
+            Self::Library(path) => path.parent_components(),
+            Self::Trash(path) => &path.components()[..path.components().len() - 1],
+        }
+    }
+
+    /// The note kind of the file this path names, if any.
+    pub fn note_kind(&self) -> Option<NoteKind> {
+        note_kind(self.name())
+    }
+
+    /// A step path is always safe to display.
+    pub fn display(&self) -> String {
+        self.text()
+    }
 }
 
 /// NFC of a caller-supplied name, for storing.
 pub fn to_nfc(text: &str) -> String {
     text.nfc().collect()
+}
+
+/// Case-folded then NFC: the one identity used when two names must not
+/// collide (ADR-016 §10, ADR-017 §4). It matches the index's own fold, so the
+/// search layer and the write layer agree on what "same name" means.
+pub fn fold_key(text: &str) -> String {
+    text.case_fold().nfc().collect()
 }
 
 fn note_kind(name: &str) -> Option<NoteKind> {

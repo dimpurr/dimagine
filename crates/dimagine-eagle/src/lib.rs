@@ -209,6 +209,26 @@ pub fn import(
         walk_folders(folders, "", &mut folder_paths)?;
     }
 
+    // The importer is a writer of the destination library
+    // like any other (ADR-016 §1): it takes the one write
+    // lock before the first byte is written and holds it
+    // across the whole import — every copy, rename and
+    // note write — so no concurrent dimagine writer can
+    // interleave with them (RW60b F1). The destination
+    // root is created first when missing: the lock lives
+    // in its `.dimagine/`. A destination that cannot be
+    // written stops the run before any item is read — an
+    // unfinished reading (HLD exit code 3), not a
+    // completed import with problems.
+    let no_progress = ImportReport::default();
+    fs::create_dir_all(dst_library)
+        .map_err(|error| partial_io(error, dst_library, &no_progress))?;
+    let writer = dimagine_write::Writer::open(dst_library)
+        .map_err(|error| partial_io(io::Error::other(error), dst_library, &no_progress))?;
+    let _write_lock = writer
+        .lock_library()
+        .map_err(|error| partial_io(io::Error::other(error), dst_library, &no_progress))?;
+
     let now: DateTime<Local> = Local::now();
     let now_text = now.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
     let mut report = ImportReport::default();

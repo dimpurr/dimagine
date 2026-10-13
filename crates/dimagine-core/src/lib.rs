@@ -17,7 +17,9 @@
 //! - [`image_meta`]: per-image header facts for the index refresh,
 //! - [`index`]: write one scan into the SQLite index,
 //! - [`check`]: findings for `dimagine check`,
-//! - [`scan`]: summary for `dimagine scan`.
+//! - [`scan`]: summary for `dimagine scan`,
+//! - [`settings`]: `.dimagine/settings.json`, the schema-first
+//!   settings file (ADR-019).
 //!
 //! The HLD's `preview`, `import` and `serve` modules live in their own
 //! crates; this layout leaves them somewhere natural to slot in.
@@ -32,9 +34,11 @@ pub mod library;
 pub mod links;
 pub mod note;
 pub mod scan;
+pub mod settings;
 pub mod sniff;
 
 pub use check::{CheckReport, Finding, Severity};
 pub use index::sync_index;
 pub use library::{FileClass, FileEntry, Library, NotAFolder};
 pub use scan::ScanReport;
+pub use settings::{ApplyError, Change, Effect, SettingKind, Settings, SettingsReport};

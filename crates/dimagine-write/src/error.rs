@@ -28,6 +28,10 @@ pub enum PathReject {
     /// The resolved location is not inside the library root, compared at a
     /// separator boundary so `library-other` does not look like `library/`.
     OutsideRoot,
+    /// A permanent deletion may only target a file inside `.trash/`
+    /// (ADR-017 §7): library content is never hard-deleted by this
+    /// crate.
+    NotInTrash,
 }
 
 impl PathReject {
@@ -41,6 +45,7 @@ impl PathReject {
             Self::NotANote => "only note files (.md, .canvas) may be updated",
             Self::Symlink => "path resolution refuses symlinks",
             Self::OutsideRoot => "path resolves outside the library root",
+            Self::NotInTrash => "a permanent deletion must be inside .trash/",
         }
     }
 }
@@ -69,12 +74,16 @@ pub struct Conflict {
 ///
 /// The rest of the batch is unaffected: steps that reached the disk count as
 /// success and are already in the audit log, so this only describes the steps
-/// that did not.
+/// that did not. A step with `landed_unaudited` is the one exception: its
+/// write reached the disk but its audit-log line did not, so the change is
+/// real and must never be retried as a fresh write (RW60b F3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchStepError {
     pub step_idx: usize,
     pub path: PathBuf,
     pub message: String,
+    /// The step's write landed on disk but its audit-log line did not.
+    pub landed_unaudited: bool,
 }
 
 /// Everything that can go wrong in this crate.
@@ -117,6 +126,17 @@ pub enum Error {
     /// (ADR-016 §7).
     #[error("unparsable journal {op:?}: {message}")]
     BadJournal { op: String, message: String },
+    /// The step's write landed on disk, but its audit-log line did not
+    /// (RW60b F3). The change is durable and real: a caller must not
+    /// retry the step as a fresh write, and the file keeps no audit
+    /// trail of the change.
+    #[error("write to {path:?} landed but its audit line failed: {message}")]
+    LandedButUnaudited { path: String, message: String },
+    /// A trash record could not be parsed (ADR-017 §7). It is
+    /// reported, never silently dropped: the group it describes is
+    /// neither restored, counted nor purged.
+    #[error("unparsable trash record {path:?}: {message}")]
+    BadRecord { path: String, message: String },
     /// The library root is not usable.
     #[error("library root {0:?}")]
     BadRoot(String),
@@ -153,6 +173,10 @@ pub enum UndoReason {
     /// A modify was logged without its before-bytes, so there is nothing to
     /// restore: undo must not pretend to have done something.
     NoRecord,
+    /// The step permanently deleted its file (a purged trash
+    /// group, ADR-017 §7): there is nothing to restore, so the
+    /// operation is not undoable.
+    Permanent,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

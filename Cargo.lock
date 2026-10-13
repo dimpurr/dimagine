@@ -407,11 +407,13 @@ dependencies = [
  "dimagine-index",
  "dimagine-preview",
  "dimagine-serve",
+ "dimagine-write",
  "rpassword",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -438,6 +440,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dimagine-core",
+ "dimagine-write",
  "saphyr",
  "serde",
  "serde_json",

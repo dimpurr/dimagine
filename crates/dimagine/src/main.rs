@@ -1,7 +1,9 @@
-//! The dimagine command-line interface, version 0.1: `scan` and `check`,
-//! both strictly read-only, plus built-in plugin subcommands that are
-//! compiled per Cargo feature (ADR-013): `import eagle`, `previews` and
-//! `serve`.
+//! The dimagine command-line interface, version 0.1: the read-only `scan` and
+//! `check`, the write commands of ADR-016/017 (`tag`, `rate`, `set`, `collect`,
+//! `trash` (with its `purge` and `empty`), `restore`, `undo`, `config`), and
+//! built-in plugin
+//! subcommands that are compiled per Cargo feature (ADR-013): `import eagle`,
+//! `previews` and `serve`.
 //!
 //! Exit codes (HLD):
 //!
@@ -20,6 +22,7 @@ mod previews;
 mod serve;
 #[cfg(feature = "serve")]
 mod user;
+mod write;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -54,6 +57,9 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let library_dir = resolve_library(sub);
+    if let Some(code) = write::dispatch(name, sub, &library_dir) {
+        return code;
+    }
     match name {
         "scan" => run_scan(sub, &library_dir),
         "check" => run_check(sub, &library_dir),
@@ -73,7 +79,7 @@ fn cli(plugins: &CorePlugins) -> Command {
     let command = Command::new("dimagine")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
-        .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. Commands only read the library; derived data lives in .dimagine/ and can always be deleted.")
+        .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. scan and check only read; the write commands (tag, rate, set, collect, trash, trash purge, trash empty, restore, undo, config) change files through a journaled operation that undo can reverse. trash purge and trash empty delete permanently, so their undo refuses. Derived data lives in .dimagine/ and can always be deleted.")
         .arg(
             Arg::new("library")
                 .long("library")
@@ -104,6 +110,7 @@ fn cli(plugins: &CorePlugins) -> Command {
         .subcommand(
             Command::new("check").about("Report problems in the library; never changes files."),
         )
+        .subcommands(write::commands())
         .subcommand_required(true)
         .arg_required_else_help(true);
     // Built-in plugins: compiled per Cargo feature, then switched per library
@@ -228,6 +235,11 @@ fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     {
         report.preview_gaps = previews::gaps(library_dir);
     }
+    // The write-side state (ADR-016 §9): half-finished operations, refused
+    // undos, and trash or temporary files that outlived their purpose. The
+    // walk of .dimagine/ is the only thing here that looks under the derived
+    // folder, and it changes nothing.
+    write::append_write_state(&mut report, library_dir);
     if json {
         print_check_json(&report);
     } else {

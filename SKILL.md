@@ -153,9 +153,44 @@ Folders with thousands of files work, but file browsers slow down. When a folder
 passes a few thousand images, suggest splitting it by topic or by time, and say
 what you plan before moving anything.
 
+## Delete
+
+Nothing is deleted in place. Move the whole group into `.trash/` at the library
+root, keeping its relative path, and write the record beside it:
+
+```bash
+mkdir -p .trash/refs
+mv refs/girl.jpg refs/girl.jpg.md .trash/refs/
+```
+
+Then write `.trash/refs/girl.jpg.trash.json` naming each file's original path,
+its path in `.trash/`, its modification time, and the time you trashed it. A
+restore is the move back. A permanent delete happens only past the retention
+period, or when the user asks to empty the trash, and only when the user asked
+for it. Prefer `dimagine trash <img>` and `dimagine restore <img>`, which do
+this and keep the audit log.
+
+An older version of the format put deleted files in `.dimagine/trash/`. Nothing
+writes there now. If you find one, leave it alone and tell the user: there is no
+record of where those files came from, so recovering them is a manual move.
+
+## With the dimagine CLI
+
+`dimagine tag`, `rate`, `set`, `collect`, `trash`, `restore`, `undo` and
+`config` make the changes above through one journaled operation each; a command
+that changes a file prints that operation's id, and `dimagine undo <id>`
+reverses it. `dimagine trash purge` deletes the groups past the retention
+period and `dimagine trash empty` deletes every trashed group now; both need
+`--yes` and neither can be undone. Every command takes `--library <dir>` (default:
+the current folder) and `--json` for one machine-readable document. Exit codes:
+`0` done, `1` a finding or a failed operation, `2` a usage error, `3` the
+library could not be read fully, so a "not found" proves nothing. Write through
+the CLI when it is installed: it holds the library lock, checks hashes before it
+overwrites, and can undo what it did.
+
 ## What not to do
 
 - Do not rename images to IDs or hashes.
 - Do not create notes for images when there is nothing to record.
 - Do not create files in `.dimagine/`.
-- Do not delete; move to `.dimagine/trash/` only through a tool, or ask the user.
+- Do not delete; move to `.trash/` as above, through a tool, or ask the user.

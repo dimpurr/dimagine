@@ -9,7 +9,7 @@ use crate::error::{conflict_err, Error, Exists, PathReject, Result};
 use crate::fingerprint::Fingerprint;
 use crate::fs::{self, Renamed};
 use crate::lock::WriteLock;
-use crate::paths::{self, RelPath};
+use crate::paths::{self, RelPath, StepPath};
 
 /// An RAII guard to clean up a dot-temp file if an operation fails or panics.
 pub(crate) struct TempFileGuard<'a> {
@@ -17,6 +17,13 @@ pub(crate) struct TempFileGuard<'a> {
     name: String,
     active: bool,
 }
+
+/// The settings file's directory and name, under the
+/// library root (ADR-019 §1). The schema itself lives
+/// in dimagine-core; this door only reads and writes
+/// the bytes.
+pub const SETTINGS_DIR: &str = ".dimagine";
+pub const SETTINGS_FILE: &str = "settings.json";
 
 impl<'a> TempFileGuard<'a> {
     pub(crate) fn new(dir: &'a File, name: String) -> Self {
@@ -122,6 +129,18 @@ impl Writer {
         Ok((bytes, fp))
     }
 
+    /// Read a regular file the way a journal step names it: under
+    /// the library or inside `.trash/` — the only two doors a
+    /// step may touch (ADR-016 §0, ADR-017 §7). Symlinks are
+    /// refused.
+    pub fn read_step(&self, path: &StepPath) -> Result<(Vec<u8>, Fingerprint)> {
+        let dir = fs::resolve_dir(&self.root, path.parent_components(), false)?;
+        fs::under_root(&dir, &self.root_path, &path.text())?;
+        let (bytes, meta) = fs::read_leaf(&dir, path.name())?;
+        let fp = Fingerprint::of(&bytes, &meta);
+        Ok((bytes, fp))
+    }
+
     /// Update an existing note (.md or .canvas) with compare-and-swap durability.
     ///
     /// Never touches images or raw metadata sidecars (enforced by `path.note_kind()`).
@@ -135,13 +154,13 @@ impl Writer {
         new_bytes: &[u8],
     ) -> Result<Fingerprint> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        self.update_existing_locked(&lock, path, expected, new_bytes)
+        self.update_existing_locked(&lock, &StepPath::Library(path.clone()), expected, new_bytes)
     }
 
     pub(crate) fn update_existing_locked(
         &self,
         _lock: &WriteLock,
-        path: &RelPath,
+        path: &StepPath,
         expected: &Fingerprint,
         new_bytes: &[u8],
     ) -> Result<Fingerprint> {
@@ -218,13 +237,13 @@ impl Writer {
     /// Create a new file exclusively, failing with `Exists` if the target exists.
     pub fn create_exclusive(&self, path: &RelPath, bytes: &[u8]) -> Result<Fingerprint> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        self.create_exclusive_locked(&lock, path, bytes)
+        self.create_step_exclusive_locked(&lock, &StepPath::Library(path.clone()), bytes)
     }
 
-    pub(crate) fn create_exclusive_locked(
+    pub(crate) fn create_step_exclusive_locked(
         &self,
         _lock: &WriteLock,
-        path: &RelPath,
+        path: &StepPath,
         bytes: &[u8],
     ) -> Result<Fingerprint> {
         let dir = fs::resolve_dir(&self.root, path.parent_components(), true)?;
@@ -291,14 +310,18 @@ impl Writer {
     /// Move a file, refusing to replace an existing target.
     pub fn move_noreplace(&self, from: &RelPath, to: &RelPath) -> Result<()> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        self.move_noreplace_locked(&lock, from, to)
+        self.move_step_noreplace_locked(
+            &lock,
+            &StepPath::Library(from.clone()),
+            &StepPath::Library(to.clone()),
+        )
     }
 
-    pub(crate) fn move_noreplace_locked(
+    pub(crate) fn move_step_noreplace_locked(
         &self,
         _lock: &WriteLock,
-        from: &RelPath,
-        to: &RelPath,
+        from: &StepPath,
+        to: &StepPath,
     ) -> Result<()> {
         let from_dir = fs::resolve_dir(&self.root, from.parent_components(), false)?;
         fs::under_root(&from_dir, &self.root_path, &from.text())?;
@@ -325,6 +348,24 @@ impl Writer {
             Err(Error::Exists(_)) => Err(Error::Exists(Exists { path: to.to_path() })),
             Err(e) => Err(e),
         }
+    }
+
+    /// Permanently unlink a file inside `.trash/` — the only
+    /// place this crate hard-deletes (ADR-016 §0, ADR-017 §7):
+    /// library content is never unlinked, only moved to the
+    /// trash. A journal's `delete` step applies through here.
+    pub(crate) fn unlink_step_locked(&self, _lock: &WriteLock, path: &StepPath) -> Result<()> {
+        let StepPath::Trash(_) = path else {
+            return Err(Error::BadPath {
+                path: path.text(),
+                reject: PathReject::NotInTrash,
+            });
+        };
+        let dir = fs::resolve_dir(&self.root, path.parent_components(), false)?;
+        fs::under_root(&dir, &self.root_path, &path.text())?;
+        fs::unlink(&dir, path.name())?;
+        fs::fsync_dir(&dir)?;
+        Ok(())
     }
 
     /// Fold keys of every name anywhere in the library (ADR-017 §4).
@@ -456,7 +497,11 @@ impl Writer {
                 Some(p) => p.join(&candidate_name)?,
                 None => RelPath::parse(&candidate_name)?,
             };
-            match self.create_exclusive_locked(lock, &candidate_path, bytes) {
+            match self.create_step_exclusive_locked(
+                lock,
+                &StepPath::Library(candidate_path.clone()),
+                bytes,
+            ) {
                 Ok(fp) => return Ok((candidate_path, fp)),
                 Err(Error::Exists(_)) => {
                     n += 1;
@@ -530,7 +575,12 @@ impl Writer {
                 current_bytes,
             }));
         }
-        self.update_existing_locked(&lock, path, &current_fp, new_bytes)
+        self.update_existing_locked(
+            &lock,
+            &StepPath::Library(path.clone()),
+            &current_fp,
+            new_bytes,
+        )
     }
 
     /// Sweep leftover dot-temp files and run journal recovery.
@@ -673,6 +723,7 @@ impl Writer {
                     step_idx: idx,
                     path: PathBuf::from(step.dst.clone()),
                     message: e.to_string(),
+                    landed_unaudited: matches!(e, Error::LandedButUnaudited { .. }),
                 });
             }
 
@@ -703,9 +754,14 @@ impl Writer {
             // ADR-016 §7: files that reached the disk count as success — their
             // op-log lines are already fsynced — and the rest come back as
             // per-file errors. The operation must reach a terminal state
-            // before returning: the journal is removed so a later recovery
-            // cannot roll the landed files back.
-            journal.cleanup(&self.root)?;
+            // before returning: the `partial` marker is written first, so a
+            // later recovery reads "subset landed — do nothing" even when the
+            // directory removal below fails (RW60b F2).
+            journal.mark_partial()?;
+            // The marker is the terminal state; a failed removal no
+            // longer decides it — recovery reads the marker and
+            // removes the directory itself.
+            let _ = journal.cleanup(&self.root);
             Err(Error::BatchPartial {
                 op: op_id.to_string(),
                 errors: failures,
@@ -741,7 +797,7 @@ impl Writer {
 
         let after_hash_recorded = match step.kind {
             crate::journal::StepKind::Create => {
-                let dst = RelPath::parse(&step.dst)?;
+                let dst = StepPath::parse(&step.dst)?;
                 let bytes = step
                     .after_bytes
                     .as_deref()
@@ -752,12 +808,12 @@ impl Writer {
                             step.step_idx
                         ),
                     })?;
-                let new_fp = self.create_exclusive_locked(lock, &dst, bytes)?;
+                let new_fp = self.create_step_exclusive_locked(lock, &dst, bytes)?;
                 new_fp.hex()
             }
             crate::journal::StepKind::Modify => {
-                let dst = RelPath::parse(&step.dst)?;
-                let (cur_bytes, cur_fp) = self.read(&dst)?;
+                let dst = StepPath::parse(&step.dst)?;
+                let (cur_bytes, cur_fp) = self.read_step(&dst)?;
                 before_bytes_recorded = Some(cur_bytes);
                 let bytes = step
                     .after_bytes
@@ -773,14 +829,28 @@ impl Writer {
                 new_fp.hex()
             }
             crate::journal::StepKind::Move => {
-                let src = RelPath::parse(step.src.as_ref().unwrap())?;
-                let dst = RelPath::parse(&step.dst)?;
-                self.move_noreplace_locked(lock, &src, &dst)?;
+                let src = StepPath::parse(step.src.as_ref().unwrap())?;
+                let dst = StepPath::parse(&step.dst)?;
+                self.move_step_noreplace_locked(lock, &src, &dst)?;
                 step.after_hash.clone()
+            }
+            crate::journal::StepKind::Delete => {
+                let dst = StepPath::parse(&step.dst)?;
+                self.unlink_step_locked(lock, &dst)?;
+                // The recorded bytes ride the audit line, so an
+                // undo can put a small trash record back
+                // (ADR-017 §7). A purged image records none and
+                // is permanent by design (ADR-016 §8).
+                before_bytes_recorded = step.before_bytes.clone();
+                // The after-state of a delete is absence.
+                String::new()
             }
         };
 
-        // Right after rename, append to ops.jsonl and fsync
+        // Right after rename, append to ops.jsonl and fsync. A write
+        // that landed here but whose audit line failed is classified
+        // distinctly (RW60b F3): the change is real, so a caller must
+        // never retry the step as a fresh write.
         let log_entry = crate::op_log::OpEntry {
             op_id: op_id.to_string(),
             time: now.to_string(),
@@ -794,7 +864,12 @@ impl Writer {
             after_hash: after_hash_recorded,
             before_bytes: before_bytes_recorded,
         };
-        crate::op_log::append_op_entry(&self.root, &log_entry)?;
+        crate::op_log::append_op_entry(&self.root, &log_entry).map_err(|e| {
+            Error::LandedButUnaudited {
+                path: step.dst.clone(),
+                message: e.to_string(),
+            }
+        })?;
         Ok(())
     }
 
@@ -813,5 +888,102 @@ impl Writer {
     pub fn undo_force(&self, op_id: &str) -> Result<crate::op_log::UndoOutcome> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
         crate::op_log::undo(self, &lock, op_id, true)
+    }
+
+    /// Execute an already-planned operation while holding the
+    /// write lock (ADR-016 §6).
+    ///
+    /// For a caller that must plan steps from facts only the
+    /// filesystem knows — the collision renaming of a trash
+    /// group is the example — the contract is the same as the
+    /// crate's own: hold [`Writer::lock_library`] across the
+    /// planning reads and this one call. The guard is not
+    /// reentrant, so no primitive may be called in between.
+    pub fn execute_op_with_lock(
+        &self,
+        lock: &WriteLock,
+        op_id: &str,
+        source: &str,
+        intent: serde_json::Value,
+        steps: Vec<crate::journal::StepRecord>,
+    ) -> Result<()> {
+        self.execute_op_locked(lock, op_id, source, None, intent, steps, None)
+    }
+
+    /// Read `<library>/.dimagine/settings.json` (ADR-019 §1).
+    ///
+    /// `Ok(None)` when the file or its directory does not exist
+    /// yet: every setting then defaults. The bytes are returned
+    /// unparsed — the schema lives in dimagine-core, and this
+    /// crate stays the door, not the interpreter.
+    pub fn read_settings(&self) -> Result<Option<Vec<u8>>> {
+        let dir = match fs::resolve_dir(&self.root, &[SETTINGS_DIR.to_string()], false) {
+            Ok(dir) => dir,
+            Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
+                return Ok(None)
+            }
+            Err(e) => return Err(e),
+        };
+        match fs::read_leaf(&dir, SETTINGS_FILE) {
+            Ok((bytes, _)) => Ok(Some(bytes)),
+            Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Atomically write `<library>/.dimagine/settings.json`
+    /// (ADR-019 §2): dot-temp file, fsync, rename, directory
+    /// fsync (ADR-016 §4). The caller decides the content —
+    /// the schema, the non-default-key rule and the unknown
+    /// keys are dimagine-core's settings module.
+    pub fn write_settings(&self, bytes: &[u8]) -> Result<()> {
+        let _lock = WriteLock::acquire(&self.root, &self.root_path)?;
+        let dir = fs::resolve_dir(&self.root, &[SETTINGS_DIR.to_string()], true)?;
+        fs::under_root(
+            &dir,
+            &self.root_path,
+            &format!("{SETTINGS_DIR}/{SETTINGS_FILE}"),
+        )?;
+
+        let nonce = ulid::Ulid::new().to_string();
+        let temp_name = fs::temp_name(&nonce);
+        let temp_file = fs::open_leaf(
+            &dir,
+            &temp_name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o644,
+        )?;
+        let mut temp_guard = TempFileGuard::new(&dir, temp_name.clone());
+        let mut temp_writer = temp_file;
+        temp_writer
+            .write_all(bytes)
+            .map_err(|e| fs::io_failed("write settings file", &temp_name, e))?;
+        fs::fsync_file(&temp_writer)?;
+        fs::rename_replace(&dir, &temp_name, SETTINGS_FILE)?;
+        temp_guard.defuse();
+        fs::fsync_dir(&dir)?;
+        Ok(())
+    }
+
+    /// Set the modification time of a file under the library or
+    /// inside `.trash/`, without following symlinks. A restore
+    /// puts the original mtime back (ADR-017 §7); a rename
+    /// already preserves it, so this is the belt-and-braces
+    /// half of that promise.
+    pub fn set_mtime(&self, path: &StepPath, mtime_ns: i64) -> Result<()> {
+        let dir = fs::resolve_dir(&self.root, path.parent_components(), false)?;
+        fs::under_root(&dir, &self.root_path, &path.text())?;
+        fs::set_mtime(&dir, path.name(), mtime_ns)
+    }
+
+    /// Every trash record in the library (ADR-017 §7), with
+    /// the path each was read from. Records are the
+    /// `<group>.trash.json` files under `.trash/`; a record
+    /// that does not parse is reported as an error item
+    /// rather than dropped, so `check` can flag it.
+    pub fn trash_records(&self) -> Result<Vec<crate::trash::ScannedRecord>> {
+        crate::trash::scan_records(self)
     }
 }

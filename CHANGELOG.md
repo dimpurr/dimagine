@@ -7,6 +7,39 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- CLI write commands (Phase 3a): `dimagine tag` (add and remove tags), `rate`
+  (0–5, or `none` to clear) and `set` (scalar properties — and `KEY=` with no
+  value clears a property by deleting its key, never by writing `key: ""`)
+  edit one image's note
+  through the front-matter editor, print the resulting front matter, and write
+  nothing at all when the change would not change the file. `collect --new
+  <title>` writes a collection note (in the folder `.obsidian/app.json` asks
+  for, at the next free name) and gives every image it lists an `id`; `collect
+  --add` and `--remove` edit an existing collection's embed list. `trash` moves
+  an image group — image, note, raw sidecars — into `.trash/` keeping its
+  relative path and writes the record beside it; `restore` moves it back to the
+  recorded original paths and their recorded times, refusing when a path is
+  taken. `undo [op-id]` reverses the last operation, or the one named (a command
+  that changes a file prints its `op` id, in `--json` too): all of it or none, unless
+  `--force` takes what still matches its recorded hash.   `config list|get|set|reset`
+  reads and changes `.dimagine/settings.json` against the settings schema.
+  `trash` is the group that manages the trash: `trash <img>…` moves a group in,
+  `trash purge --dry-run|--yes` deletes the groups past `trash.retentionDays`
+  (default 180 days; `0` never purges), and `trash empty --yes` deletes every
+  trashed group now — both permanently, so their undo refuses, and both leaving
+  any file without a record alone.
+  Each command is one journaled operation through the write core: the library
+  lock held for the whole operation, every file hashed before it is replaced and
+  a mismatch refused, a `.dimagine.tmp.<nonce>` write fsynced and renamed into
+  place, each step journaled so a crash recovers, and each step audited in
+  `.dimagine/log/ops.jsonl` with its operation's id, intent and the hash of the
+  file before and after. A created file undone comes back as a
+  trash move, never a delete. `dimagine check` now also reports the state of
+  past writes: an unrecovered journal, a stray temporary file, a `.trash` that
+  is a symbolic link, a trash record that does not parse or names a file
+  that is not there, and any files left in the old `.dimagine/trash/` — a
+  location nothing writes to any more, but which stays readable so a library
+  that has one is reported rather than stranded.
 - The front-matter editor (Phase 3a): `dimagine-core::fm_edit` edits a note's
   YAML properties as raw bytes, splicing exactly the range an edit intends
   and leaving every other byte identical. `set_scalar`, `delete_key`,

@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::path::Path;
 
 use dimagine_core::{FileClass, Library};
@@ -49,6 +50,21 @@ pub struct BackfillReport {
 pub fn backfill_added(library: &Path, apply: bool) -> Result<BackfillReport, ImportError> {
     let library = Library::open(library)
         .map_err(|error| ImportError::InvalidSource(format!("not a dimagine library: {error}")))?;
+    // With `apply` the backfill rewrites notes, so it is a
+    // writer like any other and takes the one write lock
+    // across the whole run (ADR-016 §1; RW60b F1). A dry
+    // run only reads and needs no lock.
+    let _write_lock = if apply {
+        let writer = dimagine_write::Writer::open(&library.root)
+            .map_err(|error| ImportError::Io(io::Error::other(error)))?;
+        Some(
+            writer
+                .lock_library()
+                .map_err(|error| ImportError::Io(io::Error::other(error)))?,
+        )
+    } else {
+        None
+    };
     let raw_paths: HashSet<&str> = library
         .files
         .iter()

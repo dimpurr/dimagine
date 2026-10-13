@@ -11,14 +11,23 @@
 //!
 //! Two invariants hold for every operation:
 //!
-//! - *Closed subset.* Only a plain (optionally double-quoted) top-level key
-//!   that occurs exactly once can be edited, and its value must be one of:
-//!   a single-line plain or double-quoted scalar, a single-line flow list of
-//!   plain/double-quoted strings, or a block list of single-line
-//!   plain/double-quoted strings. Front matter that relies on structures
-//!   outside this subset — duplicate keys, merge keys (`<<`), anchors and
-//!   aliases, complex keys, other-key values outside the subset — is refused
-//!   with a typed error and no bytes. A refusal never carries note content.
+//! - *Closed subset.* Only a plain (optionally double-quoted) top-level
+//!   key that occurs exactly once can be edited, and its value must be
+//!   one of: a single-line plain or double-quoted scalar, a single-line
+//!   flow list of plain/double-quoted strings, or a block list of
+//!   single-line plain/double-quoted strings. Refusals come in two
+//!   scopes, and the difference is deliberate: *document hazards* —
+//!   duplicate top-level keys, merge keys (`<<`), anchors and aliases at
+//!   a key, value or item position, and constructs the scanner cannot
+//!   attribute — refuse every operation on the region; *property
+//!   shapes* — a single-quoted key, a nested structure, a block or
+//!   multiline scalar, a `tags` value that is not a list of strings —
+//!   refuse only the operation that targets that key, and an unrelated
+//!   key holding such a value keeps it (ADR-017 item 1: only the
+//!   target key changes). An anchor or merge key nested inside another
+//!   key's value is not scanned (no splice can reach it), so it does
+//!   not refuse; the value carrying it is itself outside the subset and
+//!   refuses when targeted. A refusal never carries note content.
 //! - *Re-parsed before committing.* The editor never trusts its own scanning:
 //!   before the splice the parsed value of the key must equal what the
 //!   scanner saw, and after the splice the edited front matter is parsed
@@ -289,8 +298,12 @@ pub enum RatingEdit {
 // Spelling: how new key lines, scalar tokens and tags are written.
 // ---------------------------------------------------------------------------
 
-/// The note's line-ending style, used for every line the editor inserts:
-/// the style of the first line break in the file, or LF when there is none.
+/// The note's line-ending style, used for every line the editor
+/// inserts: the style of the first line break in the file, or LF when
+/// there is none. Only `\n` and `\r\n` are styles the reader and the
+/// scanner can parse back; a CR-only file keeps LF here (a front
+/// matter block must stay parseable), and the one place a CR-only
+/// file keeps its own style is the self-embed's appended line.
 fn newline_style(raw: &[u8]) -> &'static [u8] {
     match raw.iter().position(|&b| b == b'\n') {
         Some(pos) if pos > 0 && raw[pos - 1] == b'\r' => b"\r\n",
@@ -1195,9 +1208,6 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
     let mut scan = Scan::default();
     let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut pos = region.start;
-    // Blank and comment lines buffered until the open entry proves it owns
-    // them by continuing after them.
-    let mut dangle: Option<usize> = None;
     let mut consume: Option<Consume> = None;
     let mut block_indent: Option<usize> = None;
 
@@ -1223,8 +1233,9 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
         //    structures and is reprocessed below.
         if let Some(mode) = consume {
             if current.is_blank_or_comment() {
-                // Fall through to the shared dangle logic; the mode stays
-                // and re-enters on the next content line.
+                // The mode stays and re-enters on the next
+                // content line; attribution rides on the
+                // entry's end, which only extends here.
             } else {
                 let mut reprocess = false;
                 match mode {
@@ -1269,16 +1280,16 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
                     if let Some(entry) = scan.entries.last_mut() {
                         entry.end = break_end.unwrap_or(content_end);
                     }
-                    dangle = None;
                     pos = break_end.unwrap_or(region.end);
                     continue;
                 }
             }
         }
 
-        // 2. Blank lines and comment lines never close anything.
+        // 2. Blank lines and comment lines never close anything;
+        //    attribution of them to an entry rides on the entry's
+        //    end, extended only when content continues after them.
         if current.is_blank_or_comment() {
-            dangle.get_or_insert(content_start);
             pos = break_end.unwrap_or(region.end);
             continue;
         }
@@ -1287,7 +1298,6 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
         //    including plain scalars continued on the next line, which moves
         //    the value out of the subset.
         if current.indent > 0 && scan.entries.last().is_some() {
-            dangle = None;
             continue_entry(&mut scan, &mut consume, &mut block_indent, &current);
             pos = break_end.unwrap_or(region.end);
             continue;
@@ -1304,7 +1314,6 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
                 )
             });
             if open_for_items || consume == Some(Consume::Nested) {
-                dangle = None;
                 if consume == Some(Consume::Nested) {
                     if let Some(entry) = scan.entries.last_mut() {
                         entry.end = break_end.unwrap_or(content_end);
@@ -1323,7 +1332,6 @@ fn scan_region(raw: &[u8], region: Range<usize>) -> Scan {
 
         // 5. Column-0 content: a new key line, or something the editor
         //    refuses to interpret.
-        dangle = None;
         block_indent = None;
         match parse_key_line(trimmed, content_start) {
             KeyLineKind::Key {
@@ -1573,17 +1581,6 @@ fn scalar_eq(a: &Scalar<'_>, b: &Scalar<'_>) -> bool {
     }
 }
 
-/// The text form of a parsed scalar, for case-insensitive tag comparison.
-fn scalar_text(y: &Yaml) -> Option<String> {
-    match y {
-        Yaml::Value(Scalar::String(text)) => Some(text.to_string()),
-        Yaml::Value(Scalar::Integer(n)) => Some(n.to_string()),
-        Yaml::Value(Scalar::Boolean(b)) => Some(b.to_string()),
-        Yaml::Value(Scalar::FloatingPoint(f)) => Some(f.0.to_string()),
-        _ => None,
-    }
-}
-
 /// Parse a front matter region into its single document, which must be a
 /// mapping; an empty region stands in as an empty mapping. Parse errors keep
 /// the parser's position plus one line: the region starts on the note's
@@ -1623,6 +1620,19 @@ fn mapping_get<'y>(doc: &'y Yaml<'y>, key: &str) -> Option<&'y Yaml<'y>> {
         .map(|(_, v)| v)
 }
 
+/// Whether a parsed scalar spells "no value": the reader
+/// ([`crate::note`]) reads `id: ""` and `id: null` as no `id`,
+/// just like a bare `id:`. The writer must agree, or it would
+/// refuse to fill or delete a spelling the reader already treats
+/// as absent (RW61 L1).
+fn scalar_is_empty(doc: &Yaml, key: &str) -> bool {
+    match mapping_get(doc, key) {
+        Some(Yaml::Value(Scalar::Null)) => true,
+        Some(Yaml::Value(Scalar::String(text))) => text.is_empty(),
+        _ => false,
+    }
+}
+
 /// What the target key must read after the splice.
 enum TargetAfter {
     /// The key must be gone.
@@ -1658,7 +1668,13 @@ fn pre_verify(raw: &[u8], scan: &Scan, doc: &Yaml, key: &str) -> Result<(), FmEd
     };
     let agrees = match &entry.value {
         ScannedValue::Empty { .. } => {
-            matches!(expect_of(actual), Some(Expect::Str(ref text)) if text.is_empty())
+            // An empty `key:` reads as an empty string under the
+            // locked saphyr 0.1.0 and as null under 0.1.2; both
+            // spellings are the same "no value yet" state, so the
+            // check must not depend on which saphyr version `0.1`
+            // resolves to (RW61 M2).
+            matches!(expect_of(actual), Some(Expect::Null))
+                || matches!(expect_of(actual), Some(Expect::Str(ref text)) if text.is_empty())
         }
         ScannedValue::Scalar { token } => {
             mini_doc_match(raw, std::slice::from_ref(token), actual, MiniForm::Scalar)
@@ -2010,7 +2026,10 @@ pub fn set_scalar(raw: &[u8], key: &str, value: &str) -> Result<Vec<u8>, FmEditE
             let ctx = open_edit(raw, text, fm, key)?;
             match ctx.find(key)? {
                 Some(entry) => {
-                    if key == "id" && !matches!(entry.value, ScannedValue::Empty { .. }) {
+                    if key == "id"
+                        && !matches!(entry.value, ScannedValue::Empty { .. })
+                        && !scalar_is_empty(&ctx.doc, key)
+                    {
                         return Err(FmEditError::IdImmutable);
                     }
                     match &entry.value {
@@ -2075,7 +2094,10 @@ pub fn delete_key(raw: &[u8], key: &str) -> Result<Vec<u8>, FmEditError> {
     let Some(entry) = ctx.find(key)? else {
         return Ok(raw.to_vec());
     };
-    if key == "id" && !matches!(entry.value, ScannedValue::Empty { .. }) {
+    if key == "id"
+        && !matches!(entry.value, ScannedValue::Empty { .. })
+        && !scalar_is_empty(&ctx.doc, key)
+    {
         return Err(FmEditError::IdImmutable);
     }
     match &entry.value {
@@ -2176,14 +2198,29 @@ fn normalize_tag_list(tags: &[&str]) -> Result<Vec<String>, FmEditError> {
     Ok(out)
 }
 
-/// The tag texts an entry already holds, in order, from the parsed values.
-fn existing_tag_texts(doc: &Yaml) -> Option<Vec<String>> {
-    let value = mapping_get(doc, "tags")?;
-    let sequence = value.as_vec()?;
-    sequence
-        .iter()
-        .map(scalar_text)
-        .collect::<Option<Vec<String>>>()
+/// The tag texts an entry already holds, in order, from the parsed
+/// values. A `tags` list holding an element that is not a plain or
+/// double-quoted *string* — a number, boolean or null — is outside
+/// the closed subset (ADR-016 §5: flow and block lists carry string
+/// elements), so it refuses as `ValueNotEditable` rather than as an
+/// internal verification failure (RW61 M1). `Ok(None)` means the
+/// parsed `tags` value is not a sequence, which the callers treat
+/// as a scanner/parser disagreement.
+fn existing_tag_texts(doc: &Yaml) -> Result<Option<Vec<String>>, FmEditError> {
+    let Some(value) = mapping_get(doc, "tags") else {
+        return Ok(None);
+    };
+    let Some(sequence) = value.as_vec() else {
+        return Ok(None);
+    };
+    let mut out = Vec::with_capacity(sequence.len());
+    for item in sequence {
+        match item {
+            Yaml::Value(Scalar::String(text)) => out.push(text.to_string()),
+            _ => return Err(FmEditError::ValueNotEditable),
+        }
+    }
+    Ok(Some(out))
 }
 
 /// The tags that survive, as expected values: the parsed existing ones kept
@@ -2234,7 +2271,7 @@ pub fn add_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
         Some(entry) => match &entry.value {
             ScannedValue::FlowSeq { items, close_pos } => {
                 let existing =
-                    existing_tag_texts(&ctx.doc).ok_or(FmEditError::VerificationFailed)?;
+                    existing_tag_texts(&ctx.doc)?.ok_or(FmEditError::VerificationFailed)?;
                 let existing_ci: std::collections::BTreeSet<String> =
                     existing.iter().map(|t| t.to_lowercase()).collect();
                 let to_add: Vec<String> = additions
@@ -2259,7 +2296,7 @@ pub fn add_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
             }
             ScannedValue::BlockSeq { items } => {
                 let existing =
-                    existing_tag_texts(&ctx.doc).ok_or(FmEditError::VerificationFailed)?;
+                    existing_tag_texts(&ctx.doc)?.ok_or(FmEditError::VerificationFailed)?;
                 let existing_ci: std::collections::BTreeSet<String> =
                     existing.iter().map(|t| t.to_lowercase()).collect();
                 let to_add: Vec<String> = additions
@@ -2343,12 +2380,14 @@ pub fn remove_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
         return Ok(raw.to_vec());
     };
     let existing_and_matched = |doc: &Yaml| {
-        let existing = existing_tag_texts(doc)?;
+        let Some(existing) = existing_tag_texts(doc)? else {
+            return Ok(None);
+        };
         let matched: Vec<bool> = existing
             .iter()
             .map(|t| remove_ci.contains(&t.to_lowercase()))
             .collect();
-        Some((existing, matched))
+        Ok(Some((existing, matched)))
     };
     match &entry.value {
         // Nothing on the key line can hold tags to remove.
@@ -2357,7 +2396,7 @@ pub fn remove_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
         ScannedValue::Uneditable => Err(FmEditError::ValueNotEditable),
         ScannedValue::BlockSeq { .. } => {
             let (existing, matched) =
-                existing_and_matched(&ctx.doc).ok_or(FmEditError::VerificationFailed)?;
+                existing_and_matched(&ctx.doc)?.ok_or(FmEditError::VerificationFailed)?;
             if !matched.iter().any(|m| *m) {
                 return Ok(raw.to_vec());
             }
@@ -2385,7 +2424,7 @@ pub fn remove_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
         }
         ScannedValue::FlowSeq { items, .. } => {
             let (existing, matched) =
-                existing_and_matched(&ctx.doc).ok_or(FmEditError::VerificationFailed)?;
+                existing_and_matched(&ctx.doc)?.ok_or(FmEditError::VerificationFailed)?;
             if !matched.iter().any(|m| *m) {
                 return Ok(raw.to_vec());
             }
@@ -2462,8 +2501,9 @@ fn comma_before(raw: &[u8], from: usize) -> usize {
 }
 
 /// Write the `id` when — and only when — it is absent: a ULID in canonical
-/// uppercase. An existing `id` is left alone (FORMAT §3.3); an empty `id:` is
-/// writable, since the reader reads no id from it.
+/// uppercase. An existing `id` is left alone (FORMAT §3.3); an empty
+/// spelling — a bare `id:`, `id: ""` or `id: null`, all of which the
+/// reader reads as no id — is writable.
 pub fn ensure_id(raw: &[u8], ulid: &str) -> Result<Vec<u8>, FmEditError> {
     let text = ensure_utf8(raw)?;
     if !is_valid_ulid(ulid) {
@@ -2488,6 +2528,18 @@ pub fn ensure_id(raw: &[u8], ulid: &str) -> Result<Vec<u8>, FmEditError> {
     let ctx = open_edit(raw, text, fm, KEY)?;
     match ctx.find(KEY)? {
         Some(entry) => match &entry.value {
+            // `id: ""` / `id: null` read as no id (the reader's
+            // spelling), so the writer fills them like a bare
+            // `id:` rather than treating the key as present.
+            ScannedValue::Scalar { .. } if scalar_is_empty(&ctx.doc, KEY) => {
+                let token = scalar_span(&entry.value);
+                finish_edit(
+                    &ctx,
+                    KEY,
+                    vec![(token, canonical.clone().into_bytes())],
+                    TargetAfter::Value(Expect::Str(canonical)),
+                )
+            }
             ScannedValue::Scalar { .. } => Ok(raw.to_vec()),
             ScannedValue::Empty { .. } => {
                 let (insert_at, prefix_space, suffix_space) = empty_spot(&entry.value);
@@ -2513,8 +2565,12 @@ pub fn ensure_id(raw: &[u8], ulid: &str) -> Result<Vec<u8>, FmEditError> {
 /// Append the self-embed as the last block when the note does not already
 /// contain it. The caller supplies the link text (W62 owns its spelling);
 /// presence is a byte match against the body. The append uses the file's
-/// newline style; a lone trailing `\r` is completed rather than joined into
-/// the embed's own line. Front matter is never re-serialized.
+/// newline style — except that a file whose only breaks are lone `\r`s
+/// (a CR-only file) keeps that style for the embed's own line, instead
+/// of the mixed `\r\n` break plus LF line it used to get (RW61 L4). A
+/// trailing `\r` of a `\n`-using file is an incomplete CRLF break and is
+/// completed rather than joined into the embed's own line. Front matter
+/// is never re-serialized.
 pub fn ensure_self_embed(raw: &[u8], embed_text: &str) -> Result<Vec<u8>, FmEditError> {
     ensure_utf8(raw)?;
     let body_start = match front_matter_range(raw) {
@@ -2524,7 +2580,16 @@ pub fn ensure_self_embed(raw: &[u8], embed_text: &str) -> Result<Vec<u8>, FmEdit
     if embed_text.is_empty() || contains_slice(&raw[body_start..], embed_text.as_bytes()) {
         return Ok(raw.to_vec());
     }
-    let newline = newline_style(raw);
+    // The embed line's style: the file's own, except that a
+    // CR-only file (no `\n` anywhere, breaks of lone `\r`) keeps
+    // its CR breaks.
+    let newline = if raw.contains(&b'\n') {
+        newline_style(raw)
+    } else if raw.contains(&b'\r') {
+        b"\r"
+    } else {
+        b"\n"
+    };
     let after_bom = raw.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(raw);
     if after_bom.is_empty() {
         // An empty (or BOM-only) note becomes just the embed.
@@ -2536,7 +2601,13 @@ pub fn ensure_self_embed(raw: &[u8], embed_text: &str) -> Result<Vec<u8>, FmEdit
     let mut out = raw.to_vec();
     match out.last() {
         Some(b'\n') => {}
-        Some(b'\r') => out.push(b'\n'),
+        // A `\n`-using file's trailing `\r` is an incomplete
+        // CRLF break (or a stray CR): complete it.
+        Some(b'\r') if newline != b"\r" => out.push(b'\n'),
+        // A CR-only file's trailing `\r` is a complete break
+        // of the file's own style; the embed starts a new
+        // line after it.
+        Some(b'\r') => {}
         _ => out.extend_from_slice(newline),
     }
     out.extend_from_slice(embed_text.as_bytes());
@@ -2837,6 +2908,41 @@ mod edit_tests {
     }
 
     #[test]
+    fn a_non_string_tag_element_is_outside_the_subset() {
+        // A `tags` list holding a number, boolean or null
+        // element is outside the closed subset: it refuses
+        // as ValueNotEditable, not as an internal
+        // verification failure (RW61 M1).
+        for before in [
+            b"---\ntags: [4]\n---\n".to_vec(),
+            b"---\ntags: [a, true]\n---\n".to_vec(),
+            b"---\ntags: [null]\n---\n".to_vec(),
+            b"---\ntags: [0x10]\n---\n".to_vec(),
+            b"---\ntags:\n  - 4\n---\n".to_vec(),
+        ] {
+            assert_eq!(
+                add_tags(&before, &["new"]),
+                Err(FmEditError::ValueNotEditable),
+                "add_tags on {:?}",
+                before
+            );
+            assert_eq!(
+                remove_tags(&before, &["a"]),
+                Err(FmEditError::ValueNotEditable),
+                "remove_tags on {:?}",
+                before
+            );
+        }
+        // A quoted "4" is a string element and stays
+        // editable, keeping its spelling.
+        let before = b"---\ntags: [\"4\"]\n---\n".to_vec();
+        assert_eq!(
+            add_tags(&before, &["five"]).unwrap(),
+            b"---\ntags: [\"4\", five]\n---\n"
+        );
+    }
+
+    #[test]
     fn ensure_id_writes_only_when_absent() {
         let id = "01JA8X3Q7K2M9V4T6R1B5N0C3Q";
         let before = b"---\ntitle: T\n---\n".to_vec();
@@ -2852,6 +2958,20 @@ mod edit_tests {
         let before = b"---\nid:\n---\n".to_vec();
         let after = ensure_id(&before, id).unwrap();
         assert_eq!(after, format!("---\nid: {id}\n---\n").as_bytes());
+        // `id: ""` and `id: null` read as no id to the reader,
+        // so the writer fills them too (RW61 L1).
+        for before in [
+            b"---\nid: \"\"\n---\n".to_vec(),
+            b"---\nid: null\n---\n".to_vec(),
+        ] {
+            let after = ensure_id(&before, id).unwrap();
+            assert_eq!(after, format!("---\nid: {id}\n---\n").as_bytes());
+            // Deleting the empty spelling is allowed as well.
+            let before = b"---\nid: \"\"\n---\n".to_vec();
+            assert_eq!(delete_key(&before, "id").unwrap(), b"---\n---\n");
+            let before = b"---\nid: null\n---\n".to_vec();
+            assert_eq!(delete_key(&before, "id").unwrap(), b"---\n---\n");
+        }
         // Invalid input refuses.
         assert_eq!(ensure_id(&before, "nope"), Err(FmEditError::NotAUlid));
         assert_eq!(
@@ -2880,10 +3000,21 @@ mod edit_tests {
             b"---\r\ntitle: T\r\n---\r\nText.\r\n![[girl.jpg]]\r\n"
         );
 
-        // A lone trailing CR is completed, not glued to the embed.
+        // A CR-only file keeps its own style: the trailing `\r`
+        // is a complete break, and the embed gets its own CR
+        // line, not an LF line glued onto a mixed break (RW61 L4).
         let before = b"Text.\r".to_vec();
         let after = ensure_self_embed(&before, embed).unwrap();
-        assert_eq!(after, b"Text.\r\n![[girl.jpg]]\n");
+        assert_eq!(after, b"Text.\r![[girl.jpg]]\r");
+        // The same for a file with several CR-only lines.
+        let before = b"Text.\rMore.\r".to_vec();
+        let after = ensure_self_embed(&before, embed).unwrap();
+        assert_eq!(after, b"Text.\rMore.\r![[girl.jpg]]\r");
+        // A `\n`-using file's stray trailing `\r` is still
+        // completed, not glued to the embed.
+        let before = b"Text\n.\r".to_vec();
+        let after = ensure_self_embed(&before, embed).unwrap();
+        assert_eq!(after, b"Text\n.\r\n![[girl.jpg]]\n");
 
         // Empty and BOM-only notes become just the embed.
         let after = ensure_self_embed(b"", embed).unwrap();

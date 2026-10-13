@@ -3,7 +3,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use dimagine_write::journal::{RecoveryOutcome, StepKind, StepRecord};
-use dimagine_write::{Error, Fingerprint, PathReject, RelPath, UndoReason, UndoneItem, Writer};
+use dimagine_write::{
+    Error, Fingerprint, PathReject, RelPath, StepPath, UndoReason, UndoneItem, Writer,
+};
 use tempfile::tempdir;
 
 /// Make the journaled writer look dead, so recovery is allowed to act.
@@ -129,12 +131,22 @@ fn test_journaled_move_rolls_back_and_undoes() {
     assert!(writer.read(&src).is_err());
 
     let outcome = writer.undo(undo_op).unwrap();
-    assert!(outcome.audit_errors.is_empty());
     assert!(outcome.undone.contains(&UndoneItem::Moved {
-        from: dst,
-        to: src.clone()
+        from: StepPath::Library(dst),
+        to: StepPath::Library(src.clone())
     }));
     assert_eq!(writer.read(&src).unwrap().0, b"pixels\n");
+    // The reverse move is journaled as its own operation
+    // (RW60b F4): the audit log holds an undo-sourced line
+    // pointing back at the undone op.
+    let entries = writer.op_log_entries().unwrap();
+    let undo_line = entries
+        .iter()
+        .find(|e| e.source == "undo" && e.intent == serde_json::json!({"undo_op": undo_op}))
+        .expect("the reverse move is audited as an undo op");
+    assert_eq!(undo_line.step_kind, StepKind::Move);
+    assert_eq!(undo_line.path, "shots/a.jpg");
+    assert_eq!(undo_line.src_path.as_deref(), Some("archive/a.jpg"));
 }
 
 #[test]
@@ -1144,6 +1156,135 @@ fn test_partial_failure_reaches_terminal_state_and_survives_reopen() {
             .0,
         b"theirs\n"
     );
+}
+
+#[test]
+fn test_partial_marker_recovery_touches_nothing() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    writer
+        .create_exclusive(&RelPath::parse("taken.md").unwrap(), b"theirs\n")
+        .unwrap();
+
+    // Step 0 lands, step 1 collides, and the operation dies
+    // between writing the terminal `partial` marker and
+    // removing the journal (RW60b F2): the marker, not the
+    // directory's existence, is what recovery must trust.
+    let steps = vec![
+        StepRecord {
+            step_idx: 0,
+            kind: StepKind::Create,
+            src: None,
+            dst: "landed.md".to_string(),
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: Some(b"ok\n".to_vec()),
+        },
+        StepRecord {
+            step_idx: 1,
+            kind: StepKind::Create,
+            src: None,
+            dst: "taken.md".to_string(),
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: Some(b"clash\n".to_vec()),
+        },
+    ];
+    assert!(matches!(
+        writer.execute_op(
+            "op-partial-marker",
+            "test",
+            None,
+            serde_json::json!({}),
+            steps,
+        ),
+        Err(Error::BatchPartial { .. })
+    ));
+
+    // Rebuild the crash-left state: an uncommitted journal
+    // whose terminal partial marker survived the removal.
+    let op_dir = dir.path().join(".dimagine/journal/op-partial-marker");
+    fs::create_dir_all(&op_dir).unwrap();
+    let meta = dimagine_write::journal::JournalMeta {
+        op_id: "op-partial-marker".to_string(),
+        pid: 0,
+        boot_id: None,
+        created_at: "2026-01-01T00:00:00+00:00".to_string(),
+    };
+    fs::write(op_dir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+    fs::write(op_dir.join("partial"), b"").unwrap();
+
+    let report = writer.startup_sweep().unwrap();
+    assert!(
+        matches!(&report.recovery[0], RecoveryOutcome::PartialLanded { .. }),
+        "{:?}",
+        report.recovery
+    );
+    // A subset landed and the caller was told which: recovery
+    // keeps the landed file, leaves the colliding target
+    // alone, and removes the journal.
+    assert_eq!(
+        writer
+            .read(&RelPath::parse("landed.md").unwrap())
+            .unwrap()
+            .0,
+        b"ok\n"
+    );
+    assert_eq!(
+        writer.read(&RelPath::parse("taken.md").unwrap()).unwrap().0,
+        b"theirs\n"
+    );
+    assert!(!op_dir.exists());
+    // The terminal state is stable: a later sweep finds nothing.
+    let report = writer.startup_sweep().unwrap();
+    assert!(report.recovery.is_empty());
+}
+
+#[test]
+fn test_landed_but_unaudited_is_reported_as_landed() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    // A directory where the audit log file should be makes
+    // every op-log append fail right after a step's write
+    // landed (RW60b F3).
+    fs::create_dir_all(dir.path().join(".dimagine/log")).unwrap();
+    fs::create_dir(dir.path().join(".dimagine/log/ops.jsonl")).unwrap();
+
+    let steps = vec![StepRecord {
+        step_idx: 0,
+        kind: StepKind::Create,
+        src: None,
+        dst: "created.md".to_string(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(b"new\n".to_vec()),
+    }];
+    match writer.execute_op("op-unaudited", "test", None, serde_json::json!({}), steps) {
+        Err(Error::BatchPartial { errors, .. }) => {
+            assert_eq!(errors.len(), 1);
+            assert!(
+                errors[0].landed_unaudited,
+                "the write landed; only its audit line failed"
+            );
+        }
+        other => panic!("expected BatchPartial, got {other:?}"),
+    }
+    // The change is on disk: a caller must never retry it
+    // as a fresh write.
+    assert_eq!(
+        writer
+            .read(&RelPath::parse("created.md").unwrap())
+            .unwrap()
+            .0,
+        b"new\n"
+    );
+    // And no audit line exists for it.
+    assert!(writer.op_log_entries().is_err());
 }
 
 #[test]

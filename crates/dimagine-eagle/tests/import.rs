@@ -64,6 +64,12 @@ fn tree(root: &Path) -> Vec<(String, Vec<u8>)> {
         for entry in fs::read_dir(path).unwrap() {
             let entry = entry.unwrap();
             if entry.file_type().unwrap().is_dir() {
+                // `.dimagine/` is this crate's own bookkeeping
+                // (the write lock), not import output the
+                // prototype would produce.
+                if entry.file_name() == ".dimagine" {
+                    continue;
+                }
                 visit(root, &entry.path(), output);
             } else {
                 output.push((

@@ -20,7 +20,7 @@ use crate::fingerprint::Fingerprint;
 use crate::fs;
 use crate::journal::StepKind;
 use crate::lock::WriteLock;
-use crate::paths::RelPath;
+use crate::paths::{RelPath, StepPath};
 use crate::writer::{TempFileGuard, Writer};
 
 pub const LOG_DIR: &str = ".dimagine/log";
@@ -50,12 +50,26 @@ pub struct OpEntry {
 /// An action produced by undoing a step.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UndoneItem {
-    /// A created file to be handed to the trash by the caller.
+    /// A created library file to be handed to the trash
+    /// by the caller (ADR-016 §8: create ⇒ delete via
+    /// trash, never a hard delete).
     TrashThis(RelPath),
-    /// A modified note whose before-bytes were restored with CAS.
+    /// A modified note whose before-bytes were restored
+    /// with CAS.
     Modified(RelPath),
-    /// A moved file whose move was reversed.
-    Moved { from: RelPath, to: RelPath },
+    /// A moved file whose move was reversed, from its
+    /// after-path back to its before-path — either door.
+    Moved { from: StepPath, to: StepPath },
+    /// A trash-side file (a trash record) the undo
+    /// removed permanently: it is trash-internal
+    /// state, not library content, so its inverse is a
+    /// deletion, not a hand-back to the trash.
+    Removed(StepPath),
+    /// A deleted trash record the undo recreated from
+    /// its recorded bytes — the inverse of the delete
+    /// a restore performs, so undoing a restore puts
+    /// the group back into the trash whole.
+    Recreated(StepPath),
 }
 
 /// The result of an undo operation.
@@ -64,8 +78,6 @@ pub struct UndoOutcome {
     pub op_id: String,
     pub undone: Vec<UndoneItem>,
     pub skipped: Vec<UndoMismatch>,
-    /// Inverse steps that landed but could not be written to the audit log.
-    pub audit_errors: Vec<String>,
 }
 
 /// Append a single operation line and fsync it immediately.
@@ -184,13 +196,13 @@ pub(crate) fn compact_op_log(root: &File, _lock: &WriteLock) -> Result<()> {
 /// Verifies every participant is at its after-hash. If any participant is not,
 /// refuses listing the paths unless `force` is true.
 ///
-/// The apply phase below is deliberately *not* journaled (cf. ADR-016 §7 for
-/// the forward path): verification is the all-or-nothing gate, and every
-/// inverse that lands appends its own audit line (`record_undo_entry`), so a
-/// crash mid-undo leaves the landed inverses in the audit log for the caller
-/// to see via `audit_errors` and the follow-up entries. A dedicated undo
-/// journal with crash replay is deferred to W63, when `undo` is wired to
-/// users.
+/// The inverse steps are applied as one journaled operation of their
+/// own — a new op id, source `undo`, intent `{"undo_op": <id>}` — so a
+/// crash mid-undo is recovered exactly like any other operation (ADR-016
+/// §7, §8; RW60b F4): the landed inverses roll back to the state after
+/// the original operation. Created files are not written by undo; they
+/// are handed back as [`UndoneItem::TrashThis`] for the caller to trash,
+/// and the trash operation journals its own op.
 pub(crate) fn undo(
     writer: &Writer,
     lock: &WriteLock,
@@ -211,36 +223,36 @@ pub(crate) fn undo(
     let mut valid_entries = Vec::new();
 
     for entry in &op_entries {
-        let path_rel = RelPath::parse(&entry.path)?;
+        let path = StepPath::parse(&entry.path)?;
         match entry.step_kind {
-            StepKind::Create => match writer.read(&path_rel) {
+            StepKind::Create => match writer.read_step(&path) {
                 Ok((bytes, _)) => {
                     let fp = Fingerprint::of_bytes(&bytes);
                     if fp.hex() == entry.after_hash {
                         valid_entries.push(entry.clone());
                     } else {
                         mismatches.push(UndoMismatch {
-                            path: path_rel.to_path(),
+                            path: path.to_path(),
                             reason: UndoReason::Changed,
                         });
                     }
                 }
                 Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
                     mismatches.push(UndoMismatch {
-                        path: path_rel.to_path(),
+                        path: path.to_path(),
                         reason: UndoReason::Missing,
                     });
                 }
                 Err(e) => return Err(e),
             },
-            StepKind::Modify => match writer.read(&path_rel) {
+            StepKind::Modify => match writer.read_step(&path) {
                 Ok((bytes, _)) => {
                     let fp = Fingerprint::of_bytes(&bytes);
                     let hex = fp.hex();
                     if hex == entry.after_hash {
                         if entry.before_bytes.is_none() {
                             mismatches.push(UndoMismatch {
-                                path: path_rel.to_path(),
+                                path: path.to_path(),
                                 reason: UndoReason::NoRecord,
                             });
                         } else {
@@ -248,19 +260,19 @@ pub(crate) fn undo(
                         }
                     } else if entry.before_hash.as_deref() == Some(&hex) {
                         mismatches.push(UndoMismatch {
-                            path: path_rel.to_path(),
+                            path: path.to_path(),
                             reason: UndoReason::Reverted,
                         });
                     } else {
                         mismatches.push(UndoMismatch {
-                            path: path_rel.to_path(),
+                            path: path.to_path(),
                             reason: UndoReason::Changed,
                         });
                     }
                 }
                 Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
                     mismatches.push(UndoMismatch {
-                        path: path_rel.to_path(),
+                        path: path.to_path(),
                         reason: UndoReason::Missing,
                     });
                 }
@@ -271,15 +283,15 @@ pub(crate) fn undo(
                     op: op_id.to_string(),
                     message: "move log entry missing src_path".to_string(),
                 })?;
-                let src_rel = RelPath::parse(src_text)?;
+                let src = StepPath::parse(src_text)?;
 
-                let dst_read = writer.read(&path_rel);
-                let src_read = writer.read(&src_rel);
+                let dst_read = writer.read_step(&path);
+                let src_read = writer.read_step(&src);
 
                 let src_exists = src_read.is_ok();
                 if src_exists {
                     mismatches.push(UndoMismatch {
-                        path: src_rel.to_path(),
+                        path: src.to_path(),
                         reason: UndoReason::SourceBack,
                     });
                     continue;
@@ -292,7 +304,7 @@ pub(crate) fn undo(
                             valid_entries.push(entry.clone());
                         } else {
                             mismatches.push(UndoMismatch {
-                                path: path_rel.to_path(),
+                                path: path.to_path(),
                                 reason: UndoReason::Changed,
                             });
                         }
@@ -301,8 +313,43 @@ pub(crate) fn undo(
                         if source.raw_os_error() == Some(libc::ENOENT) =>
                     {
                         mismatches.push(UndoMismatch {
-                            path: path_rel.to_path(),
+                            path: path.to_path(),
                             reason: UndoReason::Missing,
+                        });
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            StepKind::Delete => {
+                // A delete's after-state is absence. With
+                // recorded bytes — the small trash record a
+                // restore consumes (ADR-017 §7) — the
+                // inverse is a re-create. Without them the
+                // deletion is permanent and the operation
+                // is not undoable (ADR-016 §8).
+                match writer.read_step(&path) {
+                    Err(Error::Io { source, .. })
+                        if source.raw_os_error() == Some(libc::ENOENT) =>
+                    {
+                        if entry.before_bytes.is_some() {
+                            valid_entries.push(entry.clone());
+                        } else {
+                            mismatches.push(UndoMismatch {
+                                path: path.to_path(),
+                                reason: UndoReason::Permanent,
+                            });
+                        }
+                    }
+                    Ok((bytes, _)) => {
+                        let hex = Fingerprint::of_bytes(&bytes).hex();
+                        let reason = if entry.before_hash.as_deref() == Some(&hex) {
+                            UndoReason::Reverted
+                        } else {
+                            UndoReason::Changed
+                        };
+                        mismatches.push(UndoMismatch {
+                            path: path.to_path(),
+                            reason,
                         });
                     }
                     Err(e) => return Err(e),
@@ -318,87 +365,136 @@ pub(crate) fn undo(
         });
     }
 
-    // Apply inverse actions on valid entries in reverse order
+    // Apply the inverses of the valid entries, newest first.
+    // Modify and move inverses become steps of one journaled
+    // undo operation, so a crash mid-undo is recovered like
+    // any other operation (ADR-016 §7, §8; RW60b F4).
+    // Created library files are not written by undo: they are
+    // handed back as [`UndoneItem::TrashThis`] for the caller
+    // to trash, and the trash operation journals its own op.
     let mut undone = Vec::new();
-    let mut audit_errors: Vec<String> = Vec::new();
-    let undo_time = chrono::Utc::now().to_rfc3339();
-    let undo_op_id = ulid::Ulid::new().to_string();
-
+    let mut steps = Vec::new();
     for entry in valid_entries.iter().rev() {
-        let path_rel = RelPath::parse(&entry.path)?;
+        let path = StepPath::parse(&entry.path)?;
         match entry.step_kind {
-            StepKind::Create => {
-                // Hand back to caller as "trash this" (ADR-016 §8, W63 wires trash)
-                undone.push(UndoneItem::TrashThis(path_rel));
-            }
+            StepKind::Create => match &path {
+                // A created library file: the caller hands
+                // it to the trash (ADR-016 §8).
+                StepPath::Library(rel) => {
+                    undone.push(UndoneItem::TrashThis(rel.clone()));
+                }
+                // A created trash-side file — a trash
+                // record: trash-internal state whose
+                // inverse is a permanent removal, not a
+                // hand-back to the trash.
+                StepPath::Trash(trash) => {
+                    undone.push(UndoneItem::Removed(StepPath::Trash(trash.clone())));
+                    steps.push(crate::journal::StepRecord {
+                        step_idx: steps.len(),
+                        kind: StepKind::Delete,
+                        src: None,
+                        dst: entry.path.clone(),
+                        before_hash: None,
+                        after_hash: String::new(),
+                        before_bytes: None,
+                        after_bytes: None,
+                    });
+                }
+            },
             StepKind::Modify => {
-                let (bytes, cur_fp) = writer.read(&path_rel)?;
                 let Some(before_bytes) = entry.before_bytes.as_ref() else {
                     return Err(Error::BadJournal {
                         op: op_id.to_string(),
                         message: format!("no before-bytes recorded for {:?}", entry.path),
                     });
                 };
-                let new_fp =
-                    writer.update_existing_locked(lock, &path_rel, &cur_fp, before_bytes)?;
-                undone.push(UndoneItem::Modified(path_rel.clone()));
-
-                // Record undo in op log
-                let undo_entry = OpEntry {
-                    op_id: undo_op_id.clone(),
-                    time: undo_time.clone(),
-                    source: "undo".to_string(),
-                    client_addr: None,
-                    intent: serde_json::json!({ "undo_op": op_id }),
-                    step_kind: StepKind::Modify,
-                    path: entry.path.clone(),
-                    src_path: None,
-                    before_hash: Some(cur_fp.hex()),
-                    after_hash: new_fp.hex(),
-                    before_bytes: Some(bytes),
+                let StepPath::Library(rel) = &path else {
+                    return Err(Error::BadJournal {
+                        op: op_id.to_string(),
+                        message: format!("modify step targets the trash: {:?}", entry.path),
+                    });
                 };
-                record_undo_entry(writer, &undo_entry, &mut audit_errors);
+                undone.push(UndoneItem::Modified(rel.clone()));
+                // The before-state is re-read from the file (which
+                // sits at the recorded after-hash) and the after-state
+                // is the recorded before-bytes, by `enrich_step` and
+                // the journal write respectively.
+                steps.push(crate::journal::StepRecord {
+                    step_idx: steps.len(),
+                    kind: StepKind::Modify,
+                    src: None,
+                    dst: entry.path.clone(),
+                    before_hash: None,
+                    after_hash: String::new(),
+                    before_bytes: None,
+                    after_bytes: Some(before_bytes.clone()),
+                });
             }
             StepKind::Move => {
                 let src_text = entry.src_path.as_ref().unwrap();
-                let src_rel = RelPath::parse(src_text)?;
-                writer.move_noreplace_locked(lock, &path_rel, &src_rel)?;
+                let src = StepPath::parse(src_text)?;
                 undone.push(UndoneItem::Moved {
-                    from: path_rel.clone(),
-                    to: src_rel.clone(),
+                    from: path.clone(),
+                    to: src.clone(),
                 });
-
-                // Record undo in op log
-                let undo_entry = OpEntry {
-                    op_id: undo_op_id.clone(),
-                    time: undo_time.clone(),
-                    source: "undo".to_string(),
-                    client_addr: None,
-                    intent: serde_json::json!({ "undo_op": op_id }),
-                    step_kind: StepKind::Move,
-                    path: src_text.clone(),
-                    src_path: Some(entry.path.clone()),
-                    before_hash: entry.before_hash.clone(),
-                    after_hash: entry.after_hash.clone(),
+                // The move is reversed: from the recorded
+                // destination back to the recorded source.
+                steps.push(crate::journal::StepRecord {
+                    step_idx: steps.len(),
+                    kind: StepKind::Move,
+                    src: Some(entry.path.clone()),
+                    dst: src_text.clone(),
+                    before_hash: None,
+                    after_hash: String::new(),
                     before_bytes: None,
+                    after_bytes: None,
+                });
+            }
+            StepKind::Delete => {
+                // The recorded bytes are the deleted
+                // trash record: the inverse is a
+                // re-create, so undoing a restore puts
+                // the group back into the trash whole.
+                let Some(before_bytes) = entry.before_bytes.as_ref() else {
+                    return Err(Error::BadJournal {
+                        op: op_id.to_string(),
+                        message: format!(
+                            "delete entry recorded no before-bytes to restore: {:?}",
+                            entry.path
+                        ),
+                    });
                 };
-                record_undo_entry(writer, &undo_entry, &mut audit_errors);
+                undone.push(UndoneItem::Recreated(path.clone()));
+                steps.push(crate::journal::StepRecord {
+                    step_idx: steps.len(),
+                    kind: StepKind::Create,
+                    src: None,
+                    dst: entry.path.clone(),
+                    before_hash: None,
+                    after_hash: String::new(),
+                    before_bytes: None,
+                    after_bytes: Some(before_bytes.clone()),
+                });
             }
         }
+    }
+
+    if !steps.is_empty() {
+        let undo_op_id = ulid::Ulid::new().to_string();
+        writer.execute_op_locked(
+            lock,
+            &undo_op_id,
+            "undo",
+            None,
+            serde_json::json!({ "undo_op": op_id }),
+            steps,
+            None,
+        )?;
     }
 
     Ok(UndoOutcome {
         op_id: op_id.to_string(),
         undone,
         skipped: mismatches,
-        audit_errors,
     })
-}
-
-/// The inverse step landed; a failed audit line is reported, not a failure of
-/// the undo itself (the file change is already durable).
-fn record_undo_entry(writer: &Writer, entry: &OpEntry, audit_errors: &mut Vec<String>) {
-    if let Err(e) = append_op_entry(writer.root_file(), entry) {
-        audit_errors.push(format!("{:?}: {e}", entry.path));
-    }
 }

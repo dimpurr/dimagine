@@ -41,6 +41,7 @@ Obsidian vault. This is a description of compatibility, not an affiliation.
 | any other `*.md` | no | Notes, including collections (§5). |
 | `*.canvas` | no | Boards in JSON Canvas format (§6). |
 | `.dimagine/` | no | Tool settings and caches (§8). Safe to delete. |
+| `.trash/` | no | Deleted groups waiting to be restored or purged (§7.1). Ignored like any dotted name; emptying it is the permanent delete. |
 
 ### 2.1 Images
 
@@ -245,14 +246,57 @@ These are plain file operations. To keep a library consistent:
   may do this automatically using `id` (§3.3).
 - A copied image is a new image. If its note was copied too, the duplicate `id`
   is resolved as in §3.3.
-- Tools that delete should move files to `.dimagine/trash/` rather than remove
-  them.
+
+### 7.1 Deleting
+
+A tool that deletes moves a group — the image, its note, and every raw metadata
+sidecar named after the image — into `.trash/` at the library root, keeping each
+file's library-relative path, and writes a record beside them:
+
+```
+.trash/refs/girl.png
+.trash/refs/girl.png.md
+.trash/refs/girl.png.trash.json
+```
+
+The record is JSON: the operation's id, the time it trashed (`trashed_at`,
+RFC 3339 UTC), and for each file its original library path, its path in
+`.trash/` and its modification time. A group whose name is already taken in
+`.trash/` gets the next bumped name (`girl 2.png`), and the record moves with
+it. Nothing is deleted in place: a tool removes a file permanently only when it
+is past the retention period and the user asked for the purge.
+
+Because `.trash/` starts with a dot it is ignored (§2.2): a trashed image is
+out of the library as far as every other tool is concerned, and a restore is a
+plain move back to the recorded original path.
+
+A group with no record is never deleted automatically, whoever put it there —
+including a file Obsidian moved into `.trash/` itself.
+
+An older version of this document named `.dimagine/trash/` as the place to
+delete into. That location is no longer written: a tool puts new groups in
+`.trash/`. It stays readable, so a library that already has one is not stranded
+— a tool reports what is in it and leaves it alone. Recovering those files is a
+manual move back into the library, because the format has no record of where
+they came from.
+
+Two operations remove a file for good, and both are irreversible: deleting the
+groups past the retention period, and emptying the whole trash on request. A
+tool that offers either asks for explicit confirmation, and neither has an
+undo.
 
 ## 8. The `.dimagine/` folder
 
 `.dimagine/` holds only things that are meaningless to other tools and safe to
 lose: settings, plugin state, previews, indexes and embeddings. Deleting it must
 not lose any user data. It should be excluded from backups and sync.
+
+`.dimagine/settings.json` is the library's settings: one JSON object keyed by
+setting, the key dotted and namespaced (`trash.retentionDays`). Only the
+settings the user changed from their default are written; a tool that writes the
+file leaves keys it does not know untouched, and never stores a secret in it. A
+tool reads what it knows, treats a value that fails its own rule as unset, and
+says so once rather than refusing to start.
 
 ### 8.1 Caches
 
@@ -279,7 +323,52 @@ Tools that generate previews should produce:
 - Larger renditions are produced on demand from the original, not stored by
   default.
 
-## 9. Versioning
+### 8.3 The write log and journal
+
+A tool that writes the library records what it did:
+
+- `.dimagine/log/ops.jsonl` — one line per step, newest last: the operation's
+  id and time, who asked (`source`: a CLI, the viewer, an import), the intent as
+  JSON, the step's kind and path, and the SHA-256 each file had before and after.
+  The bytes needed to put a step back ride along, which is what an undo reads.
+  The log keeps its last 200 operations; older ones are dropped.
+- `.dimagine/journal/<op-id>/` — the in-progress steps of an operation, removed
+  when it finishes. A folder left here means an operation did not complete and
+  needs recovery; `check` reports it.
+- `.dimagine/write.lock` — held while an operation runs.
+- `.dimagine.tmp.<nonce>` — a temporary file beside the one being replaced,
+  renamed into place. It carries the dotted prefix so it is ignored (§2.2).
+
+All of it is derived: an operation the log does not describe still left its
+files on disk, and a library with the folder deleted is a normal library that
+can no longer be undone.
+
+## 9. The `dimagine` CLI
+
+This document describes the files; these are the commands that write them. The
+full behaviour is in [HLD.md](HLD.md). Every command takes `--library <path>`
+(default: the current directory) and `--json`.
+
+```
+dimagine tag <img> [--add T] [--remove T]     # edit an image note's tags
+dimagine rate <img> <0-5|none>                # set or clear its rating
+dimagine set <img> KEY=VALUE …                # set scalar properties (KEY= clears)
+dimagine collect --new <title> <img>…         # create a collection note (§5)
+dimagine collect --add|--remove <note> <img>… # edit a collection's members
+dimagine trash <img>…                         # move groups into .trash/ (§7.1)
+dimagine restore <img>…                       # move them back
+dimagine undo [<op-id>] [--force]             # reverse one recorded operation
+dimagine config list|get|set|reset …          # read or write .dimagine/settings.json (§8)
+dimagine trash purge [--dry-run] [--yes]      # delete groups past the retention period
+dimagine trash empty [--yes]                  # delete every trashed group now
+dimagine check                                # report problems, including past writes
+```
+
+A command that changes a file prints the id of the operation it made, which is
+what `undo` takes; `--json` prints one document per command carrying the same
+id. `purge` and `empty` delete for good, so each needs an explicit `--yes`.
+
+## 10. Versioning
 
 This document carries the format version. Libraries do not record a version;
 files are expected to stay readable across versions, and a future version that
@@ -296,3 +385,6 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-06 | `thumb` previews keep a readable shape: long edge ≤ 400 px, aspect ≤ 5:2; an extreme-aspect source is cropped to 5:2 from the top (tall) or the left (wide) instead of shrinking to a sliver, and the short edge is ≥ 40 px unless the source itself is smaller (§8.2). |
 | 0.1 | 2026-10-06 | A rendition is valid only for the rendition policy that made it: the cache key carries a policy generation, and older-policy entries are regenerated, not reused (§8.2). |
 | 0.1 | 2026-10-06 | An out-of-range or non-integer `rating` reads as no rating (§3.1). |
+| 0.1 | 2026-10-13 | Deletion is a group move into `.trash/` with a `<name>.trash.json` record beside it (§7.1); `.trash/` joins the ignored dotted names (§2.2). `.dimagine/` gains `settings.json`, `log/ops.jsonl`, `journal/`, `write.lock` and the `.dimagine.tmp.` temporary prefix (§8, §8.3). |
+| 0.1 | 2026-10-13 | The old `.dimagine/trash/` is no longer written to but stays readable, so a library that still holds one reports its files instead of losing track of them (§7.1). A group with no record is never deleted automatically (§7.1). |
+| 0.1 | 2026-10-13 | The CLI that writes the format is listed with what each command does (§9); Versioning moves to §10. |

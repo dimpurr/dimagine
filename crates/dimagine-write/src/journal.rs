@@ -2,7 +2,12 @@
 //!
 //! Scope: multi-file operations write one atomically-fsynced step file per
 //! step into `.dimagine/journal/<op-id>/`, then touch user files, then write a
-//! fsynced `committed` marker, and finally remove the journal directory.
+//! fsynced `committed` marker, and finally remove the journal directory. A
+//! partial batch (a step failed, the rest landed) writes a fsynced `partial`
+//! marker *before* attempting that removal, so the terminal state — "a subset
+//! landed, the caller was told which" — survives even a failed directory
+//! removal: recovery reads the marker, touches nothing, and removes the
+//! directory itself (RW60b F2).
 //!
 //! Recovery runs only when the write lock is obtainable and the recorded writer
 //! pid/boot id is dead. Files in a third state are never touched.
@@ -17,11 +22,15 @@ use crate::error::{Error, PathReject, Result};
 use crate::fingerprint::Fingerprint;
 use crate::fs;
 use crate::lock::WriteLock;
-use crate::paths::RelPath;
+use crate::paths::StepPath;
 use crate::writer::Writer;
 
 pub const JOURNAL_DIR: &str = ".dimagine/journal";
 pub const COMMITTED_MARKER: &str = "committed";
+/// Terminal-state marker of a partial batch: a subset of the
+/// steps landed and the caller was told which ones. Recovery
+/// interprets it as "do nothing to user files" (RW60b F2).
+pub const PARTIAL_MARKER: &str = "partial";
 pub const META_FILE: &str = "meta.json";
 
 /// The kind of change a journal step performs.
@@ -31,6 +40,15 @@ pub enum StepKind {
     Create,
     Modify,
     Move,
+    /// A permanent unlink, only ever of a file inside
+    /// `.trash/` (ADR-017 §7): a purged group, or the
+    /// trash record a restore consumes. Unlike the other
+    /// kinds there is no inverse: the step is either
+    /// permanent (no bytes recorded — a purged image) or
+    /// reversible from its recorded bytes (a small trash
+    /// record), and recovery and undo treat the two
+    /// exactly so.
+    Delete,
 }
 
 /// A recorded step in an operation journal.
@@ -137,6 +155,13 @@ pub enum RecoveryOutcome {
         op_id: String,
         steps: usize,
     },
+    /// The operation had already reached its terminal state as a
+    /// partial batch: a subset of its steps landed and the caller
+    /// was told which files those were. Recovery touches no user
+    /// file and only removes the journal (RW60b F2).
+    PartialLanded {
+        op_id: String,
+    },
     ThirdStateRefused {
         op_id: String,
         reason: String,
@@ -238,6 +263,24 @@ impl JournalOp {
         Ok(())
     }
 
+    /// Write the terminal-state marker of a partial batch: a subset
+    /// of the steps landed and the caller was told which. Written
+    /// *before* the journal directory is removed, so the terminal
+    /// state does not depend on that removal succeeding — recovery
+    /// reads the marker, touches no user file, and removes the
+    /// directory itself (RW60b F2).
+    pub(crate) fn mark_partial(&self) -> Result<()> {
+        let file = fs::open_leaf(
+            &self.op_dir,
+            PARTIAL_MARKER,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+            0o644,
+        )?;
+        fs::fsync_file(&file)?;
+        fs::fsync_dir(&self.op_dir)?;
+        Ok(())
+    }
+
     /// Rewrite one step file: used when the filesystem knows something about
     /// the step that the caller's intent did not (ADR-016 §7).
     pub(crate) fn record_step(&self, step: &StepRecord) -> Result<()> {
@@ -327,8 +370,8 @@ pub(crate) fn enrich_step(writer: &Writer, step: &mut StepRecord) -> Result<()> 
             }
         }
         StepKind::Modify => {
-            let dst = RelPath::parse(&step.dst)?;
-            let (bytes, _) = writer.read(&dst)?;
+            let dst = StepPath::parse(&step.dst)?;
+            let (bytes, _) = writer.read_step(&dst)?;
             step.before_hash = Some(Fingerprint::of_bytes(&bytes).hex());
             step.before_bytes = Some(bytes);
             if step.after_bytes.is_none() {
@@ -346,16 +389,30 @@ pub(crate) fn enrich_step(writer: &Writer, step: &mut StepRecord) -> Result<()> 
                 op: step.dst.clone(),
                 message: "move step missing src".to_string(),
             })?;
-            let src = RelPath::parse(src_text)?;
+            let src = StepPath::parse(src_text)?;
             // A rename does not change bytes, so the source's hash is both the
             // before state and the after state of the destination. The step
             // file keeps hashes only: a move is its own inverse and never
             // needs bytes.
-            let (bytes, _) = writer.read(&src)?;
+            let (bytes, _) = writer.read_step(&src)?;
             let hex = Fingerprint::of_bytes(&bytes).hex();
             step.before_hash = Some(hex.clone());
             step.before_bytes = None;
             step.after_hash = hex;
+        }
+        StepKind::Delete => {
+            let dst = StepPath::parse(&step.dst)?;
+            let (bytes, _) = writer.read_step(&dst)?;
+            step.before_hash = Some(Fingerprint::of_bytes(&bytes).hex());
+            // A delete's after-state is absence, so the
+            // after hash is the empty string. The bytes
+            // stay as the caller recorded them: a small
+            // trash record carries them so recovery and
+            // undo can put it back, while a purged
+            // image — which this crate must never copy
+            // (ADR-016 §8) — records none and is
+            // permanent by design.
+            step.after_hash = String::new();
         }
     }
     Ok(())
@@ -363,9 +420,9 @@ pub(crate) fn enrich_step(writer: &Writer, step: &mut StepRecord) -> Result<()> 
 
 /// Classify a single step against the current filesystem state.
 pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
-    let dst_rel = RelPath::parse(&step.dst)?;
+    let dst = StepPath::parse(&step.dst)?;
     match step.kind {
-        StepKind::Create => match writer.read(&dst_rel) {
+        StepKind::Create => match writer.read_step(&dst) {
             Ok((bytes, _)) => {
                 let fp = Fingerprint::of_bytes(&bytes);
                 if fp.hex() == step.after_hash {
@@ -383,7 +440,7 @@ pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
             }
             Err(e) => Err(e),
         },
-        StepKind::Modify => match writer.read(&dst_rel) {
+        StepKind::Modify => match writer.read_step(&dst) {
             Ok((bytes, _)) => {
                 let fp = Fingerprint::of_bytes(&bytes);
                 let hex = fp.hex();
@@ -408,10 +465,10 @@ pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
                 op: step.dst.clone(),
                 message: "move step missing src".to_string(),
             })?;
-            let src_rel = RelPath::parse(src_text)?;
+            let src = StepPath::parse(src_text)?;
 
-            let src_read = writer.read(&src_rel);
-            let dst_read = writer.read(&dst_rel);
+            let src_read = writer.read_step(&src);
+            let dst_read = writer.read_step(&dst);
 
             let dst_has_after = match &dst_read {
                 Ok((bytes, _)) => Fingerprint::of_bytes(bytes).hex() == step.after_hash,
@@ -450,6 +507,24 @@ pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
                 dst_read.is_ok()
             )))
         }
+        StepKind::Delete => match writer.read_step(&dst) {
+            // The after-state of a delete is absence.
+            Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
+                Ok(StepState::Executed)
+            }
+            Ok((bytes, _)) => {
+                let hex = Fingerprint::of_bytes(&bytes).hex();
+                if step.before_hash.as_deref() == Some(&hex) {
+                    Ok(StepState::NotExecuted)
+                } else {
+                    Ok(StepState::ThirdState(format!(
+                        "delete target {} has third-state hash {}",
+                        step.dst, hex
+                    )))
+                }
+            }
+            Err(e) => Err(e),
+        },
     }
 }
 
@@ -508,6 +583,18 @@ fn recover_op(
         return Ok(RecoveryOutcome::SkippedLiveWriter {
             op_id: op_id.to_string(),
             pid: meta.pid,
+        });
+    }
+
+    // A partial batch already reached its terminal state: a
+    // subset of steps landed and the caller was told which
+    // ones. Recovery touches no user file — the landed files
+    // count as success — and only removes the journal, whose
+    // removal may have failed before (RW60b F2).
+    if fs::leaf_exists(&op_dir, PARTIAL_MARKER) {
+        cleanup_op_dir(writer.root_file(), &op_id)?;
+        return Ok(RecoveryOutcome::PartialLanded {
+            op_id: op_id.to_string(),
         });
     }
 
@@ -598,7 +685,7 @@ fn recover_op(
             }
             match step.kind {
                 StepKind::Create => {
-                    let dst = RelPath::parse(&step.dst)?;
+                    let dst = StepPath::parse(&step.dst)?;
                     let bytes = step
                         .after_bytes
                         .as_deref()
@@ -609,11 +696,11 @@ fn recover_op(
                                 step.step_idx
                             ),
                         })?;
-                    writer.create_exclusive_locked(lock, &dst, bytes)?;
+                    writer.create_step_exclusive_locked(lock, &dst, bytes)?;
                 }
                 StepKind::Modify => {
-                    let dst = RelPath::parse(&step.dst)?;
-                    let (_, cur_fp) = writer.read(&dst)?;
+                    let dst = StepPath::parse(&step.dst)?;
+                    let (_, cur_fp) = writer.read_step(&dst)?;
                     let bytes = step
                         .after_bytes
                         .as_deref()
@@ -628,12 +715,16 @@ fn recover_op(
                 }
                 StepKind::Move => {
                     let src =
-                        RelPath::parse(step.src.as_ref().ok_or_else(|| Error::BadJournal {
+                        StepPath::parse(step.src.as_ref().ok_or_else(|| Error::BadJournal {
                             op: op_id.to_string(),
                             message: "move step missing src".to_string(),
                         })?)?;
-                    let dst = RelPath::parse(&step.dst)?;
-                    writer.move_noreplace_locked(lock, &src, &dst)?;
+                    let dst = StepPath::parse(&step.dst)?;
+                    writer.move_step_noreplace_locked(lock, &src, &dst)?;
+                }
+                StepKind::Delete => {
+                    let dst = StepPath::parse(&step.dst)?;
+                    writer.unlink_step_locked(lock, &dst)?;
                 }
             }
             count += 1;
@@ -647,14 +738,14 @@ fn recover_op(
             }
             match step.kind {
                 StepKind::Create => {
-                    let dst = RelPath::parse(&step.dst)?;
+                    let dst = StepPath::parse(&step.dst)?;
                     let dst_dir =
                         fs::resolve_dir(writer.root_file(), dst.parent_components(), false)?;
                     fs::unlink(&dst_dir, dst.name())?;
                     let _ = fs::fsync_dir(&dst_dir);
                 }
                 StepKind::Modify => {
-                    let dst = RelPath::parse(&step.dst)?;
+                    let dst = StepPath::parse(&step.dst)?;
                     let before_bytes =
                         step.before_bytes
                             .as_ref()
@@ -665,17 +756,32 @@ fn recover_op(
                                     step.step_idx
                                 ),
                             })?;
-                    let (_, cur_fp) = writer.read(&dst)?;
+                    let (_, cur_fp) = writer.read_step(&dst)?;
                     writer.update_existing_locked(lock, &dst, &cur_fp, before_bytes)?;
                 }
                 StepKind::Move => {
                     let src =
-                        RelPath::parse(step.src.as_ref().ok_or_else(|| Error::BadJournal {
+                        StepPath::parse(step.src.as_ref().ok_or_else(|| Error::BadJournal {
                             op: op_id.to_string(),
                             message: "move step missing src".to_string(),
                         })?)?;
-                    let dst = RelPath::parse(&step.dst)?;
-                    writer.move_noreplace_locked(lock, &dst, &src)?;
+                    let dst = StepPath::parse(&step.dst)?;
+                    writer.move_step_noreplace_locked(lock, &dst, &src)?;
+                }
+                StepKind::Delete => {
+                    // A permanent deletion is only rolled back when its
+                    // bytes were recorded — the small trash record a
+                    // restore consumes (ADR-017 §7). Without them there
+                    // is nothing to restore, so the deletion stands and
+                    // the step is left alone: purged images are
+                    // unrecoverable by design, never copied into the
+                    // journal (ADR-016 §8).
+                    let dst = StepPath::parse(&step.dst)?;
+                    let Some(bytes) = step.before_bytes.as_deref() else {
+                        // Permanent: nothing was restored, nothing counted.
+                        continue;
+                    };
+                    writer.create_step_exclusive_locked(lock, &dst, bytes)?;
                 }
             }
             count += 1;

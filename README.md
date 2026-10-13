@@ -17,6 +17,17 @@ Start with [docs/FORMAT.md](docs/FORMAT.md) for the format, [docs/VISION.md](doc
 for what this is and is not, and [docs/INDEX.md](docs/INDEX.md) for where each
 kind of documentation lives.
 
+## Changing a library
+
+`dimagine tag`, `rate` and `set` edit an image note's properties, `collect`
+creates a collection note or adds and removes its members, and `trash` /
+`restore` move a whole image group in and out of `.trash/`. Each of them is one
+recorded operation, so `dimagine undo` gives it back; `dimagine config` shows and
+changes the library's settings, `dimagine trash purge` clears trashed groups once
+they are past the retention period, and `dimagine trash empty` clears them now.
+They write through the same locked, hashed and journaled path, so a note you
+edited by hand yourself is never overwritten.
+
 ## Sharing a library
 
 `dimagine serve` starts a read-only viewer on `127.0.0.1`; `--bind` moves it to

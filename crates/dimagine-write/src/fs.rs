@@ -267,6 +267,37 @@ pub(crate) fn fsync_dir(dir: &File) -> Result<(), Error> {
     Ok(())
 }
 
+/// Set a leaf's modification time without following
+/// symlinks (a restore puts the original mtime back,
+/// ADR-017 §7; both atime and mtime take the value).
+pub fn set_mtime(dir: &File, name: &str, mtime_ns: i64) -> Result<(), Error> {
+    let c = cname(name)?;
+    let sec = mtime_ns.div_euclid(1_000_000_000);
+    let nsec = mtime_ns.rem_euclid(1_000_000_000);
+    let times = [
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec as _,
+        },
+        libc::timespec {
+            tv_sec: sec,
+            tv_nsec: nsec as _,
+        },
+    ];
+    let rc = unsafe {
+        libc::utimensat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc < 0 {
+        return Err(io_failed("set mtime", name, errno()));
+    }
+    Ok(())
+}
+
 /// The outcome of a "rename only if the target is absent" attempt.
 pub(crate) enum Renamed {
     Done,
