@@ -1,0 +1,21 @@
+[package]
+name = "dimagine-write"
+description = "The single write path for a dimagine library: durable, compare-and-swap, undoable."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", features = ["clock"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10.9"
+thiserror = "2.0.17"
+ulid = "1"
+unicode-casefold = "0.2"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
