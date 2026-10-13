@@ -693,6 +693,13 @@ async fn stream_image(
     let mut response = Response::new(body);
     let h = response.headers_mut();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    // ADR-018 §5: image responses tell the browser not to reinterpret the
+    // bytes as something else. The MIME is the sniffed one, so a mismatched
+    // extension cannot coax a renderer out of served bytes.
+    h.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
     h.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),

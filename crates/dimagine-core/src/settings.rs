@@ -64,6 +64,20 @@ pub fn schema() -> &'static [SettingSpec] {
     &SCHEMA
 }
 
+/// The key prefix reserved for the plugin switches that will fold into
+/// this file as `plugins.<name>.enabled` (ADR-019 §6). Today the switches
+/// still live in `.dimagine/core-plugins.json` and are read from there;
+/// a key under this prefix is recognised — kept verbatim and never
+/// reported as an unknown key — but no value here drives behaviour yet.
+pub const RESERVED_PREFIX: &str = "plugins.";
+
+/// Whether a key is a reserved plugin-switch key (ADR-019 §6). It is
+/// recognised so the settings tools do not flag it unknown, even though
+/// the source of truth stays in `core-plugins.json` for now.
+pub fn is_reserved(key: &str) -> bool {
+    key.starts_with(RESERVED_PREFIX)
+}
+
 /// What was wrong with a settings file, reported to `check` and the
 /// settings page (ADR-019 §3).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -122,9 +136,10 @@ impl Settings {
         if let Some(map) = file_map {
             let known: BTreeSet<&str> = schema().iter().map(|s| s.key).collect();
             for key in map.keys() {
-                if !known.contains(key.as_str()) {
-                    report.unknown.push(key.clone());
+                if known.contains(key.as_str()) || is_reserved(key) {
+                    continue;
                 }
+                report.unknown.push(key.clone());
             }
         }
         Self { values, report }
@@ -400,6 +415,19 @@ mod tests {
         assert_eq!(settings.trash_retention_days(), 30);
         assert_eq!(settings.report.unknown, ["future.setting"]);
         assert!(settings.report.invalid.is_empty());
+    }
+
+    #[test]
+    fn reserved_plugin_keys_are_recognised_not_unknown() {
+        // ADR-019 §6: `plugins.<name>.enabled` is reserved and the old
+        // core-plugins.json is still the source of truth, so a key under
+        // the prefix is kept verbatim but never reported as unknown.
+        let settings = Settings::resolve(Some(
+            r#"{"plugins.import-eagle.enabled": false, "future.setting": true}"#,
+        ));
+        assert_eq!(settings.report.unknown, ["future.setting"]);
+        assert!(is_reserved("plugins.import-eagle.enabled"));
+        assert!(!is_reserved("trash.retentionDays"));
     }
 
     #[test]

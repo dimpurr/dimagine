@@ -74,7 +74,7 @@ run them as one **operation** (FORMAT §8.3).
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `write` | The one path that changes the library: the lock, the read-hash-temp-rename write, the per-operation journal and crash recovery, and the `.dimagine/log/ops.jsonl` audit log with its inverse (FORMAT §8.3). Every write command is a planner that builds steps for this module; none of them writes a file itself. Also `.dimagine/settings.json`: a schema of typed settings with a default and a validation rule each, applied to whatever file is there — unknown keys kept, invalid values read as unset plus a report line. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
-| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. |
+| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. |
 
 ## Serving media (0.1)
 
@@ -92,6 +92,60 @@ route promise a year: a rename or a move keeps the address, and changed bytes
 are a new one. Pages and the JSON they read state the digest, so a picture is
 asked for by its content — and the script spells the generation it reads off
 the page rather than keeping a copy of the policy.
+
+## Serving with writes (deployment)
+
+By default `dimagine serve` is read-only: with no `--write`, none of the write
+routes exist, so upgrading the binary never quietly opens a door (ADR-018 §1).
+Turning it on is a deliberate, reviewable act with preconditions the server
+refuses to start without:
+
+- `--write` also requires `--public-origin <scheme://host[:port]>`. Every write
+  is checked against this exact origin (its `Origin`, or its `Referer` when
+  there is none); a mismatch, a `null`, or a look-alike prefix is refused. There
+  is no path or trailing slash in the origin, because a request's `Origin`
+  carries neither.
+- A write is an **owner** action. A passcode-only server or a first-run server
+  with no account yet stays read-only even with `--write`; a session that is not
+  an owner account's is refused.
+- Each session carries a server-side CSRF token that the owner's own pages echo
+  back in the `x-csrf-token` header; it is never in a URL or a client-set
+  cookie. Writes are `POST`/`PATCH` only, must be `application/json`, and are
+  body-capped at 1 MiB as they stream.
+- `--allow-anonymous-write` exists only for a no-login server (`--auth none`) on
+  a loopback bind; on any other bind the server refuses to start rather than
+  accept writes with no session.
+
+The settings page's password change has the same shape: the signed-in account
+gives its current password and the new one twice, and on success every *other*
+session of that account is signed out — a new password set because the old one
+leaked has to end the sessions it leaked to. The account is the session's own,
+so a session can never change another account's password, and a passcode
+session (which signs in to the server, not to a person) is offered no form at
+all.
+
+The write itself is the same journaled operation the CLI runs through
+`dimagine-write`, so the two agree about what a change means; the peer address is
+recorded in `.dimagine/log/ops.jsonl` (`X-Forwarded-For` is trusted only from a
+`--trusted-proxy` peer).
+
+Deployment changes the filesystem the service writes through, and the operator
+does these steps themselves:
+
+1. Make the library writable by the service user (the unit that mounts it
+   read-only stops mounting it so).
+2. Put the library's files under the service group, set the setgid bit on
+   directories, and set a **default ACL** (`setfacl -d -m g:<group>:rwX`) on the
+   library, rather than relying on `umask` — files written in over `ssh` or by
+   root would not honour a umask.
+3. Record the one-time ownership change (this step changes the group and mode of
+   existing files).
+4. `dimagine check` then reports the fourth deployment item: files the service
+   user cannot write (alongside an unrecovered journal, a stray temporary file,
+   a `.trash` that is a symlink, and trash/record mismatches).
+
+Enabling `--write` on a real server is gated on the Phase 3a review passing;
+until then it is exercised against test libraries only.
 
 ## `check` findings (0.1)
 

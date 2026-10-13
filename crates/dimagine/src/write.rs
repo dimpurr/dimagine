@@ -1886,6 +1886,110 @@ pub mod wcodes {
     pub const TRASH_DOUBLE_CLAIM: &str = "write_trash_double_claim";
     pub const UNPARSABLE_RECORD: &str = "write_trash_unparsable_record";
     pub const LEGACY_TRASH: &str = "write_legacy_trash";
+    pub const SERVICE_UNWRITABLE: &str = "write_service_unwritable";
+}
+
+/// Report what the service user could not write (ADR-018 §7): the fourth of
+/// the four deployment checks. A write lands by writing a dot-temp in a note's
+/// directory and renaming it over the target, and by keeping its lock, journal
+/// and log under `.dimagine/` — so a directory the service cannot write makes
+/// every file in it unwritable, and an unwritable note cannot be updated even
+/// when its directory is fine.
+///
+/// Read-only: it asks the kernel with `access(W_OK)` and never touches a file.
+/// It reports as the process runs it — the exact answer when `check` runs as
+/// the service user, and the operator's own view otherwise.
+pub fn append_service_writability(report: &mut CheckReport, library_dir: &Path, library: &Library) {
+    // The derived folder holds the lock, journal and log every operation
+    // needs. Without it the write core cannot commit anything, so it is the
+    // first thing to test; when it does not exist yet, creating it needs the
+    // library root itself.
+    let state_dir = library_dir.join(".dimagine");
+    if state_dir.exists() {
+        if !dimagine_write::fs::access_writable(&state_dir) {
+            report.findings.push(Finding {
+                severity: Severity::Error,
+                code: wcodes::SERVICE_UNWRITABLE,
+                path: ".dimagine/".to_string(),
+                path_non_utf8: false,
+                message: "the service user cannot write the derived folder, so no operation can \
+                          take its lock or journal"
+                    .to_string(),
+                detail: None,
+            });
+        }
+    } else if !dimagine_write::fs::access_writable(library_dir) {
+        report.findings.push(Finding {
+            severity: Severity::Error,
+            code: wcodes::SERVICE_UNWRITABLE,
+            path: ".".to_string(),
+            path_non_utf8: false,
+            message: "the service user cannot write the library root, so it cannot create the \
+                      derived folder `.dimagine/`"
+                .to_string(),
+            detail: None,
+        });
+    }
+
+    // Each directory is asked once: a note write is a temp-plus-rename inside
+    // the directory, so an unwritable directory blocks every note in it and a
+    // per-file check would only repeat that. A note whose own file is not
+    // writable, in a directory that is, is reported against the note. Paths are
+    // built from the root plus the entry's library-relative path, so a
+    // root-level note sits in the root and never in an empty directory.
+    let mut bad_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut checked_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut unwritable_notes: Vec<(String, bool)> = Vec::new();
+    for entry in &library.files {
+        if !matches!(
+            entry.class,
+            FileClass::ImageNote | FileClass::Note | FileClass::Canvas
+        ) {
+            continue;
+        }
+        let absolute = library_dir.join(&entry.rel);
+        let lossy = absolute.to_str().is_none();
+        let dir = absolute.parent().map(Path::to_path_buf);
+        let dir_ok = match &dir {
+            Some(dir) => {
+                if !checked_dirs.contains(dir) {
+                    checked_dirs.insert(dir.clone());
+                    if !dimagine_write::fs::access_writable(dir) {
+                        bad_dirs.insert(dir.clone());
+                        report.findings.push(Finding {
+                            severity: Severity::Error,
+                            code: wcodes::SERVICE_UNWRITABLE,
+                            path: format!("{}/", display_rel(library_dir, dir)),
+                            path_non_utf8: dir.to_str().is_none(),
+                            message: "the service user cannot write this folder, so it cannot \
+                                      replace a note in it"
+                                .to_string(),
+                            detail: None,
+                        });
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    !bad_dirs.contains(dir)
+                }
+            }
+            None => true,
+        };
+        if dir_ok && !dimagine_write::fs::access_writable(&absolute) {
+            unwritable_notes.push((entry.rel.clone(), lossy));
+        }
+    }
+    for (rel, lossy) in unwritable_notes {
+        report.findings.push(Finding {
+            severity: Severity::Error,
+            code: wcodes::SERVICE_UNWRITABLE,
+            path: rel,
+            path_non_utf8: lossy,
+            message: "the service user cannot write this note".to_string(),
+            detail: None,
+        });
+    }
 }
 
 /// The old trash location, `.dimagine/trash/`, which ADR-017 §7 keeps readable

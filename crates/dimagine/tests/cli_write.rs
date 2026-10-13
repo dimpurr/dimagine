@@ -1102,3 +1102,53 @@ fn a_subcommand_of_trash_cannot_also_be_an_image_argument() {
     assert_ne!(code, 0);
     assert!(stderr.contains("at least one image"), "{stderr:?}");
 }
+
+/// ADR-018 §7: the fourth deployment check names the files the service user
+/// could not write. A healthy library run by its owner is writable all over,
+/// so it stays clean; a note the service cannot write is an error.
+#[test]
+fn a_service_writable_library_is_clean_and_an_unwritable_note_is_reported() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = one_image("service-writable");
+        // A real note lands first, so the derived folder and a note exist.
+        ok(&dir.0, &["tag", "one.png", "--add", "cat"]);
+        // Everything is the test user's: the check must stay clean.
+        let (_, codes) = check_codes(&dir.0);
+        assert!(
+            !codes.iter().any(|c| c == "write_service_unwritable"),
+            "a library the user owns is clean: {codes:?}"
+        );
+        // Now a note the owner cannot write (mode drops the write bit).
+        std::fs::set_permissions(
+            dir.0.join("one.png.md"),
+            std::fs::Permissions::from_mode(0o444),
+        )
+        .unwrap();
+        let (code, codes) = check_codes(&dir.0);
+        assert_eq!(code, 1, "an unwritable note is a problem: {codes:?}");
+        assert!(
+            codes.iter().any(|c| c == "write_service_unwritable"),
+            "the unwritable note is named: {codes:?}"
+        );
+    }
+}
+
+/// ADR-018 §7: a `.trash` that is a symlink is reported — the write core
+/// refuses to follow it, so a library whose trash was replaced by a link is a
+/// problem, not a working trash.
+#[test]
+fn check_reports_a_trash_that_is_a_symlink() {
+    #[cfg(unix)]
+    {
+        let dir = one_image("trash-symlink");
+        std::os::unix::fs::symlink(std::env::temp_dir(), dir.0.join(".trash")).unwrap();
+        let (code, codes) = check_codes(&dir.0);
+        assert_eq!(code, 1, "a symlinked trash is a problem: {codes:?}");
+        assert!(
+            codes.iter().any(|c| c == "write_trash_symlink"),
+            "the symlinked trash is named: {codes:?}"
+        );
+    }
+}

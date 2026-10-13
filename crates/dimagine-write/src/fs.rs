@@ -680,3 +680,19 @@ pub(crate) fn dup_dir(root: &File) -> File {
     }
     unsafe { File::from_raw_fd(raw) }
 }
+
+/// Can this process write `path` as it stands right now?
+///
+/// A read-only probe for `check` (ADR-018 §7): it asks the kernel whether the
+/// file or directory is writable by the *current* user, without touching it.
+/// The service user is the process that writes the library, so a deployment
+/// where `check` runs as that user gets the exact answer; run as another user
+/// it reports that user's view, which is still what an operator acts on. It
+/// is deliberately not part of the write path — a write never consults it, it
+/// only compares hashes under the lock (ADR-016 §3).
+pub fn access_writable(path: &std::path::Path) -> bool {
+    let Some(c) = path.to_str().and_then(|s| CString::new(s).ok()) else {
+        return false;
+    };
+    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+}

@@ -491,6 +491,8 @@ dependencies = [
  "dimagine-core",
  "dimagine-index",
  "dimagine-preview",
+ "dimagine-write",
+ "http-body-util",
  "httpdate",
  "mime_guess",
  "percent-encoding",

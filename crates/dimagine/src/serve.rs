@@ -100,6 +100,24 @@ pub fn command() -> Command {
                 .value_parser(clap::value_parser!(std::path::PathBuf))
                 .help("State directory where accounts are stored (default: $XDG_STATE_HOME/dimagine or ~/.local/state/dimagine)."),
         )
+        .arg(
+            Arg::new("write")
+                .long("write")
+                .action(clap::ArgAction::SetTrue)
+                .help("Open the write API (ADR-018). Off by default: without it every write route is absent. Requires --public-origin."),
+        )
+        .arg(
+            Arg::new("public_origin")
+                .long("public-origin")
+                .value_name("ORIGIN")
+                .help("The exact origin the server is reached at (scheme://host[:port]) for write CSRF checks (ADR-018 §3)."),
+        )
+        .arg(
+            Arg::new("allow_anonymous_write")
+                .long("allow-anonymous-write")
+                .action(clap::ArgAction::SetTrue)
+                .help("Let a no-login server (`--auth none`) on a loopback bind accept writes without a session (ADR-018 §2)."),
+        )
         .after_help(format!(
             "If no users exist and {PASSCODE_ENV} is set, passcode mode is active. \
              Otherwise /setup creates the owner account: create it right after the first \
@@ -190,6 +208,23 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
             );
         }
     }
+    // ADR-018 §1–§3: the write surface is off unless asked for, and turning it
+    // on has preconditions the server will not run without. These are checked
+    // at startup, not at request time, so a misconfiguration that would leave
+    // writes half-open or unverifiable refuses to start.
+    let write = sub.get_flag("write");
+    let allow_anonymous_write = sub.get_flag("allow_anonymous_write");
+    let public_origin = sub.get_one::<String>("public_origin").cloned();
+    if let Some(reason) = write_flag_refusal(
+        write,
+        allow_anonymous_write,
+        auth,
+        bind,
+        public_origin.as_deref(),
+    ) {
+        emit_failure(json, reason);
+        return ExitCode::from(2);
+    }
     let config = ServeConfig {
         passcode,
         trusted_proxies,
@@ -197,6 +232,9 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         auth,
         rescan_interval,
         https: sub.get_flag("secure_cookies"),
+        write,
+        allow_anonymous_write,
+        public_origin: if write { public_origin } else { None },
         ..ServeConfig::default()
     };
     let address = SocketAddr::new(bind, port);
@@ -318,4 +356,121 @@ fn passcode_from_env() -> Option<String> {
     std::env::var(PASSCODE_ENV)
         .ok()
         .filter(|passcode| !passcode.is_empty())
+}
+
+/// Whether a `--public-origin` value is a bare origin: a scheme, `://`, a
+/// non-empty authority, and nothing after it (no path, no trailing slash). A
+/// request's `Origin` header carries no path, so an origin with one could
+/// never be matched and the CSRF check would always fail.
+fn origin_of_is_wellformed(origin: &str) -> bool {
+    match origin.split_once("://") {
+        Some((scheme, authority)) => {
+            !scheme.is_empty() && !authority.is_empty() && !authority.contains('/')
+        }
+        None => false,
+    }
+}
+
+/// Why this set of write flags must not start the server (ADR-018 §1–§3), or
+/// `None` when it may. Decided once, at startup: a server that cannot verify
+/// the CSRF origin, or that would take session-less writes from anywhere but
+/// loopback, is a server that should not be running at all.
+fn write_flag_refusal(
+    write: bool,
+    allow_anonymous_write: bool,
+    auth: AuthMode,
+    bind: IpAddr,
+    public_origin: Option<&str>,
+) -> Option<&'static str> {
+    if write && !public_origin.is_some_and(origin_of_is_wellformed) {
+        // Every write compares the request's `Origin` (or `Referer`) against
+        // this exact origin; with none there is nothing to check against, so
+        // the CSRF defence (ADR-018 §3) would be unverifiable.
+        return Some(
+            "--write needs --public-origin set to the exact origin \
+             (scheme://host[:port], with no path or trailing slash)",
+        );
+    }
+    if allow_anonymous_write {
+        // ADR-018 §2: anonymous writes exist only for a no-login server, and
+        // only on a loopback bind it cannot be reached from elsewhere. This is
+        // a hard refusal, not a warning.
+        if auth != AuthMode::None {
+            return Some(
+                "--allow-anonymous-write only applies to --auth none; \
+                 a server with accounts writes only through an owner session",
+            );
+        }
+        if !bind.is_loopback() {
+            return Some(
+                "--allow-anonymous-write is refused on a non-loopback bind \
+                 (writes without a session are a loopback-only mode)",
+            );
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
+
+    const ORIGIN: Option<&str> = Some("https://dimagine.example");
+    const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    const PUBLIC: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+    #[test]
+    fn writes_need_an_exact_public_origin() {
+        // `--write` without an origin to compare a request's `Origin` against
+        // refuses to start (ADR-018 §3).
+        assert!(
+            write_flag_refusal(true, false, AuthMode::Account, LOOPBACK, None).is_some(),
+            "no origin"
+        );
+        // An origin with a path could never equal an `Origin` header.
+        assert!(
+            write_flag_refusal(
+                true,
+                false,
+                AuthMode::Account,
+                LOOPBACK,
+                Some("https://dimagine.example/settings")
+            )
+            .is_some(),
+            "origin with a path"
+        );
+        assert!(
+            write_flag_refusal(true, false, AuthMode::Account, PUBLIC, ORIGIN).is_none(),
+            "a well-formed origin on any bind"
+        );
+        // With writes off there is nothing to refuse (ADR-018 §1).
+        assert!(write_flag_refusal(false, false, AuthMode::Account, PUBLIC, None).is_none());
+    }
+
+    #[test]
+    fn anonymous_write_is_no_login_and_loopback_only() {
+        // The one combination ADR-018 §2 allows: `--auth none` bound to
+        // loopback, IPv4 and IPv6 alike.
+        assert!(write_flag_refusal(true, true, AuthMode::None, LOOPBACK, ORIGIN).is_none());
+        assert!(write_flag_refusal(
+            true,
+            true,
+            AuthMode::None,
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            ORIGIN
+        )
+        .is_none());
+        // The same flags on a bind others can reach refuse to start outright —
+        // not a warning, which is the point of the item.
+        assert!(
+            write_flag_refusal(true, true, AuthMode::None, PUBLIC, ORIGIN).is_some(),
+            "anonymous write on a non-loopback bind"
+        );
+        // With accounts, an anonymous write is not a thing at all.
+        assert!(
+            write_flag_refusal(true, true, AuthMode::Account, LOOPBACK, ORIGIN).is_some(),
+            "anonymous write in account mode"
+        );
+    }
 }

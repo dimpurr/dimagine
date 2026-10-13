@@ -18,6 +18,7 @@ pub(crate) mod media;
 pub mod pages;
 pub mod ui;
 pub mod view_query;
+pub mod write_api;
 
 pub use ui::shell::Frame;
 
@@ -46,6 +47,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
+
+use dimagine_write::Writer;
 
 use crate::accounts::{is_weak_password, WEAK_PASSWORD_LENGTH};
 use crate::pages::{
@@ -127,6 +130,20 @@ pub struct ServeConfig {
     /// Seconds between background library rescans (default: 300, 0
     /// disables).
     pub rescan_interval: u64,
+    /// Whether the write API is open at all (ADR-018 §1). Off by default:
+    /// upgrading the binary never silently opens writes. When off, every
+    /// write route is absent (404) and the settings page is a read-only
+    /// display.
+    pub write: bool,
+    /// Whether writes are allowed without a session (ADR-018 §2). Only
+    /// meaningful with [`AuthMode::None`]; the CLI refuses to start with it
+    /// on a non-loopback bind. It does not relax the origin check.
+    pub allow_anonymous_write: bool,
+    /// The exact public origin (scheme, host, and port) the write API is
+    /// reached at, e.g. `https://lib.example.org` (ADR-018 §3). A write
+    /// request's `Origin` must equal it exactly; with no `Origin` its
+    /// `Referer`'s origin must. Required whenever `write` is on.
+    pub public_origin: Option<String>,
 }
 
 impl Default for ServeConfig {
@@ -139,6 +156,9 @@ impl Default for ServeConfig {
             data_dir: accounts::default_data_dir(),
             auth: AuthMode::Account,
             rescan_interval: 300,
+            write: false,
+            allow_anonymous_write: false,
+            public_origin: None,
         }
     }
 }
@@ -214,6 +234,22 @@ pub(crate) struct AppState {
     /// directory, is the natural follow-up.
     pub(crate) setup_lock: Arc<Mutex<()>>,
     pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
+    /// The server-side CSRF token of each session (ADR-018 §3), keyed by the
+    /// same session token as [`AppState::sessions`] and pruned with it. It is
+    /// handed to the owner's own pages and read back from a request header on
+    /// every write; it is never in a URL or a client-settable cookie.
+    pub(crate) csrf: Arc<Mutex<HashMap<String, String>>>,
+    /// The account a session was opened for, keyed by the same session token
+    /// as [`AppState::sessions`] and pruned with it. A passcode session has
+    /// no entry: it authenticates the server, not a person. The settings
+    /// page's password change is the one caller — it edits the signed-in
+    /// account's own credential and signs out that account's other sessions,
+    /// so it needs to know which account the request belongs to.
+    pub(crate) session_users: Arc<Mutex<HashMap<String, String>>>,
+    /// The library write core, opened once at router build (ADR-016 §1: the
+    /// library root is opened once). `None` when `--write` is off, so every
+    /// write route is absent and the settings page is read-only.
+    pub(crate) writer: Option<Arc<Writer>>,
     pub(crate) throttles: Arc<Mutex<ThrottleState>>,
     pub(crate) admission: Arc<Admission>,
     pub(crate) login_slots: Arc<tokio::sync::Semaphore>,
@@ -663,22 +699,63 @@ pub fn router<C: Catalog, P: PreviewProvider>(
         .expect("accounts store must be readable")
 }
 
+/// Why a router could not be built. Both cases mean the caller must
+/// exit non-zero rather than start a viewer in a state its operator
+/// did not ask for.
+#[derive(Debug)]
+pub enum RouterError {
+    /// The accounts store could not be read at startup.
+    Accounts(accounts::AccountsError),
+    /// `--write` was asked for but the library write core could not be
+    /// opened. A viewer that cannot write must not pretend it can, so a
+    /// failure here refuses to start rather than serving read-only.
+    Write(String),
+}
+
+impl std::fmt::Display for RouterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RouterError::Accounts(error) => write!(f, "{error}"),
+            RouterError::Write(message) => write!(f, "{message}"),
+        }
+    }
+}
+
+impl std::error::Error for RouterError {}
+
+impl From<accounts::AccountsError> for RouterError {
+    fn from(error: accounts::AccountsError) -> Self {
+        RouterError::Accounts(error)
+    }
+}
+
 /// Build a router from trait objects for later CLI integration.
 ///
 /// Fails when `accounts.json` is unreadable, malformed, or written by
 /// an unknown schema version: the caller must exit non-zero rather
 /// than start a viewer that would silently fall back to first-run
 /// setup. With [`AuthMode::None`] the store is never read, so a
-/// missing or broken one does not stop a no-login server.
+/// missing or broken one does not stop a no-login server. When
+/// `config.write` is set it also opens the write core, and fails if
+/// that cannot be opened.
 pub fn router_from(
     catalog: Arc<dyn Catalog>,
     previews: Arc<dyn PreviewProvider>,
     config: ServeConfig,
-) -> Result<Router, accounts::AccountsError> {
+) -> Result<Router, RouterError> {
     let accounts = accounts::AccountsStore::new(&config.data_dir);
     if config.auth == AuthMode::Account {
         accounts.has_users()?;
     }
+    // The write core opens the library root once (ADR-016 §1) and is held for
+    // the router's life. Opening only when `--write` is on keeps the default
+    // read-only: no `--write`, no writer, no write routes (ADR-018 §1).
+    let writer = match config.write {
+        false => None,
+        true => Some(Arc::new(Writer::open(catalog.root()).map_err(|error| {
+            RouterError::Write(format!("cannot open the library for writing: {error}"))
+        })?)),
+    };
     let index_handle = match IndexHandle::open(catalog.root()) {
         Ok(handle) => handle,
         // A library whose index cannot be built is still worth
@@ -701,6 +778,9 @@ pub fn router_from(
         accounts,
         setup_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        csrf: Arc::new(Mutex::new(HashMap::new())),
+        session_users: Arc::new(Mutex::new(HashMap::new())),
+        writer,
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(Admission::new()),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
@@ -715,7 +795,16 @@ pub fn router_from(
     let shared = Arc::new(state);
     content::ensure_preview_backfill(&shared);
     let state = AppState::clone(&shared);
-    Ok(Router::new()
+    // The write API is merged in only when `--write` is on (ADR-018 §1): with
+    // it off these routes are never added, so a client sees 404 and an
+    // upgraded binary cannot quietly open a write door. It is built before the
+    // auth layer so the gate also covers every write route.
+    let write_routes = if state.writer.is_some() {
+        write_api::write_router(&state)
+    } else {
+        Router::new()
+    };
+    let app = Router::new()
         .route("/login", get(login_page).post(login))
         .route("/logout", get(logout).post(logout))
         .route("/setup", get(setup_page).post(setup))
@@ -748,8 +837,16 @@ pub fn router_from(
         .route("/api/folder/*path", get(folder_json))
         .route("/api/collection/*path", get(collection_json))
         .route("/api/image/*path", get(image_json))
+        // The settings page (ADR-019 §5): owner-only, and reachable whether
+        // or not `--write` is on. Without `--write` it is a read-only display;
+        // the save route lives in the write sub-router and is absent when
+        // `--write` is off. `/settings/json` is its read-only "open JSON" view.
+        .route("/settings", get(write_api::settings_page))
+        .route("/settings/json", get(write_api::settings_json_page))
+        .merge(write_routes)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state))
+        .with_state(state);
+    Ok(app)
 }
 
 /// What a request has to satisfy before it reaches a page.
@@ -1038,6 +1135,7 @@ async fn setup(
         token.clone(),
         now_seconds(),
     );
+    attach_csrf(&state, &token, Some(trimmed_email));
     let mut response = Redirect::to("/").into_response();
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -1157,6 +1255,10 @@ async fn login(
         .min(LOGIN_MAX_DELAY_SECS * 1000);
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 
+    // Which account this session will belong to, when it authenticates one.
+    // A passcode session authenticates the server, not a person, and carries
+    // no account.
+    let mut account_email: Option<String> = None;
     let authenticated = if has_users {
         let user_opt = state
             .accounts
@@ -1164,7 +1266,11 @@ async fn login(
             .ok()
             .flatten();
         if let Some(user) = user_opt {
-            accounts::verify_password(&form.password, &user.password_hash)
+            let matches = accounts::verify_password(&form.password, &user.password_hash);
+            if matches {
+                account_email = Some(user.email.clone());
+            }
+            matches
         } else {
             const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$eW91cnNhbHQxMjM0NTY3OA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
             let _ = accounts::verify_password(&form.password, DUMMY_HASH);
@@ -1218,6 +1324,7 @@ async fn login(
         token.clone(),
         now_seconds(),
     );
+    attach_csrf(&state, &token, account_email.as_deref());
     let mut response = Redirect::to("/").into_response();
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -1249,7 +1356,7 @@ async fn logout(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| cookie_value(v, &state.config.cookie_name));
     if let Some(token) = token {
-        state.sessions.lock().unwrap().remove(&token);
+        drop_session(&state, &token);
     }
     let mut response = Redirect::to("/login").into_response();
     let cookie = format!(
@@ -1353,7 +1460,100 @@ fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
     sessions.insert(token, now + SESSION_SECONDS);
 }
 
-fn cookie_value(cookies: &str, name: &str) -> Option<String> {
+/// A fresh server-side CSRF token: 32 random bytes, hex. It is stored against
+/// the session (ADR-018 §3) and never leaves the server except to the owner's
+/// own pages.
+fn new_csrf_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(64);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Give a freshly authenticated session its CSRF token and, when it
+/// authenticates a person, the account it belongs to — forgetting the entries
+/// of sessions that have since expired so the three maps cannot drift apart.
+/// Called by both `/login` and `/setup` right after `store_session`.
+///
+/// `account` is `None` for a passcode session: it signs in to the server, not
+/// to an account, and the write surface refuses it anyway (ADR-018 §2).
+fn attach_csrf(state: &AppState, token: &str, account: Option<&str>) {
+    // Lock order everywhere a map is touched from two of the three is
+    // sessions → csrf → session_users; see `invalidate_other_sessions`.
+    let sessions = state.sessions.lock().unwrap();
+    let mut csrf = state.csrf.lock().unwrap();
+    let mut users = state.session_users.lock().unwrap();
+    csrf.retain(|session, _| sessions.contains_key(session));
+    users.retain(|session, _| sessions.contains_key(session));
+    csrf.insert(token.to_owned(), new_csrf_token());
+    match account {
+        Some(email) => {
+            users.insert(token.to_owned(), email.to_owned());
+        }
+        None => {
+            users.remove(token);
+        }
+    }
+}
+
+/// Forget a session, its CSRF token and its account together (logout).
+fn drop_session(state: &AppState, token: &str) {
+    state.sessions.lock().unwrap().remove(token);
+    state.csrf.lock().unwrap().remove(token);
+    state.session_users.lock().unwrap().remove(token);
+}
+
+/// The account a live session was opened for, or `None` when the session is
+/// absent, expired, or a passcode session. Mirrors [`session_token`]'s view of
+/// liveness: a token that just expired has no account.
+pub(crate) fn session_account(state: &AppState, token: &str) -> Option<String> {
+    let now = now_seconds();
+    let live = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(token)
+        .is_some_and(|expiry| *expiry > now);
+    if !live {
+        return None;
+    }
+    state
+        .session_users
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(token)
+        .cloned()
+}
+
+/// Sign out every *other* session of one account, keeping `keep` — the
+/// session that just changed the account's password. Returns how many were
+/// signed out.
+///
+/// The account is matched case-insensitively, the way the store matches an
+/// email everywhere else. A session with no account entry (a passcode
+/// session) is never touched: it does not belong to this account.
+pub(crate) fn invalidate_other_sessions(state: &AppState, account: &str, keep: &str) -> usize {
+    let mut sessions = state.sessions.lock().unwrap();
+    let mut csrf = state.csrf.lock().unwrap();
+    let mut users = state.session_users.lock().unwrap();
+    let doomed: Vec<String> = users
+        .iter()
+        .filter(|(token, email)| token.as_str() != keep && email.eq_ignore_ascii_case(account))
+        .map(|(token, _)| token.clone())
+        .collect();
+    for token in &doomed {
+        sessions.remove(token);
+        csrf.remove(token);
+        users.remove(token);
+    }
+    doomed.len()
+}
+
+pub(crate) fn cookie_value(cookies: &str, name: &str) -> Option<String> {
     cookies
         .split(';')
         .filter_map(|p| p.trim().split_once('='))
@@ -1361,7 +1561,7 @@ fn cookie_value(cookies: &str, name: &str) -> Option<String> {
         .map(|(_, v)| v.to_string())
 }
 
-fn now_seconds() -> u64 {
+pub(crate) fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

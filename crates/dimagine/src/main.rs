@@ -240,6 +240,10 @@ fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     // walk of .dimagine/ is the only thing here that looks under the derived
     // folder, and it changes nothing.
     write::append_write_state(&mut report, library_dir);
+    // The fourth deployment check (ADR-018 §7): what the service user could
+    // not write. Read-only, an `access(W_OK)` probe over the notes the walk
+    // already found.
+    write::append_service_writability(&mut report, library_dir, &library);
     if json {
         print_check_json(&report);
     } else {

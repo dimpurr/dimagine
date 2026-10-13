@@ -37,9 +37,37 @@ All notable changes to this project are documented here. The format follows
   trash move, never a delete. `dimagine check` now also reports the state of
   past writes: an unrecovered journal, a stray temporary file, a `.trash` that
   is a symbolic link, a trash record that does not parse or names a file
-  that is not there, and any files left in the old `.dimagine/trash/` — a
-  location nothing writes to any more, but which stays readable so a library
-  that has one is reported rather than stranded.
+   that is not there, and any files left in the old `.dimagine/trash/` — a
+   location nothing writes to any more, but which stays readable so a library
+   that has one is reported rather than stranded.
+- `dimagine serve` can write, off by default (Phase 3a). `--write` opens the
+  write API — front-matter edit, undo, the trash view, and settings save — each
+  a journaled operation through the write core, the same the CLI runs. Without
+  `--write` none of those routes exist, so upgrading never quietly opens a write
+  door. `--write` requires `--public-origin`, against which every write checks
+  its `Origin` (or `Referer`); a write must be `POST`/`PATCH`,
+  `application/json`, capped at 1 MiB as it streams, and carry the session's
+  server-side CSRF token in `x-csrf-token`. Writing is an owner action: a
+  passcode-only or account-less server stays read-only even with `--write`, and
+  `--allow-anonymous-write` — no-login writes with no session — is confined to a
+  loopback bind and refuses to start on any other. Each operation records the
+  peer address in the audit log, trusting `X-Forwarded-For` only from a
+  `--trusted-proxy` peer. Deployment steps (make the library group-writable with
+  a setgid + default ACL, the one-time ownership change, the `check` item for
+  files the service cannot write) are in `docs/HLD.md`.
+- Viewer settings page at `/settings`, from the same schema the CLI's `config`
+  reads: owner-only, a read-only display without `--write` and an editable,
+  searchable form with it, saving through the write core under the CSRF rules
+  above. `X-Content-Type-Options: nosniff` is now on every image and rendition
+  response.
+- Viewer password change: `/settings` carries the signed-in account's own
+  password change — the current password, the new one twice, and the
+  weak-password confirmation the setup form asks for. It follows the write
+  rules above (present only with `--write`, JSON body, exact origin, the
+  session's CSRF token in `x-csrf-token`), it edits only the account the
+  session belongs to, and on success every other session of that account is
+  signed out, so setting a new password because the old one leaked ends the
+  sessions it leaked to.
 - The front-matter editor (Phase 3a): `dimagine-core::fm_edit` edits a note's
   YAML properties as raw bytes, splicing exactly the range an edit intends
   and leaving every other byte identical. `set_scalar`, `delete_key`,

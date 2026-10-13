@@ -508,7 +508,7 @@ fn running_as_root() -> bool {
 
 /// Build the router the way the CLI does, so a store that cannot be read is a
 /// returned error instead of a panic.
-fn try_router(root: &TempDir) -> Result<axum::Router, dimagine_serve::accounts::AccountsError> {
+fn try_router(root: &TempDir) -> Result<axum::Router, dimagine_serve::RouterError> {
     let config = ServeConfig {
         data_dir: root.path().join("state"),
         ..ServeConfig::default()
