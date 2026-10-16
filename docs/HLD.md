@@ -110,8 +110,10 @@ refuses to start without:
   an owner account's is refused.
 - Each session carries a server-side CSRF token that the owner's own pages echo
   back in the `x-csrf-token` header; it is never in a URL or a client-set
-  cookie. Writes are `POST`/`PATCH` only, must be `application/json`, and are
-  body-capped at 1 MiB as they stream.
+   cookie. Writes are `POST`/`PATCH` only, must be `application/json`, and are
+   body-capped at 1 MiB as they stream. Uploads (multipart, the 100 MB cap,
+   magic-vs-extension with SVG/HTML/XML refusal) have no endpoint in 3a and are
+   deferred to 3b (W66).
 - `--allow-anonymous-write` exists only for a no-login server (`--auth none`) on
   a loopback bind; on any other bind the server refuses to start rather than
   accept writes with no session.

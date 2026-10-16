@@ -130,7 +130,7 @@ fn test_journaled_move_rolls_back_and_undoes() {
         .unwrap();
     assert!(writer.read(&src).is_err());
 
-    let outcome = writer.undo(undo_op).unwrap();
+    let outcome = writer.undo(undo_op, None).unwrap();
     assert!(outcome.undone.contains(&UndoneItem::Moved {
         from: StepPath::Library(dst),
         to: StepPath::Library(src.clone())
@@ -961,7 +961,7 @@ fn test_undo_all_or_nothing_and_force() {
     fs::write(dir.path().join("note_a.md"), b"tampered a\n").unwrap();
 
     // Ordinary undo refuses all-or-nothing
-    let err = writer.undo(op_id);
+    let err = writer.undo(op_id, None);
     match err {
         Err(Error::UndoRefused { op, mismatches }) => {
             assert_eq!(op, op_id);
@@ -976,7 +976,7 @@ fn test_undo_all_or_nothing_and_force() {
     assert_eq!(writer.read(&file_b).unwrap().0, b"modified b\n");
 
     // Force undo reverts the matching subset (note_b) and skips note_a
-    let outcome = writer.undo_force(op_id).unwrap();
+    let outcome = writer.undo_force(op_id, None).unwrap();
     assert_eq!(outcome.skipped.len(), 1);
     assert_eq!(outcome.skipped[0].path, file_a.to_path());
     assert!(outcome

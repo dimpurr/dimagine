@@ -348,7 +348,7 @@ fn undo_of_trash_reverses_the_moves_and_removes_the_record() {
         )
         .unwrap();
 
-    let outcome = writer.undo("op-trash").unwrap();
+    let outcome = writer.undo("op-trash", None).unwrap();
 
     // The moves reversed, the record removed: the group is
     // back in the library whole.
@@ -393,7 +393,7 @@ fn undo_of_restore_retrashes_the_group_whole() {
         )
         .unwrap();
 
-    let outcome = writer.undo("op-restore").unwrap();
+    let outcome = writer.undo("op-restore", None).unwrap();
 
     // Undoing a restore puts the group back into the trash
     // whole: the moves reverse and the record is recreated
@@ -438,7 +438,7 @@ fn a_purged_group_is_permanent_and_not_undoable() {
 
     // A permanent deletion has no inverse: the undo refuses
     // naming the purged paths (ADR-016 §8).
-    match writer.undo("op-purge") {
+    match writer.undo("op-purge", None) {
         Err(Error::UndoRefused { mismatches, .. }) => {
             assert!(mismatches.iter().all(|m| m.reason == UndoReason::Permanent));
             assert_eq!(mismatches.len(), 4);

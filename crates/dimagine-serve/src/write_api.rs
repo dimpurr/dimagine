@@ -147,9 +147,13 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
 
     // ADR-018 §2: writes require an owner. In account mode that means an
     // account exists (a passcode-only server, or first-run setup, stays
-    // read-only) and the session carries the server's CSRF token, presented
-    // in a header. In no-login mode writes are allowed only with
-    // `--allow-anonymous-write`, and there is no session to hold a token.
+    // read-only), the session belongs to one of those accounts, and the
+    // session carries the server's CSRF token, presented in a header. The
+    // account test is per session, not just per server: a session minted
+    // while no account existed (or whose account was deleted out-of-band)
+    // has no account and stays refused once one appears. In no-login mode
+    // writes are allowed only with `--allow-anonymous-write`, and there is
+    // no session to hold a token.
     match state.config.auth {
         AuthMode::Account => {
             match state.accounts.has_users() {
@@ -165,6 +169,25 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
             let Some(token) = session_token(&state, request.headers()) else {
                 return json_error(StatusCode::UNAUTHORIZED, "a session is required to write");
             };
+            // The session's own account, as `change_password` requires: a
+            // passcode session has none, and an account deleted out-of-band
+            // leaves its sessions behind, so both stay refused here.
+            let Some(account) = crate::session_account(&state, &token) else {
+                return json_error(
+                    StatusCode::FORBIDDEN,
+                    "this session is not signed in to an account",
+                );
+            };
+            match state.accounts.find_user_by_email(&account) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return json_error(
+                        StatusCode::FORBIDDEN,
+                        "this session's account no longer exists",
+                    )
+                }
+                Err(error) => return store_error(error),
+            }
             let expected = state
                 .csrf
                 .lock()
@@ -555,7 +578,7 @@ async fn undo_op(
         &headers,
         &state.config.trusted_proxies,
     );
-    match writer.undo(op_id) {
+    match writer.undo(op_id, Some(&client_addr)) {
         Ok(outcome) => {
             // Undoing a *create* hands the file back to the trash rather than
             // hard-deleting it (ADR-016 §8): the write core returns the files
@@ -933,7 +956,20 @@ fn owner_only(state: &AppState, headers: &HeaderMap) -> Option<Response> {
     let allowed = match state.config.auth {
         AuthMode::Account => {
             let has_owner = state.accounts.has_users().unwrap_or(false);
-            has_owner && session_token(state, headers).is_some()
+            // The same per-session account test the CSRF guard applies to a
+            // write (F1): a session minted before any owner existed, or whose
+            // account was deleted out-of-band, is not an owner session.
+            let owned = session_token(state, headers).is_some_and(|token| {
+                crate::session_account(state, &token).is_some_and(|account| {
+                    state
+                        .accounts
+                        .find_user_by_email(&account)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                })
+            });
+            has_owner && owned
         }
         AuthMode::None => state.config.allow_anonymous_write,
     };
@@ -991,6 +1027,11 @@ fn settings_body(settings: &Settings, editable: bool, csrf: &str, account: Optio
         };
         let min = spec.min.map(|m| m.to_string()).unwrap_or_default();
         let max = spec.max.map(|m| m.to_string()).unwrap_or_default();
+        // `value` and `default` are rendered escaped: the only schema kind
+        // today is `Int`, but a future string-typed setting must not become
+        // an HTML-injection surface through the file value.
+        let value_html = escape_html(&value.to_string());
+        let default_html = escape_html(&spec.default.to_string());
         out.push_str(&format!(
             "<div class=\"setting\" data-key=\"{key}\">
 <label for=\"set-{key}\"><strong>{key}</strong></label>
@@ -998,8 +1039,8 @@ fn settings_body(settings: &Settings, editable: bool, csrf: &str, account: Optio
 <p>Current <b>{value}</b>, default {default}, range {range_min}\u{2013}{range_max}.{mark}{invalid}</p>",
             key = escape_html(spec.key),
             description = escape_html(spec.description_en),
-            value = value,
-            default = spec.default,
+            value = value_html,
+            default = default_html,
             range_min = escape_html(if min.is_empty() { "any" } else { &min }),
             range_max = escape_html(if max.is_empty() { "any" } else { &max }),
             mark = escape_html(mark),
@@ -1011,10 +1052,10 @@ fn settings_body(settings: &Settings, editable: bool, csrf: &str, account: Optio
                  min=\"{min}\" max=\"{max}\" value=\"{value}\"> \
                  <button type=\"button\" data-reset=\"{key}\">Restore default</button>",
                 key = escape_html(spec.key),
-                default = spec.default,
+                default = default_html,
                 min = escape_html(&min),
                 max = escape_html(&max),
-                value = value,
+                value = value_html,
             ));
         } else {
             out.push_str(
@@ -1388,6 +1429,12 @@ fn plan_trash_steps(
     let mut trashed: Vec<String> = Vec::new();
     for image in images {
         let entry = resolve_image(files, resolver, image)?;
+        // A repeated argument names one group once, as the CLI's planner
+        // does: planning the same moves twice would fail the second block
+        // and report the operation as partially applied.
+        if trashed.contains(&entry.rel) {
+            continue;
+        }
         let members = group_members(files, entry);
         let image_rel = RelPath::parse(&entry.rel).map_err(|e| e.to_string())?;
         let round = free_trash_round(writer, &entry.name, &image_rel, &members)?;

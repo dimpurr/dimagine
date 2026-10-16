@@ -874,9 +874,17 @@ impl Writer {
     }
 
     /// Undo an operation by op_id.
-    pub fn undo(&self, op_id: &str) -> Result<crate::op_log::UndoOutcome> {
+    ///
+    /// `client_addr` is the peer the undo was asked for, recorded on the
+    /// inverse operation's audit lines (ADR-018 §6). Callers without a peer
+    /// — the CLI — pass `None`.
+    pub fn undo(
+        &self,
+        op_id: &str,
+        client_addr: Option<&str>,
+    ) -> Result<crate::op_log::UndoOutcome> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        crate::op_log::undo(self, &lock, op_id, false)
+        crate::op_log::undo(self, &lock, op_id, false, client_addr)
     }
 
     /// Read all audit log entries currently recorded.
@@ -885,9 +893,13 @@ impl Writer {
     }
 
     /// Force undo an operation by op_id, reverting the subset that still matches.
-    pub fn undo_force(&self, op_id: &str) -> Result<crate::op_log::UndoOutcome> {
+    pub fn undo_force(
+        &self,
+        op_id: &str,
+        client_addr: Option<&str>,
+    ) -> Result<crate::op_log::UndoOutcome> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        crate::op_log::undo(self, &lock, op_id, true)
+        crate::op_log::undo(self, &lock, op_id, true, client_addr)
     }
 
     /// Execute an already-planned operation while holding the

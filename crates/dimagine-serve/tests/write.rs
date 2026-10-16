@@ -206,6 +206,124 @@ async fn a_passcode_session_cannot_write_even_with_write_enabled() {
     assert!(text(&body).contains("no owner account"), "{}", text(&body));
 }
 
+#[tokio::test]
+async fn a_session_from_before_any_owner_existed_gains_no_write_access() {
+    let root = library();
+    // No owner account yet: a passcode session is possible, writing is not.
+    let app = app_for(&root, true, Some("passcode123"));
+    let cookie = login(&app, "passcode=passcode123").await;
+    let csrf = csrf_for(&app, &cookie).await;
+    let attempt = || {
+        write_post(
+            "/api/write/settings",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"reset":["trash.retentionDays"]}"#,
+        )
+    };
+
+    // Before any owner exists the guard refuses the write...
+    let (status, _, _) = send(&app, attempt()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // ...and creating an owner out-of-band must not promote that session:
+    // it belongs to no account, so it stays refused.
+    create_owner(&root, "owner@example.com", "secret123");
+    let (status, _, body) = send(&app, attempt()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert!(
+        text(&body).contains("not signed in to an account"),
+        "{}",
+        text(&body)
+    );
+    // The settings page agrees it is not an owner session.
+    let (status, _, _) = send(&app, get("/settings", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Control: a fresh session of the new owner writes fine.
+    let owner = login(&app, "email=owner%40example.com&password=secret123").await;
+    let owner_csrf = csrf_for(&app, &owner).await;
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/settings",
+            &owner,
+            &owner_csrf,
+            Some(ORIGIN),
+            r#"{"reset":["trash.retentionDays"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    // ...and deleting that account out-of-band revokes the session again:
+    // its account no longer exists, so its writes are refused. A second
+    // owner stays so the server itself still has an owner.
+    create_owner(&root, "second@example.com", "secret123");
+    AccountsStore::new(&root.path().join("state"))
+        .delete_user("owner@example.com")
+        .unwrap();
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/settings",
+            &owner,
+            &owner_csrf,
+            Some(ORIGIN),
+            r#"{"reset":["trash.retentionDays"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&body));
+    assert!(text(&body).contains("no longer exists"), "{}", text(&body));
+}
+
+#[tokio::test]
+async fn anonymous_write_on_a_no_login_server_succeeds_with_the_origin() {
+    let root = library();
+    // `--auth none --allow-anonymous-write`: no session, no CSRF token. The
+    // CLI confines this mode to a loopback bind; the origin check is what
+    // the test pins here.
+    let config = ServeConfig {
+        data_dir: root.path().join("state"),
+        auth: AuthMode::None,
+        write: true,
+        allow_anonymous_write: true,
+        public_origin: Some(ORIGIN.to_string()),
+        ..ServeConfig::default()
+    };
+    let app = router(
+        FsCatalog::new(root.path().join("library")).unwrap(),
+        OriginalPreview,
+        config,
+    );
+
+    // No cookie, no token — a well-formed write still lands.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/write/settings")
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .body(Body::from(r#"{"set":{"trash.retentionDays":90}}"#))
+        .unwrap();
+    let (status, _, body) = send(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let on_disk =
+        std::fs::read_to_string(root.path().join("library/.dimagine/settings.json")).unwrap();
+    assert!(on_disk.contains("90"), "{on_disk}");
+
+    // Without the origin it is still refused.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/write/settings")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"reset":["trash.retentionDays"]}"#))
+        .unwrap();
+    let (status, _, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
 // ---------------------------------------------------------------------------
 // CSRF (ADR-018 §3)
 // ---------------------------------------------------------------------------
@@ -277,6 +395,55 @@ async fn every_write_without_the_origin_or_the_token_is_refused() {
         .unwrap();
     let (status, _, _) = send(&app, not_json).await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn get_on_a_post_only_route_changes_nothing() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    // GET on a POST-only route never reaches a write: the path exists, so
+    // axum answers 405 rather than running a handler.
+    for uri in [
+        "/api/write/settings",
+        "/api/write/restore",
+        "/api/write/collections",
+        "/api/write/password",
+        "/api/write/image/front-matter",
+    ] {
+        let (status, _, _) = send(&app, get(uri, Some(&cookie))).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+    }
+
+    // The one GET on a mutating path — the undo toast — is a read: nothing
+    // to undo before any write...
+    let (status, _, body) = send(&app, get("/api/write/undo", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["op"], serde_json::Value::Null);
+
+    // ...and reading it beside a write changes nothing: two reads agree,
+    // and the toast still names the write's op.
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/image/front-matter",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"image":"one.png","add":["cat"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let op = json_body(&body)["op"].as_str().unwrap().to_owned();
+    let (status, _, first) = send(&app, get("/api/write/undo", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, second) = send(&app, get("/api/write/undo", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first, second, "the toast is a read, not a mutation");
+    assert_eq!(json_body(&first)["op"], serde_json::json!(op));
 }
 
 #[tokio::test]
@@ -464,6 +631,64 @@ async fn front_matter_edit_writes_a_note_and_undo_undoes_it() {
 }
 
 #[tokio::test]
+async fn undo_records_the_peer_on_its_audit_lines() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    // Trash the image (a move, so its undo has inverse steps of its own),
+    // then undo the trash.
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/trash",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"images":["one.png"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let op = json_body(&body)["op"].as_str().unwrap().to_owned();
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/undo",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &format!("{{\"op\":\"{op}\"}}"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+
+    // The undo's own audit lines carry the peer like every other serve
+    // write (ADR-018 §6).
+    let log = std::fs::read_to_string(root.path().join("library/.dimagine/log/ops.jsonl")).unwrap();
+    let undo_lines: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains(r#""source":"undo""#))
+        .collect();
+    assert!(
+        !undo_lines.is_empty(),
+        "the undo wrote its own audit lines: {log}"
+    );
+    for line in undo_lines {
+        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(
+            entry
+                .get("client_addr")
+                .and_then(|value| value.as_str())
+                .is_some_and(|addr| !addr.is_empty()),
+            "the undo line carries the peer: {line}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn front_matter_rejects_a_path_outside_the_library() {
     let root = library();
     create_owner(&root, "owner@example.com", "secret123");
@@ -532,6 +757,50 @@ async fn trash_moves_a_group_out_and_restore_brings_it_back() {
     assert!(image.exists(), "the image is back");
     let (_, _, body) = send(&app, get("/api/write/trash", Some(&cookie))).await;
     assert!(json_body(&body)["groups"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn trash_names_each_group_once_when_an_image_is_repeated() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    // A repeated name trashes one group, not a partially applied operation.
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/trash",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"images":["one.png","one.png"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert_eq!(
+        json_body(&body)["trashed"],
+        serde_json::json!(["one.png"]),
+        "{}",
+        text(&body)
+    );
+    assert!(!root.path().join("library/one.png").exists());
+
+    // The single group restores whole.
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/restore",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"images":["one.png"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert!(root.path().join("library/one.png").exists());
 }
 
 #[tokio::test]

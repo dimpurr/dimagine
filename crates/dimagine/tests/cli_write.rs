@@ -441,6 +441,26 @@ fn trash_moves_the_whole_group_and_writes_a_record() {
 }
 
 #[test]
+fn trash_names_each_group_once_when_an_image_is_repeated() {
+    let dir = one_image("trash-dupe");
+    let stdout = ok(&dir.0, &["trash", "one.png", "one.png", "--json"]);
+    let doc = json_in(&stdout);
+    assert_eq!(doc["trashed"], serde_json::json!(["one.png"]));
+    assert!(!exists(&dir.0, "one.png"), "the image left the library");
+    assert!(exists(&dir.0, ".trash/one.png"));
+    assert!(exists(&dir.0, ".trash/one.png.trash.json"));
+    // The single group restores whole, and nothing is double-claimed.
+    ok(&dir.0, &["restore", "one.png"]);
+    assert!(exists(&dir.0, "one.png"));
+    let (code, codes) = check_codes(&dir.0);
+    assert_eq!(code, 0);
+    assert!(
+        !codes.iter().any(|c| c.starts_with("write_trash")),
+        "{codes:?}"
+    );
+}
+
+#[test]
 fn restore_puts_the_group_back_and_removes_the_record() {
     let dir = tmp("restore");
     write(&dir.0, "girl.png", PNG);
@@ -887,16 +907,29 @@ fn check_warns_about_a_stranded_trash_group() {
     let other = tmp("check-foreign");
     write(&other.0, "one.png", PNG);
     write(&other.0, ".trash/obsidian-note.md", b"not ours");
+    // Even a note shaped exactly like a dimagine hand-back — a collection
+    // note as `collect --new` writes it — stays info when it has no record:
+    // the collection shape is public (FORMAT §5), so a hand-written note can
+    // match it byte for byte, and a library-root hand-back lands flat, just
+    // like another tool's trash. Content-sniffing it would false-positive.
+    write(
+        &other.0,
+        ".trash/Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\n",
+    );
     let (code, stdout, _) = dimagine(&other.0, &["check", "--json"]);
     assert_eq!(code, 0, "{stdout}");
     let doc = json_in(&stdout);
-    let found = doc["findings"]
+    let stranded: Vec<&serde_json::Value> = doc["findings"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|finding| finding["code"] == "write_trash_file_no_record")
-        .unwrap_or_else(|| panic!("the foreign file is named: {stdout}"));
-    assert_eq!(found["severity"], "info");
+        .filter(|finding| finding["code"] == "write_trash_file_no_record")
+        .collect();
+    assert_eq!(stranded.len(), 2, "{stdout}");
+    for finding in stranded {
+        assert_eq!(finding["severity"], "info", "{finding}");
+    }
 }
 
 #[test]

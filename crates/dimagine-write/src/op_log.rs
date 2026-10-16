@@ -208,6 +208,7 @@ pub(crate) fn undo(
     lock: &WriteLock,
     op_id: &str,
     force: bool,
+    client_addr: Option<&str>,
 ) -> Result<UndoOutcome> {
     let all_entries = read_all_entries(writer.root_file())?;
     let op_entries: Vec<OpEntry> = all_entries
@@ -485,7 +486,7 @@ pub(crate) fn undo(
             lock,
             &undo_op_id,
             "undo",
-            None,
+            client_addr,
             serde_json::json!({ "undo_op": op_id }),
             steps,
             None,

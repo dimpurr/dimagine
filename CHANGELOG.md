@@ -41,7 +41,8 @@ All notable changes to this project are documented here. The format follows
    location nothing writes to any more, but which stays readable so a library
    that has one is reported rather than stranded.
 - `dimagine serve` can write, off by default (Phase 3a). `--write` opens the
-  write API — front-matter edit, undo, the trash view, and settings save — each
+  write API — front-matter edit, undo, the trash view, `POST
+  /api/write/collections` (new/add/remove), and settings save — each
   a journaled operation through the write core, the same the CLI runs. Without
   `--write` none of those routes exist, so upgrading never quietly opens a write
   door. `--write` requires `--public-origin`, against which every write checks

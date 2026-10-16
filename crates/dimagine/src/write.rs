@@ -977,6 +977,12 @@ fn plan_trash_steps(
     let mut trashed: Vec<String> = Vec::new();
     for image in images {
         let entry = resolve_image(files, resolver, image)?;
+        // A repeated argument names one group once (restore skips an already
+        // restored record the same way): planning the same moves twice would
+        // fail the second block and report the operation as partially applied.
+        if trashed.contains(&entry.rel) {
+            continue;
+        }
         let members = group_members(files, entry);
         let image_rel = RelPath::parse(&entry.rel).map_err(|e| e.to_string())?;
         let round = free_trash_round(writer, &entry.name, &image_rel, &members)?;
@@ -1357,9 +1363,9 @@ fn run_undo(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         },
     };
     let outcome = if force {
-        writer.undo_force(&op_id)
+        writer.undo_force(&op_id, None)
     } else {
-        writer.undo(&op_id)
+        writer.undo(&op_id, None)
     };
     let outcome = match outcome {
         Ok(outcome) => outcome,
