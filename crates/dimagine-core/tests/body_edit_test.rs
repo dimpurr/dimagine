@@ -1,15 +1,18 @@
-//! Collection body edits (ADR-017 §4, §5, §6): the byte diffs are pinned by
-//! the fixtures under `tests/fixtures/body/`, one case per rule, and asserted
-//! exactly — both the new bytes and the ranges they were taken from.
+//! Collection and note body edits (ADR-017 §4, §5, §6, §10): the byte diffs are
+//! pinned by the fixtures under `tests/fixtures/body/`, one case per rule, and
+//! asserted exactly — both the new bytes and the ranges they were taken from.
 
 use std::path::{Path, PathBuf};
 
 use dimagine_core::body_edit::{
     self, append_member, is_member, link_text_for, member_spans, new_collection_body,
-    remove_member, safe_file_name, verify_points_to, BodyCtx, EditError, Embed, FolderSource,
+    remove_member, replace_body, safe_file_name, verify_points_to, BodyCtx, EditError, Embed,
+    FolderSource,
 };
+use dimagine_core::fm_edit::{front_matter_range, FmRange};
 use dimagine_core::library::{classify, FileEntry};
 use dimagine_core::links::Resolver;
+use dimagine_core::note::parse_note;
 use serde::Deserialize;
 
 fn fixtures() -> PathBuf {
@@ -30,10 +33,16 @@ struct Case {
     image: String,
     #[serde(rename = "in")]
     in_file: String,
+    /// The replacement body, for the `replace` op.
+    #[serde(default)]
+    new_body: Option<String>,
     #[serde(default)]
     out: Option<String>,
     #[serde(default)]
     member: Option<bool>,
+    /// The `replace` case that must say a self-embed was appended.
+    #[serde(default)]
+    restored: Option<bool>,
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
@@ -170,8 +179,82 @@ fn body_cases_match_their_expected_bytes() {
                     label()
                 );
             }
+            "replace" => {
+                let new_body = read(&format!(
+                    "body/{}",
+                    case.new_body.as_deref().unwrap_or(&case.in_file)
+                ));
+                match replace_body(&body, note, &new_body, &ctx) {
+                    Err(err) => assert_eq!(
+                        Some(err.to_string()),
+                        case.error,
+                        "{}: unexpected refusal",
+                        label()
+                    ),
+                    Ok(replaced) => {
+                        assert_eq!(case.error, None, "{}: expected a refusal", label());
+                        let want = read(&format!(
+                            "body/{}",
+                            case.out.as_deref().unwrap_or(&case.in_file)
+                        ));
+                        assert_eq!(replaced.bytes, want, "{}: bytes", label());
+                        assert_eq!(replaced.changed, want != body, "{}: changed", label());
+                        let restored = replaced.self_embed_restored;
+                        assert_eq!(
+                            Some(restored),
+                            case.restored.or(Some(false)),
+                            "{}: self-embed restored",
+                            label()
+                        );
+                        // The byte diff is the body and nothing else: every
+                        // byte up to the closing fence is carried over, and the
+                        // rest is the body that was asked for — plus the
+                        // self-embed line alone when the rule added one.
+                        let head = head_end(&want);
+                        assert_eq!(head, head_end(&body), "{}: the split point moved", label());
+                        assert_eq!(
+                            &body[..head],
+                            &want[..head],
+                            "{}: front matter bytes must be untouched",
+                            label()
+                        );
+                        let tail = &want[head..];
+                        assert!(
+                            tail.starts_with(&new_body),
+                            "{}: the body must be the bytes given",
+                            label()
+                        );
+                        let extra = &tail[new_body.len()..];
+                        if restored {
+                            let embed =
+                                link_text_for(image, &ctx).expect("the own picture is nameable");
+                            let Embed::Text(text) = embed else {
+                                panic!("{}: the own picture is ambiguous", label());
+                            };
+                            assert_eq!(
+                                String::from_utf8(extra.to_vec()).unwrap(),
+                                format!("{text}\n"),
+                                "{}: only the self-embed line may be added",
+                                label()
+                            );
+                        } else {
+                            assert_eq!(extra, b"", "{}: nothing beyond the body changed", label());
+                        }
+                    }
+                }
+            }
             other => panic!("{}: unknown op {other}", case.name),
         }
+    }
+}
+
+/// Just past the closing front matter fence, or just past the BOM when the note
+/// has no front matter — the offset a whole-body replace splits at.
+fn head_end(bytes: &[u8]) -> usize {
+    match front_matter_range(bytes) {
+        FmRange::NoFrontMatter { bom_len } => bom_len,
+        FmRange::Closed { body_start, .. } => body_start,
+        FmRange::Unterminated { body_start } => body_start,
     }
 }
 
@@ -478,4 +561,117 @@ fn an_image_under_a_non_utf8_folder_cannot_be_named() {
         Some(EditError::NonUtf8Path),
         "a lossy display path could alias a different real folder"
     );
+}
+
+#[test]
+fn replace_body_refuses_bytes_that_are_not_text() {
+    with_ctx(&["t.md", "girl.jpg"], |ctx| {
+        let note = ctx.index_of("t.md").unwrap();
+        // The note itself: a reader that decodes the whole file cannot read it.
+        let broken = b"---\ntitle: T\n---\n\x87\x8b\n".to_vec();
+        assert_eq!(
+            replace_body(&broken, note, b"clean\n", ctx).unwrap_err(),
+            EditError::NotUtf8
+        );
+        // The new body: text is what a body is made of.
+        assert_eq!(
+            replace_body(b"---\ntitle: T\n---\nold\n", note, b"\xff\xfe", ctx).unwrap_err(),
+            EditError::BodyNotUtf8
+        );
+    });
+}
+
+#[test]
+fn replace_body_targets_only_notes() {
+    with_ctx(&["girl.jpg", "girl.jpg.eagle.json"], |ctx| {
+        let image = ctx.index_of("girl.jpg").unwrap();
+        let raw = ctx.index_of("girl.jpg.eagle.json").unwrap();
+        // An original and a raw metadata sidecar are never written at all
+        // (ADR-016 §0), and the editor says so before any byte is composed.
+        assert_eq!(
+            replace_body(b"body\n", image, b"new\n", ctx).unwrap_err(),
+            EditError::NotANote
+        );
+        assert_eq!(
+            replace_body(b"{}\n", raw, b"new\n", ctx).unwrap_err(),
+            EditError::NotANote
+        );
+    });
+}
+
+#[test]
+fn replace_body_leaves_an_unpaired_image_note_alone() {
+    // The picture is not in the library, so there is no embed to restore: the
+    // body is spliced as given rather than refused (ADR-017 §2 needs a pair).
+    with_ctx(&["gone.jpg.md"], |ctx| {
+        let note = ctx.index_of("gone.jpg.md").unwrap();
+        let got = replace_body(b"---\ntitle: Gone\n---\nold\n", note, b"new\n", ctx).unwrap();
+        assert_eq!(got.bytes, b"---\ntitle: Gone\n---\nnew\n".to_vec());
+        assert!(!got.self_embed_restored);
+    });
+}
+
+#[test]
+fn replace_body_refuses_a_note_whose_fence_never_closes() {
+    with_ctx(&["t.md", "girl.jpg"], |ctx| {
+        let note = ctx.index_of("t.md").unwrap();
+        assert_eq!(
+            replace_body(b"---\ntitle: T\nno closing fence\n", note, b"new\n", ctx).unwrap_err(),
+            EditError::UnterminatedFrontMatter
+        );
+    });
+}
+
+#[test]
+fn replace_body_gives_a_bare_closing_fence_the_line_break_it_lacked() {
+    // A note can end right at its closing fence, with no line break after it:
+    // the body has no line of its own yet. Splicing onto the fence directly
+    // would make that line `---new`, which is not a fence, and the reader would
+    // report the front matter as never closed. So the fence is given the break
+    // it lacked and nothing else about the front matter changes.
+    with_ctx(&["t.md", "girl.jpg"], |ctx| {
+        let note = ctx.index_of("t.md").unwrap();
+        let got = replace_body(b"---\ntitle: T\n---", note, b"new\n", ctx).unwrap();
+        assert_eq!(got.bytes, b"---\ntitle: T\n---\nnew\n".to_vec());
+        assert!(got.changed);
+        // Still a note the reader parses, with the same front matter.
+        let text = String::from_utf8(got.bytes.clone()).unwrap();
+        assert_eq!(parse_note(&text).error, None);
+        assert!(matches!(
+            front_matter_range(&got.bytes),
+            FmRange::Closed { body_start: 17, .. }
+        ));
+    });
+    // The break follows the note's own style: a CRLF note gets CRLF, and its
+    // front matter is still carried over untouched.
+    with_ctx(&["t.md", "girl.jpg"], |ctx| {
+        let note = ctx.index_of("t.md").unwrap();
+        let got = replace_body(b"---\r\ntitle: T\r\n---", note, b"new\r\n", ctx).unwrap();
+        assert_eq!(got.bytes, b"---\r\ntitle: T\r\n---\r\nnew\r\n".to_vec());
+        let text = String::from_utf8(got.bytes.clone()).unwrap();
+        assert_eq!(parse_note(&text).error, None);
+    });
+}
+
+#[test]
+fn replace_body_refuses_to_append_an_embed_inside_an_open_fence() {
+    // The new body leaves a code block unclosed, so the self-embed the rule
+    // wants would land inside the code and resolve to nothing: the whole edit
+    // is refused rather than written broken (ADR-017 §4).
+    with_ctx(&["girl.jpg", "girl.jpg.md"], |ctx| {
+        let note = ctx.index_of("girl.jpg.md").unwrap();
+        let image = ctx.index_of("girl.jpg").unwrap();
+        let error = replace_body(
+            b"---\ntitle: Girl\n---\nold\n",
+            note,
+            b"in code now\n```\nnot closed\n",
+            ctx,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, EditError::UnclosedFence(_)),
+            "expected an unclosed fence, got {error}"
+        );
+        assert_ne!(image, note);
+    });
 }

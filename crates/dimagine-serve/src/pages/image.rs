@@ -10,7 +10,7 @@
 
 use axum::{
     extract::{Path, RawQuery, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse, Response},
     Json,
 };
@@ -25,7 +25,7 @@ use crate::index_sync::RECENT_LIMIT;
 use crate::ui::shell::Frame;
 use crate::ui::{encode_path, escape_html, markdown_html, tile_anchor};
 use crate::view_query::{query_value, ViewParams, PAGE_SIZE};
-use crate::{catalog_error_page, error_page, error_response, AppState};
+use crate::{catalog_error_page, error_page, error_response, write_api, AppState};
 
 /// The destination of "Back to view".
 const DESTINATION: crate::ui::shell::Destination = crate::ui::shell::Destination::Library;
@@ -46,6 +46,7 @@ pub(crate) async fn image_page(
     State(state): State<AppState>,
     Path(path): Path<String>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     let catalog = state.catalog.clone();
     let detail = match tokio::task::spawn_blocking(move || catalog.image_detail(&path)).await {
@@ -114,6 +115,7 @@ pub(crate) async fn image_page(
         neighbours.as_ref(),
         meta,
         &stage_src,
+        write_api::write_controls_for(&state, &headers).as_deref(),
     );
     let frame = Frame {
         banner: state.banner(),
@@ -285,6 +287,7 @@ fn image_body(
     neighbours: Option<&Neighbours>,
     meta: Option<ImageMeta>,
     stage_src: &str,
+    edit: Option<&str>,
 ) -> String {
     let path = encode_path(&detail.path);
     let title = title_of(detail);
@@ -358,6 +361,15 @@ fn image_body(
             escape_html(note),
             body_html
         ));
+        // The source-mode body editor (ADR-017 §10, FORMAT §5.3):
+        // a plain textarea over the note's body, an explicit Save, and no WYSIWYG.
+        // It draws only for a viewer who can write (ADR-018 §2), and only once we
+        // also carry the note's open-time hash (ADR-016 §3) — the precondition the
+        // save posts back, and the value a conflict refreshes. Without either the
+        // note stays read-only on the page, exactly as before.
+        if let (Some(csrf), Some(hash)) = (edit, detail.note_hash.as_deref()) {
+            out.push_str(&note_editor_html(note, hash, &detail.body, csrf));
+        }
     }
     if let Some(error) = &detail.front_matter_error {
         out.push_str(&format!(
@@ -376,6 +388,110 @@ fn image_body(
     ));
     out.push_str("</div></div></div>");
     out
+}
+
+/// The body-editor section, drawn only for a viewer who can write. It carries
+/// the note's path and its open-time hash on the section (the hash the save
+/// posts as its precondition, and a conflict refreshes), a textarea holding the
+/// body verbatim, and one explicit Save. Front matter is not here — it has its
+/// own editor and is never re-serialized through this one (ADR-017 §10).
+///
+/// A single newline is written just after the `<textarea>` open tag: the HTML
+/// parser strips exactly one leading newline, so whatever the body really starts
+/// with — including a newline of its own — survives round-tripping to `.value`
+/// byte for byte.
+fn note_editor_html(note: &str, hash: &str, body: &str, csrf: &str) -> String {
+    let note = escape_html(note);
+    format!(
+        "<section class=\"image-section note-editor\" data-note=\"{note}\" data-hash=\"{hash}\">\
+         <h2>Edit note body</h2>\
+         <p class=\"note-editor-hint\">\
+         The body only; the fields above are edited separately. \
+         Your text is saved only when you press Save.</p>\
+         <textarea class=\"note-body-edit\" rows=\"12\" spellcheck=\"false\" \
+         aria-label=\"Note body\">\n{}</textarea>\
+         <p><button type=\"button\" class=\"note-save\">Save</button> \
+         <span class=\"note-editor-status\" role=\"status\" aria-live=\"polite\"></span></p>\
+         </section>\n\
+         <script>window.DIMAGINE_CSRF={};</script>\n{}",
+        escape_html(body),
+        serde_json::to_string(csrf).unwrap_or_else(|_| "\"\"".into()),
+        note_editor_script(),
+    )
+}
+
+/// The small same-origin script behind the body editor: it posts the textarea to
+/// `/api/write/note/body` with the session's CSRF token in a header (a plain
+/// form cannot carry that, ADR-018 §3), and drives the conflict prompt (ADR-016
+/// §3): on a 409 it offers "load the latest" (reload) or "use mine anyway" (retry
+/// carrying the hash the server just returned). It is written by hand, so it
+/// adds no dependency (FORMAT §5.3: source mode, not a rich editor).
+fn note_editor_script() -> &'static str {
+    r#"<script>
+(function () {
+  var CSRF = window.DIMAGINE_CSRF || '';
+  var section = document.querySelector('.note-editor');
+  if (!section) return;
+  var area = section.querySelector('.note-body-edit');
+  var save = section.querySelector('.note-save');
+  var status = section.querySelector('.note-editor-status');
+  var note = section.getAttribute('data-note');
+  var hash = section.getAttribute('data-hash');
+  function say(message, failed) {
+    status.textContent = message;
+    status.className = 'note-editor-status' + (failed ? ' error' : '');
+  }
+  function post(current) {
+    return fetch('/api/write/note/body', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-csrf-token': CSRF },
+      body: JSON.stringify({ note: note, hash: current, body: area.value }),
+      credentials: 'same-origin'
+    });
+  }
+  function saveWith(current) {
+    say('Saving\u2026', false);
+    post(current)
+      .then(function (response) {
+        return response.json().then(function (data) {
+          return { ok: response.ok, status: response.status, data: data };
+        });
+      })
+      .then(function (result) {
+        if (result.ok) {
+          if (result.data.hash) { hash = result.data.hash; section.setAttribute('data-hash', hash); }
+          say(result.data.changed ? 'Saved.' : 'Already up to date.', false);
+          return;
+        }
+        if (result.status === 409) { offerConflict(result.data.hash); return; }
+        say((result.data && result.data.error) || 'the body could not be saved.', true);
+      })
+      .catch(function () { say('the body could not be saved.', true); });
+  }
+  function offerConflict(current) {
+    status.textContent = '';
+    status.className = 'note-editor-status error';
+    var msg = document.createTextNode(
+      'The note was changed elsewhere while you were editing. ');
+    var reload = document.createElement('button');
+    reload.type = 'button';
+    reload.textContent = 'Load the latest';
+    reload.addEventListener('click', function () { location.reload(); });
+    var overwrite = document.createElement('button');
+    overwrite.type = 'button';
+    overwrite.textContent = 'Use my version anyway';
+    overwrite.addEventListener('click', function () {
+      if (current) { hash = current; }
+      saveWith(hash);
+    });
+    status.appendChild(msg);
+    status.appendChild(reload);
+    status.appendChild(document.createTextNode(' or '));
+    status.appendChild(overwrite);
+  }
+  save.addEventListener('click', function () { saveWith(hash); });
+})();
+</script>"#
 }
 
 /// The stage's shape, from the indexed dimensions first and the note's own
@@ -967,6 +1083,7 @@ mod tests {
             neighbours,
             meta,
             "/media/refs/%E7%8C%AB.png",
+            None,
         )
     }
 
@@ -983,6 +1100,7 @@ mod tests {
             body_html: None,
             raw_files: vec!["猫.png.eagle.json".into()],
             note_path: Some("refs/猫.png.md".into()),
+            note_hash: Some("b".repeat(64)),
         }
     }
 
@@ -1298,6 +1416,7 @@ mod tests {
             body_html: None,
             raw_files: Vec::new(),
             note_path: None,
+            note_hash: None,
         };
         let (context, _) = plain();
         let html = page_html(&bare, Some(&[]), &context, None, None);

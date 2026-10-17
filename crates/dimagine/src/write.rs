@@ -1,4 +1,4 @@
-//! The dimagine write commands (ADR-016, ADR-017): `tag` `rate` `set`
+//! The dimagine write commands (ADR-016, ADR-017): `tag` `rate` `set` `edit`
 //! `collect` `mv` `trash` `restore` `undo` `config`, and the trash group's own
 //! `trash purge` / `trash empty`.
 //!
@@ -82,6 +82,37 @@ pub fn commands() -> Vec<Command> {
                     .num_args(1..)
                     .required(true)
                     .help("One or more KEY=VALUE pairs (scalars only); KEY= with no value clears the key."),
+            ),
+        Command::new("edit")
+            .about("Replace a note's body, leaving its front matter untouched.")
+            .arg(
+                Arg::new("note")
+                    .value_name("NOTE")
+                    .required(true)
+                    .help("The note, by library-relative path (`shelf.md`, or an image's `photo.jpg.md`)."),
+            )
+            .arg(
+                Arg::new("body_file")
+                    .long("body-file")
+                    .value_name("PATH")
+                    .conflicts_with("stdin")
+                    .help("Take the new body from this file, verbatim."),
+            )
+            .arg(
+                Arg::new("stdin")
+                    .long("stdin")
+                    .action(ArgAction::SetTrue)
+                    .help("Take the new body from standard input, verbatim."),
+            )
+            .arg(
+                Arg::new("expect")
+                    .long("expect")
+                    .value_name("HASH")
+                    .help(
+                        "The note's sha256 as read when the edit was opened. A note that \
+                         changed since then is refused with a conflict and nothing is written \
+                         (ADR-016 §3); without it the precondition is this command's own read.",
+                    ),
             ),
         Command::new("collect")
             .about("Create a collection note, add/remove images, reorder its members, or edit a caption.")
@@ -250,6 +281,7 @@ pub fn dispatch(name: &str, sub: &ArgMatches, library_dir: &Path) -> Option<Exit
         "tag" => run_tag(sub, library_dir),
         "rate" => run_rate(sub, library_dir),
         "set" => run_set(sub, library_dir),
+        "edit" => run_edit(sub, library_dir),
         "collect" => run_collect(sub, library_dir),
         "mv" => run_move(sub, library_dir),
         "trash" => run_trash(sub, library_dir),
@@ -646,6 +678,166 @@ fn print_front_matter(json: bool, op_id: &str, image_rel: &str, bytes: &[u8]) {
 }
 
 // ---------------------------------------------------------------------------
+// edit
+// ---------------------------------------------------------------------------
+
+/// `edit NOTE --body-file PATH | --stdin [--expect HASH]`: replace everything
+/// after the note's closing front matter fence with the bytes given, as one
+/// whole-replace step guarded by an open hash (ADR-017 §10, ADR-016 §3).
+///
+/// There is no interactive editor: a script, an agent or a test drives this and
+/// reads the new hash from the output.
+fn run_edit(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let note = sub
+        .get_one::<String>("note")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let new_body = match read_body_arg(sub) {
+        Ok(bytes) => bytes,
+        Err(message) => return fail(json, &message),
+    };
+    let expect = match sub.get_one::<String>("expect") {
+        Some(raw) => match Fingerprint::from_hex(raw) {
+            Some(fp) => Some(fp),
+            None => {
+                return fail(
+                    json,
+                    &format!("--expect {raw:?} is not a 64-character hex sha256"),
+                )
+            }
+        },
+        None => None,
+    };
+    let library = match library_walk(library_dir, json) {
+        Ok(library) => library,
+        Err(code) => return code,
+    };
+    let writer = match open_writer(library_dir, json) {
+        Ok(writer) => writer,
+        Err(code) => return code,
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+    let (note_rel, note_index, bytes, fp) = match read_note(json, &writer, note, &ctx) {
+        Ok(got) => got,
+        Err(code) => return code,
+    };
+    // The caller's open hash is checked against the note as it stands before
+    // anything is computed: a stale read is a conflict, never a silent no-op
+    // and never an overwrite (ADR-016 §3).
+    if let Some(expect) = expect.as_ref() {
+        if !expect.same_bytes(&fp) {
+            return fail(
+                json,
+                &format!(
+                    "conflict on {}: the note is now {} ({} bytes), expected {}",
+                    note_rel.text(),
+                    fp.hex(),
+                    fp.size,
+                    expect.hex()
+                ),
+            );
+        }
+    }
+    let replaced = match body_edit::replace_body(&bytes, note_index, &new_body, &ctx) {
+        Ok(replaced) => replaced,
+        Err(error) => return fail(json, &error.to_string()),
+    };
+    if !replaced.changed {
+        return edit_unchanged(json, &note_rel.text(), &fp);
+    }
+    let op_id = new_op_id();
+    let restored = replaced.self_embed_restored;
+    let intent = serde_json::json!({"action": "edit_body", "note": note_rel.text()});
+    // The digest of the bytes this operation writes. The write is a
+    // compare-and-swap on the same bytes, so this is the hash the note carries
+    // once it lands — reported without reading the file back.
+    let after = Fingerprint::of_bytes(&replaced.bytes);
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(replaced.bytes),
+    };
+    // Without `--expect` the precondition is this command's own read, which is
+    // what makes the write a compare-and-swap rather than a blind overwrite.
+    let expect = expect.as_ref().unwrap_or(&fp);
+    if let Err(error) = writer.execute_op_guarded(
+        &op_id,
+        SOURCE,
+        None,
+        intent,
+        vec![step],
+        (&note_rel, expect),
+    ) {
+        return fail(json, &error_message(&error));
+    }
+    report_edit(json, &note_rel.text(), &op_id, &after, restored);
+    ExitCode::from(0)
+}
+
+/// The new body, taken verbatim from `--body-file` or standard input. Neither
+/// normalizes anything: the bytes are the body (ADR-017 §10).
+fn read_body_arg(sub: &ArgMatches) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if let Some(path) = sub.get_one::<String>("body_file") {
+        return std::fs::read(path).map_err(|error| format!("read {path}: {error}"));
+    }
+    if sub.get_flag("stdin") {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|error| format!("read standard input: {error}"))?;
+        return Ok(bytes);
+    }
+    Err("give --body-file PATH or --stdin for the new body".to_string())
+}
+
+/// An edit that wrote what the note already held: no operation, so nothing to
+/// undo, and the hash is unchanged.
+fn edit_unchanged(json: bool, note: &str, fp: &Fingerprint) -> ExitCode {
+    if json {
+        let doc = serde_json::json!({
+            "schema": "dimagine.edit/0.1",
+            "note": note,
+            "changed": false,
+            "hash": fp.hex(),
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("{note} already holds that body");
+    }
+    ExitCode::from(0)
+}
+
+/// The written body and its new hash: what a script reads to carry into its
+/// next precondition (ADR-016 §3).
+fn report_edit(json: bool, note: &str, op_id: &str, fp: &Fingerprint, restored: bool) {
+    if json {
+        let doc = serde_json::json!({
+            "schema": "dimagine.edit/0.1",
+            "note": note,
+            "changed": true,
+            "op": op_id,
+            "hash": fp.hex(),
+            "bytes": fp.size,
+            "self_embed_restored": restored,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("wrote the body of {note} ({} bytes)", fp.size);
+        println!("hash: {}", fp.hex());
+        if restored {
+            println!("restored the note's own embed, which the new body left out");
+        }
+    }
+}
+// ---------------------------------------------------------------------------
 // collect
 // ---------------------------------------------------------------------------
 
@@ -864,28 +1056,28 @@ fn collect_unchanged(json: bool, collection: &str) -> ExitCode {
     ExitCode::from(0)
 }
 
-/// Resolve an existing collection note and read its body and fingerprint. The
-/// block and caption editors carry the open-hash precondition into the write
-/// (ADR-016 §3), so they need the fingerprint the read produced.
-fn read_collection(
+/// Resolve an existing note by library-relative path and read its body and
+/// fingerprint. The whole-replace editors carry the open-hash precondition into
+/// the write (ADR-016 §3), so they need the fingerprint this read produced.
+fn read_note(
     json: bool,
     writer: &Writer,
-    collection: &str,
+    path: &str,
     ctx: &BodyCtx,
 ) -> Result<(RelPath, usize, Vec<u8>, Fingerprint), ExitCode> {
-    let note_rel = match RelPath::parse(collection.trim_start_matches("./")) {
+    let note_rel = match RelPath::parse(path.trim_start_matches("./")) {
         Ok(rel) => rel,
         Err(error) => return Err(fail(json, &error_message(&error))),
     };
     let note_index = match ctx.index_of(&note_rel.text()) {
         Some(index) => index,
-        None => return Err(fail(json, &format!("no note at {collection}"))),
+        None => return Err(fail(json, &format!("no note at {path}"))),
     };
     if !matches!(
         ctx.files[note_index].class,
         FileClass::Note | FileClass::ImageNote
     ) {
-        return Err(fail(json, &format!("{collection} is not a note")));
+        return Err(fail(json, &format!("{path} is not a note")));
     }
     let (body, fp) = match writer.read(&note_rel) {
         Ok(got) => got,
@@ -928,7 +1120,7 @@ fn collect_reorder(
     operands: &[String],
     ctx: &BodyCtx,
 ) -> ExitCode {
-    let (note_rel, note_index, body, fp) = match read_collection(json, writer, collection, ctx) {
+    let (note_rel, note_index, body, fp) = match read_note(json, writer, collection, ctx) {
         Ok(got) => got,
         Err(code) => return code,
     };
@@ -994,7 +1186,7 @@ fn collect_caption(
     operands: &[String],
     ctx: &BodyCtx,
 ) -> ExitCode {
-    let (note_rel, note_index, body, fp) = match read_collection(json, writer, collection, ctx) {
+    let (note_rel, note_index, body, fp) = match read_note(json, writer, collection, ctx) {
         Ok(got) => got,
         Err(code) => return code,
     };

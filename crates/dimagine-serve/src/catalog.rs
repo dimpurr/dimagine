@@ -119,6 +119,10 @@ pub struct ImageDetail {
     /// Library-relative path of the image's note, when it has one. `None` is
     /// different from an empty note: it means there is no note to open.
     pub note_path: Option<String>,
+    /// The sha256 of the note's bytes as this read saw them, lowercase hex —
+    /// the "open-time hash" a whole-replace edit carries back as its
+    /// precondition (ADR-016 §3). `None` when the image has no note.
+    pub note_hash: Option<String>,
 }
 
 /// Read-only library catalog contract.
@@ -418,7 +422,7 @@ impl Catalog for FsCatalog {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => return Err(CatalogError::Unreadable),
         };
-        let (properties, body, front_matter_error, note_relative_path, body_html) =
+        let (properties, body, front_matter_error, note_relative_path, body_html, note_hash) =
             if let Some(note_meta) = note_meta {
                 if note_meta.file_type().is_symlink() {
                     return Err(CatalogError::Forbidden);
@@ -436,6 +440,10 @@ impl Catalog for FsCatalog {
                 }
                 let text =
                     fs::read_to_string(&canonical_note).map_err(|_| CatalogError::Unreadable)?;
+                // The digest of the bytes this read saw, spelled the way the
+                // write core spells it: the page hands it back as the
+                // precondition of a whole-replace edit (ADR-016 §3).
+                let note_hash = dimagine_write::Fingerprint::of_bytes(text.as_bytes()).hex();
                 let parsed = parse_note(&text);
                 let relative = note_relative.to_string_lossy().replace('\\', "/");
                 let body_html = self.render_note_body(&relative, &parsed.body);
@@ -445,9 +453,17 @@ impl Catalog for FsCatalog {
                     parsed.error,
                     Some(relative),
                     Some(body_html),
+                    Some(note_hash),
                 )
             } else {
-                (serde_json::Value::Null, String::new(), None, None, None)
+                (
+                    serde_json::Value::Null,
+                    String::new(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
             };
         let parent = image.parent().ok_or(CatalogError::NotFound)?;
         let base = image.file_name().unwrap_or_default().to_string_lossy();
@@ -474,6 +490,7 @@ impl Catalog for FsCatalog {
             front_matter_error,
             raw_files,
             note_path: note_relative_path,
+            note_hash,
         })
     }
 

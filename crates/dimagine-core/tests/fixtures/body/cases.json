@@ -339,5 +339,159 @@
    "\n"
   ],
   "desc": "at most one blank line below a member line is taken, never a run of them"
+ },
+ {
+  "name": "replace_exotic",
+  "op": "replace",
+  "library": [
+   "ink.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "ink.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_exotic.in.md",
+  "new_body": "replace_exotic.body.md",
+  "out": "replace_exotic.out.md",
+  "desc": "a whole-body replace leaves the front matter's exotic spellings byte-identical",
+  "error": null
+ },
+ {
+  "name": "replace_crlf_bom",
+  "op": "replace",
+  "library": [
+   "sea.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "sea.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_crlf_bom.in.md",
+  "new_body": "replace_crlf_bom.body.md",
+  "out": "replace_crlf_bom.out.md",
+  "desc": "a BOM and CRLF front matter, with a trailing space on the closing fence, are carried over",
+  "error": null
+ },
+ {
+  "name": "replace_no_fm",
+  "op": "replace",
+  "library": [
+   "prose.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "prose.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_no_fm.in.md",
+  "new_body": "replace_no_fm.body.md",
+  "out": "replace_no_fm.out.md",
+  "desc": "with no front matter the body is the file, and only the BOM stays in front of it",
+  "error": null
+ },
+ {
+  "name": "replace_unclosed",
+  "op": "replace",
+  "library": [
+   "bad.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "bad.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_unclosed.in.md",
+  "new_body": "replace_unclosed.body.md",
+  "desc": "an unterminated fence means the split point is unknown: refuse, touch nothing",
+  "error": "the note opens a `---` fence that is never closed, so its body has no start"
+ },
+ {
+  "name": "replace_self_missing",
+  "op": "replace",
+  "library": [
+   "girl.jpg",
+   "girl.jpg.md"
+  ],
+  "note": "girl.jpg.md",
+  "image": "girl.jpg",
+  "in": "replace_self_missing.in.md",
+  "new_body": "replace_self_missing.body.md",
+  "out": "replace_self_missing.out.md",
+  "restored": true,
+  "desc": "a body edit that left the own picture out gets the self-embed appended (ADR-017 §2)",
+  "error": null
+ },
+ {
+  "name": "replace_self_mispointed",
+  "op": "replace",
+  "library": [
+   "girl.jpg",
+   "refs/a/sea.jpg",
+   "refs/a/sea.jpg.md"
+  ],
+  "note": "refs/a/sea.jpg.md",
+  "image": "refs/a/sea.jpg",
+  "in": "replace_self_mispointed.in.md",
+  "new_body": "replace_self_mispointed.body.md",
+  "out": "replace_self_mispointed.out.md",
+  "restored": true,
+  "desc": "a body that embeds some other picture still lacks its own, so one is appended",
+  "error": null
+ },
+ {
+  "name": "replace_self_kept",
+  "op": "replace",
+  "library": [
+   "girl.jpg",
+   "refs/a/sea.jpg",
+   "refs/a/sea.jpg.md"
+  ],
+  "note": "refs/a/sea.jpg.md",
+  "image": "refs/a/sea.jpg",
+  "in": "replace_self_kept.in.md",
+  "new_body": "replace_self_kept.body.md",
+  "out": "replace_self_kept.out.md",
+  "restored": false,
+  "desc": "an aliased embed of the own picture counts: no second one is appended",
+  "error": null
+ },
+ {
+  "name": "replace_no_final_newline",
+  "op": "replace",
+  "library": [
+   "t.md",
+   "girl.jpg"
+  ],
+  "note": "t.md",
+  "image": "girl.jpg",
+  "in": "replace_no_final_newline.in.md",
+  "new_body": "replace_no_final_newline.body.md",
+  "out": "replace_no_final_newline.out.md",
+  "desc": "the new body's own shape is kept, including no trailing newline",
+  "error": null
+ },
+ {
+  "name": "replace_collection",
+  "op": "replace",
+  "library": [
+   "shelf.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "shelf.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_collection.in.md",
+  "new_body": "replace_collection.body.md",
+  "out": "replace_collection.out.md",
+  "desc": "a collection note is editable as text like any note",
+  "error": null
+ },
+ {
+  "name": "replace_empty_note",
+  "op": "replace",
+  "library": [
+   "e.md",
+   "refs/deep-sea/girl.jpg"
+  ],
+  "note": "e.md",
+  "image": "refs/deep-sea/girl.jpg",
+  "in": "replace_empty_note.in.md",
+  "new_body": "replace_empty_note.body.md",
+  "out": "replace_empty_note.out.md",
+  "desc": "an empty body is what was asked for",
+  "error": null
  }
 ]

@@ -197,12 +197,18 @@ record of where those files came from, so recovering them is a manual move.
 
 ## With the dimagine CLI
 
-`dimagine tag`, `rate`, `set`, `collect`, `mv`, `trash`, `restore`, `undo` and
-`config` make the changes above through one journaled operation each; a command
-that changes a file prints that operation's id, and `dimagine undo <id>`
-reverses it. `dimagine collect --reorder <note> <ordinals…>` permutes a
+`dimagine tag`, `rate`, `set`, `edit`, `collect`, `mv`, `trash`, `restore`,
+`undo` and `config` make the changes above through one journaled operation each; a
+command that changes a file prints that operation's id, and `dimagine undo <id>`
+reverses it. `dimagine edit <note> --body-file <path>` (or `--stdin`) replaces a
+note's whole body — every byte after its front matter — with the text you give,
+leaving the front matter and the body's own line endings, BOM and trailing newline
+exactly as they are; `--expect <sha256>` carries the note's hash as you read it so
+a note changed since then is refused, not clobbered. Editing the body never drops
+an image note's self-embed (it is restored if the new text left it out).
+`dimagine collect --reorder <note> <ordinals…>` permutes a
 collection's member blocks and `dimagine collect --caption <note> <block> <line>
-<text|->` edits, deletes (`-`) or appends one caption line; both carry the
+<text|->` edits, deletes (`-`) or appends one caption line; all three carry the
 note's hash as a precondition, so a note changed since you read it is refused
 rather than overwritten. `dimagine trash purge` deletes the groups past the
 retention period and `dimagine trash empty` deletes every trashed group now;

@@ -254,6 +254,27 @@ A tool that edits a **caption line** replaces, appends or deletes one line of
 plain text in a block. The member line itself is not a caption: removing it is
 removing the member.
 
+### 5.3 Whole-body edit
+
+A note's **body** is every byte after the line its front matter closes on — the
+same delimiter rule the reader uses to find the body (§5.1, §3). A tool that
+replaces the whole body overwrites exactly those bytes and nothing before them:
+the front matter is carried over untouched and never re-serialized, and the body's
+own line endings, byte-order mark and trailing newline (or its absence) are kept
+as given. A note with no front matter has a body that is the whole file (minus a
+BOM, §3.1); a note whose opening `---` fence is never closed has no defined body
+boundary, so it is refused rather than guessed at. A note that ends *at* its
+closing fence has an empty body and no line break after the fence; the break is
+added, in the file's own line-ending style, because text spliced onto the fence
+line would no longer be a fence and the front matter would stop parsing.
+
+Replacing a body is a whole-file write, so it carries a precondition on the bytes
+it replaces (§9): a tool must not clobber a change it never read. The self-embed
+still applies to the result (§3.2): an image note whose new body no longer embeds
+its own picture gets the embed added at the end. Collection notes and other plain
+notes are edited as text the same way; only the self-embed rule is specific to
+image notes.
+
 ## 6. Boards
 
 A board is a [JSON Canvas](https://jsoncanvas.org/) file (`*.canvas`). Image
@@ -390,6 +411,7 @@ full behaviour is in [HLD.md](HLD.md). Every command takes `--library <path>`
 dimagine tag <img> [--add T] [--remove T]     # edit an image note's tags
 dimagine rate <img> <0-5|none>                # set or clear its rating
 dimagine set <img> KEY=VALUE …                # set scalar properties (KEY= clears)
+dimagine edit <note> (--body-file <path>|--stdin) [--expect <sha256>]  # replace the body (§5.3)
 dimagine collect --new <title> <img>…         # create a collection note (§5)
 dimagine collect --add|--remove <note> <img>… # edit a collection's members
 dimagine collect --reorder <note> <ordinal>…  # permute the member blocks (§5.2)
@@ -430,3 +452,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-13 | The CLI that writes the format is listed with what each command does (§9); Versioning moves to §10. |
 | 0.1 | 2026-10-16 | The contract for an automatic move (§7): the `id` is fixed before anything moves and lands with the note's edit, the group renames together and refuses a taken destination, links are rewritten in place keeping their syntax and display parts, `.canvas` `nodes[].file` values follow, ambiguous links are reported and not touched. `dimagine mv` joins the CLI (§9). |
 | 0.1 | 2026-10-17 | Member blocks, caption lines and reordering (§5.2): a member line plus the plain-text lines that follow it; reordering permutes only the blocks and leaves every other byte, line boundary and trailing-newline shape alone; a caption edit touches one line and never the member line. `dimagine collect --reorder` and `collect --caption` join the CLI (§9). |
+| 0.1 | 2026-10-17 | The whole-body edit (§5.3): a note's body is the bytes after its front matter's closing line; a replacement keeps the front matter and every byte-order mark, line ending and trailing newline as given, carries a precondition on the bytes it replaces, and keeps the self-embed rule on the result; a note whose opening fence is never closed is refused, and a note that ends at its closing fence is given the line break its body needs. `dimagine edit` joins the CLI (§9). |

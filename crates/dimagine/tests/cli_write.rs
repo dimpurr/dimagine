@@ -1631,3 +1631,359 @@ fn mv_reports_ambiguous_links_and_leaves_them_alone() {
         "keep ![[x.jpg]] and full ![[c/y.jpg]]\n"
     );
 }
+
+// ---------------------------------------------------------------------------
+// edit — whole-body replacement (ADR-017 §10, ADR-016 §3)
+// ---------------------------------------------------------------------------
+
+/// The digest the write core reports for these bytes: the same sha256 the
+/// command prints, computed here independently of it.
+fn digest(bytes: &[u8]) -> String {
+    dimagine_write::Fingerprint::of_bytes(bytes).hex()
+}
+
+/// Run one command with stdin supplied, `--library` appended.
+fn dimagine_stdin(library: &Path, args: &[&str], input: &[u8]) -> (i32, String, String) {
+    use std::io::Write;
+    let mut child = Command::new(BIN)
+        .args(args)
+        .arg("--library")
+        .arg(library)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run dimagine");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input)
+        .expect("write stdin");
+    let output = child.wait_with_output().expect("wait");
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+const SHELF: &str =
+    "---\nkind: collection\ntitle: Shelf\n---\n\n![[refs/a/girl.jpg]]\nold caption\n";
+const SHELF_NEW: &str = "\n![[refs/a/girl.jpg]]\nnew caption\n";
+
+/// A library in one temporary folder and the body files the edits feed in
+/// another, so nothing that is not library content is ever walked.
+struct EditLib {
+    library: TempDir,
+    bodies: TempDir,
+}
+
+impl EditLib {
+    fn lib(&self) -> &Path {
+        &self.library.0
+    }
+
+    /// Write a new body outside the library and give back its path, as the
+    /// command line would spell it.
+    fn body(&self, name: &str, text: &str) -> String {
+        write(&self.bodies.0, name, text);
+        self.bodies.0.join(name).to_str().unwrap().to_string()
+    }
+}
+
+fn edit_lib(tag: &str) -> EditLib {
+    let dir = EditLib {
+        library: tmp(tag),
+        bodies: tmp(&format!("{tag}-body")),
+    };
+    write(dir.lib(), "refs/a/girl.jpg", PNG);
+    write(dir.lib(), "shelf.md", SHELF);
+    dir
+}
+
+#[test]
+fn edit_replaces_the_body_and_reports_the_new_hash() {
+    let dir = edit_lib("edit-basic");
+    let body = dir.body("new.md", SHELF_NEW);
+    let stdout = ok(
+        dir.lib(),
+        &["edit", "shelf.md", "--body-file", &body, "--json"],
+    );
+    let doc = json_in(&stdout);
+    assert_eq!(doc["schema"], "dimagine.edit/0.1");
+    assert_eq!(doc["note"], "shelf.md");
+    assert_eq!(doc["changed"], true);
+    assert_eq!(doc["self_embed_restored"], false);
+    let want = format!("---\nkind: collection\ntitle: Shelf\n---\n{SHELF_NEW}");
+    assert_eq!(read(dir.lib(), "shelf.md"), want);
+    assert_eq!(doc["hash"], digest(want.as_bytes()));
+    assert_eq!(doc["bytes"].as_u64().unwrap(), want.len() as u64);
+    assert!(!doc["op"].as_str().unwrap().is_empty());
+
+    // The hash it printed is the note's real current hash: handing it back as
+    // `--expect` for the same body is accepted, not a conflict.
+    let hash = doc["hash"].as_str().unwrap().to_string();
+    let stdout = ok(
+        dir.lib(),
+        &[
+            "edit",
+            "shelf.md",
+            "--body-file",
+            &body,
+            "--expect",
+            &hash,
+            "--json",
+        ],
+    );
+    let doc = json_in(&stdout);
+    assert_eq!(doc["changed"], false, "the same body is no operation");
+    assert_eq!(doc["hash"], hash);
+    assert_eq!(read(dir.lib(), "shelf.md"), want);
+}
+
+#[test]
+fn edit_from_stdin_keeps_the_notes_own_bytes_elsewhere() {
+    let dir = edit_lib("edit-stdin");
+    // CRLF in the new body is the new body's business: nothing normalizes it,
+    // and the front matter above the closing fence is carried over untouched.
+    let (code, stdout, stderr) = dimagine_stdin(
+        dir.lib(),
+        &["edit", "shelf.md", "--stdin"],
+        "\r\nfirst\r\n".as_bytes(),
+    );
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert!(stdout.contains("wrote the body of shelf.md"), "{stdout}");
+    assert_eq!(
+        read(dir.lib(), "shelf.md"),
+        "---\nkind: collection\ntitle: Shelf\n---\n\r\nfirst\r\n"
+    );
+    assert!(
+        stdout.contains("hash: "),
+        "the human output carries the new hash too: {stdout}"
+    );
+}
+
+#[test]
+fn edit_carries_a_bom_and_crlf_front_matter_over_byte_for_byte() {
+    let dir = edit_lib("edit-bom");
+    write(
+        dir.lib(),
+        "bom.md",
+        "\u{feff}---\r\ntitle: \"Ink: a study\"\r\nrating: \"4\"\r\n--- \r\nold\r\n",
+    );
+    let body = dir.body("body.md", "new\r\nbody\r\n");
+    ok(dir.lib(), &["edit", "bom.md", "--body-file", &body]);
+    assert_eq!(
+        std::fs::read(dir.lib().join("bom.md")).unwrap(),
+        "\u{feff}---\r\ntitle: \"Ink: a study\"\r\nrating: \"4\"\r\n--- \r\nnew\r\nbody\r\n"
+            .as_bytes()
+    );
+}
+
+#[test]
+fn edit_gives_a_note_ending_at_its_closing_fence_a_body_line() {
+    let dir = edit_lib("edit-bare-fence");
+    // A note that ends right at its closing fence has an empty body and no line
+    // break after the fence. The edit must not glue the new text onto `---`,
+    // which would stop the front matter parsing.
+    write(dir.lib(), "bare.md", "---\ntitle: Bare\n---");
+    let before = std::fs::read(dir.lib().join("bare.md")).unwrap();
+    let body = dir.body("bare.new.md", "first line\nsecond\n");
+    let stdout = ok(
+        dir.lib(),
+        &["edit", "bare.md", "--body-file", &body, "--json"],
+    );
+    let doc = json_in(&stdout);
+    assert_eq!(
+        read(dir.lib(), "bare.md"),
+        "---\ntitle: Bare\n---\nfirst line\nsecond\n"
+    );
+    // Still readable, and undo hands back exactly the bytes that were there.
+    assert_eq!(
+        doc["hash"],
+        digest(b"---\ntitle: Bare\n---\nfirst line\nsecond\n")
+    );
+    ok(dir.lib(), &["undo", doc["op"].as_str().unwrap(), "--json"]);
+    assert_eq!(std::fs::read(dir.lib().join("bare.md")).unwrap(), before);
+}
+
+#[test]
+fn edit_with_a_stale_expect_conflicts_and_writes_nothing() {
+    let dir = edit_lib("edit-conflict");
+    let body = dir.body("new.md", SHELF_NEW);
+    let before = std::fs::read(dir.lib().join("shelf.md")).unwrap();
+    let audit_before = read(dir.lib(), ".dimagine/log/ops.jsonl");
+    let stale = digest(b"some other version entirely");
+    let (code, stdout, stderr) = dimagine(
+        dir.lib(),
+        &["edit", "shelf.md", "--body-file", &body, "--expect", &stale],
+    );
+    assert_eq!(code, 1, "a stale open hash is a failure");
+    let message = format!("{stdout}{stderr}");
+    assert!(message.contains("conflict"), "{message}");
+    // The report names the version the note really holds, so the caller can
+    // reload or force against it (ADR-016 §3).
+    assert!(message.contains(&digest(&before)), "{message}");
+    assert_eq!(std::fs::read(dir.lib().join("shelf.md")).unwrap(), before);
+    assert_eq!(
+        read(dir.lib(), ".dimagine/log/ops.jsonl"),
+        audit_before,
+        "a conflict leaves no audit line"
+    );
+}
+
+#[test]
+fn edit_rejects_a_malformed_expect() {
+    let dir = edit_lib("edit-badhash");
+    let body = dir.body("new.md", SHELF_NEW);
+    let (code, _stdout, stderr) = dimagine(
+        dir.lib(),
+        &[
+            "edit",
+            "shelf.md",
+            "--body-file",
+            &body,
+            "--expect",
+            "nonsense",
+        ],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("64-character hex sha256"), "{stderr}");
+    assert_eq!(read(dir.lib(), "shelf.md"), SHELF);
+}
+
+#[test]
+fn edit_is_one_audited_operation_and_undo_restores_the_prior_bytes() {
+    let dir = edit_lib("edit-undo");
+    let body = dir.body("new.md", SHELF_NEW);
+    let stdout = ok(
+        dir.lib(),
+        &["edit", "shelf.md", "--body-file", &body, "--json"],
+    );
+    let op = json_in(&stdout)["op"].as_str().unwrap().to_string();
+    let audit = read(dir.lib(), ".dimagine/log/ops.jsonl");
+    let lines: Vec<&str> = audit
+        .lines()
+        .filter(|line| line.contains(&format!("\"op_id\":\"{op}\"")))
+        .collect();
+    assert_eq!(lines.len(), 1, "one file, one audit line: {audit}");
+    assert!(lines[0].contains("\"edit_body\""), "{}", lines[0]);
+    assert!(
+        lines[0].contains("\"before_bytes\""),
+        "the prior content is recorded, so undo has something to restore"
+    );
+
+    ok(dir.lib(), &["undo", &op]);
+    assert_eq!(
+        read(dir.lib(), "shelf.md"),
+        SHELF,
+        "undo puts the note back byte for byte"
+    );
+}
+
+#[test]
+fn edit_restores_a_self_embed_the_new_body_left_out() {
+    let dir = edit_lib("edit-selfembed");
+    write(
+        dir.lib(),
+        "refs/a/girl.jpg.md",
+        "---\ntitle: Girl\n---\nprose only\n",
+    );
+    let body = dir.body("new.md", "the note, rewritten\n");
+    let stdout = ok(
+        dir.lib(),
+        &["edit", "refs/a/girl.jpg.md", "--body-file", &body, "--json"],
+    );
+    let doc = json_in(&stdout);
+    assert_eq!(doc["self_embed_restored"], true);
+    assert_eq!(
+        read(dir.lib(), "refs/a/girl.jpg.md"),
+        "---\ntitle: Girl\n---\nthe note, rewritten\n![[refs/a/girl.jpg]]\n",
+        "ADR-017 §2: the picture's own note always carries its embed"
+    );
+
+    // A body that keeps an aliased embed of its own picture gets no second one.
+    let aliased = dir.body("aliased.md", "text\n![[refs/a/girl.jpg|the girl]]\n");
+    let stdout = ok(
+        dir.lib(),
+        &[
+            "edit",
+            "refs/a/girl.jpg.md",
+            "--body-file",
+            &aliased,
+            "--json",
+        ],
+    );
+    assert_eq!(json_in(&stdout)["self_embed_restored"], false);
+    assert_eq!(
+        read(dir.lib(), "refs/a/girl.jpg.md"),
+        "---\ntitle: Girl\n---\ntext\n![[refs/a/girl.jpg|the girl]]\n"
+    );
+}
+
+#[test]
+fn edit_refuses_a_note_it_cannot_split_and_a_target_that_is_not_a_note() {
+    let dir = edit_lib("edit-refusals");
+    let body = dir.body("new.md", SHELF_NEW);
+
+    write(
+        dir.lib(),
+        "unclosed.md",
+        "---\ntitle: never closed\nstill inside\n",
+    );
+    let (code, _stdout, stderr) =
+        dimagine(dir.lib(), &["edit", "unclosed.md", "--body-file", &body]);
+    assert_eq!(code, 1);
+    assert!(
+        stderr.contains("never closed") && stderr.contains("body has no start"),
+        "{stderr}"
+    );
+    assert_eq!(
+        read(dir.lib(), "unclosed.md"),
+        "---\ntitle: never closed\nstill inside\n"
+    );
+
+    let (code, _stdout, stderr) = dimagine(
+        dir.lib(),
+        &["edit", "refs/a/girl.jpg", "--body-file", &body],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("is not a note"), "{stderr}");
+
+    let (code, _stdout, stderr) =
+        dimagine(dir.lib(), &["edit", "missing.md", "--body-file", &body]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no note at missing.md"), "{stderr}");
+
+    // An original is never opened for writing (ADR-016 §0): it is still there,
+    // with its bytes.
+    assert_eq!(
+        std::fs::read(dir.lib().join("refs/a/girl.jpg"))
+            .unwrap()
+            .len(),
+        PNG.len()
+    );
+}
+
+#[test]
+fn edit_asks_for_where_the_body_comes_from() {
+    let dir = edit_lib("edit-nosource");
+    let (code, _stdout, stderr) = dimagine(dir.lib(), &["edit", "shelf.md"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("--body-file"), "{stderr}");
+    assert_eq!(read(dir.lib(), "shelf.md"), SHELF);
+}
+
+#[test]
+fn edit_takes_a_body_file_and_stdin_never_both() {
+    let dir = edit_lib("edit-both");
+    let body = dir.body("new.md", SHELF_NEW);
+    let (code, _stdout, stderr) = dimagine(
+        dir.lib(),
+        &["edit", "shelf.md", "--body-file", &body, "--stdin"],
+    );
+    assert_eq!(code, 2, "clap refuses the contradiction as a usage error");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+    assert_eq!(read(dir.lib(), "shelf.md"), SHELF);
+}

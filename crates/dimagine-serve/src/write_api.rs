@@ -67,6 +67,7 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
         .route("/api/write/collections", post(edit_collection))
         .route("/api/write/collections/reorder", post(reorder_collection))
         .route("/api/write/collections/caption", post(caption_collection))
+        .route("/api/write/note/body", post(edit_note_body))
         // The mutations. No mutating handler is ever registered for GET
         // (ADR-018 §3), and there is no method-override machinery to honour,
         // so a GET to one of these paths is a 405 or the read that shares
@@ -956,7 +957,23 @@ pub(crate) async fn settings_json_page(
 /// with any power over the library is the one `--allow-anonymous-write`
 /// admits.
 fn owner_only(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    let allowed = match state.config.auth {
+    (!owner_view_allowed(state, headers)).then(|| {
+        crate::error_page(
+            state,
+            StatusCode::FORBIDDEN,
+            "the settings page is owner-only, and this server has no signed-in owner",
+        )
+    })
+}
+
+/// Whether this request may be shown write controls at all: it is the signed-in
+/// owner (ADR-018 §2). Account mode needs an owner to exist and the session to
+/// belong to one of its accounts; no-login mode needs `--allow-anonymous-write`
+/// (which the CLI confines to a loopback bind). A page that renders for anyone
+/// — an image, a collection — uses this to decide whether to draw its editor,
+/// leaving the note itself readable to everyone.
+fn owner_view_allowed(state: &AppState, headers: &HeaderMap) -> bool {
+    match state.config.auth {
         AuthMode::Account => {
             let has_owner = state.accounts.has_users().unwrap_or(false);
             // The same per-session account test the CSRF guard applies to a
@@ -975,14 +992,31 @@ fn owner_only(state: &AppState, headers: &HeaderMap) -> Option<Response> {
             has_owner && owned
         }
         AuthMode::None => state.config.allow_anonymous_write,
-    };
-    (!allowed).then(|| {
-        crate::error_page(
-            state,
-            StatusCode::FORBIDDEN,
-            "the settings page is owner-only, and this server has no signed-in owner",
-        )
-    })
+    }
+}
+
+/// The CSRF token to embed in a page's write controls, or `None` when this
+/// request should see no editor: writes must be on (`--write`, ADR-018 §1) and
+/// the viewer the owner (ADR-018 §2). The token goes in a header the page's own
+/// script sends back; it is never in a URL or a client-settable cookie. In
+/// no-login mode there is no session and the token is empty, which the write
+/// surface accepts (its cross-site defence is the origin check).
+pub(crate) fn write_controls_for(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if state.writer.is_none() || !owner_view_allowed(state, headers) {
+        return None;
+    }
+    Some(
+        session_token(state, headers)
+            .and_then(|token| {
+                state
+                    .csrf
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get(&token)
+                    .cloned()
+            })
+            .unwrap_or_default(),
+    )
 }
 
 /// The headers every settings view carries: this is live state, never cacheable.
@@ -2196,7 +2230,7 @@ async fn reorder_collection(
     };
     let resolver = Resolver::new(&library.files);
     let ctx = BodyCtx::new(&library.files, &resolver);
-    let (note_rel, note_index, bytes, current) = match read_collection(writer, collection, &ctx) {
+    let (note_rel, note_index, bytes, current) = match read_note(writer, collection, &ctx) {
         Ok(got) => got,
         Err(response) => return *response,
     };
@@ -2323,7 +2357,7 @@ async fn caption_collection(
     };
     let resolver = Resolver::new(&library.files);
     let ctx = BodyCtx::new(&library.files, &resolver);
-    let (note_rel, note_index, bytes, current) = match read_collection(writer, collection, &ctx) {
+    let (note_rel, note_index, bytes, current) = match read_note(writer, collection, &ctx) {
         Ok(got) => got,
         Err(response) => return *response,
     };
@@ -2383,12 +2417,12 @@ async fn caption_collection(
     .into_response()
 }
 
-/// Resolve an existing collection note and read its current bytes, for the
-/// block and caption editors. Mirrors the CLI's `read_collection`, but the
+/// Resolve an existing note and read its current bytes, for the whole-replace
+/// editors (reorder, caption, body). Mirrors the CLI's `read_note`, but the
 /// precondition is the caller's open hash (ADR-016 §3), not this read: the
 /// read supplies the body the new bytes are computed from, and the fingerprint
 /// that goes with it. A refusal is the ready-made JSON response.
-fn read_collection(
+fn read_note(
     writer: &Writer,
     collection: &str,
     ctx: &BodyCtx,
@@ -2414,6 +2448,122 @@ fn read_collection(
         .read(&note_rel)
         .map_err(|e| Box::new(write_error(e)))?;
     Ok((note_rel, note_index, body, fp))
+}
+
+/// `POST /api/write/note/body` — replace a note's whole body (everything after
+/// its front matter's closing fence) with the text given, as one journaled
+/// operation guarded by an open hash (ADR-017 §10, ADR-016 §3). This is the
+/// source-mode body edit the image/note page's textarea posts; front matter is
+/// never re-serialized here (it has its own editor), and only the body region
+/// changes byte for byte.
+///
+/// The body is `{"note": <path>, "hash": <the note's sha256 at open time>,
+/// "body": <the new body text>}`. `hash` is the open-time precondition (ADR-016
+/// §3): a request without one is refused, never treated as an overwrite, and a
+/// note that changed since that read is a 409 carrying the note's current hash
+/// and ETag — never a retry. "Overwrite anyway" is simply a second request
+/// carrying the hash the 409 returned; if the file became a third version in
+/// between, that retry conflicts too.
+async fn edit_note_body(
+    State(state): State<AppState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let Some(note) = request.get("note").and_then(|v| v.as_str()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"note\" path is required");
+    };
+    // The new body is taken verbatim; a body that is absent is a bad request,
+    // but an empty string is a legitimate one (it empties the note).
+    let Some(new_body) = request.get("body").and_then(|v| v.as_str()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"body\" string is required");
+    };
+    // The note's hash at open time is the precondition (ADR-016 §3); a request
+    // without one is refused, never treated as an overwrite.
+    let Some(expect) = request
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .and_then(Fingerprint::from_hex)
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "a \"hash\" (the note's 64-character sha256 at open time) is required",
+        );
+    };
+    let client_addr = crate::resolve_client_ip(
+        client.map(|info| info.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
+    let library = match Library::open(writer.root_path()) {
+        Ok(library) => library,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+    let (note_rel, note_index, bytes, current) = match read_note(writer, note, &ctx) {
+        Ok(got) => got,
+        Err(response) => return *response,
+    };
+    // The precondition holds even when the new body equals the old: a stale
+    // open hash is a conflict, not a silent no-op (ADR-016 §3).
+    if !expect.same_bytes(&current) {
+        return conflict_response(&current);
+    }
+    let replaced = match body_edit::replace_body(&bytes, note_index, new_body.as_bytes(), &ctx) {
+        Ok(replaced) => replaced,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if !replaced.changed {
+        return Json(serde_json::json!({
+            "note": note_rel.text(),
+            "changed": false,
+            "hash": current.hex(),
+        }))
+        .into_response();
+    }
+    let op_id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({"action": "edit_body", "note": note_rel.text()});
+    // The digest of the bytes this operation writes: a compare-and-swap on the
+    // same bytes lands with exactly this hash, so it is reported without
+    // reading the file back (ADR-016 §3).
+    let after = Fingerprint::of_bytes(&replaced.bytes);
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(replaced.bytes),
+    };
+    if let Err(error) = writer.execute_op_guarded(
+        &op_id,
+        SOURCE,
+        Some(&client_addr),
+        intent,
+        vec![step],
+        (&note_rel, &expect),
+    ) {
+        return guarded_write_error(error);
+    }
+    Json(serde_json::json!({
+        "note": note_rel.text(),
+        "changed": true,
+        "op": op_id,
+        "hash": after.hex(),
+        "bytes": after.size,
+        "self_embed_restored": replaced.self_embed_restored,
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -2609,7 +2759,8 @@ fn guarded_write_error(error: dimagine_write::Error) -> Response {
 }
 
 /// The 409 an open-hash precondition mismatch answers (ADR-016 §3): the note's
-/// current view ETag, so the client can offer "load the latest and re-edit",
+/// current sha256 and view ETag, so the client can offer "load the latest and
+/// re-edit" or "overwrite with mine" (a retry carrying the hash returned here),
 /// and nothing of the request is applied.
 fn conflict_response(current: &Fingerprint) -> Response {
     // The note's view ETag is built from size and mtime (media.rs, the source
@@ -2619,7 +2770,8 @@ fn conflict_response(current: &Fingerprint) -> Response {
     let mut response = (
         StatusCode::CONFLICT,
         Json(serde_json::json!({
-            "error": "the collection changed since it was read",
+            "error": "the file changed since it was read",
+            "hash": current.hex(),
             "etag": etag,
         })),
     )

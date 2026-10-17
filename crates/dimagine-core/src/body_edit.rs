@@ -1,4 +1,4 @@
-//! Writing links and editing collection bodies (ADR-017 §4, §5, §6).
+//! Writing links and editing note bodies (ADR-017 §4, §5, §6, §9, §10).
 //!
 //! Every function here is pure: it takes bytes, the files of one library walk
 //! and the [`Resolver`] built from them, and returns new bytes or a typed
@@ -7,6 +7,9 @@
 //!
 //! The rules these functions implement:
 //!
+//! - a body edit (ADR-017 §10) replaces the bytes after the closing front
+//!   matter fence and nothing before it: the front matter is carried over
+//!   verbatim, never re-serialized;
 //! - a link a tool writes names the image unambiguously: a full library path
 //!   for an image in a folder, a bare name for one at the library root, which
 //!   is also its full path. When a root image's bare name is shared by more
@@ -17,11 +20,14 @@
 //!   percent-encoding and `<>`-wrapped targets all count, and links inside
 //!   fenced code or inline code never do;
 //! - removing a member takes the member line, and only that line: captions,
-//!   headings and every other line stay.
+//!   headings and every other line stay;
+//! - an image note always carries the embed of its own picture, so a body edit
+//!   that left it out gets one appended at the end (ADR-017 §2).
 
 use std::ops::Range;
 use std::path::Component;
 
+use crate::fm_edit::{front_matter_range, FmRange};
 use crate::format;
 use crate::library::{FileClass, FileEntry};
 use crate::links::{extract_link_spans, Outcome, Resolver};
@@ -69,7 +75,8 @@ pub enum EditError {
     /// link can name it without risking a different file.
     NonUtf8Path,
     /// The note is the image's own note and the hit is its self-embed, which
-    /// body edits must never delete (ADR-017 §2).
+    /// taking a member out must never delete (ADR-017 §2). A body edit, by
+    /// contrast, restores the embed rather than refusing.
     SelfEmbed,
     /// A root image whose bare name matches more than one file: the caller
     /// must rename it or move it into a folder before it can be collected.
@@ -91,6 +98,14 @@ pub enum EditError {
     NotCaptionText { text: String },
     /// A caption line was given no text and there is nothing there to delete.
     NothingToDelete { block: usize, line: usize },
+    /// A whole-body replacement was asked of a note whose opening `---` fence
+    /// is never closed: there is no line that says where the front matter ends,
+    /// so no byte range can be replaced without guessing (ADR-017 §10).
+    UnterminatedFrontMatter,
+    /// The new body is not valid UTF-8. A note is a text file and the reader
+    /// decodes the whole thing, so bytes that are not text cannot become its
+    /// body.
+    BodyNotUtf8,
 }
 
 /// True when a line can be a caption line (ADR-017 §9): pure text, not a
@@ -269,6 +284,11 @@ impl std::fmt::Display for EditError {
             EditError::NothingToDelete { block, line } => {
                 write!(f, "block {block} has no caption line {line} to delete")
             }
+            EditError::UnterminatedFrontMatter => write!(
+                f,
+                "the note opens a `---` fence that is never closed, so its body has no start"
+            ),
+            EditError::BodyNotUtf8 => write!(f, "the new body is not valid UTF-8"),
         }
     }
 }
@@ -597,6 +617,11 @@ pub struct Removed {
 /// a caption, a heading or any other line stays, including when it sits
 /// directly under the member line. When the embed shares its line with another
 /// embed, only that link's own text is cut out.
+///
+/// An image note's own embed is refused here, because taking an image out of a
+/// collection has no business deleting the note that belongs to the picture; a
+/// whole-body replacement ([`replace_body`]) is where that embed is restored if
+/// the new text left it out (ADR-017 §2).
 pub fn remove_member(
     body: &[u8],
     note: usize,
@@ -614,7 +639,8 @@ pub fn remove_member(
     }
     if is_own_note(entry, image, ctx) {
         // FORMAT §3.2: the self-embed of an image note is a preview of its own
-        // picture, and no body edit may remove it (ADR-017 §2).
+        // picture, and taking a member out is not a way to remove it
+        // (ADR-017 §2).
         return Err(EditError::SelfEmbed);
     }
     let blank = |i: usize| text[lines[i].start..lines[i].content_end].trim().is_empty();
@@ -1335,4 +1361,102 @@ pub fn edit_caption(
 
     out.extend_from_slice(&body[lines[last_line].end..]);
     Ok((out, change))
+}
+
+// ---------------------------------------------------------------------------
+// Whole-body replacement (ADR-017 §10)
+// ---------------------------------------------------------------------------
+
+/// The result of [`replace_body`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyReplaced {
+    /// The note's new bytes.
+    pub bytes: Vec<u8>,
+    /// True when `bytes` differ from the bytes as read.
+    pub changed: bool,
+    /// True when the new body held no embed of this image note's own picture,
+    /// so one was appended at the end (ADR-017 §2).
+    pub self_embed_restored: bool,
+}
+
+/// Replace everything after the front matter's closing fence, and nothing
+/// before it (ADR-017 §10).
+///
+/// The split point is the end of that fence's line, as [`front_matter_range`]
+/// reports it — the one delimiter rule the reader uses too — so the front matter
+/// is carried into the result byte for byte and is never re-serialized. Line
+/// endings, a BOM, and an absent trailing newline are the new body's own business:
+/// these bytes are spliced, not normalized.
+///
+/// A note with no front matter is body from just past its BOM, so its body is
+/// the whole file. A note whose opening fence is never closed is refused: nothing
+/// says where its front matter ends, and guessing would rewrite user bytes. A
+/// note that ends *at* its closing fence has an empty body and no line break
+/// after the fence; the break is added, because a body spliced onto the fence
+/// line would leave the reader with a note whose front matter never closes.
+///
+/// The result still satisfies the self-embed rule (ADR-017 §2): an image note
+/// whose new body holds no embed resolving to its own picture gets the standard
+/// embed line appended at the end. `note` and `ctx` exist for that check alone;
+/// a plain note, or an image note whose picture is not in the library, is
+/// spliced as given.
+pub fn replace_body(
+    note_bytes: &[u8],
+    note: usize,
+    new_body: &[u8],
+    ctx: &BodyCtx<'_>,
+) -> Result<BodyReplaced, EditError> {
+    let entry = ctx.files.get(note).ok_or(EditError::NotInLibrary)?;
+    if !matches!(entry.class, FileClass::Note | FileClass::ImageNote) {
+        return Err(EditError::NotANote);
+    }
+    let text = std::str::from_utf8(note_bytes).map_err(|_| EditError::NotUtf8)?;
+    std::str::from_utf8(new_body).map_err(|_| EditError::BodyNotUtf8)?;
+    let (head_end, fence_closed_the_line) = match front_matter_range(note_bytes) {
+        FmRange::NoFrontMatter { bom_len } => (bom_len, true),
+        FmRange::Closed { body_start, .. } => {
+            (body_start, note_bytes[..body_start].ends_with(b"\n"))
+        }
+        FmRange::Unterminated { .. } => return Err(EditError::UnterminatedFrontMatter),
+    };
+    let mut bytes = Vec::with_capacity(head_end + new_body.len() + 2);
+    bytes.extend_from_slice(&note_bytes[..head_end]);
+    if !fence_closed_the_line {
+        // The closing fence was the file's last line and held no line break, so
+        // the body had no line to start on. Splicing onto it directly would make
+        // that line `---<new text>`, which is no longer a fence, and the reader
+        // would then report the front matter as never closed. So the fence gets
+        // the break it lacked, in the note's own style — the treatment an append
+        // already gives a file whose last line has no terminator (ADR-017 §4).
+        bytes.extend_from_slice(newline_style(text).as_bytes());
+    }
+    bytes.extend_from_slice(new_body);
+
+    let mut self_embed_restored = false;
+    if let Some(image) = own_image(note, ctx) {
+        // The same append the collection rules use: no-op while an embed of the
+        // picture resolves from the body, an unclosed fence refused rather than
+        // written into.
+        let appended = append_member(&bytes, note, image, ctx)?;
+        if appended.added.is_some() {
+            bytes = appended.bytes;
+            self_embed_restored = true;
+        }
+    }
+    let changed = bytes != note_bytes;
+    Ok(BodyReplaced {
+        bytes,
+        changed,
+        self_embed_restored,
+    })
+}
+
+/// The library index of the picture paired with image note `note`, or `None`
+/// when the note is not an image note or its picture is not in the library.
+fn own_image(note: usize, ctx: &BodyCtx<'_>) -> Option<usize> {
+    let entry = ctx.files.get(note)?;
+    let paired = entry.paired_image_path()?;
+    ctx.files
+        .iter()
+        .position(|candidate| candidate.class == FileClass::Image && candidate.path == paired)
 }

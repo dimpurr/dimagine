@@ -15,6 +15,7 @@ dimagine check           # report problems, including the state of past writes
 dimagine tag             # add or remove tags in an image's note
 dimagine rate            # set an image's rating, or clear it
 dimagine set             # set scalar front-matter properties (KEY= clears one)
+dimagine edit            # replace a note's whole body (everything after its front matter), with an open-hash precondition (FORMAT §5.3)
 dimagine collect         # create a collection note, add and remove members, reorder blocks, edit a caption
 dimagine mv              # move an image group and repair the links pointing at it (FORMAT §7)
 dimagine trash           # move an image group into .trash/ (FORMAT §7.1)
@@ -86,7 +87,7 @@ run them as one **operation** (FORMAT §8.3).
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `write` | The one path that changes the library: the lock, the read-hash-temp-rename write, the per-operation journal and crash recovery, and the `.dimagine/log/ops.jsonl` audit log with its inverse (FORMAT §8.3). Every write command is a planner that builds steps for this module; none of them writes a file itself. Also `.dimagine/settings.json`: a schema of typed settings with a default and a validation rule each, applied to whatever file is there — unknown keys kept, invalid values read as unset plus a report line. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
-| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, move, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. |
+| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, note body edit, move, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. The image/note page carries a plain textarea that edits the body as source and posts it to `/api/write/note/body`, with the note's open-time hash as a precondition and a reload-or-overwrite prompt on a conflict. |
 
 ## Serving media (0.1)
 

@@ -72,6 +72,27 @@ All notable changes to this project are documented here. The format follows
   /api/write/collections/reorder` and `/caption` expose the same two behind the
   write API's gates, answering a stale precondition with a `409` and the note's
   current ETag.
+- `dimagine edit <note> --body-file <path>|--stdin [--expect <sha256>]` (Phase
+  3b): the whole-body edit FORMAT §5.3 promises. It replaces every byte after
+  the note's front matter with the text given and touches nothing before it —
+  the front matter is carried over untouched, never re-serialized, and the body's
+  own line endings, byte-order mark and trailing newline (or absence) survive
+  byte for byte. A note whose opening `---` fence is never closed is refused,
+  because nothing says where its body starts, and a note that ends right at its
+  closing fence is given the line break its first body line needs. Collection and
+  other plain notes are edited as text the same way. The result keeps the
+  self-embed rule: an image note whose new body no longer embeds its own picture
+  gets the embed restored at the end. It is a whole-replace operation, so it
+  carries the note's hash as the caller read it (`--expect`, or the command's own
+  read) and a mismatch is a conflict that writes nothing; the new hash is printed
+  for the caller to carry onward, and `undo` puts the prior bytes back. `POST
+  /api/write/note/body` exposes the same behind the write API's gates. The
+  image/note page now carries a plain textarea over the body with an explicit
+  Save (source mode, no autosave, no WYSIWYG, no new dependency): it posts the
+  body with the open-time hash the page read, and on a `409` offers to load the
+  latest or use your version anyway (a retry carrying the hash the conflict
+  returned). The `409` a whole-replace edit answers now names the file's current
+  hash next to its ETag, so an overwrite-anyway has that hash to send back.
 - `dimagine check` gained `dangling_link`: image links that resolve to no file,
   reported once per note with each link's line and body byte span — the exact
   damage a hand move in another tool leaves behind. The per-link `missing_link`

@@ -1600,6 +1600,39 @@ a.image-nav-next:hover {
   border-bottom: 1px dotted currentColor;
 }
 
+/* The source-mode body editor (FORMAT §5.3): a plain textarea
+   over the note body — monospace, so the source reads as source — and its one
+   explicit Save. Nothing fancy: this is a text box, drawn plainly. */
+.note-editor .note-body-edit {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 12rem;
+  padding: var(--pad);
+  font-family: var(--mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  resize: vertical;
+}
+.note-editor .note-body-edit:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.note-editor .note-editor-hint {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+.note-editor .note-editor-status:not(:empty) {
+  margin-left: 8px;
+  font-size: var(--text-sm);
+}
+.note-editor .note-editor-status.error button {
+  margin-left: 6px;
+}
+
 /* === W45: the pull-up sheet and the pinned inspector ===================== */
 
 /* The tokens this block needs, by their DESIGN.md names (values verbatim):

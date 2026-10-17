@@ -1647,3 +1647,251 @@ async fn the_reorder_endpoint_obeys_the_write_bar() {
     let (status, _, _) = send(&app, anon).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// Whole-note body edit (ADR-017 §10, ADR-016 §3, FORMAT §5.3)
+// ---------------------------------------------------------------------------
+
+/// A library holding one image and its note: front matter, then a body whose
+/// first line is the note's own self-embed (ADR-017 §2).
+fn body_library() -> TempDir {
+    let root = library();
+    std::fs::write(
+        root.path().join("library/one.png.md"),
+        "---\ntitle: One\ntags: [a]\n---\n![[one.png]]\nold body line\n",
+    )
+    .unwrap();
+    root
+}
+
+/// A whole-body replace whose new text keeps the self-embed: the front matter
+/// is carried over untouched, only the body region moves, and nothing is
+/// restored because the embed still resolves. The new hash is reported.
+#[tokio::test]
+async fn the_body_endpoint_replaces_the_body_for_the_owner() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let hash = note_hash(&root, "one.png.md");
+    let body = serde_json::json!({
+        "note": "one.png.md",
+        "hash": hash,
+        "body": "# Note\n\n![[one.png]]\nall about it\n",
+    })
+    .to_string();
+    let (status, _, bytes) = send(
+        &app,
+        write_post("/api/write/note/body", &cookie, &csrf, Some(ORIGIN), &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let doc = json_body(&bytes);
+    assert_eq!(doc["changed"], true);
+    assert_eq!(doc["self_embed_restored"], false);
+    // The note now is the untouched front matter plus exactly the body sent.
+    assert_eq!(
+        read_note(&root, "one.png.md"),
+        b"---\ntitle: One\ntags: [a]\n---\n# Note\n\n![[one.png]]\nall about it\n"
+    );
+    assert_eq!(doc["hash"], note_hash(&root, "one.png.md"));
+    // The hash the response names is the precondition for the very next edit.
+    let next = doc["hash"].as_str().unwrap();
+    let again = serde_json::json!({
+        "note": "one.png.md", "hash": next, "body": "![[one.png]]\ndone\n",
+    })
+    .to_string();
+    let (status, _, _) = send(
+        &app,
+        write_post("/api/write/note/body", &cookie, &csrf, Some(ORIGIN), &again),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// ADR-016 §3: the open hash is required and enforced. A request without one is
+/// refused (never an overwrite); one whose hash no longer matches is a 409 that
+/// names the note's current hash and ETag, and no byte moves.
+#[tokio::test]
+async fn the_body_endpoint_refuses_a_missing_or_stale_hash() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let before = read_note(&root, "one.png.md");
+    let current = note_hash(&root, "one.png.md");
+
+    // No hash: a failure, never an overwrite.
+    let no_hash = serde_json::json!({"note": "one.png.md", "body": "gone\n"}).to_string();
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/note/body",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &no_hash,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A well-formed hash that is not the note's: 409 carrying the real one.
+    let stale = "0".repeat(64);
+    let body =
+        serde_json::json!({"note": "one.png.md", "hash": stale, "body": "gone\n"}).to_string();
+    let (status, headers, bytes) = send(
+        &app,
+        write_post("/api/write/note/body", &cookie, &csrf, Some(ORIGIN), &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", text(&bytes));
+    let doc = json_body(&bytes);
+    assert_eq!(doc["hash"], current);
+    let etag = doc["etag"].as_str().expect("a current etag");
+    assert!(etag.starts_with("\"size-"), "{etag:?}");
+    assert_eq!(headers["etag"], etag);
+    assert_eq!(read_note(&root, "one.png.md"), before);
+}
+
+/// The self-embed rule (ADR-017 §2): a new body that leaves the note's own
+/// picture unembedded gets the embed appended, and the response says so.
+#[tokio::test]
+async fn the_body_endpoint_restores_a_missing_self_embed() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let hash = note_hash(&root, "one.png.md");
+    let body = serde_json::json!({
+        "note": "one.png.md", "hash": hash, "body": "just some words\n",
+    })
+    .to_string();
+    let (status, _, bytes) = send(
+        &app,
+        write_post("/api/write/note/body", &cookie, &csrf, Some(ORIGIN), &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes)["self_embed_restored"], true);
+    let note = read_note(&root, "one.png.md");
+    assert_eq!(
+        note,
+        b"---\ntitle: One\ntags: [a]\n---\njust some words\n![[one.png]]\n"
+    );
+}
+
+/// Collection notes are edited as text too (FORMAT §5.3): the whole-replace
+/// accepts a plain note and keeps its front matter byte for byte.
+#[tokio::test]
+async fn the_body_endpoint_replaces_a_collection_note_as_text() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let hash = note_hash(&root, "Picks.md");
+    let body = serde_json::json!({
+        "note": "Picks.md", "hash": hash, "body": "a note about picks\n",
+    })
+    .to_string();
+    let (status, _, bytes) = send(
+        &app,
+        write_post("/api/write/note/body", &cookie, &csrf, Some(ORIGIN), &body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let doc = json_body(&bytes);
+    assert_eq!(doc["changed"], true);
+    assert_eq!(doc["self_embed_restored"], false);
+    assert_eq!(
+        read_note(&root, "Picks.md"),
+        b"---\nkind: collection\ntitle: Picks\n---\na note about picks\n"
+    );
+}
+
+/// The endpoint is a write like any other: the route is absent without `--write`,
+/// a request without the CSRF token is refused, and an anonymous one never
+/// reaches the handler (ADR-018 §1, §2, §3).
+#[tokio::test]
+async fn the_body_endpoint_obeys_the_write_bar() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let body = serde_json::json!({"note": "one.png.md", "hash": "0", "body": "x"}).to_string();
+
+    let app = app_for(&root, false, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/note/body",
+            &cookie,
+            "unused",
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = app_for(&root, true, None);
+    let (cookie, _) = owner_and_csrf(&app).await;
+    let no_token = Request::builder()
+        .method("POST")
+        .uri("/api/write/note/body")
+        .header("content-type", "application/json")
+        .header("cookie", &cookie)
+        .header("origin", ORIGIN)
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let (status, _, _) = send(&app, no_token).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let anon = Request::builder()
+        .method("POST")
+        .uri("/api/write/note/body")
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .body(Body::from(body))
+        .unwrap();
+    let (status, _, _) = send(&app, anon).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The page carries the editor for an owner with writes on: a textarea over the
+/// body and the note's open-time hash the save posts back as its precondition.
+#[tokio::test]
+async fn the_image_page_offers_the_body_editor_to_the_owner() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    let hash = note_hash(&root, "one.png.md");
+    let (status, _, bytes) = send(&app, get("/image/one.png", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let page = text(&bytes);
+    assert!(page.contains("class=\"note-body-edit\""), "{page}");
+    assert!(
+        page.contains(&format!("data-hash=\"{hash}\"")),
+        "the open hash reaches the page: {page}"
+    );
+    assert!(page.contains("data-note=\"one.png.md\""), "{page}");
+    assert!(page.contains("/api/write/note/body"), "{page}");
+    // The raw body is shown in the textarea, its self-embed intact.
+    assert!(page.contains("![[one.png]]"), "{page}");
+}
+
+/// Without `--write` the note is still shown, but the editor is not offered —
+/// an upgraded binary does not quietly open a write door (ADR-018 §1).
+#[tokio::test]
+async fn the_image_page_hides_the_body_editor_without_write() {
+    let root = body_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, false, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    let (status, _, bytes) = send(&app, get("/image/one.png", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK);
+    let page = text(&bytes);
+    assert!(!page.contains("note-body-edit"), "{page}");
+    // The note itself is still there to read.
+    assert!(page.contains("class=\"note-body\""), "{page}");
+}
