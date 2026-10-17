@@ -40,6 +40,32 @@ All notable changes to this project are documented here. The format follows
    that is not there, and any files left in the old `.dimagine/trash/` — a
    location nothing writes to any more, but which stays readable so a library
    that has one is reported rather than stranded.
+- `dimagine mv <img> <new-path>` (Phase 3b): the move that FORMAT §7 promises.
+  The plan fixes the `id` before anything moves — creating the group's
+  note if it has none, the `id` landing with the note's edit — renames
+  the whole group, refuses when any destination is taken by a different
+  file (a file, a directory, or a name that differs only by case or
+  Unicode form — a rename onto the file's own case-shifted spelling
+  remains the routine way to fix display case), and
+  then rewrites in
+  place every link that resolved to the group: wikilinks, Markdown images and
+  canvas `nodes[].file` values, each keeping its syntax and display parts
+  (alias, heading, block reference, alt, title), code blocks and inline code
+  left alone. A link that was already ambiguous is reported and untouched; a
+  destination whose bare name would come out ambiguous is refused. `--dry-run`
+  prints the renames and every link edit without changing a byte. The whole
+  move is one journaled operation, so one `dimagine undo <op>` puts every byte
+  back; the write core carries a modify step's before-state when the operation
+  itself is what moves the file into place, and undo's all-or-none check reads
+  each file's final state, not one journal line at a time.
+- `dimagine check` gained `dangling_link`: image links that resolve to no file,
+  reported once per note with each link's line and body byte span — the exact
+  damage a hand move in another tool leaves behind. The per-link `missing_link`
+  and `ambiguous_link` warnings are unchanged.
+- The write API can move too (Phase 3b): `POST /api/write/move`
+  (`{"from", "to", "dry_run"?}`) runs the same plan as the CLI and answers with
+  it, `dimagine.move/0.1`, the `op` id null on a dry run — behind the same
+  auth, CSRF, origin and `--write` gates as every other write.
 - `dimagine serve` can write, off by default (Phase 3a). `--write` opens the
   write API — front-matter edit, undo, the trash view, `POST
   /api/write/collections` (new/add/remove), and settings save — each

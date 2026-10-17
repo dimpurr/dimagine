@@ -198,6 +198,202 @@ fn test_move_in_third_state_is_never_touched() {
     assert!(writer.read(&src).is_err());
 }
 
+/// The move-then-edit-same-path pattern of ADR-017 §8: one
+/// operation renames the group and then edits the moved note at
+/// its new path. Crash after that edit lands but before
+/// `committed`: recovery must classify the renames as executed
+/// (undo's per-file rule — the destination carries a later
+/// same-op step's hash) and roll the whole group back intact.
+#[test]
+fn test_crash_after_move_edit_rolls_back_the_group() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    let image = RelPath::parse("a/x.jpg").unwrap();
+    writer.create_exclusive(&image, b"jpeg\n").unwrap();
+    let note = RelPath::parse("a/x.jpg.md").unwrap();
+    let note_before = b"---\nid: note\n---\n\n![[a/x.jpg]]\n".to_vec();
+    writer.create_exclusive(&note, &note_before).unwrap();
+    let note_edited = b"---\nid: note\n---\n\n![[a/y.jpg]]\n".to_vec();
+
+    let image_hash = Fingerprint::of_bytes(b"jpeg\n").hex();
+    let before_hash = Fingerprint::of_bytes(&note_before).hex();
+    let edited_hash = Fingerprint::of_bytes(&note_edited).hex();
+
+    let steps = vec![
+        StepRecord {
+            step_idx: 0,
+            kind: StepKind::Move,
+            src: Some("a/x.jpg".to_string()),
+            dst: "a/y.jpg".to_string(),
+            before_hash: None,
+            after_hash: image_hash.clone(),
+            before_bytes: None,
+            after_bytes: None,
+        },
+        StepRecord {
+            step_idx: 1,
+            kind: StepKind::Move,
+            src: Some("a/x.jpg.md".to_string()),
+            dst: "a/y.jpg.md".to_string(),
+            before_hash: None,
+            after_hash: before_hash.clone(),
+            before_bytes: None,
+            after_bytes: None,
+        },
+        StepRecord {
+            step_idx: 2,
+            kind: StepKind::Modify,
+            src: None,
+            dst: "a/y.jpg.md".to_string(),
+            before_hash: Some(before_hash.clone()),
+            after_hash: edited_hash.clone(),
+            before_bytes: Some(note_before.clone()),
+            after_bytes: Some(note_edited.clone()),
+        },
+    ];
+
+    // Crash after the moved note's edit landed, before `committed`.
+    let err = writer.execute_op_with_crash_injection(
+        "op-mv-edit-crash",
+        "test",
+        None,
+        serde_json::json!({"action": "mv"}),
+        steps,
+        Some(2),
+    );
+    assert!(err.is_err());
+    // The edit is on disk at the new path.
+    assert_eq!(
+        writer
+            .read(&RelPath::parse("a/y.jpg.md").unwrap())
+            .unwrap()
+            .0,
+        note_edited
+    );
+
+    kill_journal_writer(dir.path(), "op-mv-edit-crash");
+    let report = writer.startup_sweep().unwrap();
+    assert!(
+        matches!(
+            &report.recovery[0],
+            RecoveryOutcome::RolledBack { steps: 3, .. }
+        ),
+        "{:?}",
+        report.recovery
+    );
+    // The group is back at its original paths with its original bytes.
+    assert_eq!(writer.read(&image).unwrap().0, b"jpeg\n");
+    assert_eq!(writer.read(&note).unwrap().0, note_before);
+    assert!(writer.read(&RelPath::parse("a/y.jpg").unwrap()).is_err());
+    assert!(writer.read(&RelPath::parse("a/y.jpg.md").unwrap()).is_err());
+    // No eternal journal: the operation reached its terminal state,
+    // so the next open has nothing to report.
+    assert!(!dir
+        .path()
+        .join(".dimagine/journal/op-mv-edit-crash")
+        .exists());
+    let report2 = writer.startup_sweep().unwrap();
+    assert!(report2.recovery.is_empty(), "{:?}", report2.recovery);
+}
+
+/// The same move-then-edit pattern, crashing after `committed` but
+/// before the journal directory is removed: recovery must not report
+/// a spurious third state for the renamed-then-edited note and must
+/// complete the cleanup, leaving the finished move in place.
+#[test]
+fn test_crash_after_committed_move_edit_cleans_up() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    let image = RelPath::parse("a/x.jpg").unwrap();
+    writer.create_exclusive(&image, b"jpeg\n").unwrap();
+    let note = RelPath::parse("a/x.jpg.md").unwrap();
+    let note_before = b"---\nid: note\n---\n\n![[a/x.jpg]]\n".to_vec();
+    writer.create_exclusive(&note, &note_before).unwrap();
+    let note_edited = b"---\nid: note\n---\n\n![[a/y.jpg]]\n".to_vec();
+
+    let image_hash = Fingerprint::of_bytes(b"jpeg\n").hex();
+    let before_hash = Fingerprint::of_bytes(&note_before).hex();
+    let edited_hash = Fingerprint::of_bytes(&note_edited).hex();
+
+    let steps = vec![
+        StepRecord {
+            step_idx: 0,
+            kind: StepKind::Move,
+            src: Some("a/x.jpg".to_string()),
+            dst: "a/y.jpg".to_string(),
+            before_hash: None,
+            after_hash: image_hash,
+            before_bytes: None,
+            after_bytes: None,
+        },
+        StepRecord {
+            step_idx: 1,
+            kind: StepKind::Move,
+            src: Some("a/x.jpg.md".to_string()),
+            dst: "a/y.jpg.md".to_string(),
+            before_hash: None,
+            after_hash: before_hash.clone(),
+            before_bytes: None,
+            after_bytes: None,
+        },
+        StepRecord {
+            step_idx: 2,
+            kind: StepKind::Modify,
+            src: None,
+            dst: "a/y.jpg.md".to_string(),
+            before_hash: Some(before_hash),
+            after_hash: edited_hash,
+            before_bytes: Some(note_before),
+            after_bytes: Some(note_edited.clone()),
+        },
+    ];
+
+    // Crash after the `committed` marker, before the journal is removed.
+    let err = writer.execute_op_with_crash_injection(
+        "op-mv-edit-committed",
+        "test",
+        None,
+        serde_json::json!({"action": "mv"}),
+        steps,
+        Some(3),
+    );
+    assert!(err.is_err());
+
+    kill_journal_writer(dir.path(), "op-mv-edit-committed");
+    let report = writer.startup_sweep().unwrap();
+    assert!(
+        matches!(
+            &report.recovery[0],
+            RecoveryOutcome::RolledForward { steps: 0, .. }
+        ),
+        "{:?}",
+        report.recovery
+    );
+    // The finished move stands: the group is at its new paths and
+    // the note carries its edit.
+    assert_eq!(
+        writer.read(&RelPath::parse("a/y.jpg").unwrap()).unwrap().0,
+        b"jpeg\n"
+    );
+    assert_eq!(
+        writer
+            .read(&RelPath::parse("a/y.jpg.md").unwrap())
+            .unwrap()
+            .0,
+        note_edited
+    );
+    assert!(writer.read(&image).is_err());
+    assert!(writer.read(&note).is_err());
+    assert!(!dir
+        .path()
+        .join(".dimagine/journal/op-mv-edit-committed")
+        .exists());
+    let report2 = writer.startup_sweep().unwrap();
+    assert!(report2.recovery.is_empty(), "{:?}", report2.recovery);
+}
+
 #[test]
 fn test_journal_records_actual_state_not_caller_guesses() {
     let dir = tempdir().unwrap();

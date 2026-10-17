@@ -1185,3 +1185,216 @@ fn check_reports_a_trash_that_is_a_symlink() {
         );
     }
 }
+
+/// ADR-017 §8: `mv` renames the group and repairs every link that resolved to
+/// it, in one journaled operation that `undo` reverses byte for byte.
+#[test]
+fn mv_moves_the_group_and_repairs_every_link_then_undoes() {
+    let dir = tmp("mv-roundtrip");
+    write(&dir.0, "a/x.jpg", PNG);
+    write(&dir.0, "a/x.jpg.xmp", b"sidecar");
+    write(
+        &dir.0,
+        "a/x.jpg.md",
+        "---\ntags: [keep]\n---\nOwn note ![[a/x.jpg]]\n",
+    );
+    write(
+        &dir.0,
+        "shelf.md",
+        "one ![[a/x.jpg]] two ![[x.jpg]] three ![[x|alias]] four ![[a/x.jpg#t]]\n",
+    );
+    let shelf_before = read(&dir.0, "shelf.md");
+    let note_before = read(&dir.0, "a/x.jpg.md");
+
+    let stdout = ok(&dir.0, &["mv", "a/x.jpg", "refs/x2.jpg"]);
+    assert!(stdout.contains("moved a/x.jpg -> refs/x2.jpg"), "{stdout}");
+    // The real run reports the same per-file results as --dry-run.
+    assert!(stdout.contains("rename a/x.jpg -> refs/x2.jpg"), "{stdout}");
+    assert!(
+        stdout.contains("rename a/x.jpg.xmp -> refs/x2.jpg.xmp"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("id assigned"), "{stdout}");
+    assert!(!exists(&dir.0, "a/x.jpg"));
+    assert!(!exists(&dir.0, "a/x.jpg.md"));
+    assert!(!exists(&dir.0, "a/x.jpg.xmp"));
+    assert!(exists(&dir.0, "refs/x2.jpg"));
+    assert!(exists(&dir.0, "refs/x2.jpg.xmp"));
+    assert_eq!(
+        read(&dir.0, "shelf.md"),
+        "one ![[refs/x2.jpg]] two ![[refs/x2.jpg]] three ![[refs/x2.jpg|alias]] four ![[refs/x2.jpg#t]]\n"
+    );
+    let note = read(&dir.0, "refs/x2.jpg.md");
+    assert!(note.contains("tags: [keep]"), "{note}");
+    assert!(note.contains("id: "), "the move assigns an id: {note}");
+    assert!(note.contains("![[refs/x2.jpg]]"), "{note}");
+
+    // One operation, audited once with the move intent.
+    let audit = read(&dir.0, ".dimagine/log/ops.jsonl");
+    let intents: Vec<&str> = audit
+        .lines()
+        .filter(|l| l.contains("\"action\":\"move\""))
+        .collect();
+    let op = intents[0]
+        .split("\"op_id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_string();
+    let op_lines = audit.lines().filter(|l| l.contains(&op)).count();
+    let total_ops = {
+        let mut ids: Vec<&str> = audit
+            .lines()
+            .map(|l| {
+                l.split("\"op_id\":\"")
+                    .nth(1)
+                    .unwrap()
+                    .split('"')
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.len()
+    };
+    assert_eq!(total_ops, 1, "the whole move is one op: {audit}");
+    assert!(op_lines >= 5, "every file has an audit line: {audit}");
+
+    ok(&dir.0, &["undo", &op]);
+    assert_eq!(read(&dir.0, "shelf.md"), shelf_before);
+    assert_eq!(read(&dir.0, "a/x.jpg.md"), note_before);
+    assert!(exists(&dir.0, "a/x.jpg.xmp"));
+    assert!(!exists(&dir.0, "refs/x2.jpg"));
+}
+
+/// `--dry-run` prints the plan — renames and per-line link edits — and leaves
+/// every byte of the library where it was.
+#[test]
+fn mv_dry_run_prints_the_plan_and_changes_nothing() {
+    let dir = tmp("mv-dryrun");
+    write(&dir.0, "a/x.jpg", PNG);
+    write(&dir.0, "shelf.md", "pinned ![[a/x.jpg]]\n");
+    let shelf_before = read(&dir.0, "shelf.md");
+
+    let stdout = ok(&dir.0, &["mv", "a/x.jpg", "refs/x2.jpg", "--dry-run"]);
+    assert!(stdout.contains("(dry run"), "{stdout}");
+    assert!(stdout.contains("rename a/x.jpg -> refs/x2.jpg"), "{stdout}");
+    assert!(
+        stdout.contains("line 1: ![[a/x.jpg]] -> ![[refs/x2.jpg]]"),
+        "{stdout}"
+    );
+    assert!(exists(&dir.0, "a/x.jpg"));
+    assert!(!exists(&dir.0, "refs/x2.jpg"));
+    assert_eq!(read(&dir.0, "shelf.md"), shelf_before);
+
+    let doc: serde_json::Value = serde_json::from_str(&ok(
+        &dir.0,
+        &["--json", "mv", "a/x.jpg", "refs/x2.jpg", "--dry-run"],
+    ))
+    .expect("dry-run json");
+    assert_eq!(doc["schema"], "dimagine.move/0.1");
+    assert_eq!(doc["dry_run"], true);
+    assert_eq!(doc["op"], serde_json::Value::Null);
+    assert_eq!(doc["renames"][0]["from"], "a/x.jpg");
+    assert_eq!(doc["renames"][0]["to"], "refs/x2.jpg");
+    assert_eq!(doc["edited"][0]["path"], "shelf.md");
+    assert_eq!(doc["edited"][0]["links"][0]["to"], "![[refs/x2.jpg]]");
+}
+
+/// A destination already in use refuses with a message and a non-zero exit;
+/// nothing moves and no operation is recorded (ADR-017 §8).
+#[test]
+fn mv_refuses_a_taken_destination_without_touching_anything() {
+    let dir = tmp("mv-taken");
+    write(&dir.0, "a/x.jpg", PNG);
+    write(&dir.0, "refs/taken.jpg", PNG);
+    let (code, _stdout, stderr) = dimagine(&dir.0, &["mv", "a/x.jpg", "refs/taken.jpg"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("refs/taken.jpg already exists"), "{stderr}");
+    assert!(exists(&dir.0, "a/x.jpg"));
+    assert_eq!(read(&dir.0, ".dimagine/log/ops.jsonl"), "");
+}
+
+/// A case-only self-rename is not a taken destination: the only occupier of
+/// the new spelling is the file being moved, so the move lands and repairs
+/// its links (RW65b D1). The folder is listed by name, since `exists` cannot
+/// tell the two spellings apart on the case-insensitive volume this is
+/// routine on.
+#[test]
+fn mv_allows_a_case_only_self_rename() {
+    let dir = tmp("mv-caseonly");
+    write(&dir.0, "a/x.jpg", PNG);
+    write(&dir.0, "shelf.md", "![[a/x.jpg]]\n");
+    ok(&dir.0, &["mv", "a/x.jpg", "a/X.JPG"]);
+    let names: Vec<String> = std::fs::read_dir(dir.0.join("a"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(names.contains(&"X.JPG".to_string()), "{names:?}");
+    assert!(!names.contains(&"x.jpg".to_string()), "{names:?}");
+    assert!(names.contains(&"X.JPG.md".to_string()), "{names:?}");
+    assert!(read(&dir.0, "shelf.md").contains("![[a/X.JPG]]"));
+}
+
+/// An image with no note gets one at its new path, with the id and a
+/// self-embed (ADR-017 §2); the undo hands the created note back through the
+/// trash and the image and move come back too.
+#[test]
+fn mv_creates_the_missing_note_with_id_and_self_embed() {
+    let dir = tmp("mv-newnote");
+    write(&dir.0, "x.png", PNG);
+    let stdout = ok(&dir.0, &["mv", "x.png", "inbox/y.png"]);
+    assert!(stdout.contains("moved x.png -> inbox/y.png"), "{stdout}");
+    assert!(
+        stdout.contains("create inbox/y.png.md (the group needs a note for its id)"),
+        "{stdout}"
+    );
+    let note = read(&dir.0, "inbox/y.png.md");
+    assert!(note.contains("id: "), "{note}");
+    assert!(note.contains("![[inbox/y.png]]"), "{note}");
+
+    let audit = read(&dir.0, ".dimagine/log/ops.jsonl");
+    let op = audit
+        .lines()
+        .next()
+        .unwrap()
+        .split("\"op_id\":\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    // One op id serves both the journal and the id the new
+    // note gains (ADR-017 §3), like the serve endpoint.
+    assert!(
+        note.contains(&format!("id: {op}")),
+        "the assigned id is the op id: {note}"
+    );
+    ok(&dir.0, &["undo", op]);
+    assert!(exists(&dir.0, "x.png"));
+    assert!(!exists(&dir.0, "inbox/y.png"));
+}
+
+/// A link that was ambiguous before the move is reported on stderr and left
+/// byte-identical; the move itself still lands (ADR-017 §8).
+#[test]
+fn mv_reports_ambiguous_links_and_leaves_them_alone() {
+    let dir = tmp("mv-ambiguous");
+    write(&dir.0, "a/x.jpg", PNG);
+    write(&dir.0, "b/x.jpg", PNG);
+    write(
+        &dir.0,
+        "shelf.md",
+        "keep ![[x.jpg]] and full ![[a/x.jpg]]\n",
+    );
+    let (code, _stdout, stderr) = dimagine(&dir.0, &["mv", "a/x.jpg", "c/y.jpg"]);
+    assert_eq!(code, 0);
+    assert!(stderr.contains("ambiguous link"), "{stderr}");
+    assert_eq!(
+        read(&dir.0, "shelf.md"),
+        "keep ![[x.jpg]] and full ![[c/y.jpg]]\n"
+    );
+}

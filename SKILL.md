@@ -121,6 +121,20 @@ Use a board when spatial arrangement matters; otherwise use a collection.
 ## Move or rename
 
 ```bash
+dimagine mv refs/girl.jpg refs/deep-sea/girl.jpg
+```
+
+One command renames the whole group — the image, its note, its raw sidecars —
+and rewrites every link that pointed at it, in one operation `dimagine undo`
+can reverse. It adds the note and the `id` if either is missing, refuses when
+the destination is taken, and reports links that were already ambiguous
+instead of guessing. `--dry-run` prints the plan without touching a library
+byte (opening the library may still finish a crashed operation's recovery,
+and reports it).
+
+Without the CLI, move the group yourself:
+
+```bash
 mv refs/girl.jpg refs/deep-sea/girl.jpg
 mv refs/girl.jpg.md refs/deep-sea/girl.jpg.md 2>/dev/null
 mv refs/girl.jpg.*.json refs/deep-sea/ 2>/dev/null
@@ -133,7 +147,9 @@ grep -rn --include='*.md' --include='*.canvas' 'refs/girl.jpg' .
 ```
 
 If the bare name was used in links and is still unique, nothing needs changing.
-This includes the self-embed at the end of the image's own note.
+This includes the self-embed at the end of the image's own note. When you are
+done, run `dimagine check`: it reports any image link left pointing at nothing
+(the `dangling_link` item names each one and where it sits).
 
 ## Search
 
@@ -176,7 +192,7 @@ record of where those files came from, so recovering them is a manual move.
 
 ## With the dimagine CLI
 
-`dimagine tag`, `rate`, `set`, `collect`, `trash`, `restore`, `undo` and
+`dimagine tag`, `rate`, `set`, `collect`, `mv`, `trash`, `restore`, `undo` and
 `config` make the changes above through one journaled operation each; a command
 that changes a file prints that operation's id, and `dimagine undo <id>`
 reverses it. `dimagine trash purge` deletes the groups past the retention

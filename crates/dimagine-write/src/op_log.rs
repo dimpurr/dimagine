@@ -223,7 +223,7 @@ pub(crate) fn undo(
     let mut mismatches = Vec::new();
     let mut valid_entries = Vec::new();
 
-    for entry in &op_entries {
+    for (entry_idx, entry) in op_entries.iter().enumerate() {
         let path = StepPath::parse(&entry.path)?;
         match entry.step_kind {
             StepKind::Create => match writer.read_step(&path) {
@@ -301,7 +301,19 @@ pub(crate) fn undo(
                 match dst_read {
                     Ok((bytes, _)) => {
                         let fp = Fingerprint::of_bytes(&bytes);
-                        if fp.hex() == entry.after_hash {
+                        let hex = fp.hex();
+                        // ADR-016 §8 asks every file to be in the state the
+                        // operation left it in — per path, not per line. A
+                        // move with link repair (ADR-017 §8) renames a note
+                        // and then edits that same path within one operation,
+                        // so the file's final bytes carry the later edit's
+                        // hash, not the move's. A move still counts as
+                        // executed when a later line of the same operation
+                        // leaves this path at the bytes on disk.
+                        let edited_later = op_entries[entry_idx + 1..]
+                            .iter()
+                            .any(|later| later.path == entry.path && later.after_hash == hex);
+                        if hex == entry.after_hash || edited_later {
                             valid_entries.push(entry.clone());
                         } else {
                             mismatches.push(UndoMismatch {

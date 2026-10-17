@@ -371,9 +371,32 @@ pub(crate) fn enrich_step(writer: &Writer, step: &mut StepRecord) -> Result<()> 
         }
         StepKind::Modify => {
             let dst = StepPath::parse(&step.dst)?;
-            let (bytes, _) = writer.read_step(&dst)?;
-            step.before_hash = Some(Fingerprint::of_bytes(&bytes).hex());
-            step.before_bytes = Some(bytes);
+            match writer.read_step(&dst) {
+                Ok((bytes, _)) => {
+                    step.before_hash = Some(Fingerprint::of_bytes(&bytes).hex());
+                    step.before_bytes = Some(bytes);
+                }
+                Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT) => {
+                    // The file is not at its path yet, but the operation
+                    // itself is putting it there: a move with link repair
+                    // (ADR-017 §8) renames the note and edits it at its new
+                    // path in one journaled op, and the ADR-016 §8 undo rule
+                    // requires the edit to be recorded at the path it ends up
+                    // at. The caller describes the before state it read from
+                    // the old path; nothing is guessed here. Applying the
+                    // step re-reads the real file first, so the journal is
+                    // corrected to fact before a single byte is written, and
+                    // a step that carries no before state still refuses.
+                    let Some(before) = step.before_bytes.as_ref() else {
+                        return Err(Error::BadJournal {
+                            op: step.dst.clone(),
+                            message: "modify step names a file that is not there; only a step carrying its before bytes may describe one its own operation is moving in".to_string(),
+                        });
+                    };
+                    step.before_hash = Some(Fingerprint::of_bytes(before).hex());
+                }
+                Err(e) => return Err(e),
+            }
             if step.after_bytes.is_none() {
                 return Err(Error::BadJournal {
                     op: step.dst.clone(),
@@ -419,7 +442,19 @@ pub(crate) fn enrich_step(writer: &Writer, step: &mut StepRecord) -> Result<()> 
 }
 
 /// Classify a single step against the current filesystem state.
-pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
+///
+/// `later_steps` are the steps of the same operation that run after
+/// this one. A move with link repair (ADR-017 §8) renames a file
+/// and then edits it at its new path, so the moved file's final
+/// bytes carry the later edit's hash, not the move's; like undo
+/// (op_log.rs), such a move still counts as executed when its
+/// source is gone and a later step of the same operation leaves
+/// the destination at the bytes on disk.
+pub fn classify_step(
+    writer: &Writer,
+    step: &StepRecord,
+    later_steps: &[StepRecord],
+) -> Result<StepState> {
     let dst = StepPath::parse(&step.dst)?;
     match step.kind {
         StepKind::Create => match writer.read_step(&dst) {
@@ -470,17 +505,35 @@ pub fn classify_step(writer: &Writer, step: &StepRecord) -> Result<StepState> {
             let src_read = writer.read_step(&src);
             let dst_read = writer.read_step(&dst);
 
-            let dst_has_after = match &dst_read {
-                Ok((bytes, _)) => Fingerprint::of_bytes(bytes).hex() == step.after_hash,
-                _ => false,
+            let dst_hex = match &dst_read {
+                Ok((bytes, _)) => Some(Fingerprint::of_bytes(bytes).hex()),
+                _ => None,
             };
             let src_missing = matches!(
                 &src_read,
                 Err(Error::Io { source, .. }) if source.raw_os_error() == Some(libc::ENOENT)
             );
 
-            // Move is applied iff dst has after-hash and src absent (ADR-016 §7)
-            if dst_has_after && src_missing {
+            // Move is applied iff dst has the after-hash — or the
+            // hash a later step of this same operation left on
+            // this path — and src is absent (ADR-016 §7). The
+            // second form is the move-then-edit pattern (ADR-017
+            // §8): the operation renames the file and then edits
+            // it at its new path, so "executed" is judged per
+            // file, like undo (op_log.rs), never per journal
+            // line. Without this rule a crash after the edit but
+            // before `committed` would misclassify the rename as
+            // a third state, skip its rollback and tear the
+            // group.
+            let dst_has_after = dst_hex.as_deref() == Some(step.after_hash.as_str());
+            let edited_later = src_missing
+                && dst_hex.as_deref().is_some_and(|hex| {
+                    later_steps
+                        .iter()
+                        .any(|later| later.dst == step.dst && later.after_hash == hex)
+                });
+
+            if src_missing && (dst_has_after || edited_later) {
                 return Ok(StepState::Executed);
             }
 
@@ -626,8 +679,8 @@ fn recover_op(
     // back (uncommitted), and only the third-state file is left alone and
     // reported (ADR-016 §7).
     let mut states = Vec::new();
-    for step in &steps {
-        match classify_step(writer, step) {
+    for (idx, step) in steps.iter().enumerate() {
+        match classify_step(writer, step, &steps[idx + 1..]) {
             Ok(state) => states.push(state),
             Err(e) => states.push(StepState::ThirdState(format!("classification failed: {e}"))),
         }

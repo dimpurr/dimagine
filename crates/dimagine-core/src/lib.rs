@@ -14,6 +14,8 @@
 //! - [`note`]: front matter and note properties (FORMAT §3),
 //! - [`links`]: extract and resolve `![[...]]`, `[[]]`, `![]()` and canvas
 //!   file nodes (FORMAT §5.1, §6),
+//! - [`move_plan`]: plan a move/rename of an image group and the repair of
+//!   the links that pointed at it (ADR-017 §8),
 //! - [`image_meta`]: per-image header facts for the index refresh,
 //! - [`index`]: write one scan into the SQLite index,
 //! - [`check`]: findings for `dimagine check`,
@@ -32,6 +34,7 @@ pub mod image_meta;
 pub mod index;
 pub mod library;
 pub mod links;
+pub mod move_plan;
 pub mod note;
 pub mod scan;
 pub mod settings;

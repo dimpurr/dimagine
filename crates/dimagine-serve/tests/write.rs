@@ -164,7 +164,12 @@ async fn without_write_the_write_routes_are_absent_and_settings_is_read_only() {
     let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
 
     // No write route exists at all — a 404, not a forbidden page.
-    for uri in ["/api/write/settings", "/api/write/trash", "/api/write/csrf"] {
+    for uri in [
+        "/api/write/settings",
+        "/api/write/trash",
+        "/api/write/move",
+        "/api/write/csrf",
+    ] {
         let (status, _, _) = send(&app, get(uri, Some(&cookie))).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         let (status, _, _) = send(&app, write_post(uri, &cookie, "x", Some(ORIGIN), "{}")).await;
@@ -1193,4 +1198,189 @@ async fn a_password_change_edits_only_the_sessions_own_account() {
         try_login(&app, peer_email, &mine_second).await,
         StatusCode::UNAUTHORIZED
     );
+}
+
+// ---------------------------------------------------------------------------
+// Move (ADR-017 §8)
+// ---------------------------------------------------------------------------
+
+/// A library with a note, a sidecar and a shelf that links the image three
+/// ways, so a move has real work to do.
+fn movable_library() -> TempDir {
+    let root = library();
+    let l = root.path().join("library");
+    std::fs::write(l.join("one.png.xmp"), b"sidecar").unwrap();
+    std::fs::write(
+        l.join("one.png.md"),
+        "---\ntags: [keep]\n---\nmine ![[one.png]]\n",
+    )
+    .unwrap();
+    std::fs::write(l.join("shelf.md"), "a ![[one.png]] b ![[one|al]]\n").unwrap();
+    root
+}
+
+#[tokio::test]
+async fn move_renames_the_group_repairs_links_and_undoes_whole() {
+    let root = movable_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/move",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"from":"one.png","to":"inbox/two.png"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let json = json_body(&body);
+    assert_eq!(json["schema"], "dimagine.move/0.1");
+    assert_eq!(json["dry_run"], false);
+    assert!(json["op"].is_string());
+    assert_eq!(json["renames"][0]["to"], "inbox/two.png");
+    let l = root.path().join("library");
+    assert!(!l.join("one.png").exists());
+    assert_eq!(
+        std::fs::read_to_string(l.join("shelf.md")).unwrap(),
+        "a ![[inbox/two.png]] b ![[inbox/two.png|al]]\n"
+    );
+    let note = std::fs::read_to_string(l.join("inbox/two.png.md")).unwrap();
+    assert!(note.contains("id: "), "{note}");
+
+    let op = json["op"].as_str().unwrap().to_string();
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/undo",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &format!(r#"{{"op":"{op}"}}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert_eq!(
+        std::fs::read_to_string(l.join("shelf.md")).unwrap(),
+        "a ![[one.png]] b ![[one|al]]\n"
+    );
+    assert!(l.join("one.png").exists());
+    assert!(!l.join("inbox/two.png.md").exists());
+}
+
+#[tokio::test]
+async fn move_dry_run_answers_with_the_plan_and_touches_nothing() {
+    let root = movable_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/move",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"from":"one.png","to":"inbox/two.png","dry_run":true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let json = json_body(&body);
+    assert_eq!(json["dry_run"], true);
+    assert!(json["op"].is_null());
+    assert_eq!(json["edited"][1]["path"], "shelf.md");
+
+    let l = root.path().join("library");
+    assert!(l.join("one.png").exists());
+    assert!(!l.join("inbox").exists());
+    assert_eq!(
+        std::fs::read_to_string(l.join("shelf.md")).unwrap(),
+        "a ![[one.png]] b ![[one|al]]\n"
+    );
+}
+
+#[tokio::test]
+async fn move_refusals_are_400_and_security_bars_stay_up() {
+    let root = movable_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    // The taken destination refuses with the typed message, unchanged bytes.
+    let (status, _, body) = send(
+        &app,
+        write_post(
+            "/api/write/move",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"from":"one.png","to":"shelf.md"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
+    assert!(
+        root.path().join("library/one.png").try_exists().unwrap(),
+        "a refusal moves nothing"
+    );
+
+    // A missing source is a 404, like the trash's unknown image.
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/move",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"from":"nobody.png","to":"inbox/two.png"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // No CSRF header: the guard refuses before the handler (ADR-018 §3).
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/write/move")
+        .header("content-type", "application/json")
+        .header("cookie", &cookie)
+        .header("origin", ORIGIN)
+        .body(Body::from(r#"{"from":"one.png","to":"inbox/two.png"}"#))
+        .unwrap();
+    let (status, _, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // An anonymous request never reaches the handler: the auth gate closes
+    // first (account mode, no session).
+    let anon = Request::builder()
+        .method("POST")
+        .uri("/api/write/move")
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .body(Body::from(r#"{"from":"one.png","to":"inbox/two.png"}"#))
+        .unwrap();
+    let (status, _, _) = send(&app, anon).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // The wrong origin: refused, and nothing moved.
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/move",
+            &cookie,
+            &csrf,
+            Some("http://evil.test"),
+            r#"{"from":"one.png","to":"inbox/two.png"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(root.path().join("library/one.png").exists());
 }

@@ -62,6 +62,7 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
         // pages send back in `x-csrf-token`, and the trash view.
         .route("/api/write/csrf", get(csrf_bootstrap))
         .route("/api/write/trash", get(trash_view).post(trash_images))
+        .route("/api/write/move", post(move_image))
         .route("/api/write/restore", post(restore_images))
         .route("/api/write/collections", post(edit_collection))
         // The mutations. No mutating handler is ever registered for GET
@@ -1272,6 +1273,197 @@ async fn trash_images(
         return write_error(error);
     }
     Json(serde_json::json!({"trashed": trashed, "op": op_id})).into_response()
+}
+
+/// `POST /api/write/move` — rename an image and its group and repair every
+/// link that resolved to it, in one journaled operation `undo` reverses
+/// (ADR-017 §8). `{"from": <path or bare name>, "to": <new library path>}`;
+/// `{"dry_run": true}` answers with the plan and changes nothing. A refusal
+/// (target exists, ambiguous new bare name, taken link shape) is a 400 with
+/// the typed message and no operation; a link that was already ambiguous
+/// before the move lands with the move and is listed in `ambiguous`.
+async fn move_image(
+    State(state): State<AppState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let Some(from) = request.get("from").and_then(|v| v.as_str()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"from\" string is required");
+    };
+    let Some(to) = request.get("to").and_then(|v| v.as_str()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"to\" string is required");
+    };
+    if from.is_empty() || to.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "\"from\" and \"to\" must not be empty",
+        );
+    }
+    let dry_run = request
+        .get("dry_run")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let client_addr = crate::resolve_client_ip(
+        client.map(|info| info.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
+    let library = match Library::open(writer.root_path()) {
+        Ok(library) => library,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let resolver = Resolver::new(&library.files);
+    let entry = match resolve_image(&library.files, &resolver, from) {
+        Ok(entry) => entry,
+        Err(message) => return json_error(StatusCode::NOT_FOUND, &message),
+    };
+    let root = writer.root_path().to_path_buf();
+    let disk_root = root.clone();
+    let read = move |entry: &FileEntry| -> Result<Vec<u8>, String> {
+        let path = root.join(&entry.path);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        if meta.len() > dimagine_core::check::DEFAULT_MAX_NOTE_BYTES {
+            return Err("larger than the note read limit".to_string());
+        }
+        std::fs::read(&path).map_err(|e| e.to_string())
+    };
+    // Same two probes as the CLI `mv` (write.rs): the destination counts as
+    // free when its occupant is the very file the step moves.
+    let same_file = dimagine_core::move_plan::same_file_probe(disk_root.clone());
+    let occupied = move |rel: &str| disk_root.join(rel).symlink_metadata().is_ok();
+    let op_id = ulid::Ulid::new().to_string();
+    let plan = match dimagine_core::move_plan::plan_move(
+        &library.files,
+        &resolver,
+        &entry.rel,
+        to.trim_start_matches("./"),
+        &op_id,
+        &read,
+        &occupied,
+        &same_file,
+    ) {
+        Ok(plan) => plan,
+        Err(refusal) => return json_error(StatusCode::BAD_REQUEST, &refusal.to_string()),
+    };
+    if dry_run {
+        return Json(move_plan_json(&plan, None)).into_response();
+    }
+    let steps = move_steps(&plan);
+    let intent = serde_json::json!({"action": "move", "from": plan.src, "to": plan.dst});
+    if let Err(error) = writer.execute_op(&op_id, SOURCE, Some(&client_addr), intent, steps) {
+        return write_error(error);
+    }
+    Json(move_plan_json(&plan, Some(op_id.as_str()))).into_response()
+}
+
+/// Land a move plan as journaled steps, in ADR-017 §8's order: the renames,
+/// the created note, then the byte edits. The moved note's edit rides its
+/// before bytes because the file reaches its path through this operation's
+/// own rename (ADR-016 §7, §8).
+fn move_steps(plan: &dimagine_core::move_plan::MovePlan) -> Vec<StepRecord> {
+    let mut steps: Vec<StepRecord> = Vec::new();
+    let mut push = |kind: StepKind,
+                    src: Option<String>,
+                    dst: String,
+                    before: Option<Vec<u8>>,
+                    bytes: Option<Vec<u8>>| {
+        steps.push(StepRecord {
+            step_idx: steps.len(),
+            kind,
+            src,
+            dst,
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: before,
+            after_bytes: bytes,
+        })
+    };
+    for rename in &plan.renames {
+        push(
+            StepKind::Move,
+            Some(rename.src.clone()),
+            rename.dst.clone(),
+            None,
+            None,
+        );
+    }
+    if let Some(created) = &plan.new_note {
+        push(
+            StepKind::Create,
+            None,
+            created.path.clone(),
+            None,
+            Some(created.bytes.clone()),
+        );
+    }
+    for edit in plan.moved_note.iter().chain(plan.edits.iter()) {
+        push(
+            StepKind::Modify,
+            None,
+            edit.path.clone(),
+            Some(edit.before.clone()),
+            Some(edit.bytes.clone()),
+        );
+    }
+    steps
+}
+
+/// The `dimagine.move/0.1` document: the plan, and the op id once it landed
+/// (`null` on a dry run). Same shape the CLI prints, so one page reads both.
+fn move_plan_json(
+    plan: &dimagine_core::move_plan::MovePlan,
+    op: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "dimagine.move/0.1",
+        "dry_run": op.is_none(),
+        "from": plan.src,
+        "to": plan.dst,
+        "renames": plan.renames.iter().map(|r| serde_json::json!({"from": r.src, "to": r.dst})).collect::<Vec<_>>(),
+        "created_note": plan.new_note.as_ref().map(|n| n.path.clone()),
+        "id_assigned": plan.id_assigned,
+        "edited": plan
+            .moved_note
+            .iter()
+            .chain(plan.edits.iter())
+            .map(|e| serde_json::json!({
+                "path": e.path,
+                "self_embed_appended": e.self_embed_appended,
+                "links": e.replaced.iter().map(|s| serde_json::json!({
+                    "line": s.line,
+                    "from": s.old_text,
+                    "to": s.new_text,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "ambiguous": plan
+            .ambiguous
+            .iter()
+            .map(|a| serde_json::json!({
+                "note": a.note,
+                "line": a.line,
+                "target": a.target,
+                "matches": a.matches,
+            }))
+            .collect::<Vec<_>>(),
+        "warnings": plan
+            .warnings
+            .iter()
+            .map(|w| serde_json::json!({"path": w.path, "message": w.message}))
+            .collect::<Vec<_>>(),
+        "op": op,
+    })
 }
 
 /// `POST /api/write/restore` — move each named group back from `.trash/` to its

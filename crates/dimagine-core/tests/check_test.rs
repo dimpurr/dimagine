@@ -655,3 +655,64 @@ fn backslash_file_names_do_not_alias_slash_paths() {
         .expect("native backslash-named file");
     assert_eq!(entry.rel, "a\\b.jpg", "display keeps the backslash");
 }
+
+/// ADR-017 §8: `dangling_link` is the per-note, per-span item a hand move
+/// leaves behind — one Error per note, every broken image link with its body
+/// byte span and line; code blocks stay out; `check` exits non-zero on it.
+#[test]
+fn dangling_links_are_one_error_per_note_with_spans() {
+    let tmp = tmp("dangling");
+    write(tmp.path(), "keeper.jpg", jpg());
+    write(
+        tmp.path(),
+        "col.md",
+        "---\nkind: collection\n---\n![[gone.jpg]] and [[also-gone.png]] plain text\n\ntext ![[gone.jpg|al]] tail\n",
+    );
+    let lib = open_library(tmp.path());
+    let report = run(&lib);
+    let dangling: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.code == check::codes::DANGLING_LINK)
+        .collect();
+    assert_eq!(dangling.len(), 1, "{:?}", report.findings);
+    assert_eq!(dangling[0].path, "col.md");
+    assert_eq!(dangling[0].severity, Severity::Error);
+    assert_ne!(report.exit_code(), 0, "dangling links are a problem");
+
+    let links = dangling[0]
+        .detail
+        .as_ref()
+        .expect("detail")
+        .get("links")
+        .expect("links array")
+        .as_array()
+        .expect("array");
+    assert_eq!(links.len(), 3, "both embeds and the bare link");
+    let body = "![[gone.jpg]] and [[also-gone.png]] plain text\n\ntext ![[gone.jpg|al]] tail\n";
+    for entry in links {
+        let span = entry["span"].as_array().unwrap();
+        let start = span[0].as_u64().unwrap() as usize;
+        let end = span[1].as_u64().unwrap() as usize;
+        let raw = &body[start..end];
+        assert!(raw.contains("gone"), "span names the link: {raw}");
+        assert!(entry["target"].as_str().unwrap().contains("gone"));
+    }
+
+    // Code-block links never dangle.
+    write(
+        tmp.path(),
+        "doc.md",
+        "```\n![[gone.jpg]]\n```\ninline `![[gone.jpg]]` stays clean\n",
+    );
+    let lib2 = open_library(tmp.path());
+    let report2 = run(&lib2);
+    assert!(
+        !report2
+            .findings
+            .iter()
+            .any(|f| f.code == check::codes::DANGLING_LINK && f.path == "doc.md"),
+        "{:?}",
+        report2.findings
+    );
+}

@@ -247,6 +247,20 @@ These are plain file operations. To keep a library consistent:
 - A copied image is a new image. If its note was copied too, the duplicate `id`
   is resolved as in §3.3.
 
+A tool that moves an image automatically works as follows. The move plan
+fixes the `id` before anything moves; it lands with the note's edit. It
+renames the whole group and refuses the move if any destination is
+already taken. Then it rewrites, in place, every link that resolved to the
+group: each keeps its syntax and its display parts — alias, heading, block
+reference, alt text, title — and names the target by its full library path;
+links inside code blocks and inline code are left alone. A `.canvas` is
+updated by parsing its JSON and replacing only the `nodes[].file` values that
+pointed at the group, never by replacing text. A link that was already
+ambiguous before the move is reported and left as it is. A move that ends with
+an ambiguous bare name — one the repaired links could not disambiguate — is
+refused. After a move by any other tool, `dimagine check` reports the links it
+left pointing at nothing.
+
 ### 7.1 Deleting
 
 A tool that deletes moves a group — the image, its note, and every raw metadata
@@ -355,6 +369,7 @@ dimagine rate <img> <0-5|none>                # set or clear its rating
 dimagine set <img> KEY=VALUE …                # set scalar properties (KEY= clears)
 dimagine collect --new <title> <img>…         # create a collection note (§5)
 dimagine collect --add|--remove <note> <img>… # edit a collection's members
+dimagine mv <img> <new-path> [--dry-run]      # move a group and repair its links (§7)
 dimagine trash <img>…                         # move groups into .trash/ (§7.1)
 dimagine restore <img>…                       # move them back
 dimagine undo [<op-id>] [--force]             # reverse one recorded operation
@@ -388,3 +403,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-13 | Deletion is a group move into `.trash/` with a `<name>.trash.json` record beside it (§7.1); `.trash/` joins the ignored dotted names (§2.2). `.dimagine/` gains `settings.json`, `log/ops.jsonl`, `journal/`, `write.lock` and the `.dimagine.tmp.` temporary prefix (§8, §8.3). |
 | 0.1 | 2026-10-13 | The old `.dimagine/trash/` is no longer written to but stays readable, so a library that still holds one reports its files instead of losing track of them (§7.1). A group with no record is never deleted automatically (§7.1). |
 | 0.1 | 2026-10-13 | The CLI that writes the format is listed with what each command does (§9); Versioning moves to §10. |
+| 0.1 | 2026-10-16 | The contract for an automatic move (§7): the `id` is fixed before anything moves and lands with the note's edit, the group renames together and refuses a taken destination, links are rewritten in place keeping their syntax and display parts, `.canvas` `nodes[].file` values follow, ambiguous links are reported and not touched. `dimagine mv` joins the CLI (§9). |

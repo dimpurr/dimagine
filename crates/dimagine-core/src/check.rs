@@ -40,6 +40,7 @@ pub mod codes {
     pub const INVALID_ID: &str = "invalid_id";
     pub const DUPLICATE_ID: &str = "duplicate_id";
     pub const MISSING_LINK: &str = "missing_link";
+    pub const DANGLING_LINK: &str = "dangling_link";
     pub const AMBIGUOUS_LINK: &str = "ambiguous_link";
     pub const INVALID_CANVAS: &str = "invalid_canvas";
     pub const BAD_FILENAME_CHAR: &str = "bad_filename_char";
@@ -504,6 +505,41 @@ fn check_note(
                 }
             }
         }
+    }
+
+    // Dangling image links, collected per note with their byte spans
+    // (ADR-017 §8): after a hand move in another tool this is what `check`
+    // exists to find, precisely enough to repair by hand. The spans are byte
+    // ranges inside the note's body; `missing_link` keeps naming the same
+    // links one finding per link, without spans.
+    let mut dangling: Vec<serde_json::Value> = Vec::new();
+    for span_link in links::extract_link_spans(&parsed.body, &entry.rel, parsed.body_line) {
+        if matches!(
+            resolver.resolve(&span_link.target, entry, span_link.syntax),
+            Outcome::NotFound
+        ) {
+            dangling.push(serde_json::json!({
+                "line": span_link.line,
+                "span": [span_link.range.start, span_link.range.end],
+                "target": span_link.target,
+                "embed": span_link.embed,
+            }));
+        }
+    }
+    if !dangling.is_empty() {
+        let count = dangling.len();
+        findings.push(Finding {
+            severity: Severity::Error,
+            code: codes::DANGLING_LINK,
+            path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+            message: format!(
+                "{count} image link{} in this note resolve{} to no file",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "es" } else { "" }
+            ),
+            detail: Some(serde_json::json!({"links": dangling})),
+        });
     }
 
     if entry.class == FileClass::ImageNote {

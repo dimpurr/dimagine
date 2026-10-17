@@ -79,7 +79,7 @@ fn cli(plugins: &CorePlugins) -> Command {
     let command = Command::new("dimagine")
         .version(env!("CARGO_PKG_VERSION"))
         .about("Tools for a dimagine image library: a plain folder of images with optional Markdown notes.")
-        .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. scan and check only read; the write commands (tag, rate, set, collect, trash, trash purge, trash empty, restore, undo, config) change files through a journaled operation that undo can reverse. trash purge and trash empty delete permanently, so their undo refuses. Derived data lives in .dimagine/ and can always be deleted.")
+        .after_help("Every command takes --library <dir> (default: the current directory) and --json for machine-readable output. scan and check only read; the write commands (tag, rate, set, collect, mv, trash, trash purge, trash empty, restore, undo, config) change files through a journaled operation that undo can reverse. trash purge and trash empty delete permanently, so their undo refuses. Derived data lives in .dimagine/ and can always be deleted.")
         .arg(
             Arg::new("library")
                 .long("library")

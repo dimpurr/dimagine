@@ -1,5 +1,5 @@
 //! The dimagine write commands (ADR-016, ADR-017): `tag` `rate` `set`
-//! `collect` `trash` `restore` `undo` `config`, and the trash group's own
+//! `collect` `mv` `trash` `restore` `undo` `config`, and the trash group's own
 //! `trash purge` / `trash empty`.
 //!
 //! Every mutation goes through the `dimagine-write` op path — a planned set of
@@ -110,6 +110,30 @@ pub fn commands() -> Vec<Command> {
                     .required(true)
                     .help("Images, by library-relative path or bare name."),
             ),
+        Command::new("mv")
+            .about("Move or rename an image and its group, repairing the links that point at it.")
+            .arg(
+                Arg::new("src")
+                    .value_name("SRC")
+                    .required(true)
+                    .help("The image, by library-relative path or unambiguous bare name."),
+            )
+            .arg(
+                Arg::new("dst")
+                    .value_name("DST")
+                    .required(true)
+                    .help("The new library-relative path of the image; missing folders are created."),
+            )
+            .arg(
+                Arg::new("dry_run")
+                    .long("dry-run")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Print the renames and link edits; change no library byte. \
+                         Opening the library may still finish a crashed operation's \
+                         recovery, and reports it.",
+                    ),
+            ),
         Command::new("trash")
             .about("Move image groups (image, note, raw metadata) into .trash/.")
             .arg(
@@ -202,6 +226,7 @@ pub fn dispatch(name: &str, sub: &ArgMatches, library_dir: &Path) -> Option<Exit
         "rate" => run_rate(sub, library_dir),
         "set" => run_set(sub, library_dir),
         "collect" => run_collect(sub, library_dir),
+        "mv" => run_move(sub, library_dir),
         "trash" => run_trash(sub, library_dir),
         "restore" => run_restore(sub, library_dir),
         "undo" => run_undo(sub, library_dir),
@@ -895,6 +920,255 @@ fn group_members(files: &[FileEntry], image: &FileEntry) -> Vec<RelPath> {
         }
     }
     members
+}
+
+/// Land a [`MovePlan`](dimagine_core::move_plan::MovePlan) as steps, in the
+/// order ADR-017 §8 gives: every rename, then the created note, then the byte
+/// edits, the moved note's own edit among them at its new path. Its before
+/// bytes ride the step, because the file only reaches that path through this
+/// operation's rename and the write core journals every step's before-state
+/// before it touches any file (ADR-016 §7, §8).
+fn move_steps(plan: &dimagine_core::move_plan::MovePlan) -> Vec<StepRecord> {
+    let mut steps: Vec<StepRecord> = Vec::new();
+    let mut push = |kind: StepKind,
+                    src: Option<String>,
+                    dst: String,
+                    before: Option<Vec<u8>>,
+                    bytes: Option<Vec<u8>>| {
+        steps.push(StepRecord {
+            step_idx: steps.len(),
+            kind,
+            src,
+            dst,
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: before,
+            after_bytes: bytes,
+        })
+    };
+    for rename in &plan.renames {
+        push(
+            StepKind::Move,
+            Some(rename.src.clone()),
+            rename.dst.clone(),
+            None,
+            None,
+        );
+    }
+    if let Some(created) = &plan.new_note {
+        push(
+            StepKind::Create,
+            None,
+            created.path.clone(),
+            None,
+            Some(created.bytes.clone()),
+        );
+    }
+    for edit in plan.moved_note.iter().chain(plan.edits.iter()) {
+        push(
+            StepKind::Modify,
+            None,
+            edit.path.clone(),
+            Some(edit.before.clone()),
+            Some(edit.bytes.clone()),
+        );
+    }
+    steps
+}
+
+fn run_move(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let limit = sub
+        .get_one::<u64>("max_note_bytes")
+        .copied()
+        .unwrap_or(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES);
+    let library = match library_walk(library_dir, json) {
+        Ok(library) => library,
+        Err(code) => return code,
+    };
+    let writer = match open_writer(library_dir, json) {
+        Ok(writer) => writer,
+        Err(code) => return code,
+    };
+    let resolver = Resolver::new(&library.files);
+    let src = sub
+        .get_one::<String>("src")
+        .map(String::as_str)
+        .unwrap_or("");
+    let entry = match resolve_image(&library.files, &resolver, src) {
+        Ok(entry) => entry,
+        Err(message) => return fail(json, &message),
+    };
+    let dst = sub
+        .get_one::<String>("dst")
+        .map(|d| d.trim_start_matches("./").to_string())
+        .unwrap_or_default();
+    let root = library.root.clone();
+    let disk_root = root.clone();
+    let read = move |entry: &FileEntry| -> Result<Vec<u8>, String> {
+        let path = root.join(&entry.path);
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        if meta.len() > limit {
+            return Err(format!("larger than the {limit}-byte note limit"));
+        }
+        std::fs::read(&path).map_err(|e| e.to_string())
+    };
+    // The one destination a move may displace is the file it moves, which
+    // only the filesystem can confirm (a case-only self-rename on a
+    // case-insensitive volume): see `same_file_probe`.
+    let same_file = dimagine_core::move_plan::same_file_probe(disk_root.clone());
+    let occupied = move |rel: &str| disk_root.join(rel).symlink_metadata().is_ok();
+    // One op id for both the journal and the id a new
+    // note gains (ADR-017 §3): the same logical operation
+    // carries the same id on every surface, like the serve
+    // endpoint.
+    let op_id = new_op_id();
+    let plan = match dimagine_core::move_plan::plan_move(
+        &library.files,
+        &resolver,
+        &entry.rel,
+        &dst,
+        &op_id,
+        &read,
+        &occupied,
+        &same_file,
+    ) {
+        Ok(plan) => plan,
+        Err(refusal) => return fail(json, &refusal.to_string()),
+    };
+    for warning in &plan.warnings {
+        eprintln!("warning: {}: {}", warning.path, warning.message);
+    }
+    for ambiguous in &plan.ambiguous {
+        eprintln!(
+            "ambiguous link, not rewritten: {}:{} `{}` could be {}",
+            ambiguous.note,
+            ambiguous.line,
+            ambiguous.target,
+            ambiguous.matches.join(" or ")
+        );
+    }
+    let dry_run = sub.get_flag("dry_run");
+    if dry_run {
+        if json {
+            let doc = move_plan_json(&plan, None);
+            println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+        } else {
+            print_move_plan(&plan);
+        }
+        return ExitCode::from(0);
+    }
+    let steps = move_steps(&plan);
+    let intent = serde_json::json!({"action": "move", "from": plan.src, "to": plan.dst});
+    if let Err(error) = writer.execute_op(&op_id, SOURCE, None, intent, steps) {
+        return fail(json, &error_message(&error));
+    }
+    if json {
+        let doc = move_plan_json(&plan, Some(op_id.as_str()));
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("moved {} -> {}", plan.src, plan.dst);
+        print_move_details(&plan);
+        println!("undo with: dimagine undo {op_id}");
+    }
+    ExitCode::from(0)
+}
+
+fn move_plan_json(
+    plan: &dimagine_core::move_plan::MovePlan,
+    op: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "dimagine.move/0.1",
+        "dry_run": op.is_none(),
+        "from": plan.src,
+        "to": plan.dst,
+        "renames": plan.renames.iter().map(|r| serde_json::json!({"from": r.src, "to": r.dst})).collect::<Vec<_>>(),
+        "created_note": plan.new_note.as_ref().map(|n| n.path.clone()),
+        "id_assigned": plan.id_assigned,
+        "edited": plan
+            .moved_note
+            .iter()
+            .chain(plan.edits.iter())
+            .map(|e| serde_json::json!({
+                "path": e.path,
+                "self_embed_appended": e.self_embed_appended,
+                "links": e.replaced.iter().map(|s| serde_json::json!({
+                    "line": s.line,
+                    "from": s.old_text,
+                    "to": s.new_text,
+                })).collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        "ambiguous": plan
+            .ambiguous
+            .iter()
+            .map(|a| serde_json::json!({
+                "note": a.note,
+                "line": a.line,
+                "target": a.target,
+                "matches": a.matches,
+            }))
+            .collect::<Vec<_>>(),
+        "warnings": plan
+            .warnings
+            .iter()
+            .map(|w| serde_json::json!({"path": w.path, "message": w.message}))
+            .collect::<Vec<_>>(),
+        "op": op,
+    })
+}
+
+fn print_move_plan(plan: &dimagine_core::move_plan::MovePlan) {
+    println!(
+        "move {} -> {} (dry run, nothing changed)",
+        plan.src, plan.dst
+    );
+    print_move_details(plan);
+}
+
+/// The per-file results both surfaces print: every rename, the
+/// note the group gains, and every byte edit with what changed
+/// in it — the same lines a real run reports.
+fn print_move_details(plan: &dimagine_core::move_plan::MovePlan) {
+    for rename in &plan.renames {
+        println!("  rename {} -> {}", rename.src, rename.dst);
+    }
+    if let Some(created) = &plan.new_note {
+        println!(
+            "  create {} (the group needs a note for its id)",
+            created.path
+        );
+    }
+    for edit in plan.moved_note.iter().chain(plan.edits.iter()) {
+        let mut notes: Vec<String> = Vec::new();
+        if plan.id_assigned
+            && plan
+                .moved_note
+                .as_ref()
+                .is_some_and(|m| m.path == edit.path)
+        {
+            notes.push("id assigned".to_string());
+        }
+        if edit.self_embed_appended {
+            notes.push("self-embed appended".to_string());
+        }
+        notes.push(format!(
+            "{} link{} rewritten",
+            edit.replaced.len(),
+            if edit.replaced.len() == 1 { "" } else { "s" }
+        ));
+        println!("  edit {}: {}", edit.path, notes.join("; "));
+        for replaced in &edit.replaced {
+            println!(
+                "    line {}: {} -> {}",
+                replaced.line, replaced.old_text, replaced.new_text
+            );
+        }
+    }
 }
 
 fn run_trash(sub: &ArgMatches, library_dir: &Path) -> ExitCode {

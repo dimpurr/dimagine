@@ -16,6 +16,7 @@ dimagine tag             # add or remove tags in an image's note
 dimagine rate            # set an image's rating, or clear it
 dimagine set             # set scalar front-matter properties (KEY= clears one)
 dimagine collect         # create a collection note, or add and remove members
+dimagine mv              # move an image group and repair the links pointing at it (FORMAT §7)
 dimagine trash           # move an image group into .trash/ (FORMAT §7.1)
 dimagine restore         # move a trashed group back
 dimagine undo            # reverse one recorded operation
@@ -45,10 +46,16 @@ run them as one **operation** (FORMAT §8.3).
 - Each step is journaled under `.dimagine/journal/<op-id>/` before it happens;
   a crash is recovered by the next writer. Each step that lands is appended to
   `.dimagine/log/ops.jsonl` with its operation's id and intent and the
-  before/after hash of the file it touched, which is what an undo reads.
+  before/after hash of the file it touched, which is what an undo reads. A
+  step may name a file its own operation moves in — that is how `mv` renames
+  a note and then edits it at its new path inside one operation — and it
+  carries the before-state its caller read; the writer re-reads the real file
+  before writing a byte, so the journal still records fact.
 - `undo <op-id>` reverses one operation from that log, all of it or none: a
   participant whose bytes moved since is a refusal, unless `--force` says to
-  undo what still matches. A file an operation created comes back as its own
+  undo what still matches. The check is per file in the operation's final
+  state: a renamed-and-repaired note sits at its new path with the repair's
+  bytes, and counts. A file an operation created comes back as its own
   trash move, never a delete. `trash purge` and `trash empty` have no inverse
   and say so: they are the two irreversible operations.
 - `--json` prints one document per command with the `op` id, so a caller can
@@ -74,7 +81,7 @@ run them as one **operation** (FORMAT §8.3).
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `write` | The one path that changes the library: the lock, the read-hash-temp-rename write, the per-operation journal and crash recovery, and the `.dimagine/log/ops.jsonl` audit log with its inverse (FORMAT §8.3). Every write command is a planner that builds steps for this module; none of them writes a file itself. Also `.dimagine/settings.json`: a schema of typed settings with a default and a validation rule each, applied to whatever file is there — unknown keys kept, invalid values read as unset plus a report line. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
-| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. |
+| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, move, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. |
 
 ## Serving media (0.1)
 
@@ -153,6 +160,8 @@ until then it is exercised against test libraries only.
 
 Unreadable or unsupported images · extension/content mismatch · notes without
 an image · invalid YAML · duplicate `id` · ambiguous links · missing links ·
+dangling image links — one finding per note, naming every broken link with its
+line and body byte span, what a hand move leaves behind — ·
 images that moved (same `id`, new path) with links still at the old path.
 
 Plus the state of past writes (FORMAT §8.3, §7.1): an operation journal left
