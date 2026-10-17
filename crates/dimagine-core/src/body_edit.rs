@@ -74,6 +74,149 @@ pub enum EditError {
     /// A root image whose bare name matches more than one file: the caller
     /// must rename it or move it into a folder before it can be collected.
     AmbiguousBareName { name: String, matches: Vec<String> },
+    /// The ordinals a reorder was given are not a permutation of the member
+    /// blocks, so the reorder is refused whole (ADR-017 §9).
+    NotAPermutation { given: Vec<usize>, blocks: usize },
+    /// The block ordinal does not name a member block.
+    NoSuchBlock { block: usize, blocks: usize },
+    /// Line offset 0 is the member line itself: deleting it is what `--remove`
+    /// does, so a caption edit must not (ADR-017 §9).
+    MemberLineNotCaption { block: usize },
+    /// The line offset names no line of the block, and is not one past its last
+    /// line (the only place a new caption is added).
+    NoSuchLine { block: usize, line: usize },
+    /// A caption must be pure text (ADR-017 §9): not a heading, thematic
+    /// break, setext underline, list, quote, table row (or delimiter row),
+    /// code fence or embed.
+    NotCaptionText { text: String },
+    /// A caption line was given no text and there is nothing there to delete.
+    NothingToDelete { block: usize, line: usize },
+}
+
+/// True when a line can be a caption line (ADR-017 §9): pure text, not a
+/// heading, thematic break, setext underline, list item, blockquote, table
+/// row (or delimiter row), code fence or embed.
+fn is_caption_text(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // An embed on the line — `![[..]]` or `![..](..)` — is never pure text,
+    // wherever it sits (a link inside code does not count, as everywhere else).
+    if extract_link_spans(content, "", 1)
+        .iter()
+        .any(|span| span.syntax.is_strong_image())
+    {
+        return false;
+    }
+    let left = content.trim_start();
+    // ATX heading: one to six `#` followed by a space, a tab or the line end.
+    let hashes = left.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &left[hashes..];
+        if rest.is_empty() || rest.starts_with([' ', '\t']) {
+            return false;
+        }
+    }
+    // Blockquote.
+    if left.starts_with('>') {
+        return false;
+    }
+    // Unordered list item.
+    if left.starts_with("- ") || left.starts_with("* ") || left.starts_with("+ ") {
+        return false;
+    }
+    // Ordered list item: digits then `.` or `)` then a space.
+    let digits = left.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &left[digits..];
+        if rest.starts_with(". ") || rest.starts_with(") ") {
+            return false;
+        }
+    }
+    // Table row.
+    if left.starts_with('|') {
+        return false;
+    }
+    // A thematic break (`---`, `***`, `___`, spaces between the marks allowed)
+    // or a setext underline (`===`, `--`, `-`) restructures the note around the
+    // caption: either one under the member line turns the member line and its
+    // captions into a heading (ADR-017 §9).
+    if is_rule_or_setext(left) {
+        return false;
+    }
+    // A table delimiter row (`--- | ---`, `:-- | --:`) is a table row even
+    // without a leading `|`.
+    if is_table_delimiter(left) {
+        return false;
+    }
+    // A fenced code block delimiter never captions a member.
+    if left.starts_with("```") || left.starts_with("~~~") {
+        return false;
+    }
+    true
+}
+
+/// True when the line is a thematic break or a setext underline: one mark and
+/// nothing else on the line but spaces and tabs. `=` and `-` close a setext
+/// heading at any length and take no space inside the run; `-`, `*` and `_` are
+/// a thematic break at three or more marks, where a space between the marks is
+/// allowed (`- - -`) (CommonMark).
+fn is_rule_or_setext(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_' | '=') {
+        return false;
+    }
+    let mut count = 0;
+    let mut spaced = false;
+    for c in trimmed.chars() {
+        if c == first {
+            count += 1;
+        } else if matches!(c, ' ' | '\t') {
+            spaced = true;
+        } else {
+            return false;
+        }
+    }
+    if spaced {
+        // A space inside the run rules out an underline, so only the thematic
+        // break is left: three or more of `-`, `*` or `_` (`- - -`). `= = =` is
+        // neither, so it stays plain text.
+        matches!(first, '-' | '*' | '_') && count >= 3
+    } else {
+        // A solid run: `=` and `-` are a setext underline even at one mark,
+        // while `*` and `_` are block syntax only from three on.
+        matches!(first, '-' | '=') || count >= 3
+    }
+}
+
+/// True when the line is a table delimiter row (GFM): cells of one or more
+/// `-` with an optional leading and trailing `:`, separated by `|`. A leading
+/// or trailing `|` contributes an empty edge cell; an empty middle cell means
+/// the row is not a delimiter row.
+fn is_table_delimiter(line: &str) -> bool {
+    if !line.contains('|') {
+        return false;
+    }
+    let cells: Vec<&str> = line.split('|').collect();
+    for (i, raw) in cells.iter().enumerate() {
+        let cell = raw.trim();
+        if cell.is_empty() {
+            if i == 0 || i + 1 == cells.len() {
+                continue;
+            }
+            return false;
+        }
+        let core = cell.strip_prefix(':').unwrap_or(cell);
+        let core = core.strip_suffix(':').unwrap_or(core);
+        if core.is_empty() || !core.bytes().all(|b| b == b'-') {
+            return false;
+        }
+    }
+    true
 }
 
 impl std::fmt::Display for EditError {
@@ -105,6 +248,27 @@ impl std::fmt::Display for EditError {
                 "bare name {name} matches {} files: rename it or move it into a folder",
                 matches.len()
             ),
+            EditError::NotAPermutation { given, blocks } => write!(
+                f,
+                "the order {given:?} is not a permutation of the {blocks} member blocks"
+            ),
+            EditError::NoSuchBlock { block, blocks } => {
+                write!(f, "block {block} does not exist ({blocks} member blocks)")
+            }
+            EditError::MemberLineNotCaption { block } => write!(
+                f,
+                "line 0 of block {block} is the member line: use --remove to delete it"
+            ),
+            EditError::NoSuchLine { block, line } => {
+                write!(f, "block {block} has no caption line {line}")
+            }
+            EditError::NotCaptionText { text } => write!(
+                f,
+                "a caption must be plain text, not a heading, thematic break, setext underline, list, quote, table row or embed: {text:?}"
+            ),
+            EditError::NothingToDelete { block, line } => {
+                write!(f, "block {block} has no caption line {line} to delete")
+            }
         }
     }
 }
@@ -878,4 +1042,297 @@ fn folder_spellings(files: &[FileEntry]) -> std::collections::HashMap<String, St
         }
     }
     map
+}
+
+// ---------------------------------------------------------------------------
+// Member blocks: reorder and caption editing (ADR-017 §9)
+// ---------------------------------------------------------------------------
+
+/// One member block: a member line and the caption lines that directly follow
+/// it (ADR-017 §9).
+///
+/// A *member line* is a line whose only content is one strong-image link that
+/// resolves to an image outside code ([`member_blocks`] and ADR-017 §5). A
+/// *caption line* is a pure-text line right after it — a heading, list item,
+/// blockquote, table row, code fence or embed ends the block, and so does a
+/// blank line. Blocks are addressed by ordinal in document order, because the
+/// same image may appear twice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberBlock {
+    /// 0-based block ordinal, in document order.
+    pub ordinal: usize,
+    /// 0-based line index of the member line within the note.
+    pub member_line: usize,
+    /// The image the member line resolves to, as a library-relative path.
+    pub image: String,
+    /// Byte range of the whole block, member line through last caption line,
+    /// terminators included.
+    pub range: Range<usize>,
+    /// The byte range of each line of the block, member line first, then the
+    /// caption lines. `line_ranges[0]` is the member line, so line offsets into
+    /// a caption are 1-based.
+    pub line_ranges: Vec<Range<usize>>,
+}
+
+/// Every member block of a collection note, in document order (ADR-017 §9).
+///
+/// Equality and membership are resolved through the [`Resolver`], never
+/// compared as text: aliases, headings, block references, Markdown images,
+/// percent-encoding and `<>`-wrapped targets all count, and links inside
+/// fenced code or inline code never do.
+pub fn member_blocks(
+    body: &[u8],
+    note: usize,
+    ctx: &BodyCtx<'_>,
+) -> Result<Vec<MemberBlock>, EditError> {
+    let (text, lines) = parsed(body, note, ctx)?;
+    let entry = ctx.files.get(note).ok_or(EditError::NotInLibrary)?;
+    let spans = extract_link_spans(text, &entry.rel, 1);
+
+    // The member line of each strong-image link: a line holding exactly one
+    // strong-image link that is all of the line and resolves to an image.
+    let mut strong_per_line: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    for span in &spans {
+        if !span.syntax.is_strong_image() || span.range.end > text.len() {
+            continue;
+        }
+        if let Some(line) = line_of(&lines, span.range.start) {
+            *strong_per_line.entry(line).or_insert(0) += 1;
+        }
+    }
+    let mut member_of: Vec<Option<usize>> = vec![None; lines.len()];
+    for span in &spans {
+        if !span.syntax.is_strong_image() || span.range.end > text.len() {
+            continue;
+        }
+        let Some(line) = line_of(&lines, span.range.start) else {
+            continue;
+        };
+        if strong_per_line.get(&line).copied() != Some(1) {
+            continue;
+        }
+        if !link_is_all_of(text, &lines[line], &span.range) {
+            continue;
+        }
+        if let Outcome::Resolved(idx) = ctx.resolver.resolve(&span.target, entry, span.syntax) {
+            if ctx
+                .files
+                .get(idx)
+                .is_some_and(|hit| hit.class == FileClass::Image)
+            {
+                member_of[line] = Some(idx);
+            }
+        }
+    }
+    // A line that carries any strong-image link is never pure text, however the
+    // link resolves: it has an embed on it (ADR-017 §9).
+    let embed_lines: std::collections::HashSet<usize> = strong_per_line.keys().copied().collect();
+
+    let mut blocks = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(image) = member_of[i] else {
+            i += 1;
+            continue;
+        };
+        let mut last = i;
+        let mut j = i + 1;
+        while j < lines.len()
+            && !embed_lines.contains(&j)
+            && is_caption_text(&text[lines[j].start..lines[j].content_end])
+        {
+            last = j;
+            j += 1;
+        }
+        let range = lines[i].start..lines[last].end;
+        let line_ranges: Vec<Range<usize>> =
+            (i..=last).map(|k| lines[k].start..lines[k].end).collect();
+        blocks.push(MemberBlock {
+            ordinal: blocks.len(),
+            member_line: i,
+            image: ctx.files[image].rel.clone(),
+            range,
+            line_ranges,
+        });
+        i = last + 1;
+    }
+    Ok(blocks)
+}
+
+/// The length of the line terminator closing a byte range, 0 when it has none.
+/// Only the note's final line can lack one, so this is how a range's shape is
+/// read: `\n`, `\r\n` or nothing.
+fn terminator_of(range: &[u8]) -> usize {
+    let n = range.len();
+    if n == 0 || range[n - 1] != b'\n' {
+        return 0;
+    }
+    if n >= 2 && range[n - 2] == b'\r' {
+        2
+    } else {
+        1
+    }
+}
+
+/// Permute the member blocks within the byte ranges they already occupy
+/// (ADR-017 §9).
+///
+/// `order` is a permutation: `order[slot]` is the block ordinal that lands in
+/// the `slot`-th block range. Every byte outside the blocks — blank lines,
+/// headings, prose, diagnostics — is reproduced unchanged and in order; only
+/// the block contents change places. Anything that is not a permutation of the
+/// blocks is refused whole.
+///
+/// A range's terminator stays with the range rather than travelling with its
+/// block: only the note's last line may lack one, so an unterminated block
+/// moved into the middle would otherwise glue its last line onto the text that
+/// follows — a caption swallowing the next embed and the two blocks becoming
+/// one. Each slot is emitted with its own terminator, which keeps every line
+/// boundary and the note's trailing-newline shape as they were.
+pub fn reorder_members(
+    body: &[u8],
+    note: usize,
+    ctx: &BodyCtx<'_>,
+    order: &[usize],
+) -> Result<Vec<u8>, EditError> {
+    let blocks = member_blocks(body, note, ctx)?;
+    let n = blocks.len();
+    let mut seen = vec![false; n];
+    let valid = order.len() == n
+        && order.iter().all(|&slot| {
+            if slot >= n || seen[slot] {
+                return false;
+            }
+            seen[slot] = true;
+            true
+        });
+    if !valid {
+        return Err(EditError::NotAPermutation {
+            given: order.to_vec(),
+            blocks: n,
+        });
+    }
+    let mut out = Vec::with_capacity(body.len());
+    let mut cursor = 0;
+    for (slot, block) in blocks.iter().enumerate() {
+        out.extend_from_slice(&body[cursor..block.range.start]);
+        let source = blocks[order[slot]].range.clone();
+        let content_end = source.end - terminator_of(&body[source.clone()]);
+        out.extend_from_slice(&body[source.start..content_end]);
+        let slot_range = &body[block.range.clone()];
+        let terminator = terminator_of(slot_range);
+        if terminator > 0 {
+            out.extend_from_slice(&slot_range[slot_range.len() - terminator..]);
+        }
+        cursor = block.range.end;
+    }
+    out.extend_from_slice(&body[cursor..]);
+    Ok(out)
+}
+
+/// What a caption edit did, so the caller can report it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptionChange {
+    /// An existing caption line's text was replaced.
+    Edited,
+    /// A new caption line was appended to the block.
+    Added,
+    /// An existing caption line was deleted.
+    Deleted,
+}
+
+/// Add, edit or delete one caption line of a member block (ADR-017 §9).
+///
+/// `block` is the block ordinal and `line_offset` is 1-based within the block
+/// (`0` is the member line, whose deletion is what `--remove` does, so it is
+/// refused). `text` is the new caption; `None` deletes the line at that offset.
+/// `line_offset == block line count` appends a new caption after the last line.
+/// A caption that is not pure text — a heading, thematic break, setext
+/// underline, list item, blockquote, table row (or delimiter row) or embed —
+/// is refused, as is an out-of-range offset.
+pub fn edit_caption(
+    body: &[u8],
+    note: usize,
+    ctx: &BodyCtx<'_>,
+    block: usize,
+    line_offset: usize,
+    text: Option<&str>,
+) -> Result<(Vec<u8>, CaptionChange), EditError> {
+    let (src, lines) = parsed(body, note, ctx)?;
+    let blocks = member_blocks(body, note, ctx)?;
+    let target = blocks.get(block).ok_or(EditError::NoSuchBlock {
+        block,
+        blocks: blocks.len(),
+    })?;
+    if line_offset == 0 {
+        return Err(EditError::MemberLineNotCaption { block });
+    }
+    let caption_count = target.line_ranges.len() - 1;
+    if line_offset > caption_count + 1 {
+        return Err(EditError::NoSuchLine {
+            block,
+            line: line_offset,
+        });
+    }
+
+    let newline = newline_style(src);
+    let member_line = target.member_line;
+    let last_line = member_line + caption_count;
+    let mut out = Vec::with_capacity(body.len() + 64);
+    out.extend_from_slice(&body[..lines[member_line].start]);
+    // The member line, terminator included.
+    out.extend_from_slice(&body[lines[member_line].start..lines[member_line].end]);
+
+    let mut change = CaptionChange::Added;
+    for offset in 1..=caption_count {
+        let line = &lines[member_line + offset];
+        if offset == line_offset {
+            match text {
+                Some(value) => {
+                    if !is_caption_text(value) {
+                        return Err(EditError::NotCaptionText {
+                            text: value.to_string(),
+                        });
+                    }
+                    change = CaptionChange::Edited;
+                    out.extend_from_slice(value.as_bytes());
+                    out.extend_from_slice(&body[line.content_end..line.end]);
+                }
+                None => {
+                    change = CaptionChange::Deleted;
+                }
+            }
+            continue;
+        }
+        out.extend_from_slice(&body[line.start..line.end]);
+    }
+
+    if line_offset == caption_count + 1 {
+        let value = match text {
+            Some(value) => value,
+            None => {
+                return Err(EditError::NothingToDelete {
+                    block,
+                    line: line_offset,
+                })
+            }
+        };
+        if !is_caption_text(value) {
+            return Err(EditError::NotCaptionText {
+                text: value.to_string(),
+            });
+        }
+        // A block whose last line has no terminator (the note's final line)
+        // needs one before a caption can follow it.
+        if !out.is_empty() && !out.ends_with(b"\n") {
+            out.extend_from_slice(newline.as_bytes());
+        }
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(newline.as_bytes());
+        change = CaptionChange::Added;
+    }
+
+    out.extend_from_slice(&body[lines[last_line].end..]);
+    Ok((out, change))
 }

@@ -1722,3 +1722,116 @@ fn test_apply_intent_retry_exhaustion_returns_conflict() {
         other => panic!("expected Conflict after exhausted retries, got {other:?}"),
     }
 }
+
+/// A whole-replace operation carries the hash of the note as the caller read
+/// it (ADR-016 §3). A mismatch must refuse the whole operation with a typed
+/// `Conflict` before any file moves, and a match must land the edit.
+#[test]
+fn execute_op_guarded_refuses_a_stale_precondition_and_writes_nothing() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    let note = RelPath::parse("note.md").unwrap();
+    writer.create_exclusive(&note, b"one\n").unwrap();
+    let (_, stale) = writer.read(&note).unwrap();
+
+    // The note changes out from under the caller before the guarded op runs.
+    fs::write(dir.path().join("note.md"), b"two\n").unwrap();
+
+    let modify = |after: &[u8]| StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: "note.md".to_string(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(after.to_vec()),
+    };
+
+    match writer.execute_op_guarded(
+        "op-stale",
+        "test",
+        None,
+        serde_json::json!({}),
+        vec![modify(b"three\n")],
+        (&note, &stale),
+    ) {
+        Err(Error::Conflict(conflict)) => {
+            assert_eq!(conflict.current_bytes, b"two\n");
+            assert_eq!(conflict.expected.hex(), stale.hex());
+        }
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    // Nothing was written and no journal was left behind.
+    assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"two\n");
+    assert!(!dir.path().join(".dimagine/journal/op-stale").exists());
+
+    // With the fingerprint the caller just read, the same edit lands.
+    let (_, fresh) = writer.read(&note).unwrap();
+    writer
+        .execute_op_guarded(
+            "op-fresh",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![modify(b"three\n")],
+            (&note, &fresh),
+        )
+        .unwrap();
+    assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"three\n");
+}
+
+/// A web client holds only the note's sha256, not its identity fields. The
+/// precondition is on the digest (ADR-016 §3), so a `Fingerprint::from_hex`
+/// expectation must accept the matching bytes and refuse any other.
+#[test]
+fn execute_op_guarded_accepts_a_digest_only_precondition() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+
+    let note = RelPath::parse("note.md").unwrap();
+    writer.create_exclusive(&note, b"alpha\n").unwrap();
+    let digest = Fingerprint::of_bytes(b"alpha\n").hex();
+    let expect = Fingerprint::from_hex(&digest).unwrap();
+    assert_eq!(expect.hex(), digest);
+    assert!(Fingerprint::from_hex("not-hex").is_none());
+    assert!(Fingerprint::from_hex(&"0".repeat(63)).is_none());
+
+    let modify = |after: &[u8]| StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: "note.md".to_string(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(after.to_vec()),
+    };
+
+    writer
+        .execute_op_guarded(
+            "op-digest-ok",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![modify(b"beta\n")],
+            (&note, &expect),
+        )
+        .unwrap();
+    assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"beta\n");
+
+    // The old digest no longer describes the file: a 409, nothing written.
+    match writer.execute_op_guarded(
+        "op-digest-stale",
+        "test",
+        None,
+        serde_json::json!({}),
+        vec![modify(b"gamma\n")],
+        (&note, &expect),
+    ) {
+        Err(Error::Conflict(conflict)) => assert_eq!(conflict.current_bytes, b"beta\n"),
+        other => panic!("expected Conflict, got {other:?}"),
+    }
+    assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"beta\n");
+}

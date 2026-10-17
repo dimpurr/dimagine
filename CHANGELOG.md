@@ -58,6 +58,20 @@ All notable changes to this project are documented here. The format follows
   back; the write core carries a modify step's before-state when the operation
   itself is what moves the file into place, and undo's all-or-none check reads
   each file's final state, not one journal line at a time.
+- `dimagine collect --reorder <note> <ordinals…>` and `collect --caption <note>
+  <block> <line> <text|->` (Phase 3b): the collection writes FORMAT §5.2
+  promises. A member block is a member line plus the plain-text caption lines
+  that directly follow it; reordering permutes only the blocks among the byte
+  ranges they already occupy and leaves every other byte — blank lines,
+  headings, prose, front matter — exactly where it was, refusing anything that
+  is not a permutation of the blocks whole. A caption edit replaces, deletes
+  (`-`) or appends one plain-text line and never touches the member line
+  (removing a member is `--remove`). Both are whole-replace operations that
+  carry the note's hash as the caller read it: a note changed since is a
+  conflict, never an overwrite, and both are reversible with `undo`. `POST
+  /api/write/collections/reorder` and `/caption` expose the same two behind the
+  write API's gates, answering a stale precondition with a `409` and the note's
+  current ETag.
 - `dimagine check` gained `dangling_link`: image links that resolve to no file,
   reported once per note with each link's line and body byte span — the exact
   damage a hand move in another tool leaves behind. The per-link `missing_link`
@@ -422,6 +436,22 @@ All notable changes to this project are documented here. The format follows
   and parses every note any more.
 
 ### Fixed
+- A move whose destination is a symlink to the source — or any fold-equal
+  alias sitting beside it — is refused whole instead of being torn apart
+  (RW65c R1). The planner's same-file test now reads the destination entry's
+  own identity (device + inode, without following the final symlink), not the
+  path a symlink resolves to, so an alias is its own entry and the group move
+  stops before it renames anything.
+- Reordering a collection whose last line has no final newline no longer glues
+  that line onto the next one: a block's content moves, but the terminator that
+  closes a byte range stays with the range, so every line boundary and the
+  note's trailing-newline shape survive the permutation. Before this, moving the
+  unterminated block into the middle could swallow the following embed into a
+  caption and merge two member blocks into one.
+- A collection edit that would change nothing still answers a stale open hash
+  with a conflict instead of a silent `changed: false`: the precondition is
+  judged before the no-op shortcut, so a caller whose version is no longer the
+  note's learns that rather than believing its edit is in place.
 - Viewer: a busy server no longer breaks random thumbnails for good (W70). A
   grid page asks for dozens of thumbnails at once, and every one of them —
   revalidated on every reload, since rendition URLs cannot cache immutably —

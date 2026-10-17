@@ -264,6 +264,34 @@ fn a_fold_equal_destination_held_by_something_else_refuses_whole() {
     assert!(root.join("a/x.jpg.md").exists());
 }
 
+/// The probe reads entry identity, never a resolved path (RW65c R1): a
+/// symlink at the destination is its own entry, not the file it points at.
+/// Following links would read `a/alias.jpg -> x.jpg` as `a/x.jpg`, letting a
+/// fold-equal alias pass the planner, which the writer's no-replace rename
+/// then refuses, tearing the group. The disk cannot hold a fold-equal alias
+/// beside its target, so the probe's answers are stated directly, as above.
+#[cfg(unix)]
+#[test]
+fn a_symlink_alias_is_not_the_file_it_points_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a/x.jpg", b"img");
+    std::os::unix::fs::symlink("x.jpg", root.join("a/alias.jpg")).unwrap();
+    let probe = move_plan::same_file_probe(root.to_path_buf());
+    assert!(
+        probe("a/x.jpg", "a/x.jpg"),
+        "a path is the same entry as itself"
+    );
+    assert!(
+        !probe("a/x.jpg", "a/alias.jpg"),
+        "a symlink is its own entry, not the file it points at (RW65c R1)"
+    );
+    assert!(
+        !probe("a/alias.jpg", "a/x.jpg"),
+        "the order of the two paths does not matter"
+    );
+}
+
 #[test]
 fn the_note_and_sidecars_rename_with_the_image() {
     let dir = tempfile::tempdir().unwrap();

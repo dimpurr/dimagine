@@ -84,7 +84,7 @@ pub fn commands() -> Vec<Command> {
                     .help("One or more KEY=VALUE pairs (scalars only); KEY= with no value clears the key."),
             ),
         Command::new("collect")
-            .about("Create a collection note, or add/remove images in one.")
+            .about("Create a collection note, add/remove images, reorder its members, or edit a caption.")
             .arg(
                 Arg::new("new")
                     .long("new")
@@ -104,11 +104,36 @@ pub fn commands() -> Vec<Command> {
                     .help("The existing collection note to remove images from."),
             )
             .arg(
+                Arg::new("reorder")
+                    .long("reorder")
+                    .value_name("COLLECTION")
+                    .help(
+                        "Reorder the member blocks of an existing collection. Give the new \
+                         order as 1-based block ordinals, e.g. 3,1,2: the third block moves \
+                         to the first slot, and so on. Every block must appear exactly once.",
+                    ),
+            )
+            .arg(
+                Arg::new("caption")
+                    .long("caption")
+                    .value_name("COLLECTION")
+                    .help(
+                        "Edit a caption line of a member block. Give <BLOCK> <LINE> <TEXT> as \
+                         operands: BLOCK is a 1-based block ordinal, LINE is 0 for the member \
+                         line itself (refused here — use --remove) or the 1-based caption line \
+                         number, and TEXT is the new caption or `-` to delete the line. One past \
+                         the last caption line appends a new one.",
+                    ),
+            )
+            .arg(
                 Arg::new("images")
-                    .value_name("IMG")
-                    .num_args(1..)
-                    .required(true)
-                    .help("Images, by library-relative path or bare name."),
+                    .value_name("OPERAND")
+                    .num_args(0..)
+                    .help(
+                        "With --new/--add/--remove: images, by library-relative path or bare \
+                         name. With --reorder: the new 1-based block order. With --caption: \
+                         <BLOCK> <LINE> <TEXT>.",
+                    ),
             ),
         Command::new("mv")
             .about("Move or rename an image and its group, repairing the links that point at it.")
@@ -640,6 +665,16 @@ fn run_collect(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     };
     let resolver = Resolver::new(&library.files);
     let ctx = BodyCtx::new(&library.files, &resolver);
+
+    // Reorder and caption address blocks and lines, not images, so they take
+    // the operands raw and never go through image resolution.
+    if let Some(collection) = sub.get_one::<String>("reorder") {
+        return collect_reorder(json, &writer, collection, &images, &ctx);
+    }
+    if let Some(collection) = sub.get_one::<String>("caption") {
+        return collect_caption(json, &writer, collection, &images, &ctx);
+    }
+
     let targets = match resolve_all(&library.files, &resolver, &images, json) {
         Ok(targets) => targets,
         Err(code) => return code,
@@ -654,7 +689,10 @@ fn run_collect(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     if let Some(collection) = sub.get_one::<String>("remove") {
         return collect_edit(json, &writer, collection, &targets, &ctx, true);
     }
-    fail(json, "give one of --new, --add or --remove")
+    fail(
+        json,
+        "give one of --new, --add, --remove, --reorder or --caption",
+    )
 }
 
 fn collect_new(
@@ -822,6 +860,206 @@ fn collect_unchanged(json: bool, collection: &str) -> ExitCode {
         println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
     } else {
         println!("{collection}: nothing to change");
+    }
+    ExitCode::from(0)
+}
+
+/// Resolve an existing collection note and read its body and fingerprint. The
+/// block and caption editors carry the open-hash precondition into the write
+/// (ADR-016 §3), so they need the fingerprint the read produced.
+fn read_collection(
+    json: bool,
+    writer: &Writer,
+    collection: &str,
+    ctx: &BodyCtx,
+) -> Result<(RelPath, usize, Vec<u8>, Fingerprint), ExitCode> {
+    let note_rel = match RelPath::parse(collection.trim_start_matches("./")) {
+        Ok(rel) => rel,
+        Err(error) => return Err(fail(json, &error_message(&error))),
+    };
+    let note_index = match ctx.index_of(&note_rel.text()) {
+        Some(index) => index,
+        None => return Err(fail(json, &format!("no note at {collection}"))),
+    };
+    if !matches!(
+        ctx.files[note_index].class,
+        FileClass::Note | FileClass::ImageNote
+    ) {
+        return Err(fail(json, &format!("{collection} is not a note")));
+    }
+    let (body, fp) = match writer.read(&note_rel) {
+        Ok(got) => got,
+        Err(error) => return Err(fail(json, &error_message(&error))),
+    };
+    Ok((note_rel, note_index, body, fp))
+}
+
+/// A 1-based block ordinal as a 0-based block index.
+fn parse_ordinal(part: &str) -> Result<usize, String> {
+    match part.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n - 1),
+        Ok(_) => Err(format!("block ordinal {part} is not 1 or more")),
+        Err(_) => Err(format!("block ordinal {part:?} is not a whole number")),
+    }
+}
+
+/// Parse the `--reorder` operands into a 0-based order. Ordinals are 1-based
+/// and may be comma-joined in one operand (`3,1,2`) or spread across operands.
+fn parse_order(operands: &[String]) -> Result<Vec<usize>, String> {
+    let mut order = Vec::new();
+    for operand in operands {
+        for part in operand.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            order.push(parse_ordinal(part)?);
+        }
+    }
+    Ok(order)
+}
+
+/// `collect --reorder COLLECTION ORDER…`: permute the member blocks, leaving
+/// every other byte of the note where it is (ADR-017 §9).
+fn collect_reorder(
+    json: bool,
+    writer: &Writer,
+    collection: &str,
+    operands: &[String],
+    ctx: &BodyCtx,
+) -> ExitCode {
+    let (note_rel, note_index, body, fp) = match read_collection(json, writer, collection, ctx) {
+        Ok(got) => got,
+        Err(code) => return code,
+    };
+    let blocks = match body_edit::member_blocks(&body, note_index, ctx) {
+        Ok(blocks) => blocks,
+        Err(error) => return fail(json, &error.to_string()),
+    };
+    let order = match parse_order(operands) {
+        Ok(order) => order,
+        Err(message) => return fail(json, &message),
+    };
+    let new_body = match body_edit::reorder_members(&body, note_index, ctx, &order) {
+        Ok(bytes) => bytes,
+        Err(error) => return fail(json, &error.to_string()),
+    };
+    if new_body == body {
+        return collect_unchanged(json, &note_rel.text());
+    }
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(new_body),
+    };
+    let op_id = new_op_id();
+    let intent = serde_json::json!({"action": "collect_reorder", "collection": note_rel.text()});
+    if let Err(error) =
+        writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], (&note_rel, &fp))
+    {
+        return fail(json, &error_message(&error));
+    }
+    // `order` is a validated permutation by now, so every slot is in range.
+    let order_images: Vec<&str> = order
+        .iter()
+        .map(|&slot| blocks[slot].image.as_str())
+        .collect();
+    if json {
+        let doc = serde_json::json!({
+            "schema": "dimagine.collect/0.1",
+            "collection": note_rel.text(),
+            "changed": true,
+            "op": op_id,
+            "order": order_images,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("reordered {}: {}", note_rel.text(), order_images.join(", "));
+    }
+    ExitCode::from(0)
+}
+
+/// `collect --caption COLLECTION BLOCK LINE TEXT`: add, edit or delete one
+/// caption line of a member block (ADR-017 §9), as one whole-replace step
+/// guarded by the note's open hash.
+fn collect_caption(
+    json: bool,
+    writer: &Writer,
+    collection: &str,
+    operands: &[String],
+    ctx: &BodyCtx,
+) -> ExitCode {
+    let (note_rel, note_index, body, fp) = match read_collection(json, writer, collection, ctx) {
+        Ok(got) => got,
+        Err(code) => return code,
+    };
+    if operands.len() != 3 {
+        return fail(json, "give <BLOCK> <LINE> <TEXT> after --caption");
+    }
+    let block = match parse_ordinal(&operands[0]) {
+        Ok(block) => block,
+        Err(message) => return fail(json, &message),
+    };
+    let line = match operands[1].parse::<usize>() {
+        Ok(line) => line,
+        Err(_) => {
+            return fail(
+                json,
+                &format!("line offset {:?} is not a whole number", operands[1]),
+            )
+        }
+    };
+    let text = if operands[2] == "-" {
+        None
+    } else {
+        Some(operands[2].as_str())
+    };
+    let (new_body, change) =
+        match body_edit::edit_caption(&body, note_index, ctx, block, line, text) {
+            Ok(result) => result,
+            Err(error) => return fail(json, &error.to_string()),
+        };
+    if new_body == body {
+        return collect_unchanged(json, &note_rel.text());
+    }
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(new_body),
+    };
+    let op_id = new_op_id();
+    let intent = serde_json::json!({"action": "collect_caption", "collection": note_rel.text()});
+    if let Err(error) =
+        writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], (&note_rel, &fp))
+    {
+        return fail(json, &error_message(&error));
+    }
+    let verb = match change {
+        body_edit::CaptionChange::Edited => "edited",
+        body_edit::CaptionChange::Added => "added",
+        body_edit::CaptionChange::Deleted => "deleted",
+    };
+    if json {
+        let doc = serde_json::json!({
+            "schema": "dimagine.collect/0.1",
+            "collection": note_rel.text(),
+            "changed": true,
+            "op": op_id,
+            "caption": verb,
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        println!("{verb} caption in {}", note_rel.text());
     }
     ExitCode::from(0)
 }

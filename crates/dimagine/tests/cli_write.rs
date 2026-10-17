@@ -394,6 +394,149 @@ fn collect_add_and_remove_edit_one_note() {
 }
 
 #[test]
+fn collect_reorder_permutes_the_member_blocks_and_nothing_else() {
+    let dir = tmp("collect-reorder");
+    for name in ["one.png", "two.png", "three.png"] {
+        write(&dir.0, name, PNG);
+    }
+    write(
+        &dir.0,
+        "Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n\
+         ![[one.png]]\nfirst caption\n\n\
+         ![[two.png]]\nsecond caption\n\n\
+         ![[three.png]]\nthird caption\n",
+    );
+    let stdout = ok(
+        &dir.0,
+        &["collect", "--reorder", "Picks.md", "3,1,2", "--json"],
+    );
+    let doc = json_in(&stdout);
+    assert_eq!(doc["schema"], "dimagine.collect/0.1");
+    assert_eq!(doc["changed"], true);
+    assert_eq!(
+        doc["order"],
+        serde_json::json!(["three.png", "one.png", "two.png"])
+    );
+    // Byte-exact: only the blocks swap places; the blank lines, front matter
+    // and every non-block byte stay where they were (ADR-017 §9).
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n\
+         ![[three.png]]\nthird caption\n\n\
+         ![[one.png]]\nfirst caption\n\n\
+         ![[two.png]]\nsecond caption\n"
+    );
+    // The identity order changes nothing.
+    let (code, stdout, _) = dimagine(&dir.0, &["collect", "--reorder", "Picks.md", "1,2,3"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("nothing to change"), "{stdout:?}");
+}
+
+#[test]
+fn collect_reorder_refuses_a_non_permutation_and_touches_nothing() {
+    let dir = tmp("collect-reorder-bad");
+    write(&dir.0, "one.png", PNG);
+    write(&dir.0, "two.png", PNG);
+    write(
+        &dir.0,
+        "Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\n\n![[two.png]]\n",
+    );
+    let before = read(&dir.0, "Picks.md");
+    let (code, _, stderr) = dimagine(&dir.0, &["collect", "--reorder", "Picks.md", "1,1"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("not a permutation"), "{stderr:?}");
+    assert_eq!(read(&dir.0, "Picks.md"), before, "nothing changed");
+    let (code, _, stderr) = dimagine(&dir.0, &["collect", "--reorder", "Picks.md", "0,2"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("not 1 or more"), "{stderr:?}");
+    assert_eq!(read(&dir.0, "Picks.md"), before, "nothing changed");
+}
+
+#[test]
+fn collect_caption_adds_edits_and_deletes() {
+    let dir = tmp("collect-caption");
+    write(&dir.0, "one.png", PNG);
+    write(
+        &dir.0,
+        "Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nold caption\n",
+    );
+    // Offset one past the last caption appends a new line.
+    let stdout = ok(
+        &dir.0,
+        &[
+            "collect",
+            "--caption",
+            "Picks.md",
+            "1",
+            "2",
+            "new caption",
+            "--json",
+        ],
+    );
+    assert_eq!(json_in(&stdout)["caption"], "added");
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nold caption\nnew caption\n"
+    );
+    // Editing the first caption replaces just that line.
+    let stdout = ok(
+        &dir.0,
+        &[
+            "collect",
+            "--caption",
+            "Picks.md",
+            "1",
+            "1",
+            "edited",
+            "--json",
+        ],
+    );
+    assert_eq!(json_in(&stdout)["caption"], "edited");
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nedited\nnew caption\n"
+    );
+    // `-` deletes the line at that offset.
+    let stdout = ok(
+        &dir.0,
+        &["collect", "--caption", "Picks.md", "1", "1", "-", "--json"],
+    );
+    assert_eq!(json_in(&stdout)["caption"], "deleted");
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nnew caption\n"
+    );
+}
+
+#[test]
+fn collect_caption_refuses_the_member_line_and_non_text() {
+    let dir = tmp("collect-caption-refuse");
+    write(&dir.0, "one.png", PNG);
+    write(
+        &dir.0,
+        "Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\ncaption\n",
+    );
+    let before = read(&dir.0, "Picks.md");
+    let (code, _, stderr) = dimagine(&dir.0, &["collect", "--caption", "Picks.md", "1", "0", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("member line"), "{stderr:?}");
+    let (code, _, stderr) = dimagine(
+        &dir.0,
+        &["collect", "--caption", "Picks.md", "1", "2", "# heading"],
+    );
+    assert_eq!(code, 1);
+    assert!(stderr.contains("plain text"), "{stderr:?}");
+    let (code, _, stderr) = dimagine(&dir.0, &["collect", "--caption", "Picks.md", "9", "1", "x"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("does not exist"), "{stderr:?}");
+    assert_eq!(read(&dir.0, "Picks.md"), before, "nothing changed");
+}
+
+#[test]
 fn collect_names_what_it_cannot_find() {
     let dir = one_image("collect-missing");
     let (code, _, stderr) = dimagine(&dir.0, &["collect", "--add", "Nope.md", "one.png"]);
@@ -662,6 +805,88 @@ fn undo_of_a_collection_hands_every_created_file_back() {
             "{rel} has a record of its own"
         );
     }
+}
+
+#[test]
+fn undo_of_a_reorder_restores_the_original_order() {
+    let dir = tmp("undo-reorder");
+    write(&dir.0, "one.png", PNG);
+    write(&dir.0, "two.png", PNG);
+    let original = "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\n\n![[two.png]]\n";
+    write(&dir.0, "Picks.md", original);
+    let stdout = ok(
+        &dir.0,
+        &["collect", "--reorder", "Picks.md", "2,1", "--json"],
+    );
+    let op = json_in(&stdout)["op"].as_str().unwrap().to_string();
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[two.png]]\n\n![[one.png]]\n"
+    );
+    ok(&dir.0, &["undo", &op]);
+    assert_eq!(read(&dir.0, "Picks.md"), original, "the order is back");
+}
+
+#[test]
+fn undo_of_a_caption_edit_restores_the_captions() {
+    let dir = tmp("undo-caption");
+    write(&dir.0, "one.png", PNG);
+    let original = "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nCap A\nCap B\n";
+    write(&dir.0, "Picks.md", original);
+    // Add a third caption, edit the first, then delete the middle one: each is
+    // its own operation and each is undone.
+    let stdout = ok(
+        &dir.0,
+        &[
+            "collect",
+            "--caption",
+            "Picks.md",
+            "1",
+            "3",
+            "Cap C",
+            "--json",
+        ],
+    );
+    let add = json_in(&stdout)["op"].as_str().unwrap().to_string();
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nCap A\nCap B\nCap C\n"
+    );
+    let stdout = ok(
+        &dir.0,
+        &[
+            "collect",
+            "--caption",
+            "Picks.md",
+            "1",
+            "1",
+            "Cap A2",
+            "--json",
+        ],
+    );
+    let edit = json_in(&stdout)["op"].as_str().unwrap().to_string();
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nCap A2\nCap B\nCap C\n"
+    );
+    let stdout = ok(
+        &dir.0,
+        &["collect", "--caption", "Picks.md", "1", "2", "-", "--json"],
+    );
+    let delete = json_in(&stdout)["op"].as_str().unwrap().to_string();
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nCap A2\nCap C\n"
+    );
+    ok(&dir.0, &["undo", &delete]);
+    assert_eq!(
+        read(&dir.0, "Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\nCap A2\nCap B\nCap C\n",
+        "the deleted caption is back"
+    );
+    ok(&dir.0, &["undo", &edit]);
+    ok(&dir.0, &["undo", &add]);
+    assert_eq!(read(&dir.0, "Picks.md"), original, "the captions are back");
 }
 
 #[test]
@@ -953,9 +1178,17 @@ fn check_reports_two_records_claiming_one_trash_file() {
 #[test]
 fn a_healthy_written_library_checks_clean() {
     let dir = one_image("check-clean");
+    write(&dir.0, "two.png", PNG);
     ok(&dir.0, &["tag", "one.png", "--add", "x"]);
     ok(&dir.0, &["rate", "one.png", "5"]);
-    ok(&dir.0, &["collect", "--new", "Picks", "one.png"]);
+    ok(&dir.0, &["collect", "--new", "Picks", "one.png", "two.png"]);
+    // A reorder and a caption edit are writes too: they must leave a library
+    // that still checks clean (no stranded journal, no new finding).
+    ok(&dir.0, &["collect", "--reorder", "Picks.md", "2,1"]);
+    ok(
+        &dir.0,
+        &["collect", "--caption", "Picks.md", "1", "1", "a caption"],
+    );
     let (code, stdout, stderr) = dimagine(&dir.0, &["check"]);
     assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("no problems found"), "{stdout:?}");

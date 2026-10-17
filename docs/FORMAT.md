@@ -231,6 +231,29 @@ Links resolve like Obsidian wikilinks:
 
 A link that resolves to nothing is reported as missing; the line is kept.
 
+### 5.2 Member blocks, captions and reordering
+
+A **member block** is a member line — a line whose only content is one image
+embed that resolves to an image — together with the lines of plain text directly
+after it. Those following lines are the member's **caption lines**. A blank line
+ends the block, and so does any line that is not plain text: a heading, a list
+item, a blockquote, a table row, a code fence or an embed. A block's member line
+and its caption lines are addressed together, by ordinal in document order,
+because the same image may appear twice.
+
+A tool that **reorders** a collection permutes the blocks among the byte ranges
+they already occupy and changes nothing else: every byte outside the blocks —
+blank lines, headings, prose, the front matter — is reproduced unchanged and in
+order. The line terminator that closes a range belongs to the range, not to the
+block in it, so no line boundary moves and a note that does not end in a newline
+still does not after the reorder. Anything that is not a permutation of the
+blocks is refused whole. A tool that moves a member **out** of a collection
+leaves the caption text where it was, for the user to delete.
+
+A tool that edits a **caption line** replaces, appends or deletes one line of
+plain text in a block. The member line itself is not a caption: removing it is
+removing the member.
+
 ## 6. Boards
 
 A board is a [JSON Canvas](https://jsoncanvas.org/) file (`*.canvas`). Image
@@ -369,6 +392,8 @@ dimagine rate <img> <0-5|none>                # set or clear its rating
 dimagine set <img> KEY=VALUE …                # set scalar properties (KEY= clears)
 dimagine collect --new <title> <img>…         # create a collection note (§5)
 dimagine collect --add|--remove <note> <img>… # edit a collection's members
+dimagine collect --reorder <note> <ordinal>…  # permute the member blocks (§5.2)
+dimagine collect --caption <note> <block> <line> <text|->  # edit one caption line (§5.2)
 dimagine mv <img> <new-path> [--dry-run]      # move a group and repair its links (§7)
 dimagine trash <img>…                         # move groups into .trash/ (§7.1)
 dimagine restore <img>…                       # move them back
@@ -404,3 +429,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-13 | The old `.dimagine/trash/` is no longer written to but stays readable, so a library that still holds one reports its files instead of losing track of them (§7.1). A group with no record is never deleted automatically (§7.1). |
 | 0.1 | 2026-10-13 | The CLI that writes the format is listed with what each command does (§9); Versioning moves to §10. |
 | 0.1 | 2026-10-16 | The contract for an automatic move (§7): the `id` is fixed before anything moves and lands with the note's edit, the group renames together and refuses a taken destination, links are rewritten in place keeping their syntax and display parts, `.canvas` `nodes[].file` values follow, ambiguous links are reported and not touched. `dimagine mv` joins the CLI (§9). |
+| 0.1 | 2026-10-17 | Member blocks, caption lines and reordering (§5.2): a member line plus the plain-text lines that follow it; reordering permutes only the blocks and leaves every other byte, line boundary and trailing-newline shape alone; a caption edit touches one line and never the member line. `dimagine collect --reorder` and `collect --caption` join the CLI (§9). |

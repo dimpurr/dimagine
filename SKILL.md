@@ -105,7 +105,12 @@ Keep the bubbles, darker water.
 ```
 
 - Order of embeds is the order of the collection.
-- The line right after an embed is that member's note.
+- The line right after an embed is that member's note. The plain-text lines that
+  follow, up to a blank line or a heading, list, quote, table or embed, are all
+  that member's caption; anything that is not plain text ends the block.
+- To reorder, move only the embed (and its caption lines) and leave the blank
+  lines, headings and other prose where they are. Prefer
+  `dimagine collect --reorder <note> <ordinals…>`.
 - Use a bare file name only if it is unique in the library; otherwise use the
   path. Check with `find . -name 'girl.jpg' -not -path './.*'`.
 - For a project with shots, either use one note with a heading per shot, or one
@@ -195,10 +200,15 @@ record of where those files came from, so recovering them is a manual move.
 `dimagine tag`, `rate`, `set`, `collect`, `mv`, `trash`, `restore`, `undo` and
 `config` make the changes above through one journaled operation each; a command
 that changes a file prints that operation's id, and `dimagine undo <id>`
-reverses it. `dimagine trash purge` deletes the groups past the retention
-period and `dimagine trash empty` deletes every trashed group now; both need
-`--yes` and neither can be undone. Every command takes `--library <dir>` (default:
-the current folder) and `--json` for one machine-readable document. Exit codes:
+reverses it. `dimagine collect --reorder <note> <ordinals…>` permutes a
+collection's member blocks and `dimagine collect --caption <note> <block> <line>
+<text|->` edits, deletes (`-`) or appends one caption line; both carry the
+note's hash as a precondition, so a note changed since you read it is refused
+rather than overwritten. `dimagine trash purge` deletes the groups past the
+retention period and `dimagine trash empty` deletes every trashed group now;
+both need `--yes` and neither can be undone. Every command takes `--library
+<dir>` (default: the current folder) and `--json` for one machine-readable
+document. Exit codes:
 `0` done, `1` a finding or a failed operation, `2` a usage error, `3` the
 library could not be read fully, so a "not found" proves nothing. Write through
 the CLI when it is installed: it holds the library lock, checks hashes before it

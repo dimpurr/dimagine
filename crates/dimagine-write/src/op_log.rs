@@ -502,6 +502,7 @@ pub(crate) fn undo(
             serde_json::json!({ "undo_op": op_id }),
             steps,
             None,
+            None,
         )?;
     }
 

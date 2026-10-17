@@ -245,14 +245,16 @@ pub struct MovePlan {
 /// checked against it before the plan is accepted: a move whose destination
 /// is taken refuses whole, with nothing moved (ADR-017 §8).
 ///
-/// `same_file` answers whether two library-relative paths name the same file
-/// on the filesystem, and separates the one occupant a rename step may
-/// displace from a real one: a case-only self-rename (`a/x.jpg` ->
-/// `a/X.JPG`, the routine way to fix display case) resolves to the file
-/// being moved on a case-insensitive volume, while on a case-sensitive
-/// volume the same spelling can be a different file or a directory —
-/// invisible to the walk, so only the caller can tell the two apart.
-/// [`same_file_probe`] builds the probe both surfaces pass.
+/// `same_file` answers whether two library-relative paths name the same
+/// directory entry (device and inode, no final symlink followed), and
+/// separates the one occupant a rename step may displace from a real one: a
+/// case-only self-rename (`a/x.jpg` -> `a/X.JPG`, the routine way to fix
+/// display case) resolves to the entry being moved on a case-insensitive
+/// volume, while on a case-sensitive volume the same spelling can be a
+/// different file or a directory — invisible to the walk, so only the caller
+/// can tell the two apart. A symlink at the destination is always its own
+/// entry, never the file it points at. [`same_file_probe`] builds the probe
+/// both surfaces pass.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_move(
     files: &[FileEntry],
@@ -1078,7 +1080,9 @@ fn check_parents_free(dst: &str, rels: &HashSet<&str>) -> Result<(), MoveRefusal
 /// file, and moving onto it would land the group partially applied. So the
 /// walk's fold-equal branch, the caller's `occupied` and the caller's
 /// `same_file` are all required: free is "nothing there, or the very file
-/// this step moves".
+/// this step moves". `same_file` is entry identity ([`same_file_probe`]),
+/// so a symlink at the destination that points at the source is a different
+/// entry, not the file this step moves, and refuses whole (RW65c R1).
 fn destination_taken(
     dst: &str,
     src: &str,
@@ -1101,16 +1105,38 @@ fn destination_taken(
 }
 
 /// The `same_file` probe for [`plan_move`], over a library rooted at `root`:
-/// two library-relative paths name the same file when both resolve on disk
-/// to the same path. A case-only spelling resolves to the file itself on a
-/// case-insensitive volume (the routine display-case fix) and to a different
-/// path — the real occupant — anywhere else. Either path missing (or
-/// unreadable) is not the same file.
+/// two library-relative paths name the same file when they name the same
+/// directory entry — device and inode on Unix, read without following a
+/// final symlink (RW65c R1). Following links (`canonicalize`, `same_file`)
+/// reads a symlink at the destination that points at the source as the
+/// source itself, so the planner accepts a case-only self-rename it cannot
+/// land: the writer's no-replace rename refuses the existing entry and the
+/// group tears at apply time. Entry identity keeps a symlink — or any second
+/// entry — distinct from the file it names, so the whole group refuses with
+/// `TargetExists` instead. A case-only spelling of the source resolves to
+/// the source's own entry, so the routine display-case fix still answers
+/// true. Either path missing (or unreadable) is not the same file.
 pub fn same_file_probe(root: PathBuf) -> impl Fn(&str, &str) -> bool {
-    move |a: &str, b: &str| match (
-        std::fs::canonicalize(root.join(a)),
-        std::fs::canonicalize(root.join(b)),
-    ) {
+    move |a: &str, b: &str| same_entry(&root.join(a), &root.join(b))
+}
+
+/// Whether two paths name the same directory entry, without following a
+/// final symlink.
+#[cfg(unix)]
+fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+        _ => false,
+    }
+}
+
+/// Off Unix there is no portable device-and-inode: fall back to comparing
+/// resolved paths, which answers the case-only spelling correctly wherever
+/// the filesystem cannot put a fold-equal alias beside its target.
+#[cfg(not(unix))]
+fn same_entry(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => false,
     }

@@ -35,7 +35,7 @@ use dimagine_write::journal::{StepKind, StepRecord};
 use dimagine_write::op_log::OpEntry;
 use dimagine_write::paths::{RelPath, StepPath, TrashPath};
 use dimagine_write::trash::{bumped_name, TrashRecord, TrashedFile};
-use dimagine_write::{ScannedRecord, Writer};
+use dimagine_write::{Fingerprint, ScannedRecord, Writer};
 use std::net::SocketAddr;
 
 use crate::accounts::{is_weak_password, verify_password, AccountsError, WEAK_PASSWORD_LENGTH};
@@ -65,6 +65,8 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
         .route("/api/write/move", post(move_image))
         .route("/api/write/restore", post(restore_images))
         .route("/api/write/collections", post(edit_collection))
+        .route("/api/write/collections/reorder", post(reorder_collection))
+        .route("/api/write/collections/caption", post(caption_collection))
         // The mutations. No mutating handler is ever registered for GET
         // (ADR-018 §3), and there is no method-override machinery to honour,
         // so a GET to one of these paths is a 405 or the read that shares
@@ -2122,10 +2124,301 @@ fn collect_edit(
         .into_response()
 }
 
+/// `POST /api/write/collections/reorder` — permute the member blocks of a
+/// collection note (ADR-017 §9). The body is `{"collection": <path>,
+/// "hash": <the note's sha256 at open time>,
+/// "order": [1-based block ordinals]}`; every block must appear exactly once,
+/// and only the blocks move — every other byte of the note stays where it is.
+///
+/// `hash` is the open-time precondition (ADR-016 §3): a request without one is
+/// refused, never treated as an overwrite, and a note that changed since that
+/// read is a 409 carrying the note's current ETag — never a retry.
+async fn reorder_collection(
+    State(state): State<AppState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let Some(collection) = request.get("collection").and_then(|v| v.as_str()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "a \"collection\" string is required",
+        );
+    };
+    let Some(order_json) = request.get("order").and_then(|v| v.as_array()) else {
+        return json_error(StatusCode::BAD_REQUEST, "an \"order\" array is required");
+    };
+    // The note's hash at open time is the precondition (ADR-016 §3); a request
+    // without one is refused, never treated as an overwrite.
+    let Some(expect) = request
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .and_then(Fingerprint::from_hex)
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "a \"hash\" (the note's 64-character sha256 at open time) is required",
+        );
+    };
+    if order_json.len() > MAX_BATCH {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!("at most {MAX_BATCH} block ordinals per operation"),
+        );
+    }
+    let mut order: Vec<usize> = Vec::with_capacity(order_json.len());
+    for value in order_json {
+        match value.as_u64() {
+            Some(n) if n >= 1 => order.push((n - 1) as usize),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "every order ordinal must be a whole number of 1 or more",
+                )
+            }
+        }
+    }
+    let client_addr = crate::resolve_client_ip(
+        client.map(|info| info.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
+    let library = match Library::open(writer.root_path()) {
+        Ok(library) => library,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+    let (note_rel, note_index, bytes, current) = match read_collection(writer, collection, &ctx) {
+        Ok(got) => got,
+        Err(response) => return *response,
+    };
+    // The precondition holds even when this permutation would change nothing:
+    // a stale open hash is a conflict, not a silent no-op (ADR-016 §3).
+    if !expect.same_bytes(&current) {
+        return conflict_response(&current);
+    }
+    let blocks = match body_edit::member_blocks(&bytes, note_index, &ctx) {
+        Ok(blocks) => blocks,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let new_body = match body_edit::reorder_members(&bytes, note_index, &ctx, &order) {
+        Ok(bytes) => bytes,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if new_body == bytes {
+        return Json(serde_json::json!({"collection": note_rel.text(), "changed": false}))
+            .into_response();
+    }
+    // `order` is a validated permutation by now, so every slot is in range.
+    let order_images: Vec<&str> = order
+        .iter()
+        .map(|&slot| blocks[slot].image.as_str())
+        .collect();
+    let op_id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({"action": "collect_reorder", "collection": note_rel.text()});
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(new_body),
+    };
+    if let Err(error) = writer.execute_op_guarded(
+        &op_id,
+        SOURCE,
+        Some(&client_addr),
+        intent,
+        vec![step],
+        (&note_rel, &expect),
+    ) {
+        return guarded_write_error(error);
+    }
+    Json(serde_json::json!({
+        "collection": note_rel.text(),
+        "changed": true,
+        "op": op_id,
+        "order": order_images,
+    }))
+    .into_response()
+}
+
+/// `POST /api/write/collections/caption` — add, edit or delete one caption
+/// line of a member block (ADR-017 §9). The body is `{"collection": <path>,
+/// "hash": <the note's sha256 at open time>, "block": <1-based ordinal>,
+/// "line": <offset>, "text": <string|null>}`; `line` 0 is the member line
+/// (refused — remove the member instead), 1.. the caption lines, and one past
+/// the last caption line appends. `text: null` deletes the line.
+///
+/// `hash` is the open-time precondition (ADR-016 §3): a request without one is
+/// refused, and a note that changed since that read is a 409 carrying the
+/// current ETag.
+async fn caption_collection(
+    State(state): State<AppState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let Some(collection) = request.get("collection").and_then(|v| v.as_str()) else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "a \"collection\" string is required",
+        );
+    };
+    let Some(block) = request.get("block").and_then(|v| v.as_u64()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"block\" ordinal is required");
+    };
+    if block < 1 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "the \"block\" ordinal is 1 or more",
+        );
+    }
+    let Some(line) = request.get("line").and_then(|v| v.as_u64()) else {
+        return json_error(StatusCode::BAD_REQUEST, "a \"line\" offset is required");
+    };
+    let text = match request.get("text") {
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) => Some(text.as_str()),
+        Some(_) => return json_error(StatusCode::BAD_REQUEST, "\"text\" must be a string or null"),
+        None => return json_error(StatusCode::BAD_REQUEST, "a \"text\" field is required"),
+    };
+    // The note's hash at open time is the precondition (ADR-016 §3); a request
+    // without one is refused, never treated as an overwrite.
+    let Some(expect) = request
+        .get("hash")
+        .and_then(|v| v.as_str())
+        .and_then(Fingerprint::from_hex)
+    else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "a \"hash\" (the note's 64-character sha256 at open time) is required",
+        );
+    };
+    let client_addr = crate::resolve_client_ip(
+        client.map(|info| info.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
+    let library = match Library::open(writer.root_path()) {
+        Ok(library) => library,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+    let (note_rel, note_index, bytes, current) = match read_collection(writer, collection, &ctx) {
+        Ok(got) => got,
+        Err(response) => return *response,
+    };
+    // The precondition holds even when this caption would change nothing: a
+    // stale open hash is a conflict, not a silent no-op (ADR-016 §3).
+    if !expect.same_bytes(&current) {
+        return conflict_response(&current);
+    }
+    let (new_body, change) = match body_edit::edit_caption(
+        &bytes,
+        note_index,
+        &ctx,
+        (block - 1) as usize,
+        line as usize,
+        text,
+    ) {
+        Ok(result) => result,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    if new_body == bytes {
+        return Json(serde_json::json!({"collection": note_rel.text(), "changed": false}))
+            .into_response();
+    }
+    let verb = match change {
+        body_edit::CaptionChange::Edited => "edited",
+        body_edit::CaptionChange::Added => "added",
+        body_edit::CaptionChange::Deleted => "deleted",
+    };
+    let op_id = ulid::Ulid::new().to_string();
+    let intent = serde_json::json!({"action": "collect_caption", "collection": note_rel.text()});
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: note_rel.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(new_body),
+    };
+    if let Err(error) = writer.execute_op_guarded(
+        &op_id,
+        SOURCE,
+        Some(&client_addr),
+        intent,
+        vec![step],
+        (&note_rel, &expect),
+    ) {
+        return guarded_write_error(error);
+    }
+    Json(serde_json::json!({
+        "collection": note_rel.text(),
+        "changed": true,
+        "op": op_id,
+        "caption": verb,
+    }))
+    .into_response()
+}
+
+/// Resolve an existing collection note and read its current bytes, for the
+/// block and caption editors. Mirrors the CLI's `read_collection`, but the
+/// precondition is the caller's open hash (ADR-016 §3), not this read: the
+/// read supplies the body the new bytes are computed from, and the fingerprint
+/// that goes with it. A refusal is the ready-made JSON response.
+fn read_collection(
+    writer: &Writer,
+    collection: &str,
+    ctx: &BodyCtx,
+) -> Result<(RelPath, usize, Vec<u8>, Fingerprint), Box<Response>> {
+    let note_rel = RelPath::parse(collection.trim_start_matches("./"))
+        .map_err(|e| Box::new(write_error(e)))?;
+    let note_index = ctx.index_of(&note_rel.text()).ok_or_else(|| {
+        Box::new(json_error(
+            StatusCode::NOT_FOUND,
+            &format!("no note at {collection}"),
+        ))
+    })?;
+    if !matches!(
+        ctx.files[note_index].class,
+        FileClass::Note | FileClass::ImageNote
+    ) {
+        return Err(Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("{collection} is not a note"),
+        )));
+    }
+    let (body, fp) = writer
+        .read(&note_rel)
+        .map_err(|e| Box::new(write_error(e)))?;
+    Ok((note_rel, note_index, body, fp))
+}
+
 // ---------------------------------------------------------------------------
 // Shared plumbing
 // ---------------------------------------------------------------------------
-
 /// The session token carried by the request cookie, if any.
 fn session_token(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
@@ -2302,6 +2595,42 @@ fn write_error(error: dimagine_write::Error) -> Response {
         StatusCode::INTERNAL_SERVER_ERROR
     };
     json_error(status, &message)
+}
+
+/// A write error from a whole-replace operation that carries an open-hash
+/// precondition (ADR-016 §3). A `Conflict` is the caller's race, so it is the
+/// 409 the ADR promises — with the note's current ETag — never a 500 and never
+/// a retry; every other error goes through [`write_error`].
+fn guarded_write_error(error: dimagine_write::Error) -> Response {
+    let dimagine_write::Error::Conflict(conflict) = &error else {
+        return write_error(error);
+    };
+    conflict_response(&conflict.current)
+}
+
+/// The 409 an open-hash precondition mismatch answers (ADR-016 §3): the note's
+/// current view ETag, so the client can offer "load the latest and re-edit",
+/// and nothing of the request is applied.
+fn conflict_response(current: &Fingerprint) -> Response {
+    // The note's view ETag is built from size and mtime (media.rs, the source
+    // view), so the current fingerprint renders the ETag the client must
+    // re-read against.
+    let etag = format!("\"size-{:x}-mtime-{:x}\"", current.size, current.mtime_ns);
+    let mut response = (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "the collection changed since it was read",
+            "etag": etag,
+        })),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 /// Report an accounts-store failure to the client: 500 with the store's own

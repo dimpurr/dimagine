@@ -12,6 +12,7 @@ use axum::{
 use dimagine_serve::{
     accounts::AccountsStore, router, AuthMode, FsCatalog, OriginalPreview, ServeConfig,
 };
+use dimagine_write::Fingerprint;
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -1383,4 +1384,266 @@ async fn move_refusals_are_400_and_security_bars_stay_up() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(root.path().join("library/one.png").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Collection reorder and caption lines (ADR-017 §9)
+// ---------------------------------------------------------------------------
+
+/// A library whose note is a three-member collection, each member with a
+/// one-line caption.
+fn collection_library() -> TempDir {
+    let root = library();
+    for name in ["two.png", "three.png"] {
+        std::fs::write(root.path().join("library").join(name), PIXEL).unwrap();
+    }
+    std::fs::write(
+        root.path().join("library/Picks.md"),
+        "---\nkind: collection\ntitle: Picks\n---\n\n\
+         ![[one.png]]\nfirst\n\n\
+         ![[two.png]]\nsecond\n\n\
+         ![[three.png]]\nthird\n",
+    )
+    .unwrap();
+    root
+}
+
+/// The note's sha256 as the web client would carry it (the open-time hash).
+fn note_hash(root: &TempDir, rel: &str) -> String {
+    let bytes = std::fs::read(root.path().join("library").join(rel)).unwrap();
+    Fingerprint::of_bytes(&bytes).hex()
+}
+
+fn read_note(root: &TempDir, rel: &str) -> Vec<u8> {
+    std::fs::read(root.path().join("library").join(rel)).unwrap()
+}
+
+#[tokio::test]
+async fn the_reorder_endpoint_permutes_for_the_owner() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let hash = note_hash(&root, "Picks.md");
+    let body = format!(r#"{{"collection":"Picks.md","hash":"{hash}","order":[3,1,2]}}"#);
+    let (status, _, bytes) = send(
+        &app,
+        write_post(
+            "/api/write/collections/reorder",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let doc = json_body(&bytes);
+    assert_eq!(doc["changed"], true);
+    assert_eq!(
+        doc["order"],
+        serde_json::json!(["three.png", "one.png", "two.png"])
+    );
+    assert_eq!(
+        read_note(&root, "Picks.md"),
+        b"---\nkind: collection\ntitle: Picks\n---\n\n\
+          ![[three.png]]\nthird\n\n\
+          ![[one.png]]\nfirst\n\n\
+          ![[two.png]]\nsecond\n"
+    );
+}
+
+#[tokio::test]
+async fn the_caption_endpoint_adds_edits_and_deletes_for_the_owner() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+
+    // Append a caption to block 1 (ordinal 1), one past its only line.
+    let hash = note_hash(&root, "Picks.md");
+    let body =
+        format!(r#"{{"collection":"Picks.md","hash":"{hash}","block":1,"line":2,"text":"added"}}"#);
+    let (status, _, bytes) = send(
+        &app,
+        write_post(
+            "/api/write/collections/caption",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes)["caption"], "added");
+    assert!(text(&read_note(&root, "Picks.md")).contains("first\nadded\n"));
+
+    // `text: null` deletes the line, with the hash the client now holds.
+    let hash = note_hash(&root, "Picks.md");
+    let body =
+        format!(r#"{{"collection":"Picks.md","hash":"{hash}","block":1,"line":1,"text":null}}"#);
+    let (status, _, bytes) = send(
+        &app,
+        write_post(
+            "/api/write/collections/caption",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes)["caption"], "deleted");
+    let note = text(&read_note(&root, "Picks.md"));
+    assert!(!note.contains("\nfirst\n"), "{note:?}");
+    assert!(note.contains("![[one.png]]\nadded\n"), "{note:?}");
+}
+
+/// ADR-016 §3: a whole-replace op carries the open hash; a request without one
+/// is refused, and one whose hash no longer matches is a 409 that names the
+/// note's current ETag. Nothing moves in either case.
+#[tokio::test]
+async fn the_reorder_endpoint_refuses_a_missing_or_stale_hash() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let before = read_note(&root, "Picks.md");
+
+    // No hash: a failure, never an overwrite.
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/collections/reorder",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"collection":"Picks.md","order":[3,1,2]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(read_note(&root, "Picks.md"), before);
+
+    // A well-formed hash that is not the note's: 409 with the current ETag.
+    let stale = "0".repeat(64);
+    let body = format!(r#"{{"collection":"Picks.md","hash":"{stale}","order":[3,1,2]}}"#);
+    let (status, headers, bytes) = send(
+        &app,
+        write_post(
+            "/api/write/collections/reorder",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", text(&bytes));
+    let doc = json_body(&bytes);
+    let etag = doc["etag"].as_str().expect("a current etag");
+    assert!(etag.starts_with("\"size-"), "{etag:?}");
+    assert_eq!(headers["etag"], etag);
+    assert_eq!(read_note(&root, "Picks.md"), before, "nothing changed");
+}
+
+/// The precondition is judged before the "nothing to change" shortcut: an edit
+/// that would land as a no-op still reports a stale open hash as a conflict,
+/// because the caller's version is not the note's (ADR-016 §3).
+#[tokio::test]
+async fn a_no_op_edit_with_a_stale_hash_still_conflicts() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let before = read_note(&root, "Picks.md");
+    let stale = "0".repeat(64);
+
+    // Block 1 line 1 already says "first", so writing it again changes nothing.
+    let body = format!(
+        r#"{{"collection":"Picks.md","hash":"{stale}","block":1,"line":1,"text":"first"}}"#
+    );
+    let (status, _, bytes) = send(
+        &app,
+        write_post(
+            "/api/write/collections/caption",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", text(&bytes));
+    assert_eq!(read_note(&root, "Picks.md"), before);
+
+    // The identity permutation likewise.
+    let body = format!(r#"{{"collection":"Picks.md","hash":"{stale}","order":[1,2,3]}}"#);
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/collections/reorder",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(read_note(&root, "Picks.md"), before);
+}
+
+/// The same security bar as every other write (ADR-018): off by default, and
+/// past the CSRF guard or the auth gate it does not run.
+#[tokio::test]
+async fn the_reorder_endpoint_obeys_the_write_bar() {
+    let root = collection_library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let body = r#"{"collection":"Picks.md","order":[2,1,3]}"#;
+
+    // Without `--write` the route does not exist (once signed in, so the auth
+    // gate is not what answers). The write router is unmounted, so there is no
+    // CSRF token to fetch; a dummy header is fine because the guard never runs.
+    let app = app_for(&root, false, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    let (status, _, _) = send(
+        &app,
+        write_post(
+            "/api/write/collections/reorder",
+            &cookie,
+            "unused",
+            Some(ORIGIN),
+            body,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // With `--write`: no CSRF header is refused, and an anonymous request never
+    // reaches the handler.
+    let app = app_for(&root, true, None);
+    let (cookie, _) = owner_and_csrf(&app).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/write/collections/reorder")
+        .header("content-type", "application/json")
+        .header("cookie", &cookie)
+        .header("origin", ORIGIN)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let (status, _, _) = send(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let anon = Request::builder()
+        .method("POST")
+        .uri("/api/write/collections/reorder")
+        .header("content-type", "application/json")
+        .header("origin", ORIGIN)
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let (status, _, _) = send(&app, anon).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

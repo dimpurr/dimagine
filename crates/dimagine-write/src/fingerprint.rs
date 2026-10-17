@@ -36,6 +36,29 @@ impl Fingerprint {
         }
     }
 
+    /// A fingerprint whose digest is the given lowercase hex and whose identity
+    /// fields are unknown (0). Enough to describe "the version the caller
+    /// read" in a precondition or a conflict report, where only the digest is
+    /// compared.
+    pub fn from_hex(hex: &str) -> Option<Self> {
+        if hex.len() != 64 {
+            return None;
+        }
+        let raw = hex.as_bytes();
+        let mut sha256 = [0u8; 32];
+        for (i, byte) in sha256.iter_mut().enumerate() {
+            let hi = (raw[2 * i] as char).to_digit(16)?;
+            let lo = (raw[2 * i + 1] as char).to_digit(16)?;
+            *byte = (hi * 16 + lo) as u8;
+        }
+        Some(Self {
+            sha256,
+            size: 0,
+            mtime_ns: 0,
+            inode: 0,
+        })
+    }
+
     /// The hash of raw bytes with no file behind it yet — what a create or an
     /// update promises to produce.
     pub fn of_bytes(bytes: &[u8]) -> Self {
