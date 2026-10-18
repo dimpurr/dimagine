@@ -716,3 +716,155 @@ fn dangling_links_are_one_error_per_note_with_spans() {
         report2.findings
     );
 }
+
+#[test]
+fn finds_an_orphaned_upload_in_a_landing_zone_only() {
+    let tmp = tmp("orphaned-upload");
+    // An image left in `inbox/` with no note is the state an interrupted
+    // upload leaves behind (ADR-017 §11): the file landed, its provenance
+    // note never did.
+    write(tmp.path(), "inbox/stray.png", png());
+    // The same image in an ordinary folder with no note is just an image
+    // without a note yet, not an upload orphan.
+    write(tmp.path(), "misc/plain.png", png());
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        findings
+            .iter()
+            .any(|(path, code, sev)| path == "inbox/stray.png"
+                && *code == check::codes::ORPHANED_UPLOAD
+                && *sev == Severity::Info),
+        "{findings:?}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|(path, code, _)| path == "misc/plain.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+
+    // A note beside the image closes the finding.
+    write(
+        tmp.path(),
+        "inbox/stray.png.md",
+        "---\nid: 01JA8X3Q7K2M9V4T6R1B5N0C3Q\n---\n![[inbox/stray.png]]\n",
+    );
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        !findings
+            .iter()
+            .any(|(path, code, _)| path == "inbox/stray.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+}
+
+#[test]
+fn the_configured_upload_folder_is_a_landing_zone_too() {
+    let tmp = tmp("orphaned-upload-appjson");
+    // The default upload folder is `attachmentFolderPath` when app.json
+    // names one (ADR-017 §6, ADR-018 §4); an orphan left there is the
+    // same finding.
+    write(
+        tmp.path(),
+        ".obsidian/app.json",
+        br#"{"attachmentFolderPath":"Drop"}"#,
+    );
+    write(tmp.path(), "Drop/landed.png", png());
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        findings
+            .iter()
+            .any(|(path, code, _)| path == "Drop/landed.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+}
+
+/// An `attachmentFolderPath` of `./` is answered by the folder the upload is
+/// made from, and on a collection page that is the note's own folder
+/// (ADR-017 §11.1) — so an orphan left beside the collection is the same
+/// finding as one left in `inbox/`.
+#[test]
+fn a_current_folder_upload_folder_makes_each_note_folder_a_landing_zone() {
+    let tmp = tmp("orphaned-upload-current");
+    write(
+        tmp.path(),
+        ".obsidian/app.json",
+        br#"{"attachmentFolderPath":"./"}"#,
+    );
+    write(
+        tmp.path(),
+        "refs/shots.md",
+        "---\nkind: collection\ntitle: Shots\n---\n\n![[refs/landed.png]]\n",
+    );
+    write(tmp.path(), "refs/landed.png", png());
+    // The same setting outside a collection page still means the library root.
+    write(tmp.path(), "stray.png", png());
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        findings
+            .iter()
+            .any(|(path, code, _)| path == "refs/landed.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+    assert!(
+        findings
+            .iter()
+            .any(|(path, code, _)| path == "stray.png" && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+    // A folder no note lives in is still nobody's landing zone.
+    write(tmp.path(), "misc/plain.png", png());
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        !findings
+            .iter()
+            .any(|(path, code, _)| path == "misc/plain.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+}
+
+/// `./sub` is a subfolder of the folder the upload is made from, so the landing
+/// zone is that subfolder beside each note (ADR-017 §11.1).
+#[test]
+fn a_current_subfolder_upload_folder_lands_beside_the_note() {
+    let tmp = tmp("orphaned-upload-current-sub");
+    write(
+        tmp.path(),
+        ".obsidian/app.json",
+        br#"{"attachmentFolderPath":"./sub"}"#,
+    );
+    write(
+        tmp.path(),
+        "refs/shots.md",
+        "---\nkind: collection\ntitle: Shots\n---\n",
+    );
+    write(tmp.path(), "refs/sub/landed.png", png());
+    write(tmp.path(), "refs/landed.png", png());
+    let lib = open_library(tmp.path());
+    let findings = codes_of(&lib);
+    assert!(
+        findings
+            .iter()
+            .any(|(path, code, _)| path == "refs/sub/landed.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+    // Beside the note but not in the subfolder is not where the setting sends it.
+    assert!(
+        !findings
+            .iter()
+            .any(|(path, code, _)| path == "refs/landed.png"
+                && *code == check::codes::ORPHANED_UPLOAD),
+        "{findings:?}"
+    );
+}

@@ -4,7 +4,7 @@ use std::thread;
 
 use dimagine_write::journal::{RecoveryOutcome, StepKind, StepRecord};
 use dimagine_write::{
-    Error, Fingerprint, PathReject, RelPath, StepPath, UndoReason, UndoneItem, Writer,
+    Error, Fingerprint, PathReject, Precondition, RelPath, StepPath, UndoReason, UndoneItem, Writer,
 };
 use tempfile::tempdir;
 
@@ -1755,7 +1755,10 @@ fn execute_op_guarded_refuses_a_stale_precondition_and_writes_nothing() {
         None,
         serde_json::json!({}),
         vec![modify(b"three\n")],
-        (&note, &stale),
+        &[Precondition::from_read(
+            StepPath::Library(note.clone()),
+            stale.clone(),
+        )],
     ) {
         Err(Error::Conflict(conflict)) => {
             assert_eq!(conflict.current_bytes, b"two\n");
@@ -1776,7 +1779,10 @@ fn execute_op_guarded_refuses_a_stale_precondition_and_writes_nothing() {
             None,
             serde_json::json!({}),
             vec![modify(b"three\n")],
-            (&note, &fresh),
+            &[Precondition::from_read(
+                StepPath::Library(note.clone()),
+                fresh.clone(),
+            )],
         )
         .unwrap();
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"three\n");
@@ -1816,7 +1822,10 @@ fn execute_op_guarded_accepts_a_digest_only_precondition() {
             None,
             serde_json::json!({}),
             vec![modify(b"beta\n")],
-            (&note, &expect),
+            &[Precondition::from_digest(
+                StepPath::Library(note.clone()),
+                expect.clone(),
+            )],
         )
         .unwrap();
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"beta\n");
@@ -1828,7 +1837,10 @@ fn execute_op_guarded_accepts_a_digest_only_precondition() {
         None,
         serde_json::json!({}),
         vec![modify(b"gamma\n")],
-        (&note, &expect),
+        &[Precondition::from_digest(
+            StepPath::Library(note.clone()),
+            expect.clone(),
+        )],
     ) {
         Err(Error::Conflict(conflict)) => assert_eq!(conflict.current_bytes, b"beta\n"),
         other => panic!("expected Conflict, got {other:?}"),

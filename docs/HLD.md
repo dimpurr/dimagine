@@ -18,6 +18,7 @@ dimagine set             # set scalar front-matter properties (KEY= clears one)
 dimagine edit            # replace a note's whole body (everything after its front matter), with an open-hash precondition (FORMAT §5.3)
 dimagine collect         # create a collection note, add and remove members, reorder blocks, edit a caption
 dimagine mv              # move an image group and repair the links pointing at it (FORMAT §7)
+dimagine upload          # land files from outside the library as image groups with notes (FORMAT §7.2)
 dimagine trash           # move an image group into .trash/ (FORMAT §7.1)
 dimagine restore         # move a trashed group back
 dimagine undo            # reverse one recorded operation
@@ -62,10 +63,17 @@ run them as one **operation** (FORMAT §8.3).
 - `--json` prints one document per command with the `op` id, so a caller can
   name the operation it just made.
 - A whole-replace operation — a body edit, a collection reorder, a caption
-  change — carries the note's hash as the caller read it, and does not recompute
+  change, a collection join, the `id` a join assigns to an image's own note —
+  carries the note's hash as the caller read it, and does not recompute
   its intent on newer bytes: if the note has changed since, the operation
-  refuses with a conflict and writes nothing. There is no precondition-less
-  overwrite; a conflicting request re-reads and tries again.
+  refuses with a conflict and writes nothing. It is checked twice, because
+  there are two moments the note can move: under the lock before the journal
+  is written, where a mismatch refuses the whole operation, and again at the
+  step that renames, which compares against the same read — so an edit made
+  after the first check is a conflict on that step too, never a revert. There
+  is no precondition-less overwrite; a conflicting request re-reads and tries
+  again. Only the steps that will actually write carry one, so an operation
+  that turns out to change nothing about a note is not refused for it.
 
 ## Exit codes
 
@@ -87,7 +95,7 @@ run them as one **operation** (FORMAT §8.3).
 | `preview` | `thumb` and `view` renditions per FORMAT §8.2, keyed by SHA-256. |
 | `write` | The one path that changes the library: the lock, the read-hash-temp-rename write, the per-operation journal and crash recovery, and the `.dimagine/log/ops.jsonl` audit log with its inverse (FORMAT §8.3). Every write command is a planner that builds steps for this module; none of them writes a file itself. Also `.dimagine/settings.json`: a schema of typed settings with a default and a validation rule each, applied to whatever file is there — unknown keys kept, invalid values read as unset plus a report line. |
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
-| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, note body edit, move, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. The image/note page carries a plain textarea that edits the body as source and posts it to `/api/write/note/body`, with the note's open-time hash as a precondition and a reload-or-overwrite prompt on a conflict. |
+| `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, note body edit, move, upload, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. The image/note page carries a plain textarea that edits the body as source and posts it to `/api/write/note/body`, with the note's open-time hash as a precondition and a reload-or-overwrite prompt on a conflict. |
 
 ## Serving media (0.1)
 
@@ -124,9 +132,20 @@ refuses to start without:
 - Each session carries a server-side CSRF token that the owner's own pages echo
   back in the `x-csrf-token` header; it is never in a URL or a client-set
    cookie. Writes are `POST`/`PATCH` only, must be `application/json`, and are
-   body-capped at 1 MiB as they stream. Uploads (multipart, the 100 MB cap,
-   magic-vs-extension with SVG/HTML/XML refusal) have no endpoint in 3a and are
-   deferred to 3b (W66).
+   body-capped at 1 MiB as they stream. The one exception is the ADR's own
+   (ADR-018 §3): `POST /api/write/upload` is `multipart/form-data`, and
+   multipart is accepted on no other route (JSON at the upload path and
+   multipart at a JSON path both answer 415). Each file field is capped per
+   file — `--max-upload-bytes`, default 100 MiB — while it streams in: a field
+   that would cross the cap is answered 413 and the connection is dropped with
+   the rest of the body unread, nothing is buffered first. A file whose bytes
+   are not the format its name claims is refused, SVG, HTML and XML on both
+   sides (ADR-018 §5), and a batch over 1000 files before anything is opened.
+   The optional `folder` and `collection` fields are the endpoint's `--to` and
+   `--to-collection` (ADR-017 §11.1's folder-view and collection-page context
+   is the page's to send); the upload is the same journaled operation the CLI
+   runs, and the response carries the per-file outcomes and the `op` id that
+   `POST /api/write/undo` takes.
 - `--allow-anonymous-write` exists only for a no-login server (`--auth none`) on
   a loopback bind; on any other bind the server refuses to start rather than
   accept writes with no session.
@@ -184,6 +203,13 @@ shape dimagine's own group move leaves behind: with no record, neither restore
 nor purge can reach it. A library that still holds files in the old
 `.dimagine/trash/` gets one more info finding: the location stays readable
 (FORMAT §7.1) but nothing writes to it or restores from it any more.
+
+`check` also reports an image sitting in an upload landing zone — the resolved
+default upload folder, or `inbox/` — with no note (FORMAT §7.2): nothing is
+lost, but the provenance an upload would have recorded (`added`, `imported`,
+`sources`) is missing, which is what an interrupted upload whose journal was
+lost leaves behind, or a file copied in by hand. It is an info finding, and the
+scan is read-only.
 
 `check` also reports how many renditions the preview cache is missing, when
 there is an index to count from. It is a count rather than a finding: a preview

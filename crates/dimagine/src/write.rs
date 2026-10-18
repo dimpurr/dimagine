@@ -28,7 +28,7 @@ use dimagine_core::settings::{self, Settings};
 use dimagine_write::journal::{StepKind, StepRecord};
 use dimagine_write::paths::{RelPath, StepPath, TrashPath, TRASH_DIR};
 use dimagine_write::trash::{bumped_name, TrashRecord, TrashedFile};
-use dimagine_write::{Fingerprint, ScannedRecord, UndoOutcome, UndoneItem, Writer};
+use dimagine_write::{Fingerprint, Precondition, ScannedRecord, UndoOutcome, UndoneItem, Writer};
 
 /// The `source` field of every operation the CLI records.
 const SOURCE: &str = "cli";
@@ -113,6 +113,41 @@ pub fn commands() -> Vec<Command> {
                          changed since then is refused with a conflict and nothing is written \
                          (ADR-016 §3); without it the precondition is this command's own read.",
                     ),
+            ),
+        Command::new("upload")
+            .about("Upload files into the library as image groups with notes (ADR-017 §11).")
+            .arg(
+                Arg::new("files")
+                    .value_name("FILE")
+                    .required(true)
+                    .num_args(1..)
+                    .help("Files to upload, by path on this machine."),
+            )
+            .arg(
+                Arg::new("to")
+                    .long("to")
+                    .value_name("FOLDER")
+                    .help(
+                        "Land in this library folder instead of the default upload folder \
+                         (`.obsidian/app.json`'s attachmentFolderPath, else inbox/).",
+                    ),
+            )
+            .arg(
+                Arg::new("to-collection")
+                    .long("to-collection")
+                    .value_name("COLLECTION")
+                    .conflicts_with("to")
+                    .help(
+                        "An existing collection note (by library-relative path) to add the \
+                         uploads to; the files land in the default upload folder and the \
+                         collection gains one member line each.",
+                    ),
+            )
+            .arg(
+                Arg::new("dry-run")
+                    .long("dry-run")
+                    .action(ArgAction::SetTrue)
+                    .help("Report the placement, names and dedupe hits without writing anything."),
             ),
         Command::new("collect")
             .about("Create a collection note, add/remove images, reorder its members, or edit a caption.")
@@ -282,6 +317,7 @@ pub fn dispatch(name: &str, sub: &ArgMatches, library_dir: &Path) -> Option<Exit
         "rate" => run_rate(sub, library_dir),
         "set" => run_set(sub, library_dir),
         "edit" => run_edit(sub, library_dir),
+        "upload" => run_upload(sub, library_dir),
         "collect" => run_collect(sub, library_dir),
         "mv" => run_move(sub, library_dir),
         "trash" => run_trash(sub, library_dir),
@@ -765,16 +801,18 @@ fn run_edit(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         after_bytes: Some(replaced.bytes),
     };
     // Without `--expect` the precondition is this command's own read, which is
-    // what makes the write a compare-and-swap rather than a blind overwrite.
-    let expect = expect.as_ref().unwrap_or(&fp);
-    if let Err(error) = writer.execute_op_guarded(
-        &op_id,
-        SOURCE,
-        None,
-        intent,
-        vec![step],
-        (&note_rel, expect),
-    ) {
+    // what makes the write a compare-and-swap rather than a blind overwrite —
+    // and that read's fingerprint also guards the rename itself. A caller's
+    // `--expect` is a digest only, so it can be compared up front but names no
+    // identity to compare at the rename.
+    let path = StepPath::Library(note_rel.clone());
+    let expect = match expect.as_ref() {
+        Some(client) => Precondition::from_digest(path, client.clone()),
+        None => Precondition::from_read(path, fp.clone()),
+    };
+    if let Err(error) =
+        writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], &[expect])
+    {
         return fail(json, &error_message(&error));
     }
     report_edit(json, &note_rel.text(), &op_id, &after, restored);
@@ -837,6 +875,216 @@ fn report_edit(json: bool, note: &str, op_id: &str, fp: &Fingerprint, restored: 
         }
     }
 }
+// ---------------------------------------------------------------------------
+// upload
+// ---------------------------------------------------------------------------
+
+/// The `dimagine <version>` spelling an upload's notes
+/// record in `sources` (ADR-017 §11.5).
+const IMPORTER: &str = concat!("dimagine ", env!("CARGO_PKG_VERSION"));
+
+/// The `--json` schema of `upload`.
+const UPLOAD_SCHEMA: &str = "dimagine.upload/0.1";
+
+fn run_upload(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let dry_run = sub.get_flag("dry-run");
+    let files: Vec<PathBuf> = sub
+        .get_many::<String>("files")
+        .unwrap()
+        .map(PathBuf::from)
+        .collect();
+    // The batch limit is refused before anything is opened
+    // (ADR-018 §5).
+    if files.len() > dimagine_write::MAX_UPLOAD_BATCH {
+        return fail(
+            json,
+            &format!(
+                "an upload may carry at most {} files; this one carries {}",
+                dimagine_write::MAX_UPLOAD_BATCH,
+                files.len()
+            ),
+        );
+    }
+    // The bytes are read up front: a file that cannot be
+    // read refuses the upload before anything is written.
+    let mut items = Vec::with_capacity(files.len());
+    for path in &files {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => return fail(json, &format!("{}: {error}", path.display())),
+        };
+        let original_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        items.push(dimagine_write::UploadItem {
+            original_name,
+            bytes,
+        });
+    }
+
+    let library = match library_walk(library_dir, json) {
+        Ok(library) => library,
+        Err(code) => return code,
+    };
+    let writer = match open_writer(library_dir, json) {
+        Ok(writer) => writer,
+        Err(code) => return code,
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+
+    // The placement: an explicit `--to` folder, a
+    // collection page (the default folder, then the join),
+    // or the default upload folder (ADR-017 §11.1).
+    let (folder, collection) = match upload_placement(sub, &writer, &ctx, json) {
+        Ok(placement) => placement,
+        Err(code) => return code,
+    };
+
+    // Dedupe answers from the index's content hashes
+    // (ADR-017 §11.3): a hit names the live image these
+    // bytes already are, and no copy is made.
+    let index = match dimagine_index::Index::open(library_dir) {
+        Ok(index) => index,
+        Err(error) => return fail(json, &error.to_string()),
+    };
+    let dedupe = |sha: &str| index.image_by_sha256(sha).ok().flatten();
+
+    let request = dimagine_write::UploadRequest { folder, collection };
+    if dry_run {
+        let outcomes = match writer.plan_upload(request, items, &ctx, dedupe, IMPORTER) {
+            Ok(outcomes) => outcomes,
+            Err(error) => return fail(json, &error_message(&error)),
+        };
+        return print_upload(json, None, &outcomes, true);
+    }
+    let op_id = new_op_id();
+    let outcomes = match writer.upload(&op_id, SOURCE, None, request, items, &ctx, dedupe, IMPORTER)
+    {
+        Ok(outcomes) => outcomes,
+        Err(error) => return fail(json, &error_message(&error)),
+    };
+    print_upload(json, Some(&op_id), &outcomes, false)
+}
+
+/// The upload's landing spot (ADR-017 §11.1): the
+/// explicit `--to` folder, the `--to-collection` note
+/// (the default upload folder, then the join), or the
+/// default upload folder itself.
+fn upload_placement(
+    sub: &ArgMatches,
+    writer: &Writer,
+    ctx: &BodyCtx<'_>,
+    json: bool,
+) -> Result<(String, Option<RelPath>), ExitCode> {
+    if let Some(collection) = sub.get_one::<String>("to-collection") {
+        // The same resolution `collect --add` uses: a
+        // library-relative path to an existing note.
+        let note_rel = match RelPath::parse(collection.trim_start_matches("./")) {
+            Ok(rel) => rel,
+            Err(error) => return Err(fail(json, &error_message(&error))),
+        };
+        let note_index = match ctx.index_of(&note_rel.text()) {
+            Some(index) => index,
+            None => return Err(fail(json, &format!("no note at {collection}"))),
+        };
+        if !matches!(
+            ctx.files[note_index].class,
+            FileClass::Note | FileClass::ImageNote
+        ) {
+            return Err(fail(json, &format!("{collection} is not a note")));
+        }
+        // The collection page's "current folder" is the note's own
+        // folder (ADR-017 §6, §11.1): `attachmentFolderPath` of `./`
+        // or `./sub` resolves beside the collection, not at the root.
+        let folder = default_upload_folder(writer, ctx, &note_rel.parent_text());
+        return Ok((folder, Some(note_rel)));
+    }
+    if let Some(folder) = sub.get_one::<String>("to") {
+        // The write core validates the folder (no `..`, no
+        // absolute path, no dot folder) before anything is
+        // written; `""` is the library root.
+        return Ok((folder.trim_start_matches("./").to_string(), None));
+    }
+    Ok((default_upload_folder(writer, ctx, ""), None))
+}
+
+/// The library's default upload folder: `attachmentFolderPath`
+/// in `.obsidian/app.json`, resolved the way an interface
+/// resolves it for its current folder, else `inbox/`
+/// (ADR-017 §11.1). `current_folder` is that folder — the
+/// collection note's folder on a collection page, the library
+/// root otherwise. dimagine only ever reads `.obsidian/`.
+fn default_upload_folder(writer: &Writer, ctx: &BodyCtx<'_>, current_folder: &str) -> String {
+    let app_json =
+        std::fs::read_to_string(writer.root_path().join(".obsidian").join("app.json")).ok();
+    body_edit::upload_folder(app_json.as_deref(), current_folder, ctx).folder
+}
+
+/// Print an upload's result: per file, the image path, its
+/// note, and what happened to it, with the operation's id
+/// when the files landed — the id `dimagine undo` takes.
+fn print_upload(
+    json: bool,
+    op_id: Option<&str>,
+    outcomes: &[dimagine_write::UploadOutcome],
+    dry_run: bool,
+) -> ExitCode {
+    if json {
+        let doc = serde_json::json!({
+            "schema": UPLOAD_SCHEMA,
+            "dry_run": dry_run,
+            "op": op_id,
+            "files": outcomes
+                .iter()
+                .map(|outcome| {
+                    serde_json::json!({
+                        "image": outcome.image,
+                        "note": outcome.note,
+                        "renamed": outcome.renamed,
+                        "duplicate": outcome.duplicate,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        });
+        println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
+    } else {
+        for outcome in outcomes {
+            if outcome.duplicate {
+                println!("{} is already in the library", outcome.image);
+            } else if dry_run {
+                println!(
+                    "would land {} (note {}){}",
+                    outcome.image,
+                    outcome.note,
+                    if outcome.renamed {
+                        ", renamed from a meaningless name"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                println!(
+                    "landed {} (note {}){}",
+                    outcome.image,
+                    outcome.note,
+                    if outcome.renamed {
+                        ", renamed from a meaningless name"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+        if let Some(op_id) = op_id {
+            println!("op: {op_id}");
+        }
+    }
+    ExitCode::from(0)
+}
+
 // ---------------------------------------------------------------------------
 // collect
 // ---------------------------------------------------------------------------
@@ -928,13 +1176,20 @@ fn collect_new(
         before_bytes: None,
         after_bytes: Some(body),
     }];
-    if let Err(message) = push_image_id_steps(writer, &mut steps, targets, ctx) {
+    let mut preconditions: Vec<Precondition> = Vec::new();
+    if let Err(message) = push_image_id_steps(writer, &mut steps, &mut preconditions, targets, ctx)
+    {
         return fail(json, &message);
     }
     let op_id = new_op_id();
     let intent =
         serde_json::json!({"action": "collect_new", "title": title, "note": note_rel.text()});
-    if let Err(error) = writer.execute_op(&op_id, SOURCE, None, intent, steps) {
+    // The new collection is a create and needs no precondition, but each
+    // image's own note may be rewritten to carry its `id`, and that edit
+    // carries the open hash of the read it was computed from (ADR-016 §3).
+    if let Err(error) =
+        writer.execute_op_guarded(&op_id, SOURCE, None, intent, steps, &preconditions)
+    {
         return fail(json, &error_message(&error));
     }
     if json {
@@ -974,16 +1229,19 @@ fn collect_edit(
     ) {
         return fail(json, &format!("{collection} is not a note"));
     }
-    let (body, _) = match writer.read(&note_rel) {
+    let (body, fp) = match writer.read(&note_rel) {
         Ok(got) => got,
         Err(error) => return fail(json, &error_message(&error)),
     };
 
     let mut steps: Vec<StepRecord> = Vec::new();
+    let mut preconditions: Vec<Precondition> = Vec::new();
     // Joining a collection assigns each image an id (ADR-017 §3), so each
     // image's own note is created or updated in the same operation.
     if !remove {
-        if let Err(message) = push_image_id_steps(writer, &mut steps, targets, ctx) {
+        if let Err(message) =
+            push_image_id_steps(writer, &mut steps, &mut preconditions, targets, ctx)
+        {
             return fail(json, &message);
         }
     }
@@ -1025,6 +1283,10 @@ fn collect_edit(
             before_bytes: None,
             after_bytes: Some(new_body),
         });
+        preconditions.push(Precondition::from_read(
+            StepPath::Library(note_rel.clone()),
+            fp.clone(),
+        ));
     }
     let op_id = new_op_id();
     let action = if remove {
@@ -1033,7 +1295,15 @@ fn collect_edit(
         "collect_add"
     };
     let intent = serde_json::json!({"action": action, "collection": note_rel.text()});
-    if let Err(error) = writer.execute_op(&op_id, SOURCE, None, intent, steps) {
+    // The append or remove recomputes the whole note body from the bytes read
+    // above, and so does each image's `id` assignment: both are whole-replace
+    // edits that must carry the open hash (ADR-016 §3). An external edit to any
+    // of those notes since its read is a 409 of the whole operation, never a
+    // rename of bytes computed from the stale read — at the rename itself, not
+    // only at the check before the journal.
+    if let Err(error) =
+        writer.execute_op_guarded(&op_id, SOURCE, None, intent, steps, &preconditions)
+    {
         return fail(json, &error_message(&error));
     }
     if json {
@@ -1151,8 +1421,11 @@ fn collect_reorder(
     };
     let op_id = new_op_id();
     let intent = serde_json::json!({"action": "collect_reorder", "collection": note_rel.text()});
-    if let Err(error) =
-        writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], (&note_rel, &fp))
+    let expect = [Precondition::from_read(
+        StepPath::Library(note_rel.clone()),
+        fp.clone(),
+    )];
+    if let Err(error) = writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], &expect)
     {
         return fail(json, &error_message(&error));
     }
@@ -1231,8 +1504,11 @@ fn collect_caption(
     };
     let op_id = new_op_id();
     let intent = serde_json::json!({"action": "collect_caption", "collection": note_rel.text()});
-    if let Err(error) =
-        writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], (&note_rel, &fp))
+    let expect = [Precondition::from_read(
+        StepPath::Library(note_rel.clone()),
+        fp.clone(),
+    )];
+    if let Err(error) = writer.execute_op_guarded(&op_id, SOURCE, None, intent, vec![step], &expect)
     {
         return fail(json, &error_message(&error));
     }
@@ -1258,9 +1534,16 @@ fn collect_caption(
 
 /// Ensure every targeted image's own note carries an `id`, appending a create
 /// or modify step for each note that needs one (used by `collect`).
+///
+/// A modify step also carries the precondition its own read earned it
+/// (ADR-016 §3): the note's bytes are read while the operation is planned and
+/// rewritten at the end, so an edit made in between must be a typed conflict,
+/// never a silent revert. A note whose read fails is a refusal, not an empty
+/// base to rebuild from.
 fn push_image_id_steps(
     writer: &Writer,
     steps: &mut Vec<StepRecord>,
+    preconditions: &mut Vec<Precondition>,
     targets: &[Target],
     ctx: &BodyCtx,
 ) -> Result<(), String> {
@@ -1271,13 +1554,19 @@ fn push_image_id_steps(
         }
         let note_rel = target.note_relpath()?;
         let exists = target.note_present;
-        let base = if exists {
-            read_opt(writer, &note_rel)
-                .map(|(bytes, _)| bytes)
-                .unwrap_or_default()
+        let read = if exists {
+            Some(
+                writer
+                    .read(&note_rel)
+                    .map_err(|e| format!("{}: {e}", note_rel.text()))?,
+            )
         } else {
-            Vec::new()
+            None
         };
+        let base = read
+            .as_ref()
+            .map(|(bytes, _)| bytes.clone())
+            .unwrap_or_default();
         let edited = ensure_id(&base, &new_op_id()).map_err(|e| e.to_string())?;
         if exists && edited == base {
             continue;
@@ -1304,6 +1593,9 @@ fn push_image_id_steps(
             before_bytes: None,
             after_bytes: Some(final_bytes),
         });
+        if let Some((_, fp)) = read {
+            preconditions.push(Precondition::from_read(StepPath::Library(note_rel), fp));
+        }
     }
     Ok(())
 }

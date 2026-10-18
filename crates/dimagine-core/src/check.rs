@@ -13,6 +13,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
+use crate::body_edit::BodyCtx;
 use crate::format;
 use crate::library::{open_regular, FileClass, FileEntry, Library};
 use crate::links::{self, key, Link, Outcome, Resolver, TargetClass};
@@ -47,6 +48,7 @@ pub mod codes {
     pub const MISSING_SELF_EMBED: &str = "missing_self_embed";
     pub const SPECIAL_FILE: &str = "special_file";
     pub const NOTE_TOO_LARGE: &str = "note_too_large";
+    pub const ORPHANED_UPLOAD: &str = "orphaned_upload";
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -214,6 +216,10 @@ pub fn run_with_limit(library: &Library, max_note_bytes: u64) -> CheckReport {
         }
     }
 
+    // Orphaned uploads (ADR-017 §11): images sitting in an upload
+    // landing zone with no note.
+    check_orphaned_uploads(library, &resolver, &mut report.findings);
+
     report.read_complete &= !report.findings.iter().any(|finding| {
         matches!(
             finding.code,
@@ -231,6 +237,60 @@ pub fn run_with_limit(library: &Library, max_note_bytes: u64) -> CheckReport {
         .findings
         .sort_by(|a, b| (&a.path, a.code, &a.message).cmp(&(&b.path, b.code, &b.message)));
     report
+}
+
+/// Images in an upload landing zone with no image note (ADR-017 §11).
+///
+/// An upload always lands with a note beside it, so an image in the
+/// default upload folder (or `inbox/`, the fallback) with no note is
+/// the state an interrupted upload whose journal was lost leaves
+/// behind — or a file someone copied in by hand. It is an `info`
+/// finding: nothing is lost, but the provenance an upload would have
+/// recorded (`added`, `imported`, `sources`) is missing. Read-only.
+fn check_orphaned_uploads(library: &Library, resolver: &Resolver, findings: &mut Vec<Finding>) {
+    // The landing zones: the default upload folder as resolved from the
+    // library root — `.obsidian/app.json`'s attachmentFolderPath, else
+    // `inbox/` — plus `inbox/` itself, plus, when that setting is written
+    // relative to the current folder, the same folder beside each note, which
+    // is where an upload made from a collection page lands (ADR-017 §11.1).
+    // dimagine only ever reads `.obsidian/`; an unparsable file answers "no
+    // setting".
+    let app_json = std::fs::read_to_string(library.root.join(".obsidian").join("app.json")).ok();
+    let ctx = BodyCtx::new(&library.files, resolver);
+    let zones = crate::body_edit::upload_landing_zones(app_json.as_deref(), &ctx);
+    let has_note = |image_rel: &str| {
+        let note_rel = format!("{image_rel}.md");
+        library
+            .files
+            .iter()
+            .any(|entry| entry.class == FileClass::ImageNote && entry.rel == note_rel)
+    };
+    for entry in &library.files {
+        if entry.class != FileClass::Image {
+            continue;
+        }
+        let folder = entry
+            .rel
+            .rsplit_once('/')
+            .map(|(folder, _)| folder)
+            .unwrap_or("");
+        if !zones.iter().any(|zone| zone == folder) {
+            continue;
+        }
+        if has_note(&entry.rel) {
+            continue;
+        }
+        findings.push(Finding {
+            severity: Severity::Info,
+            code: codes::ORPHANED_UPLOAD,
+            path: entry.rel.clone(),
+            path_non_utf8: entry.path.to_str().is_none(),
+            message: format!(
+                "image in the upload landing zone `{folder}` has no note (no added/imported/sources record)"
+            ),
+            detail: Some(serde_json::json!({ "zone": folder })),
+        });
+    }
 }
 
 fn check_file_name(entry: &FileEntry, findings: &mut Vec<Finding>) {

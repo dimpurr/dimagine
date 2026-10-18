@@ -197,10 +197,20 @@ record of where those files came from, so recovering them is a manual move.
 
 ## With the dimagine CLI
 
-`dimagine tag`, `rate`, `set`, `edit`, `collect`, `mv`, `trash`, `restore`,
-`undo` and `config` make the changes above through one journaled operation each; a
+`dimagine tag`, `rate`, `set`, `edit`, `collect`, `mv`, `upload`, `trash`,
+`restore`, `undo` and `config` make the changes above through one journaled
+operation each; a
 command that changes a file prints that operation's id, and `dimagine undo <id>`
-reverses it. `dimagine edit <note> --body-file <path>` (or `--stdin`) replaces a
+reverses it. `dimagine upload <file>…` brings files in from outside as image
+groups (FORMAT §7.2): a meaningful name is kept, a meaningless camera or
+screenshot name lands as `Upload <time>` with the original in the note's title,
+bytes the library already holds are not copied twice, and every new image gets
+a note carrying its provenance. `--to <folder>` places it, `--to-collection
+<note>` lands it in the default folder and joins that collection, and
+`--dry-run` prints what would land without changing a byte. A web server
+started with `--write` has the same upload behind `POST /api/write/upload`
+(multipart, one file per `file` field, optional `folder` and `collection`
+fields). `dimagine edit <note> --body-file <path>` (or `--stdin`) replaces a
 note's whole body — every byte after its front matter — with the text you give,
 leaving the front matter and the body's own line endings, BOM and trailing newline
 exactly as they are; `--expect <sha256>` carries the note's hash as you read it so

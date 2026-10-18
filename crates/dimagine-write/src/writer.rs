@@ -47,6 +47,56 @@ impl<'a> Drop for TempFileGuard<'a> {
     }
 }
 
+/// One note an operation is about to replace, and the state it was read in
+/// when the bytes this operation would write for it were computed
+/// (ADR-016 §3).
+///
+/// A journaled operation has two moments at which that note can move, and the
+/// precondition answers both. Under the lock, before the journal is written,
+/// the digest is compared against the file as it stands — an operation whose
+/// bytes are stale is refused whole, before anything is touched. At the step
+/// that renames, the full fingerprint becomes `update_existing_locked`'s
+/// `expected`, so the last step of a long operation cannot rename bytes
+/// computed from a read the file has since left behind ("绝不 rename 由旧读取
+/// 算出的字节"). Without that second use the re-check compares the
+/// apply-time read against itself and proves nothing.
+#[derive(Clone, Debug)]
+pub struct Precondition {
+    /// The note this operation replaces.
+    pub path: StepPath,
+    /// The digest of the state the operation's after-bytes were computed from
+    /// — "the hash at open time". Compared on the digest alone, so a caller
+    /// holding only a sha256 (a web client) is compared alike.
+    pub expected: Fingerprint,
+    /// The full fingerprint of that same read, when this writer made the read
+    /// itself. `None` for a caller that holds only the digest: there is then
+    /// no identity to compare at the rename, and the apply-time read stands in
+    /// as it always did.
+    pub open: Option<Fingerprint>,
+}
+
+impl Precondition {
+    /// A precondition from a full read of the note by this writer: the digest
+    /// for the check up front, the identity for the check at the rename.
+    pub fn from_read(path: StepPath, read: Fingerprint) -> Self {
+        Self {
+            path,
+            expected: read.clone(),
+            open: Some(read),
+        }
+    }
+
+    /// A precondition from a bare digest — "the hash at open time" as a web
+    /// client sends it, which names the version but not the file's identity.
+    pub fn from_digest(path: StepPath, expected: Fingerprint) -> Self {
+        Self {
+            path,
+            expected,
+            open: None,
+        }
+    }
+}
+
 /// A handle to an open dimagine library.
 ///
 /// Holds the library root descriptor open. All write operations go through
@@ -651,31 +701,6 @@ impl Writer {
         steps: Vec<crate::journal::StepRecord>,
     ) -> Result<()> {
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        self.execute_op_locked(&lock, op_id, source, client_addr, intent, steps, None, None)
-    }
-
-    /// Execute a whole-replace operation against a committed precondition
-    /// (ADR-016 §3): the note must still hash to the digest the caller read,
-    /// or the whole operation is refused with a typed
-    /// [`crate::error::Conflict`] and nothing is written.
-    ///
-    /// This is for the operations that replace a note's body wholesale — a
-    /// body edit, a collection reorder, a caption change — which carry "the
-    /// hash at open time" and do not recompute an intent on newer bytes: a
-    /// mismatch is a 409, never a retry. The precondition is on the digest, so
-    /// an `expect` built from only a sha256 (`Fingerprint::from_hex`) compares
-    /// correctly.
-    pub fn execute_op_guarded(
-        &self,
-        op_id: &str,
-        source: &str,
-        client_addr: Option<&str>,
-        intent: serde_json::Value,
-        steps: Vec<crate::journal::StepRecord>,
-        expect: (&RelPath, &Fingerprint),
-    ) -> Result<()> {
-        let lock = WriteLock::acquire(&self.root, &self.root_path)?;
-        let precondition = Some((StepPath::Library(expect.0.clone()), expect.1.clone()));
         self.execute_op_locked(
             &lock,
             op_id,
@@ -684,7 +709,43 @@ impl Writer {
             intent,
             steps,
             None,
-            precondition,
+            Vec::new(),
+        )
+    }
+
+    /// Execute a whole-replace operation against committed
+    /// preconditions (ADR-016 §3): each note must still hash to
+    /// the digest the caller read, or the whole operation is
+    /// refused with a typed [`crate::error::Conflict`] and nothing
+    /// is written.
+    ///
+    /// This is for the operations that replace a note's body wholesale — a
+    /// body edit, a collection reorder, a caption change, a collection join —
+    /// which carry "the hash at open time" and do not recompute an intent on
+    /// newer bytes: a mismatch is a 409, never a retry. The check up front is
+    /// on the digest, so a precondition built from only a sha256
+    /// ([`Precondition::from_digest`], what a web client sends) compares
+    /// correctly; one built from this writer's own read also guards the
+    /// rename itself ([`Precondition::from_read`]).
+    pub fn execute_op_guarded(
+        &self,
+        op_id: &str,
+        source: &str,
+        client_addr: Option<&str>,
+        intent: serde_json::Value,
+        steps: Vec<crate::journal::StepRecord>,
+        expect: &[Precondition],
+    ) -> Result<()> {
+        let lock = WriteLock::acquire(&self.root, &self.root_path)?;
+        self.execute_op_locked(
+            &lock,
+            op_id,
+            source,
+            client_addr,
+            intent,
+            steps,
+            None,
+            expect.to_vec(),
         )
     }
 
@@ -711,7 +772,7 @@ impl Writer {
             intent,
             steps,
             fail_after_step,
-            None,
+            Vec::new(),
         )
     }
 
@@ -725,7 +786,7 @@ impl Writer {
         intent: serde_json::Value,
         steps: Vec<crate::journal::StepRecord>,
         fail_after_step: Option<usize>,
-        expect: Option<(StepPath, Fingerprint)>,
+        expect: Vec<Precondition>,
     ) -> Result<()> {
         // A caller describes an intent; the journal must record fact. Read the
         // state each step is about to change before any file is touched, so
@@ -738,19 +799,22 @@ impl Writer {
             crate::journal::enrich_step(self, step)?;
         }
 
-        // A whole-replace operation carries the hash of the note as the caller
+        // A whole-replace operation carries the hash of each note as the caller
         // read it (ADR-016 §3). The precondition is on the digest — "the hash
         // at open time" — so a caller that holds only the sha256 (a web client)
         // and one that recomputed a full fingerprint (the CLI) are compared
         // alike. The check runs here, under the lock and before the journal is
         // written, so a mismatch refuses the whole operation with a typed
-        // `Conflict` and touches nothing.
-        if let Some((path, expected)) = expect {
-            let (current_bytes, current_fp) = self.read_step(&path)?;
-            if !expected.same_bytes(&current_fp) {
+        // `Conflict` and touches nothing. It is the first of the two moments
+        // the precondition guards: the replacing step's rename is the second,
+        // and only a precondition carrying this writer's own read can answer
+        // there (see `apply_journaled_step`).
+        for pre in &expect {
+            let (current_bytes, current_fp) = self.read_step(&pre.path)?;
+            if !pre.expected.same_bytes(&current_fp) {
                 return Err(conflict_err(crate::error::Conflict {
-                    path: path.to_path(),
-                    expected,
+                    path: pre.path.to_path(),
+                    expected: pre.expected.clone(),
                     current: current_fp,
                     current_bytes,
                 }));
@@ -773,6 +837,7 @@ impl Writer {
                 &intent,
                 &now,
                 step,
+                &expect,
             ) {
                 failures.push(crate::error::BatchStepError {
                     step_idx: idx,
@@ -826,6 +891,10 @@ impl Writer {
 
     /// Apply one journaled step: re-record the on-disk state if it moved since
     /// the journal was written, perform the write, and fsync its audit line.
+    ///
+    /// `expect` are the operation's preconditions: the ones naming this step's
+    /// destination say the bytes this step writes were computed from a read of
+    /// that note, and become the step's compare-and-swap value.
     #[allow(clippy::too_many_arguments)]
     fn apply_journaled_step(
         &self,
@@ -837,6 +906,7 @@ impl Writer {
         intent: &serde_json::Value,
         now: &str,
         step: &mut crate::journal::StepRecord,
+        expect: &[Precondition],
     ) -> Result<()> {
         // Something outside this process may have edited the file since the
         // journal was written. Re-record it, so a rollback restores what
@@ -880,7 +950,21 @@ impl Writer {
                             step.step_idx
                         ),
                     })?;
-                let new_fp = self.update_existing_locked(lock, &dst, &cur_fp, bytes)?;
+                // The state this step's bytes were computed from. A
+                // precondition naming this step's destination carries the
+                // writer's own read of the note, so the pre-rename re-check
+                // compares against the state the edit was built on rather
+                // than against the read above — which it would match by
+                // construction, proving nothing, and would let a whole
+                // replace land over an edit made after the check up front
+                // (ADR-016 §3). A step with no such precondition — a move's
+                // link repair, an undo, a create — keeps the apply-time read.
+                let expected = expect
+                    .iter()
+                    .find(|pre| pre.path == dst)
+                    .and_then(|pre| pre.open.clone())
+                    .unwrap_or(cur_fp);
+                let new_fp = self.update_existing_locked(lock, &dst, &expected, bytes)?;
                 new_fp.hex()
             }
             crate::journal::StepKind::Move => {
@@ -974,7 +1058,7 @@ impl Writer {
         intent: serde_json::Value,
         steps: Vec<crate::journal::StepRecord>,
     ) -> Result<()> {
-        self.execute_op_locked(lock, op_id, source, None, intent, steps, None, None)
+        self.execute_op_locked(lock, op_id, source, None, intent, steps, None, Vec::new())
     }
 
     /// Read `<library>/.dimagine/settings.json` (ADR-019 §1).

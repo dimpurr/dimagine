@@ -8,7 +8,7 @@ publish = false
 
 [dependencies]
 argon2 = "0.5"
-axum = { version = "0.7", features = ["form", "json"] }
+axum = { version = "0.7", features = ["form", "json", "multipart"] }
 ammonia = "4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dimagine-core = { path = "../dimagine-core" }

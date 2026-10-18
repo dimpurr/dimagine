@@ -16,7 +16,10 @@
 
 use axum::{
     body::{Body, Bytes},
-    extract::{ConnectInfo, State},
+    extract::{
+        multipart::{Multipart, MultipartError},
+        ConnectInfo, State,
+    },
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
     middleware::Next,
     response::{Html, IntoResponse, Response},
@@ -35,7 +38,9 @@ use dimagine_write::journal::{StepKind, StepRecord};
 use dimagine_write::op_log::OpEntry;
 use dimagine_write::paths::{RelPath, StepPath, TrashPath};
 use dimagine_write::trash::{bumped_name, TrashRecord, TrashedFile};
-use dimagine_write::{Fingerprint, ScannedRecord, Writer};
+use dimagine_write::{
+    Fingerprint, Precondition, ScannedRecord, UploadItem, UploadRequest, Writer, MAX_UPLOAD_BATCH,
+};
 use std::net::SocketAddr;
 
 use crate::accounts::{is_weak_password, verify_password, AccountsError, WEAK_PASSWORD_LENGTH};
@@ -51,13 +56,19 @@ pub const MAX_JSON_BODY: usize = 1 << 20;
 pub const MAX_BATCH: usize = 1000;
 /// The header that carries the session's CSRF token (ADR-018 §3).
 pub const CSRF_HEADER: &str = "x-csrf-token";
+/// The one mutating route whose body is multipart rather than JSON
+/// (ADR-018 §3): files land here. The CSRF guard's content-type rule
+/// and the body-limit split below are both keyed on this path.
+pub const UPLOAD_PATH: &str = "/api/write/upload";
 
 /// Build the write sub-router, merged into the main router only when
 /// `--write` is on. It carries the request-size cap and the CSRF guard,
 /// and is layered *inside* the auth gate, so a request has already been
 /// authenticated before it is checked here.
 pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
-    Router::new()
+    // The JSON half. A JSON body larger than 1 MiB is refused as it
+    // streams in (ADR-018 §5), not after it is buffered.
+    let json_routes = Router::new()
         // The read side of the write surface: the token the owner's own
         // pages send back in `x-csrf-token`, and the trash view.
         .route("/api/write/csrf", get(csrf_bootstrap))
@@ -79,13 +90,18 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
         .route("/api/write/undo", get(undo_toast).post(undo_op))
         .route("/api/write/password", post(change_password))
         .route("/api/write/settings", post(save_settings))
-        // A JSON body larger than 1 MiB is refused as it streams in
-        // (ADR-018 §5), not after it is buffered.
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON_BODY))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            csrf_guard,
-        ))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON_BODY));
+    // The upload route carries files, not JSON: it opts out of the JSON
+    // body cap, because the whole-body limit would cap a batch of files
+    // one by one's total rather than each file. Its own cap — per file,
+    // enforced while the bytes stream in (ADR-018 §5) — lives in
+    // [`upload_files`], so the route streams nothing of its own accord.
+    let upload_routes = Router::new()
+        .route(UPLOAD_PATH, post(upload_files))
+        .layer(axum::extract::DefaultBodyLimit::disable());
+    Router::new().merge(json_routes).merge(upload_routes).layer(
+        axum::middleware::from_fn_with_state(state.clone(), csrf_guard),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -109,22 +125,32 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
         return next.run(request).await;
     }
 
-    // ADR-018 §3: a write body is JSON (an upload endpoint, which would be
-    // multipart, is out of 3a scope). The header, not the path, is what
-    // must say so.
+    // ADR-018 §3: a write body is JSON, with one exception — the upload
+    // endpoint is `multipart/form-data` (the ADR names it explicitly). The
+    // header, not the path, is what must say so, but the multipart form is
+    // only ever accepted on the one route that reads it; any other route
+    // still demands JSON.
+    let is_upload = request.uri().path() == UPLOAD_PATH;
     let content_type = request
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
-    if !content_type
+    let mime = content_type
         .split(';')
         .next()
-        .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
-    {
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let expected = if is_upload {
+        "multipart/form-data"
+    } else {
+        "application/json"
+    };
+    if mime != expected {
         return json_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "a write body must be application/json",
+            &format!("a write body must be {expected}"),
         );
     }
 
@@ -2274,7 +2300,10 @@ async fn reorder_collection(
         Some(&client_addr),
         intent,
         vec![step],
-        (&note_rel, &expect),
+        &[Precondition::from_digest(
+            StepPath::Library(note_rel.clone()),
+            expect,
+        )],
     ) {
         return guarded_write_error(error);
     }
@@ -2404,7 +2433,10 @@ async fn caption_collection(
         Some(&client_addr),
         intent,
         vec![step],
-        (&note_rel, &expect),
+        &[Precondition::from_digest(
+            StepPath::Library(note_rel.clone()),
+            expect,
+        )],
     ) {
         return guarded_write_error(error);
     }
@@ -2551,7 +2583,10 @@ async fn edit_note_body(
         Some(&client_addr),
         intent,
         vec![step],
-        (&note_rel, &expect),
+        &[Precondition::from_digest(
+            StepPath::Library(note_rel.clone()),
+            expect,
+        )],
     ) {
         return guarded_write_error(error);
     }
@@ -2564,6 +2599,235 @@ async fn edit_note_body(
         "self_embed_restored": replaced.self_embed_restored,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Upload (mirrors the CLI's `upload`, ADR-017 §11)
+// ---------------------------------------------------------------------------
+
+/// The `dimagine <version>` spelling an upload's notes record in
+/// `sources` (ADR-017 §11.5), as the viewer's uploads stamp it.
+const SERVE_IMPORTER: &str = concat!("dimagine ", env!("CARGO_PKG_VERSION"));
+
+/// `POST /api/write/upload` — land files as image groups (ADR-017 §11),
+/// the same journaled operation the CLI's `upload` runs. The body is
+/// `multipart/form-data` (ADR-018 §3, §5): every file field is an image to
+/// upload; the optional `folder` and `collection` text fields name the
+/// placement, exactly as the CLI's `--to` and `--to-collection`. A file
+/// larger than the configured per-file cap is refused *as it streams in*
+/// — the connection is dropped the moment a field crosses the cap, before
+/// the whole part is buffered (ADR-018 §5). The response carries the
+/// per-file outcomes and the operation id `POST /api/write/undo` takes.
+async fn upload_files(
+    State(state): State<AppState>,
+    client: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let cap = state.config.max_upload_bytes;
+    // The two control fields, and the file items, read straight off the
+    // stream. Files are buffered only up to `cap` each: the loop refuses
+    // a field the instant its running size would cross `cap`, so the rest
+    // of that part is never read (ADR-018 §5: enforced while streaming).
+    let mut folder_field: Option<String> = None;
+    let mut collection_field: Option<String> = None;
+    let mut items: Vec<UploadItem> = Vec::new();
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => return multipart_error(error),
+        };
+        let name = field.name().unwrap_or("").to_string();
+        if name == "folder" || name == "collection" {
+            let text = match field.text().await {
+                Ok(text) => text,
+                Err(error) => return multipart_error(error),
+            };
+            if name == "folder" {
+                folder_field = Some(text);
+            } else {
+                collection_field = Some(text);
+            }
+            continue;
+        }
+        // A file field. The batch limit is refused the moment the field
+        // count would pass it — before that field's bytes are read, and
+        // so before the library is touched (ADR-018 §5).
+        if items.len() >= MAX_UPLOAD_BATCH {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("an upload may carry at most {MAX_UPLOAD_BATCH} files"),
+            );
+        }
+        let original_name = field.file_name().unwrap_or("").to_string();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut over = false;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk)) => {
+                    if bytes.len() + chunk.len() > cap {
+                        over = true;
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk);
+                }
+                Ok(None) => break,
+                Err(error) => return multipart_error(error),
+            }
+        }
+        if over {
+            // Refuse now; dropping `multipart` here leaves the rest of the
+            // body unread, which is the disconnect the ADR asks for.
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!("a file may not exceed {cap} bytes"),
+            );
+        }
+        items.push(UploadItem {
+            original_name,
+            bytes,
+        });
+    }
+    if items.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "an upload needs at least one file");
+    }
+
+    let client_addr = crate::resolve_client_ip(
+        client.map(|info| info.0),
+        &headers,
+        &state.config.trusted_proxies,
+    );
+    let library = match Library::open(writer.root_path()) {
+        Ok(library) => library,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let resolver = Resolver::new(&library.files);
+    let ctx = BodyCtx::new(&library.files, &resolver);
+
+    // The placement (ADR-017 §11.1), the same three branches the CLI's
+    // `upload_placement` walks: a named collection (default folder + the
+    // join), a named folder, or the default upload folder.
+    let request = match upload_placement(writer, &ctx, folder_field, collection_field) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+
+    // Dedupe answers from the index's content hashes (ADR-017 §11.3): a
+    // hit names the live image these bytes already are, and no copy is
+    // made. An index that cannot answer (unopened) is a miss, so the
+    // upload copies — the fail-safe direction.
+    let index = state.index.clone();
+    let dedupe = move |sha: &str| index.image_path_for_content(sha);
+    let op_id = ulid::Ulid::new().to_string();
+    match writer.upload(
+        &op_id,
+        SOURCE,
+        Some(&client_addr),
+        request,
+        items,
+        &ctx,
+        dedupe,
+        SERVE_IMPORTER,
+    ) {
+        Ok(outcomes) => Json(serde_json::json!({
+            "op": op_id,
+            "files": outcomes.iter().map(|outcome| serde_json::json!({
+                "image": outcome.image,
+                "note": outcome.note,
+                "renamed": outcome.renamed,
+                "duplicate": outcome.duplicate,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(error) => upload_error(error),
+    }
+}
+
+/// The upload's landing spot, mirroring the CLI's `upload_placement`: a
+/// named collection lands files in the default upload folder and joins
+/// them; otherwise a named folder (the library root for `""`); otherwise
+/// the default upload folder. A `Box<Response>` is the refusal to return.
+fn upload_placement(
+    writer: &Writer,
+    ctx: &BodyCtx<'_>,
+    folder_field: Option<String>,
+    collection_field: Option<String>,
+) -> Result<UploadRequest, Box<Response>> {
+    if let Some(collection) = collection_field {
+        let note_rel = match RelPath::parse(collection.trim_start_matches("./")) {
+            Ok(rel) => rel,
+            Err(error) => return Err(Box::new(write_error(error))),
+        };
+        let Some(note_index) = ctx.index_of(&note_rel.text()) else {
+            return Err(Box::new(json_error(
+                StatusCode::NOT_FOUND,
+                &format!("no note at {collection}"),
+            )));
+        };
+        if !matches!(
+            ctx.files[note_index].class,
+            FileClass::Note | FileClass::ImageNote
+        ) {
+            return Err(Box::new(json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("{collection} is not a note"),
+            )));
+        }
+        // The collection page's "current folder" is the note's own
+        // folder (ADR-017 §6, §11.1): `attachmentFolderPath` of `./`
+        // or `./sub` resolves beside the collection, not at the root.
+        return Ok(UploadRequest {
+            folder: default_upload_folder(writer, ctx, &note_rel.parent_text()),
+            collection: Some(note_rel),
+        });
+    }
+    let folder = match folder_field {
+        Some(folder) => folder.trim_start_matches("./").to_string(),
+        None => default_upload_folder(writer, ctx, ""),
+    };
+    Ok(UploadRequest {
+        folder,
+        collection: None,
+    })
+}
+
+/// The library's default upload folder: `attachmentFolderPath` in
+/// `.obsidian/app.json`, resolved the way an interface resolves it for its
+/// current folder, else `inbox/` (ADR-017 §11.1). `current_folder` is that
+/// folder — the collection note's folder on a collection page, the library
+/// root otherwise. dimagine only ever reads `.obsidian/`, never writes it.
+fn default_upload_folder(writer: &Writer, ctx: &BodyCtx<'_>, current_folder: &str) -> String {
+    let app_json =
+        std::fs::read_to_string(writer.root_path().join(".obsidian").join("app.json")).ok();
+    body_edit::upload_folder(app_json.as_deref(), current_folder, ctx).folder
+}
+
+/// An upload refusal from the write core is the caller's mistake (a bad
+/// format, a batch too large, a missing collection), never a server fault;
+/// anything else is the 500 it is.
+fn upload_error(error: dimagine_write::Error) -> Response {
+    match &error {
+        dimagine_write::Error::UploadRefused { message } => {
+            json_error(StatusCode::BAD_REQUEST, message)
+        }
+        _ => write_error(error),
+    }
+}
+
+/// A malformed multipart body — a missing boundary, a bad part header, a
+/// stream that stopped early — is the caller's 4xx, never a 500.
+fn multipart_error(error: MultipartError) -> Response {
+    let status = error.status();
+    let status = if status.is_client_error() || status.is_server_error() {
+        status
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    json_error(status, &error.body_text())
 }
 
 // ---------------------------------------------------------------------------

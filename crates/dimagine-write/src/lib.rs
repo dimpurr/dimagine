@@ -44,6 +44,7 @@ pub mod lock;
 pub mod op_log;
 pub mod paths;
 pub mod trash;
+pub mod upload;
 pub mod writer;
 
 pub use error::{
@@ -55,4 +56,5 @@ pub use lock::WriteLock;
 pub use op_log::{OpEntry, UndoOutcome, UndoneItem};
 pub use paths::{NoteKind, RelPath, StepPath, TrashPath};
 pub use trash::{ScannedRecord, TrashRecord, TrashedFile, RECORD_SUFFIX};
-pub use writer::{SweepReport, Writer, SETTINGS_DIR, SETTINGS_FILE};
+pub use upload::{UploadItem, UploadOutcome, UploadRequest, MAX_UPLOAD_BATCH};
+pub use writer::{Precondition, SweepReport, Writer, SETTINGS_DIR, SETTINGS_FILE};

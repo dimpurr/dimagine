@@ -951,6 +951,54 @@ pub fn upload_folder(
     }
 }
 
+/// Every folder an upload may land in, for a whole-library scan
+/// (ADR-017 §11.1).
+///
+/// The default folder as resolved from the library root — what an upload
+/// outside a collection page does — plus `inbox/`, the fallback. When
+/// `attachmentFolderPath` is written relative to the current folder
+/// (`./` or `./sub`), the current folder of a collection page is the
+/// note's own folder, so that same resolution beside every note is a
+/// landing folder too, and a scan that stopped at the root would miss
+/// what an upload from a collection page leaves behind.
+pub fn upload_landing_zones(app_json: Option<&str>, ctx: &BodyCtx<'_>) -> Vec<String> {
+    let root = upload_folder(app_json, "", ctx);
+    let mut zones = vec![root.folder, "inbox".to_string()];
+    // A setting that names its own folder answers the same wherever the upload
+    // is made from, so the root answer is the whole answer.
+    if !attachment_is_current_relative(app_json) {
+        return zones;
+    }
+    for entry in ctx.files {
+        if !matches!(entry.class, FileClass::Note | FileClass::ImageNote) {
+            continue;
+        }
+        let Some(rel) = exact_rel(entry) else {
+            continue;
+        };
+        let folder = rel.rsplit_once('/').map(|(folder, _)| folder).unwrap_or("");
+        let resolved = upload_folder(app_json, folder, ctx).folder;
+        if !zones.contains(&resolved) {
+            zones.push(resolved);
+        }
+    }
+    zones
+}
+
+/// Whether `attachmentFolderPath` is written relative to the current folder
+/// (`./` or `./sub`), the spellings whose answer depends on where the upload
+/// was made from (ADR-017 §6, §11.1).
+fn attachment_is_current_relative(app_json: Option<&str>) -> bool {
+    settings(app_json)
+        .and_then(|settings| {
+            settings
+                .get("attachmentFolderPath")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .is_some_and(|raw| written_relative_to_current(&raw))
+}
+
 /// `./`-relative spellings are answered by the current folder; anything else
 /// the setting names is the setting's own answer.
 fn source_for(raw: &str, folder: &str, current: Option<&str>) -> FolderSource {

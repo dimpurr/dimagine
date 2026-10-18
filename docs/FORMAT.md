@@ -160,8 +160,8 @@ viewer shows the picture together with its note:
 - If present it must be a ULID (26 characters, Crockford base32) that is unique
   within the library.
 - Tools assign an `id` only when one is needed: when the image is first added to
-  a collection, tagged, or imported with metadata. Images nobody has touched stay
-  without a note.
+  a collection, tagged, imported with metadata, or uploaded (§9). Images nobody
+  has touched stay without a note.
 - Once written, an `id` is never changed, except when two notes carry the same
   `id`. Then the one that is a copy receives a new `id` and records the original
   in `copied_from`.
@@ -178,6 +178,12 @@ metadata, the importer stores it verbatim next to the image as
 file in the entry's `raw` field. Raw files are read-only by convention: tools
 and agents do not edit them.
 
+A file that arrives by upload (§7.2) records that in its note's `sources` with
+one entry carrying `type: upload`, the upload `imported` time, the `importer`
+(`dimagine` and its version) and the `original_name` the file arrived with. A
+bare upload carries no `raw` file and no source URL; the arrival name and time
+are its provenance.
+
 ## 4. Folders
 
 Folders mean whatever the user wants them to mean. dimagine assigns no meaning
@@ -185,7 +191,10 @@ to any folder name and requires no folder.
 
 Tools that import or create files need a default place. They should use
 `inbox/` for items with no better home, and should mirror the source's own
-structure when there is one (for example an Eagle folder path).
+structure when there is one (for example an Eagle folder path). An upload's
+default place is `attachmentFolderPath` in `.obsidian/app.json` when that
+resolves to a place inside the library, and `inbox/` otherwise (§7.2); a tool
+reads `.obsidian/` and never writes it.
 
 ## 5. Collections
 
@@ -281,7 +290,7 @@ A board is a [JSON Canvas](https://jsoncanvas.org/) file (`*.canvas`). Image
 nodes are `file` nodes whose `file` is a library path. A board is a collection
 whose members also carry positions.
 
-## 7. Moving, renaming, copying and deleting
+## 7. Moving, renaming, copying, uploading and deleting
 
 These are plain file operations. To keep a library consistent:
 
@@ -342,6 +351,50 @@ Two operations remove a file for good, and both are irreversible: deleting the
 groups past the retention period, and emptying the whole trash on request. A
 tool that offers either asks for explicit confirmation, and neither has an
 undo.
+
+### 7.2 Uploading
+
+Uploading brings a file that lives outside the library into it as an image
+group: the image, its note, and — when the upload names a collection — one
+embed line appended to that collection (§5). Upload never opens an existing
+image or a `*.json` sidecar for writing (§2.1); it only creates new files, joins
+one collection note, and refuses a duplicate rather than overwrite.
+
+**Placement.** A named folder wins. Otherwise images land in the library's
+default upload folder: `attachmentFolderPath` in `.obsidian/app.json` when it is
+set and resolves to a place inside the library, `inbox/` otherwise (§4). An
+upload that names an existing collection note lands its images in that default
+folder and adds each one to the note (§5), including a duplicate (adding an
+image that already existed is a plain join).
+
+**Naming.** A meaningful arrival name is kept, sanitized as in §2.1. A name a
+camera, a screenshot or a share panel gives — `IMG_1234`, `PXL_…`,
+`Screenshot …`, `image`, `photo`, `download`, `paste`, a stem that is only
+digits, with or without a ` (2)` copy suffix — is meaningless, and the image
+lands as `Upload <YYYYMMDDHHMMSS>.<ext>` with the original name kept in the
+note's `title` (§3.1) and in its `sources` (§3.4). A name the library already
+holds — matching NFC and case-insensitively across the whole library, the rule
+§5.1 resolves bare names by — takes the next free ` 2`, ` 3`, ... before the
+extension, created exclusively.
+
+**Type.** The arrival name carries an image extension (§2.1) and the file's
+leading bytes must be the format that extension claims; a mismatch is refused.
+SVG, HTML and XML are refused on both sides — by the final extension and by the
+bytes.
+
+**Deduplication.** Before copying, the tool compares the file's SHA-256 with the
+images already in the library — the ones that are not in `.trash/` (§7.1).
+Bytes the library already holds are not copied a second time: the upload reports
+the image that already has them. When the library's index holds no digest to
+compare against, the upload copies; a duplicate copy is always recoverable, a
+refused upload never arrives.
+
+**The note.** A new image lands with a note (§3): a fresh `id` (§3.3), `added`
+and `imported` set to the upload time with a numeric offset (§3.1), the upload
+`sources` entry (§3.4), and the self-embed (§3.2). An upload interrupted
+mid-flight leaves its half-state in the journal (§8.3), which the next writer
+recovers; an image left in a landing folder with no note is what a lost journal
+can still leave behind, and `dimagine check` reports it (`orphaned_upload`).
 
 ## 8. The `.dimagine/` folder
 
@@ -417,6 +470,7 @@ dimagine collect --add|--remove <note> <img>… # edit a collection's members
 dimagine collect --reorder <note> <ordinal>…  # permute the member blocks (§5.2)
 dimagine collect --caption <note> <block> <line> <text|->  # edit one caption line (§5.2)
 dimagine mv <img> <new-path> [--dry-run]      # move a group and repair its links (§7)
+dimagine upload <file>… [--to <folder>] [--to-collection <note>] [--dry-run]  # land files as image groups (§7.2)
 dimagine trash <img>…                         # move groups into .trash/ (§7.1)
 dimagine restore <img>…                       # move them back
 dimagine undo [<op-id>] [--force]             # reverse one recorded operation
@@ -453,3 +507,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-16 | The contract for an automatic move (§7): the `id` is fixed before anything moves and lands with the note's edit, the group renames together and refuses a taken destination, links are rewritten in place keeping their syntax and display parts, `.canvas` `nodes[].file` values follow, ambiguous links are reported and not touched. `dimagine mv` joins the CLI (§9). |
 | 0.1 | 2026-10-17 | Member blocks, caption lines and reordering (§5.2): a member line plus the plain-text lines that follow it; reordering permutes only the blocks and leaves every other byte, line boundary and trailing-newline shape alone; a caption edit touches one line and never the member line. `dimagine collect --reorder` and `collect --caption` join the CLI (§9). |
 | 0.1 | 2026-10-17 | The whole-body edit (§5.3): a note's body is the bytes after its front matter's closing line; a replacement keeps the front matter and every byte-order mark, line ending and trailing newline as given, carries a precondition on the bytes it replaces, and keeps the self-embed rule on the result; a note whose opening fence is never closed is refused, and a note that ends at its closing fence is given the line break its body needs. `dimagine edit` joins the CLI (§9). |
+| 0.1 | 2026-10-17 | Upload (§7.2): placement is a named folder, else the default upload folder — `attachmentFolderPath`, else `inbox/` — plus a plain join when the upload names a collection; naming keeps a meaningful name and renames a meaningless camera, screenshot or share name to `Upload <YYYYMMDDHHMMSS>.<ext>` with the original kept in `title` (§3.1) and `sources` (§3.4), taking ` 2` on a library-wide NFC, case-insensitive collision; the bytes must match the extension, with SVG, HTML and XML refused on both sides; identical bytes already in the library (outside `.trash/`) are not copied again; a new image lands with a note carrying `id` (§3.3), `added`, `imported` and the upload `sources` entry (§3.4). `dimagine upload` joins the CLI (§9). |

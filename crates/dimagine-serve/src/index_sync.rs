@@ -369,6 +369,17 @@ impl IndexHandle {
             .unwrap_or_default()
     }
 
+    /// The one image row that carries this content digest, if the index
+    /// holds one (ADR-017 §11.3: an upload dedupes against the image the
+    /// index already knows by hash). `None` is an unknown, never a
+    /// "certainly absent": an index that could not be opened answers the
+    /// same way a library that holds no such file does, and the upload
+    /// copies in that case — the fail-safe direction.
+    pub fn image_path_for_content(&self, sha256: &str) -> Option<String> {
+        self.with_index(|index| index.image_by_sha256(sha256).ok().flatten())
+            .flatten()
+    }
+
     /// Run one read against the open index. `None` from outside is an index
     /// that could not be opened — an unknown, never an empty answer — and the
     /// caller decides what that means for its own question.

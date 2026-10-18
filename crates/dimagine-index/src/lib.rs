@@ -778,6 +778,28 @@ impl Index {
         )
     }
 
+    /// The library-relative path of a non-deleted image whose content
+    /// is `sha256`, when the index holds a digest for it (ADR-017 §11:
+    /// an upload's dedupe looks the content hash up among the images
+    /// the index knows). Trashed images live under `.trash/`, a dotted
+    /// name the scan ignores, so no deleted image has a row: a hit is
+    /// always a live image. An image the index never hashed has no row
+    /// and answers `None`, which sends the upload down the copy path.
+    pub fn image_by_sha256(&self, sha256: &str) -> Result<Option<String>, IndexError> {
+        if !valid_sha256(sha256) {
+            return Ok(None);
+        }
+        let path: Option<String> = self
+            .conn()?
+            .query_row(
+                "SELECT path FROM files WHERE kind='image' AND sha256=?1 LIMIT 1",
+                [sha256],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(path)
+    }
+
     /// The image metadata a refresh can reuse because the file did not change:
     /// the stored SHA-256 digest plus the per-image header columns, when the
     /// row exists with the same size and nanosecond mtime and already carries

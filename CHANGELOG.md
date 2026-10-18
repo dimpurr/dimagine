@@ -97,6 +97,36 @@ All notable changes to this project are documented here. The format follows
   reported once per note with each link's line and body byte span — the exact
   damage a hand move in another tool leaves behind. The per-link `missing_link`
   and `ambiguous_link` warnings are unchanged.
+- Uploads land as image groups (Phase 3b, FORMAT §7.2): `dimagine upload
+  <file>…` refuses a file whose bytes are not the format its name claims and
+  SVG/HTML/XML on both sides, keeps a meaningful name (sanitized as ever) and
+  renames a meaningless camera, screenshot or share name to `Upload
+  <YYYYMMDDHHMMSS>.<ext>` with the original kept in the note's `title`, takes
+  ` 2` on a library-wide NFC, case-insensitive collision, and does not copy
+  twice what the library already holds: the bytes' SHA-256 is looked up among
+  the live images in the index, and a hit names the existing image instead of
+  writing a second copy. Each new image lands with a note carrying a fresh
+  `id`, `added` and `imported` at the upload time, and a `sources` entry
+  (`type: upload`, `imported`, `importer`, `original_name`). Placement is
+  ADR-017 §11.1: `--to <folder>`, or `--to-collection <note>` for the default
+  upload folder plus the join, or the default folder itself —
+  `.obsidian/app.json`'s `attachmentFolderPath`, else `inbox/`. `--dry-run`
+  reports the placement, names and dedupe hits and changes nothing; a batch
+  over 1000 files is refused before anything is opened; the whole request is
+  one journaled operation, so one `dimagine undo <op>` removes the whole
+  uploaded group.
+- The write API uploads too (Phase 3b): `POST /api/write/upload` takes
+  `multipart/form-data` — the one route ADR-018 §3 excepts from the JSON-body
+  rule, and multipart is accepted nowhere else — with one `file` field per
+  file and optional `folder` and `collection` fields mirroring the CLI. A file
+  over the per-file cap (`--max-upload-bytes`, default 100 MiB) is refused
+  while it streams: 413 the moment the field crosses the cap, the connection
+  dropped with the rest of the body unread and nothing buffered first. Owner,
+  origin, CSRF, audit and `--write` gating are every other write's; the
+  response carries the per-file outcomes and the `op` id.
+- `dimagine check` reports an image left in an upload landing zone with no
+  note (`orphaned_upload`, info): the state an interrupted upload whose
+  journal was lost leaves behind. The scan is read-only.
 - The write API can move too (Phase 3b): `POST /api/write/move`
   (`{"from", "to", "dry_run"?}`) runs the same plan as the CLI and answers with
   it, `dimagine.move/0.1`, the `op` id null on a dry run — behind the same

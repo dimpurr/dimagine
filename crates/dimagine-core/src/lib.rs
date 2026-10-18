@@ -16,6 +16,9 @@
 //!   file nodes (FORMAT §5.1, §6),
 //! - [`move_plan`]: plan a move/rename of an image group and the repair of
 //!   the links that pointed at it (ADR-017 §8),
+//! - [`upload`]: the pure half of an upload — placement inputs, naming,
+//!   the format check, the note bytes and the collection join
+//!   (ADR-017 §11),
 //! - [`image_meta`]: per-image header facts for the index refresh,
 //! - [`index`]: write one scan into the SQLite index,
 //! - [`check`]: findings for `dimagine check`,
@@ -39,6 +42,7 @@ pub mod note;
 pub mod scan;
 pub mod settings;
 pub mod sniff;
+pub mod upload;
 
 pub use check::{CheckReport, Finding, Severity};
 pub use index::sync_index;

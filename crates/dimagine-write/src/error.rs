@@ -140,6 +140,14 @@ pub enum Error {
     /// The library root is not usable.
     #[error("library root {0:?}")]
     BadRoot(String),
+    /// An upload was refused before anything was written
+    /// (ADR-017 §11): a file's bytes are not the format its
+    /// name claims, the file is SVG, HTML or XML, the batch is
+    /// too large, or the target collection does not exist.
+    /// Nothing has been touched, so the whole upload may be
+    /// retried after the cause is fixed.
+    #[error("upload refused: {message}")]
+    UploadRefused { message: String },
     /// Any filesystem failure. ENOSPC and friends land here: the temp file is
     /// removed, the original is untouched, and this error is returned
     /// (ADR-016 §4).

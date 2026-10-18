@@ -27,7 +27,7 @@ use std::time::Duration;
 use clap::{Arg, ArgMatches, Command};
 use dimagine_serve::{
     accounts::AccountsStore, remind_until_owner_exists, router_from, AuthMode, CachedPreview,
-    FsCatalog, ServeConfig, NO_OWNER_REMINDER_INTERVAL,
+    FsCatalog, ServeConfig, MAX_UPLOAD_BYTES_DEFAULT, NO_OWNER_REMINDER_INTERVAL,
 };
 use std::sync::Arc;
 
@@ -117,6 +117,13 @@ pub fn command() -> Command {
                 .long("allow-anonymous-write")
                 .action(clap::ArgAction::SetTrue)
                 .help("Let a no-login server (`--auth none`) on a loopback bind accept writes without a session (ADR-018 §2)."),
+        )
+        .arg(
+            Arg::new("max_upload_bytes")
+                .long("max-upload-bytes")
+                .value_name("BYTES")
+                .value_parser(clap::value_parser!(usize))
+                .help("Largest one upload file may be, in bytes; enforced while the multipart body streams (ADR-018 §5, default 100 MiB)."),
         )
         .after_help(format!(
             "If no users exist and {PASSCODE_ENV} is set, passcode mode is active. \
@@ -235,6 +242,10 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         write,
         allow_anonymous_write,
         public_origin: if write { public_origin } else { None },
+        max_upload_bytes: sub
+            .get_one::<usize>("max_upload_bytes")
+            .copied()
+            .unwrap_or(MAX_UPLOAD_BYTES_DEFAULT),
         ..ServeConfig::default()
     };
     let address = SocketAddr::new(bind, port);
