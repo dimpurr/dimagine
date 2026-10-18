@@ -249,13 +249,6 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         ..ServeConfig::default()
     };
     let address = SocketAddr::new(bind, port);
-    let app = match router_from(Arc::new(catalog), Arc::new(previews), config.clone()) {
-        Ok(app) => app,
-        Err(err) => {
-            emit_failure(json, &err.to_string());
-            return ExitCode::from(1);
-        }
-    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -267,6 +260,18 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         }
     };
     runtime.block_on(async move {
+        // The router is built inside the runtime on purpose: `router_from`
+        // starts the periodic background rescan, which needs a Tokio context
+        // to spawn on. Building it before the runtime existed silently left
+        // the periodic rescan unstarted, so the viewer served its startup
+        // index forever (W31).
+        let app = match router_from(Arc::new(catalog), Arc::new(previews), config.clone()) {
+            Ok(app) => app,
+            Err(err) => {
+                emit_failure(json, &err.to_string());
+                return ExitCode::from(1);
+            }
+        };
         let listener = match tokio::net::TcpListener::bind(address).await {
             Ok(listener) => listener,
             Err(error) => {

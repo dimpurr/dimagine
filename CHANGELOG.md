@@ -501,7 +501,26 @@ All notable changes to this project are documented here. The format follows
   ~16x faster, a short-text view ~14x, `collections()` ~2x, and no query reads
   and parses every note any more.
 
+### Performance
+- The viewer's list queries no longer wait for a background rescan, and a
+  repeated query no longer re-counts its whole result on every request. The
+  number of committed scans is now stored in the index and raised in the same
+  transaction as the scan's content, so a read snapshot and the number it was
+  counted against always move together. A read-only reader connection answers
+  `/api/view` — the page, each tile's header and digest, and the sidebar — while
+  the rescan writes on the index connection, so no live request blocks behind one;
+  view totals and the sidebar are cached per query and per committed generation,
+  so each is counted once per scan rather than once per request. On a 20k-image
+  library a request that once waited several seconds for an ongoing rescan now
+  answers in tens of milliseconds.
+
 ### Fixed
+- `dimagine serve` now runs its periodic background rescan. The router — which
+  starts the rescan task, and needs a Tokio runtime to spawn on — was built
+  before that runtime existed, so the task never started and the viewer served
+  its startup index forever, never seeing files added or changed after launch.
+  The app is now built inside the runtime, and a CLI regression test drops a file
+  into a served library and requires the next rescan to pick it up live.
 - A move whose destination is a symlink to the source — or any fold-equal
   alias sitting beside it — is refused whole instead of being torn apart
   (RW65c R1). The planner's same-file test now reads the destination entry's

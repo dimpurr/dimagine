@@ -7,14 +7,19 @@
 //! - Refresh: background incremental sync every `--rescan-interval` (default
 //!   300 s; `0` disables).
 //! - All list and count queries go through `dimagine_index`.
-//! - Counts and sidebar data are cached per index generation and invalidated
-//!   after each sync.
+//! - Counts and sidebar data are cached per index generation — the number of
+//!   scans committed to the index, which every committed scan raises in the
+//!   same transaction as its content — so each entry retires itself on the
+//!   first request after a rescan.
+//! - A rescan writes on the index connection while every list request reads a
+//!   read-only connection of its own (WAL), so live requests proceed
+//!   throughout and never wait for a rescan.
 
 use dimagine_core::library::Library;
 use dimagine_core::sync_index;
 use dimagine_index::{
-    AppearsIn, FacetCounts, ImageMeta, Index, IndexError, Neighbours, RecentWindow, ViewPage,
-    ViewQuery,
+    AppearsIn, CollectionInfo, Connection, FacetCounts, ImageMeta, Index, IndexError, Neighbours,
+    Reader, RecentWindow, ViewPage, ViewQuery,
 };
 use serde::Serialize;
 use std::{
@@ -160,8 +165,22 @@ enum Slot {
 pub struct IndexHandle {
     root: PathBuf,
     slot: Mutex<Slot>,
-    generation: AtomicU64,
+    /// A read-only connection to the same database, opened beside the `Index`
+    /// in `slot`. Every list query answers from it while the rescan writes on
+    /// the `Index` connection, so a request never waits for a rescan. `None`
+    /// means it could not be opened and reads fall back to the `Index`
+    /// connection through `slot` (the pre-W31 path).
+    reader: Mutex<Option<Reader>>,
     cached_sidebar: Mutex<Option<(u64, Arc<SidebarData>)>>,
+    /// View totals per query (without paging) and per committed index
+    /// generation, as `(generation, total)`. A repeated query — every grid
+    /// scroll, every sidebar lens — pays only for its page; each query counts
+    /// once per committed scan.
+    cached_totals: Mutex<HashMap<ViewQuery, (u64, u64)>>,
+    /// Test hook: milliseconds to hold the write critical section, so a test
+    /// can watch a request answer from the reader while the sync still holds
+    /// `slot`. Zero in production.
+    sync_delay: AtomicU64,
     rescan_started: AtomicBool,
     /// Whether the index was already current at startup, which decides if a
     /// first background sync is worth running.
@@ -190,8 +209,10 @@ impl IndexHandle {
             slot: Mutex::new(Slot::Closed(IndexUnavailable(
                 "the index has not been opened yet".to_owned(),
             ))),
-            generation: AtomicU64::new(1),
+            reader: Mutex::new(None),
             cached_sidebar: Mutex::new(None),
+            cached_totals: Mutex::new(HashMap::new()),
+            sync_delay: AtomicU64::new(0),
             rescan_started: AtomicBool::new(false),
             needs_first_background_sync: false,
             digest_memo: Mutex::new(HashMap::new()),
@@ -207,6 +228,19 @@ impl IndexHandle {
                 (index, true)
             }
         };
+        // A read-only connection to the same database, opened while the `Index`
+        // writer is live (it must be, so the WAL side-files already exist).
+        // Every list query answers from it; if it cannot open, reads fall back
+        // to the writer connection. The best-effort open keeps a reader
+        // hiccup from taking the viewer down.
+        let reader = Reader::open(index.database_path())
+            .map_err(|error| {
+                eprintln!("dimagine: index reader unavailable, reads will serialise: {error}")
+            })
+            .ok();
+        if let Some(reader) = reader {
+            *handle.reader.lock().expect("a fresh lock is not poisoned") = Some(reader);
+        }
         *handle.slot.lock().expect("a fresh lock is not poisoned") = Slot::Open(index);
 
         if was_missing || was_rebuilt {
@@ -226,10 +260,15 @@ impl IndexHandle {
         Ok(handle)
     }
 
-    /// Run one sync against the library files and invalidate the counts.
+    /// Run one sync against the library files.
     ///
     /// `sync_index` walks the folder but only rewrites the rows whose size,
-    /// mtime or hash moved, so resyncing an unchanged library is cheap.
+    /// mtime or hash moved, so resyncing an unchanged library is cheap. It
+    /// commits on the index connection while the reader answers every request
+    /// from a snapshot of its own, so no request waits for this; the committed
+    /// scan generation the caches validate against moves in the same
+    /// transaction as the content, which is what retires the cached totals and
+    /// sidebar on the next request after any change.
     pub fn refresh(&self) -> Result<(), IndexError> {
         self.sync_now()
     }
@@ -240,6 +279,13 @@ impl IndexHandle {
         })?;
         {
             let mut slot = self.lock()?;
+            // Test hook: hold the write critical section the way a slow rescan
+            // does, so a test can watch a request answer from the reader while
+            // this writer still holds `slot` (W31). Zero in production.
+            let delay = self.sync_delay.load(Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
             match &mut *slot {
                 Slot::Open(index) => sync_index(&library, index)?,
                 Slot::Closed(reason) => {
@@ -249,12 +295,41 @@ impl IndexHandle {
                 }
             }
         }
-        self.invalidate();
+        self.after_sync();
         Ok(())
     }
 
     /// One page of images for a view query.
+    ///
+    /// The page and its committed generation are read together on the reader
+    /// connection, in one snapshot. The total is cached per query (without
+    /// paging) under that generation and trusted only while the generation
+    /// still reads back the same, so a rescan cannot slip between a total and
+    /// the list it describes: it commits the generation bump and its content
+    /// in one transaction, so the next request fails the check and recounts
+    /// from one snapshot. A repeated query then pays only for its page.
     pub fn view(&self, query: &ViewQuery) -> Result<ViewPage, IndexError> {
+        if let Ok(reader_slot) = self.reader.lock() {
+            if let Some(reader) = reader_slot.as_ref() {
+                let key = ViewQuery {
+                    offset: 0,
+                    limit: 0,
+                    ..query.clone()
+                };
+                // The page and the generation it was read at, in one snapshot.
+                let (generation, items) = reader.view_page_with_generation(query)?;
+                if let Some(total) = self.cached_total(&key, generation)? {
+                    return Ok(ViewPage { total, items });
+                }
+                // First request for this query at this generation: count once.
+                // Total and list come from the recount's own snapshot, so they
+                // always describe the same index.
+                let (generation, page) = reader.view_with_generation(query)?;
+                self.cache_total(&key, generation, page.total)?;
+                return Ok(page);
+            }
+        }
+        // No reader connection: read through the index, as before W31.
         match &*self.lock()? {
             Slot::Open(index) => index.view(query),
             Slot::Closed(reason) => Err(reason.clone().into()),
@@ -281,6 +356,11 @@ impl IndexHandle {
     /// rather than a scan: the facts are already stored beside the path the
     /// view returned, and no image file is opened.
     pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
+        if let Ok(reader_slot) = self.reader.lock() {
+            if let Some(reader) = reader_slot.as_ref() {
+                return reader.image_meta(path);
+            }
+        }
         match &*self.lock()? {
             Slot::Open(index) => index.image_meta(path),
             Slot::Closed(reason) => Err(reason.clone().into()),
@@ -302,6 +382,15 @@ impl IndexHandle {
     /// A closed index has no digest to give and says so; that is an unknown,
     /// not an empty library.
     pub fn content_hash(&self, path: &str, size: u64, mtime_ns: i64) -> Option<String> {
+        if let Ok(reader_slot) = self.reader.lock() {
+            if let Some(reader) = reader_slot.as_ref() {
+                return reader
+                    .reusable_image_meta(path, size, mtime_ns)
+                    .ok()
+                    .flatten()
+                    .map(|(sha256, _meta)| sha256);
+            }
+        }
         self.with_index(|index| {
             index
                 .reusable_image_meta(path, size, mtime_ns)
@@ -477,26 +566,74 @@ impl IndexHandle {
         }
     }
 
-    /// Every folder, collection and tag with its count, cached per generation.
+    /// Every folder, collection and tag with its count, cached per committed
+    /// index generation.
+    ///
+    /// The whole sidebar is one read transaction on the reader connection, so
+    /// its folders, collections, tags and lens counts always describe the same
+    /// snapshot. The cache entry carries that snapshot's generation — how many
+    /// scans had been committed — and every committed scan raises it, so an
+    /// entry survives exactly until the first request after a rescan retires
+    /// it.
     pub fn sidebar_data(&self) -> Result<Arc<SidebarData>, IndexError> {
-        let generation = self.generation();
-        if let Some(cached) = self.cached_sidebar.lock().ok().and_then(|cache| {
-            cache
-                .as_ref()
-                .filter(|(cached, _)| *cached == generation)
-                .map(|(_, data)| Arc::clone(data))
-        }) {
-            return Ok(cached);
+        if let Ok(reader_slot) = self.reader.lock() {
+            if let Some(reader) = reader_slot.as_ref() {
+                let generation = reader.generation()?;
+                if let Some(cached) = self.cached_sidebar(generation)? {
+                    return Ok(cached);
+                }
+                let (generation, data) = reader.read_at_generation(Self::sidebar_data_on)?;
+                let data = Arc::new(data);
+                if let Ok(mut cache) = self.cached_sidebar.lock() {
+                    *cache = Some((generation, Arc::clone(&data)));
+                }
+                return Ok(data);
+            }
         }
-
-        let data = Arc::new(self.read_sidebar_data()?);
-        if let Ok(mut cache) = self.cached_sidebar.lock() {
-            *cache = Some((generation, Arc::clone(&data)));
-        }
-        Ok(data)
+        // No reader connection: read through the index, uncached (as before W31).
+        self.sidebar_from_index().map(Arc::new)
     }
 
-    fn read_sidebar_data(&self) -> Result<SidebarData, IndexError> {
+    /// The cached sidebar at `generation`, when one was read from that
+    /// generation of the index.
+    fn cached_sidebar(&self, generation: u64) -> Result<Option<Arc<SidebarData>>, IndexError> {
+        let cache = self.cached_sidebar.lock().map_err(|_| {
+            IndexError::Io(std::io::Error::other("the sidebar cache lock is poisoned"))
+        })?;
+        Ok(cache
+            .as_ref()
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, data)| Arc::clone(data)))
+    }
+
+    /// Everything the sidebar shows, from one snapshot on `conn`. Public pieces
+    /// of `dimagine_index` run on the caller's connection so the folders,
+    /// collections, tags and lens counts agree on the index generation the
+    /// entry is cached under.
+    fn sidebar_data_on(conn: &Connection) -> Result<SidebarData, IndexError> {
+        let folders = dimagine_index::folder_counts(conn)?;
+        let collections = dimagine_index::collections(conn)?;
+        let tags = dimagine_index::tag_counts(conn)?;
+        // One row is enough to read each lens's size: the count comes back as a
+        // total, so this stays one grouped query per lens.
+        let untagged = dimagine_index::view_total(
+            conn,
+            &ViewQuery {
+                untagged: true,
+                ..ViewQuery::default()
+            },
+        )?;
+        Ok(Self::sidebar_from_parts(
+            folders,
+            collections,
+            tags,
+            untagged,
+        ))
+    }
+
+    /// The same sidebar built through the index connection, for the case where
+    /// the reader could not be opened.
+    fn sidebar_from_index(&self) -> Result<SidebarData, IndexError> {
         let slot = self.lock()?;
         let index = match &*slot {
             Slot::Open(index) => index,
@@ -505,13 +642,6 @@ impl IndexHandle {
         let folders = index.folder_counts()?;
         let collections = index.collections()?;
         let tags = index.tag_counts()?;
-        let total = folders
-            .iter()
-            .find(|(folder, _)| folder.is_empty())
-            .map(|(_, count)| *count)
-            .unwrap_or(0);
-        // One row is enough to read each lens's size: the count comes back in
-        // `ViewPage::total`, so this stays one grouped query per lens.
         let untagged = count_matching(
             index,
             ViewQuery {
@@ -519,12 +649,33 @@ impl IndexHandle {
                 ..ViewQuery::default()
             },
         )?;
-        // Recent is the `RECENT_LIMIT` most recently added images (W34 audit
-        // #10), so its size is the whole library capped at the limit — the
-        // same size the view itself reports, 200 or fewer.
-        let recent = total.min(RECENT_LIMIT);
+        Ok(Self::sidebar_from_parts(
+            folders,
+            collections,
+            tags,
+            untagged,
+        ))
+    }
 
-        Ok(SidebarData {
+    /// Assemble [`SidebarData`] from the four counts, whatever connection read
+    /// them: the folder and collection filters and the Recent cap are one rule,
+    /// written once.
+    fn sidebar_from_parts(
+        folders: Vec<(String, u64)>,
+        collections: Vec<CollectionInfo>,
+        tags: Vec<(String, u64)>,
+        untagged: u64,
+    ) -> SidebarData {
+        let total = folders
+            .iter()
+            .find(|(folder, _)| folder.is_empty())
+            .map(|(_, count)| *count)
+            .unwrap_or(0);
+        // Recent is the `RECENT_LIMIT` most recently added images (W34 audit
+        // #10), so its size is the whole library capped at the limit — the same
+        // size the view itself reports, 200 or fewer.
+        let recent = total.min(RECENT_LIMIT);
+        SidebarData {
             folders: folders
                 .into_iter()
                 .filter(|(folder, _)| !folder.is_empty())
@@ -551,7 +702,7 @@ impl IndexHandle {
             total,
             untagged,
             recent,
-        })
+        }
     }
 
     /// Start the periodic background sync when `interval_secs` is non-zero.
@@ -598,17 +749,52 @@ impl IndexHandle {
         }
     }
 
-    /// Drop the cached counts so the next read recounts, and the digests read
-    /// for files the index had none for: the sync that just ran hashed them
-    /// into the index, so the memo has nothing left to save.
-    fn invalidate(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut cache) = self.cached_sidebar.lock() {
-            *cache = None;
-        }
+    /// After a committed sync, drop the digests read for files the index had
+    /// none for: the sync that just ran hashed them into the index, so the memo
+    /// has nothing left to save. The count and sidebar caches need no clearing —
+    /// a committed scan raised the generation they are validated against, so
+    /// they retire themselves on the next read (W31).
+    fn after_sync(&self) {
         if let Ok(mut memo) = self.digest_memo.lock() {
             memo.clear();
         }
+    }
+
+    /// Lengthen the write critical section of every sync by `millis`, for a test
+    /// that proves a request answers from the reader while the sync still holds
+    /// the writer. Not for production use.
+    #[cfg(test)]
+    pub(crate) fn set_sync_delay(&self, millis: u64) {
+        self.sync_delay.store(millis, Ordering::SeqCst);
+    }
+
+    /// The cached total for `key` when it was counted at `generation`.
+    fn cached_total(&self, key: &ViewQuery, generation: u64) -> Result<Option<u64>, IndexError> {
+        let cache = self.cached_totals.lock().map_err(|_| {
+            IndexError::Io(std::io::Error::other(
+                "the view total cache lock is poisoned",
+            ))
+        })?;
+        Ok(cache
+            .get(key)
+            .filter(|(cached, _)| *cached == generation)
+            .map(|(_, total)| *total))
+    }
+
+    /// Record `total` for `key` at `generation`, clearing the cache when it is
+    /// full so a long-lived process cannot grow it without bound.
+    fn cache_total(&self, key: &ViewQuery, generation: u64, total: u64) -> Result<(), IndexError> {
+        const VIEW_TOTAL_CACHE_LIMIT: usize = 64;
+        let mut cache = self.cached_totals.lock().map_err(|_| {
+            IndexError::Io(std::io::Error::other(
+                "the view total cache lock is poisoned",
+            ))
+        })?;
+        if cache.len() >= VIEW_TOTAL_CACHE_LIMIT {
+            cache.clear();
+        }
+        cache.insert(key.clone(), (generation, total));
+        Ok(())
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Slot>, IndexError> {
@@ -622,9 +808,21 @@ impl IndexHandle {
         &self.root
     }
 
-    /// The current index generation, bumped by every successful sync.
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+    /// The current index generation: how many scans have been committed to the
+    /// index. Read through the reader in one transaction, so it always
+    /// describes committed content; a cached count tagged with this generation
+    /// is valid exactly while it reads back the same.
+    pub fn generation(&self) -> Result<u64, IndexError> {
+        if let Ok(reader_slot) = self.reader.lock() {
+            if let Some(reader) = reader_slot.as_ref() {
+                return reader.generation();
+            }
+        }
+        // No reader: read it through the index connection.
+        match &*self.lock()? {
+            Slot::Open(index) => index.generation(),
+            Slot::Closed(reason) => Err(reason.clone().into()),
+        }
     }
 
     /// A handle that never opens, for a library whose index could not be built.
@@ -635,8 +833,10 @@ impl IndexHandle {
         Self {
             root,
             slot: Mutex::new(Slot::Closed(reason)),
-            generation: AtomicU64::new(0),
+            reader: Mutex::new(None),
             cached_sidebar: Mutex::new(None),
+            cached_totals: Mutex::new(HashMap::new()),
+            sync_delay: AtomicU64::new(0),
             rescan_started: AtomicBool::new(false),
             needs_first_background_sync: false,
             digest_memo: Mutex::new(HashMap::new()),
@@ -764,7 +964,7 @@ mod tests {
     fn a_refresh_sees_new_files_and_invalidates_the_counts() {
         let dir = test_library();
         let handle = IndexHandle::open(dir.path()).unwrap();
-        let generation = handle.generation();
+        let generation = handle.generation().unwrap();
         let before = handle.sidebar_data().unwrap();
         let folders_before = before.folders.len();
 
@@ -776,13 +976,120 @@ mod tests {
         );
 
         handle.refresh().unwrap();
-        assert!(handle.generation() > generation);
+        assert!(
+            handle.generation().unwrap() > generation,
+            "a committed scan raises the index generation the caches validate against"
+        );
         let after = handle.sidebar_data().unwrap();
         assert_eq!(after.total, before.total + 1);
         assert_eq!(
             after.folders.len(),
             folders_before,
             "a file in an existing folder adds no folder row"
+        );
+    }
+
+    /// W31: the total a view report carries must come from the same state of the
+    /// index as its list — before a change, held steady across repeat requests
+    /// while no sync runs, and recounted in full on the first request after a
+    /// sync. Walking every page and adding up the items is the check: if the
+    /// total ever disagrees with the sum of the pages, the walk reports it.
+    #[test]
+    fn a_view_total_matches_the_list_before_and_after_a_change() {
+        let dir = test_library();
+        let handle = IndexHandle::open(dir.path()).unwrap();
+        let walk = |handle: &IndexHandle, query: &ViewQuery| {
+            let (mut total, mut items, mut offset) = (None, Vec::new(), 0u32);
+            loop {
+                let page = handle
+                    .view(&ViewQuery {
+                        offset,
+                        limit: 2,
+                        ..query.clone()
+                    })
+                    .unwrap();
+                assert_eq!(
+                    page.total,
+                    *total.get_or_insert(page.total),
+                    "the total must not move between pages of one query"
+                );
+                let walked = page.items.len();
+                items.extend(page.items);
+                if walked == 0 || items.len() as u64 >= page.total {
+                    return (page.total, items);
+                }
+                offset += 2;
+            }
+        };
+
+        let query = ViewQuery {
+            folder: Some("refs".into()),
+            ..ViewQuery::default()
+        };
+        let (total, items) = walk(&handle, &query);
+        assert_eq!(total, 2);
+        assert_eq!(items.len(), 2, "{items:?}");
+        // The cached total must survive a repeat request unchanged.
+        assert_eq!(handle.view(&query).unwrap().total, 2);
+
+        fs::write(dir.path().join("refs/new-1.jpg"), JPEG).unwrap();
+        fs::write(dir.path().join("refs/new-2.jpg"), JPEG).unwrap();
+        assert_eq!(
+            walk(&handle, &query).0,
+            2,
+            "no rescan ran, so the cached total is still the truth"
+        );
+        handle.refresh().unwrap();
+        let (total, items) = walk(&handle, &query);
+        assert_eq!(total, 4, "the first request after the sync recounts");
+        assert_eq!(items.len(), 4);
+    }
+
+    /// W31 (RW27's second Medium): a slow rescan used to hold the request lock
+    /// for its whole duration, so a live `GET /api/view` waited for the full
+    /// rescan. The sync delay injection simulates exactly that hold, on the lock
+    /// the old design shared with requests; the view and the sidebar must both
+    /// answer long before the slow sync is over, from their own reader snapshot.
+    #[test]
+    fn a_view_request_completes_while_a_slow_rescan_is_in_progress() {
+        let dir = test_library();
+        let handle = Arc::new(IndexHandle::open(dir.path()).unwrap());
+        handle.set_sync_delay(750);
+
+        let syncing = {
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || handle.refresh())
+        };
+        // Let the sync reach its long critical section.
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !syncing.is_finished(),
+            "the test must measure the request during the sync, not after it"
+        );
+
+        let started = std::time::Instant::now();
+        let page = handle.view(&ViewQuery::default()).unwrap();
+        assert_eq!(page.total, 4);
+        assert_eq!(page.items.len(), 4);
+        let view_wait = started.elapsed();
+        let sidebar = handle.sidebar_data().unwrap();
+        let sidebar_wait = started.elapsed();
+        assert_eq!(sidebar.total, 4);
+
+        let slow_sync = Duration::from_millis(500);
+        assert!(
+            view_wait < slow_sync,
+            "a view request waited {view_wait:?} for a rescan that still holds the writer"
+        );
+        assert!(
+            sidebar_wait < slow_sync,
+            "the sidebar waited {sidebar_wait:?} for a rescan that still holds the writer"
+        );
+        syncing.join().unwrap().unwrap();
+        assert_eq!(
+            handle.generation().unwrap(),
+            2,
+            "the slow sync still committed"
         );
     }
 

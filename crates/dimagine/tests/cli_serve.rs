@@ -403,6 +403,28 @@ fn header_of<'a>(response: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// The JSON body of an API response, chunked or plain.
+fn api_json(response: &str) -> serde_json::Value {
+    let (headers, rest) = response.split_once("\r\n\r\n").expect("api body");
+    let bytes = rest.as_bytes();
+    let plain = if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        dechunk(bytes)
+    } else {
+        bytes.to_vec()
+    };
+    serde_json::from_slice(&plain).expect("api json")
+}
+
+/// The `total` field of `GET /api/view`.
+fn view_total(address: &str) -> u64 {
+    api_json(&http_get(address, "/api/view", None))["total"]
+        .as_u64()
+        .expect("api view total")
+}
+
 #[test]
 fn serve_login_page_and_redirect_for_anonymous() {
     let dir = library("anonymous");
@@ -1938,6 +1960,47 @@ fn serve_auth_none_starts_on_a_broken_accounts_store() {
         std::fs::read_to_string(state.0.join("accounts.json")).unwrap(),
         r#"{"schema":1}"#,
         "a no-login server must not rewrite the store"
+    );
+}
+
+/// W31: `dimagine serve` has to start the periodic background rescan for
+/// real. The router — and with it `ensure_background_rescan` — used to be
+/// built before the Tokio runtime existed, so the background task never
+/// started and the viewer served its startup index forever. With the task
+/// running, a file dropped into the library after startup appears in the
+/// view without a restart.
+#[test]
+fn serve_periodic_rescan_picks_up_files_added_after_startup() {
+    let dir = library("rescan");
+    let server = Server::start(
+        &dir.root,
+        &["--port", "0", "--auth", "none", "--rescan-interval", "1"],
+        &[],
+    );
+    let address = server.url().to_string();
+
+    let baseline = view_total(&address);
+    assert_eq!(baseline, 2, "the startup index already counts two images");
+    std::fs::write(dir.root.join("late.png"), PNG).unwrap();
+
+    // The interval is one second: the new image appears once the periodic
+    // rescan has run, without restarting the server.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let total = loop {
+        let total = view_total(&address);
+        if total > baseline || Instant::now() > deadline {
+            break total;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(
+        total, 3,
+        "the periodic rescan must pick up files added after startup"
+    );
+    let stderr = server.kill();
+    assert!(
+        !stderr.contains("background index sync failed"),
+        "the rescan must not fail: {stderr}"
     );
 }
 

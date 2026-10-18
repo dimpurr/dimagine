@@ -5,7 +5,7 @@
 
 mod view;
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, OpenFlags, OptionalExtension};
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -13,10 +13,14 @@ use std::sync::{Mutex, OnceLock};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
+/// The connection the index queries run on, re-exported because the
+/// connection-level query functions below and [`Reader`] take it, and the
+/// serve handle composes its sidebar from them on one read snapshot.
+pub use rusqlite::Connection;
 pub use view::{
-    collection_is_listed, note_is_collection, note_rating, AppearsIn, CollectionEvidence,
-    CollectionInfo, FacetCounts, ImageMetaStats, Neighbours, RecentWindow, SortKey, ViewItem,
-    ViewPage, ViewQuery,
+    collection_is_listed, collections, folder_counts, note_is_collection, note_rating, tag_counts,
+    view_total, AppearsIn, CollectionEvidence, CollectionInfo, FacetCounts, ImageMetaStats,
+    Neighbours, Reader, RecentWindow, SortKey, ViewItem, ViewPage, ViewQuery,
 };
 
 const SCHEMA_VERSION: i64 = 8;
@@ -750,6 +754,16 @@ impl Index {
                 [],
             )?;
             conn.execute("DELETE FROM scan_seen", [])?;
+            // Bump the scan generation in the same transaction as the
+            // content it describes, so a reader that reads both inside one
+            // read snapshot always sees them change together: a cached total
+            // is only valid while the generation it was counted at still
+            // reads back the same (W31). `INSERT OR IGNORE` seeds the row for
+            // a database that somehow lost it, so the increment always lands.
+            conn.execute_batch(
+                "INSERT OR IGNORE INTO index_meta(key,value) VALUES('generation',0); \
+                 UPDATE index_meta SET value=value+1 WHERE key='generation';",
+            )?;
             conn.execute_batch("COMMIT;")?;
             Ok(())
         })();
@@ -814,47 +828,7 @@ impl Index {
         size: u64,
         mtime_ns: i64,
     ) -> Result<Option<(String, ImageMeta)>, IndexError> {
-        /// One stored files row, before its digest is judged usable.
-        struct Stored {
-            sha256: Option<String>,
-            width: Option<i64>,
-            height: Option<i64>,
-            taken_ns: Option<i64>,
-            taken_reason: Option<i64>,
-        }
-        let previous: Option<Stored> = self
-            .conn()?
-            .query_row(
-                "SELECT sha256,width,height,taken_ns,taken_reason FROM files \
-                 WHERE path=?1 AND size=?2 AND mtime_ns=?3",
-                params![path, size as i64, mtime_ns],
-                |row| {
-                    Ok(Stored {
-                        sha256: row.get(0)?,
-                        width: row.get(1)?,
-                        height: row.get(2)?,
-                        taken_ns: row.get(3)?,
-                        taken_reason: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?;
-        Ok(previous.and_then(|stored| {
-            stored
-                .sha256
-                .filter(|hash| valid_sha256(hash))
-                .map(|sha256| {
-                    (
-                        sha256,
-                        ImageMeta {
-                            width: stored.width.and_then(|value| u32::try_from(value).ok()),
-                            height: stored.height.and_then(|value| u32::try_from(value).ok()),
-                            taken_ns: stored.taken_ns,
-                            taken_reason: reason_from_code(stored.taken_reason),
-                        },
-                    )
-                })
-        }))
+        reusable_image_meta_on(self.conn()?, path, size, mtime_ns)
     }
 
     /// The header metadata cached for one SHA-256 digest ([`ImageMeta`]).
@@ -1071,6 +1045,15 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
     } else if version == Some(MIGRATABLE_FROM) {
         upgrade_from_previous(conn)?;
     }
+    // The scan generation counts how many scans have been committed; the serve
+    // caches validate their totals against it (W31). Both statements are
+    // idempotent and additive, so an index built before the table existed
+    // gains it on open without a schema-version bump and the rebuild that
+    // would force; an older binary still opens a newer index that carries it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS index_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL); \
+         INSERT OR IGNORE INTO index_meta(key,value) VALUES('generation',0);",
+    )?;
     validate_schema(conn)?;
     Ok(())
 }
@@ -1356,6 +1339,57 @@ fn now_ns() -> i64 {
 
 fn valid_sha256(hash: &str) -> bool {
     hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// The connection body of [`Index::reusable_image_meta`], so a [`Reader`]'s
+/// read-only connection can answer the same per-tile digest reuse the writer
+/// path does without waiting on the rescan's write lock.
+pub(crate) fn reusable_image_meta_on(
+    conn: &Connection,
+    path: &str,
+    size: u64,
+    mtime_ns: i64,
+) -> Result<Option<(String, ImageMeta)>, IndexError> {
+    /// One stored files row, before its digest is judged usable.
+    struct Stored {
+        sha256: Option<String>,
+        width: Option<i64>,
+        height: Option<i64>,
+        taken_ns: Option<i64>,
+        taken_reason: Option<i64>,
+    }
+    let previous: Option<Stored> = conn
+        .query_row(
+            "SELECT sha256,width,height,taken_ns,taken_reason FROM files \
+             WHERE path=?1 AND size=?2 AND mtime_ns=?3",
+            params![path, size as i64, mtime_ns],
+            |row| {
+                Ok(Stored {
+                    sha256: row.get(0)?,
+                    width: row.get(1)?,
+                    height: row.get(2)?,
+                    taken_ns: row.get(3)?,
+                    taken_reason: row.get(4)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(previous.and_then(|stored| {
+        stored
+            .sha256
+            .filter(|hash| valid_sha256(hash))
+            .map(|sha256| {
+                (
+                    sha256,
+                    ImageMeta {
+                        width: stored.width.and_then(|value| u32::try_from(value).ok()),
+                        height: stored.height.and_then(|value| u32::try_from(value).ok()),
+                        taken_ns: stored.taken_ns,
+                        taken_reason: reason_from_code(stored.taken_reason),
+                    },
+                )
+            })
+    }))
 }
 
 /// One row's per-image header columns, as SQLite hands them over: width,

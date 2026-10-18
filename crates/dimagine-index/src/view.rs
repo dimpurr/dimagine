@@ -8,7 +8,7 @@
 //! Paths are library-relative and `/`-separated, the same spelling the scan
 //! stored. `folder` uses `""` for the library root.
 
-use crate::{reason_from_code, ImageMeta, Index, IndexError, MetaRow, TakenReason};
+use crate::{reason_from_code, Connection, ImageMeta, Index, IndexError, MetaRow, TakenReason};
 use rusqlite::OptionalExtension;
 use std::collections::BTreeMap;
 
@@ -43,7 +43,7 @@ pub struct ImageMetaStats {
 }
 
 /// How to order a [`ViewPage`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SortKey {
     /// `added_ns` (note `added`, else `imported`, else `first_seen_ns`).
     Added,
@@ -179,7 +179,7 @@ pub fn collection_is_listed(evidence: &CollectionEvidence<'_>) -> bool {
 }
 
 /// The parameters of a [`Index::view`] query.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ViewQuery {
     /// Library-relative folder; `None` means every folder, `Some("")` means
     /// the library root.
@@ -1071,7 +1071,7 @@ impl Index {
     /// the members are returned in collection-note order (the order their
     /// embeds appear in the note) and `sort`/`descending` are ignored.
     pub fn view(&self, q: &ViewQuery) -> Result<ViewPage, IndexError> {
-        self.view_page(|| view_sql(q), q.limit, q.offset)
+        view_page_on(self.conn()?, || view_sql(q), q.limit, q.offset)
     }
 
     /// Query images exactly like [`Index::view`], but ordered by the EXIF
@@ -1081,45 +1081,22 @@ impl Index {
     /// and a `collection` query still answers in the collection's own embed
     /// order, which always comes first.
     pub fn view_by_taken(&self, q: &ViewQuery) -> Result<ViewPage, IndexError> {
-        self.view_page(
+        view_page_on(
+            self.conn()?,
             || view_sql_with_order(q, order_by_taken(q)),
             q.limit,
             q.offset,
         )
     }
 
-    /// Run one page query, fresh-built twice because the count and the page
-    /// bind temporary `ViewSql` state (the paging pair).
-    fn view_page(
-        &self,
-        build: impl Fn() -> ViewSql,
-        limit: u32,
-        offset: u32,
-    ) -> Result<ViewPage, IndexError> {
-        let sql = build();
-        let total: i64 = self
-            .conn()?
-            .query_row(&sql.count(), bound(&sql.params), |row| row.get(0))?;
-        let (page_sql, page_params) = build().into_page(i64::from(limit), i64::from(offset));
-        let mut stmt = self.conn()?.prepare(&page_sql)?;
-        let rows = stmt.query_map(bound(&page_params), |row| {
-            let size: i64 = row.get(1)?;
-            let rating: Option<i64> = row.get(4)?;
-            Ok(ViewItem {
-                path: row.get(0)?,
-                size: size.max(0) as u64,
-                mtime_ns: row.get(2)?,
-                added_ns: row.get(3)?,
-                title: row.get(6)?,
-                rating: rating.and_then(|value| u8::try_from(value).ok()),
-                note_path: row.get(5)?,
-            })
-        })?;
-        let items = rows.collect::<Result<Vec<_>, _>>()?;
-        Ok(ViewPage {
-            total: total.max(0) as u64,
-            items,
-        })
+    /// How many scans have been committed to this index.
+    ///
+    /// [`Index::finish_scan`] raises it inside the transaction that commits the
+    /// scan's content, so it always describes committed content. The serve
+    /// caches key on it. A [`Reader`] reports the same number from a read-only
+    /// connection; this is the writer-connection path.
+    pub fn generation(&self) -> Result<u64, IndexError> {
+        scan_generation(self.conn()?)
     }
 
     /// The paths, the position and the size of the view: one image's place
@@ -1309,23 +1286,7 @@ impl Index {
     /// the viewer's own page JSON is the index API's hand-mirrored mirror,
     /// and it grows when the viewer does, not when the index does.
     pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
-        let row: Option<MetaRow> = self
-            .conn()?
-            .query_row(
-                "SELECT width,height,taken_ns,taken_reason \
-                 FROM files WHERE path=?1 AND kind='image'",
-                [path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        Ok(
-            row.map(|(width, height, taken_ns, taken_reason)| ImageMeta {
-                width: width.and_then(|value| u32::try_from(value).ok()),
-                height: height.and_then(|value| u32::try_from(value).ok()),
-                taken_ns,
-                taken_reason: reason_from_code(taken_reason),
-            }),
-        )
+        image_meta_on(self.conn()?, path)
     }
 
     /// What the index knows about image headers, counted: how many images
@@ -1375,35 +1336,7 @@ impl Index {
     /// The folder tree is a recursive query over the folder column and each
     /// count is one range scan, so nothing walks the whole library.
     pub fn folder_counts(&self) -> Result<Vec<(String, u64)>, IndexError> {
-        // Every folder that holds an image directly or in a subfolder is a
-        // prefix of some image path, so the folders are built by peeling one
-        // path segment off each folder that holds an image, and each count is
-        // one range scan over the (kind, path) index. Nothing walks the
-        // library.
-        let mut stmt = self.conn()?.prepare(
-            "WITH RECURSIVE prefixes(folder,rest) AS ( \
-               SELECT '', folder || '/' FROM ( \
-                 SELECT DISTINCT folder FROM files WHERE kind='image') WHERE folder<>'' \
-               UNION ALL \
-               SELECT prefixes.folder || CASE WHEN prefixes.folder='' THEN '' ELSE '/' END \
-                    || substr(prefixes.rest,1,instr(prefixes.rest,'/')-1), \
-                 substr(prefixes.rest, instr(prefixes.rest,'/')+1) \
-               FROM prefixes WHERE instr(prefixes.rest,'/')>0 \
-             ), tree(folder) AS ( \
-               SELECT DISTINCT folder FROM prefixes WHERE folder<>'' UNION SELECT '' \
-             ) SELECT tree.folder, CASE WHEN tree.folder='' \
-                 THEN (SELECT count(*) FROM files WHERE kind='image') ELSE ( \
-                 SELECT count(*) FROM files f WHERE f.kind='image' \
-                   AND f.path>=tree.folder||'/' AND f.path<tree.folder||'0') END \
-             FROM tree ORDER BY tree.folder",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?.max(0) as u64,
-            ))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        folder_counts(self.conn()?)
     }
 
     /// Image count per tag, over the tags of image notes that still have an
@@ -1411,18 +1344,7 @@ impl Index {
     /// the list either, and a sidebar that disagrees with the list is worse
     /// than useless. Case-insensitive.
     pub fn tag_counts(&self) -> Result<Vec<(String, u64)>, IndexError> {
-        let mut stmt = self.conn()?.prepare(
-            "SELECT note_tags.tag, count(*) FROM note_tags \
-             JOIN files ON files.path=note_tags.image_path AND files.kind='image' \
-             GROUP BY note_tags.tag ORDER BY note_tags.tag",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?.max(0) as u64,
-            ))
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        tag_counts(self.conn()?)
     }
 
     /// Notes that are collections (FORMAT §5), with their image member count
@@ -1430,31 +1352,7 @@ impl Index {
     /// ([`collection_is_listed`]). Every collection is here, listed or not,
     /// so the API keeps naming what `/?c=` accepts.
     pub fn collections(&self) -> Result<Vec<CollectionInfo>, IndexError> {
-        Ok(self
-            .collection_candidates(
-                &format!(
-                    "SELECT {CANDIDATE_COLUMNS} FROM notes \
-                     WHERE {CANDIDATE_WHERE} ORDER BY notes.path"
-                ),
-                [],
-            )?
-            .into_iter()
-            .filter(|candidate| note_is_collection(&candidate.evidence()))
-            .map(|candidate| {
-                let listed = collection_is_listed(&candidate.evidence());
-                CollectionInfo {
-                    title: candidate
-                        .props
-                        .get("title")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_owned(),
-                    note_path: candidate.path,
-                    member_count: candidate.members as u64,
-                    listed,
-                }
-            })
-            .collect())
+        collections(self.conn()?)
     }
 
     /// Whether one note is a collection (FORMAT §5), answered from its own row.
@@ -1524,17 +1422,7 @@ impl Index {
         sql: &str,
         params: P,
     ) -> Result<Vec<CollectionCandidate>, IndexError> {
-        let mut stmt = self.conn()?.prepare(sql)?;
-        let rows = stmt.query_map(params, |row| {
-            Ok(CollectionCandidate {
-                path: row.get(0)?,
-                props: serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
-                members: row.get::<_, i64>(2)?.max(0) as usize,
-                unresolved: row.get::<_, i64>(3)?.max(0) as usize,
-                image_note: row.get::<_, i64>(4)? != 0,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        collection_candidates_on(self.conn()?, sql, params)
     }
 
     /// `EXPLAIN QUERY PLAN` for a statement, so a test can check that the
@@ -1577,6 +1465,319 @@ fn bound_with<'a>(
     )
 }
 
+/// The per-image header metadata of one path, on any connection
+/// ([`Index::image_meta`]). A page of tiles asks this per image; reading it on
+/// the reader connection keeps a grid render off the rescan's write lock.
+fn image_meta_on(conn: &Connection, path: &str) -> Result<Option<ImageMeta>, IndexError> {
+    let row: Option<MetaRow> = conn
+        .query_row(
+            "SELECT width,height,taken_ns,taken_reason \
+             FROM files WHERE path=?1 AND kind='image'",
+            [path],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    Ok(
+        row.map(|(width, height, taken_ns, taken_reason)| ImageMeta {
+            width: width.and_then(|value| u32::try_from(value).ok()),
+            height: height.and_then(|value| u32::try_from(value).ok()),
+            taken_ns,
+            taken_reason: reason_from_code(taken_reason),
+        }),
+    )
+}
+
+/// How many scans have been committed to this index.
+///
+/// [`Index::finish_scan`] sets it inside the transaction that commits the
+/// scan's content, so a reader that reads the generation and the content in
+/// one read snapshot sees them change together: any commit that changed the
+/// content also bumped the generation first. The serve caches key on it,
+/// which makes a cache entry valid for exactly as long as the index it was
+/// read from is unchanged, no matter when the reader looks (W31).
+fn scan_generation(conn: &Connection) -> Result<u64, IndexError> {
+    let generation: i64 = conn.query_row(
+        "SELECT COALESCE((SELECT value FROM index_meta WHERE key='generation'),0)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(generation.max(0) as u64)
+}
+
+/// Count the images one built view query matches, before paging.
+fn view_total_of(conn: &Connection, build: impl Fn() -> ViewSql) -> Result<u64, IndexError> {
+    let sql = build();
+    let total: i64 = conn.query_row(&sql.count(), bound(&sql.params), |row| row.get(0))?;
+    Ok(total.max(0) as u64)
+}
+
+/// One page of items for a built view query, without the total.
+fn view_items_of(
+    conn: &Connection,
+    build: impl Fn() -> ViewSql,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<ViewItem>, IndexError> {
+    let (page_sql, page_params) = build().into_page(i64::from(limit), i64::from(offset));
+    let mut stmt = conn.prepare(&page_sql)?;
+    let rows = stmt.query_map(bound(&page_params), |row| {
+        let size: i64 = row.get(1)?;
+        let rating: Option<i64> = row.get(4)?;
+        Ok(ViewItem {
+            path: row.get(0)?,
+            size: size.max(0) as u64,
+            mtime_ns: row.get(2)?,
+            added_ns: row.get(3)?,
+            title: row.get(6)?,
+            rating: rating.and_then(|value| u8::try_from(value).ok()),
+            note_path: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// One page with its total, both read on `conn`. Built fresh twice because the
+/// count and the page bind temporary `ViewSql` state (the paging pair). Inside
+/// one read transaction the two always describe the same snapshot, so the
+/// reported total matches the list returned with it.
+fn view_page_on(
+    conn: &Connection,
+    build: impl Fn() -> ViewSql,
+    limit: u32,
+    offset: u32,
+) -> Result<ViewPage, IndexError> {
+    let total = view_total_of(conn, &build)?;
+    let items = view_items_of(conn, build, limit, offset)?;
+    Ok(ViewPage { total, items })
+}
+
+/// How many images a view query matches, before paging, on any connection.
+///
+/// The connection-level twin of the count [`Index::view`] runs, so a [`Reader`]
+/// snapshot and the serve sidebar can count a lens on the same connection they
+/// read the rest of the sidebar from.
+pub fn view_total(conn: &Connection, q: &ViewQuery) -> Result<u64, IndexError> {
+    view_total_of(conn, || view_sql(q))
+}
+
+/// Image count per folder, including subfolders ([`Index::folder_counts`]).
+pub fn folder_counts(conn: &Connection) -> Result<Vec<(String, u64)>, IndexError> {
+    // Every folder that holds an image directly or in a subfolder is a
+    // prefix of some image path, so the folders are built by peeling one
+    // path segment off each folder that holds an image, and each count is
+    // one range scan over the (kind, path) index. Nothing walks the library.
+    let mut stmt = conn.prepare(
+        "WITH RECURSIVE prefixes(folder,rest) AS ( \
+           SELECT '', folder || '/' FROM ( \
+             SELECT DISTINCT folder FROM files WHERE kind='image') WHERE folder<>'' \
+           UNION ALL \
+           SELECT prefixes.folder || CASE WHEN prefixes.folder='' THEN '' ELSE '/' END \
+                || substr(prefixes.rest,1,instr(prefixes.rest,'/')-1), \
+              substr(prefixes.rest, instr(prefixes.rest,'/')+1) \
+           FROM prefixes WHERE instr(prefixes.rest,'/')>0 \
+         ), tree(folder) AS ( \
+           SELECT DISTINCT folder FROM prefixes WHERE folder<>'' UNION SELECT '' \
+         ) SELECT tree.folder, CASE WHEN tree.folder='' \
+             THEN (SELECT count(*) FROM files WHERE kind='image') ELSE ( \
+             SELECT count(*) FROM files f WHERE f.kind='image' \
+               AND f.path>=tree.folder||'/' AND f.path<tree.folder||'0') END \
+         FROM tree ORDER BY tree.folder",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+        ))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Image count per tag ([`Index::tag_counts`]).
+pub fn tag_counts(conn: &Connection) -> Result<Vec<(String, u64)>, IndexError> {
+    let mut stmt = conn.prepare(
+        "SELECT note_tags.tag, count(*) FROM note_tags \
+         JOIN files ON files.path=note_tags.image_path AND files.kind='image' \
+         GROUP BY note_tags.tag ORDER BY note_tags.tag",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+        ))
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Notes that are collections ([`Index::collections`]).
+pub fn collections(conn: &Connection) -> Result<Vec<CollectionInfo>, IndexError> {
+    Ok(collection_candidates_on(
+        conn,
+        &format!(
+            "SELECT {CANDIDATE_COLUMNS} FROM notes \
+             WHERE {CANDIDATE_WHERE} ORDER BY notes.path"
+        ),
+        [],
+    )?
+    .into_iter()
+    .filter(|candidate| note_is_collection(&candidate.evidence()))
+    .map(|candidate| {
+        let listed = collection_is_listed(&candidate.evidence());
+        CollectionInfo {
+            title: candidate
+                .props
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            note_path: candidate.path,
+            member_count: candidate.members as u64,
+            listed,
+        }
+    })
+    .collect())
+}
+
+/// Run one `SELECT {CANDIDATE_COLUMNS} FROM notes WHERE ...` query on any
+/// connection — the body the [`Index`] candidate lookups and a [`Reader`]
+/// share, so the two can never disagree about what a collection is.
+fn collection_candidates_on<P: rusqlite::Params>(
+    conn: &Connection,
+    sql: &str,
+    params: P,
+) -> Result<Vec<CollectionCandidate>, IndexError> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(params, |row| {
+        Ok(CollectionCandidate {
+            path: row.get(0)?,
+            props: serde_json::from_str(&row.get::<_, String>(1)?).unwrap_or_default(),
+            members: row.get::<_, i64>(2)?.max(0) as usize,
+            unresolved: row.get::<_, i64>(3)?.max(0) as usize,
+            image_note: row.get::<_, i64>(4)? != 0,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// A read-only connection to an open index database.
+///
+/// The serve handle answers its hot list queries (a page of a view, and the
+/// whole sidebar) from a `Reader` of its own while the background rescan writes
+/// on the [`Index`] connection. The database is in WAL mode, so a reader and a
+/// writer proceed together: a request never waits for a rescan, and a rescan
+/// never waits for a request. A reader transaction started before a rescan
+/// commits keeps answering from the pre-rescan snapshot, so no request ever
+/// sees half a rescan either (W31).
+pub struct Reader {
+    conn: std::sync::Mutex<Connection>,
+}
+
+impl Reader {
+    /// Open a read-only connection to the index database at `db_path`.
+    ///
+    /// The database must already be open in WAL mode by an [`Index`] (the serve
+    /// handle always has one): a read-only open cannot create the `-wal` and
+    /// `-shm` files a first connection would, so this runs after, not before,
+    /// the writer.
+    pub fn open(db_path: &std::path::Path) -> Result<Self, IndexError> {
+        let conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        // WAL readers never block on the writer, so no busy wait is wanted; a
+        // zero timeout turns any genuine contention into an immediate error the
+        // caller can fall back from, rather than a stall.
+        conn.busy_timeout(std::time::Duration::from_secs(0))?;
+        Ok(Self {
+            conn: std::sync::Mutex::new(conn),
+        })
+    }
+
+    /// Run `f` inside one read transaction, so a caller that needs several
+    /// queries to agree holds a single snapshot of the index.
+    fn read<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        let conn = self.conn.lock().map_err(|_| {
+            IndexError::Io(std::io::Error::other("the index reader lock is poisoned"))
+        })?;
+        conn.execute_batch("BEGIN")?;
+        match f(&conn) {
+            Ok(value) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    /// How many scans have been committed, read on its own: the generation of
+    /// the snapshot this reader saw last, which the serve caches validate
+    /// their entries against.
+    pub fn generation(&self) -> Result<u64, IndexError> {
+        self.read(scan_generation)
+    }
+
+    /// Run `f` inside one read transaction and report the generation of the
+    /// snapshot it ran against. The generation is read first, which fixes the
+    /// snapshot, so `f`'s answer and the generation always describe the same
+    /// state of the index.
+    pub fn read_at_generation<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, IndexError>,
+    ) -> Result<(u64, T), IndexError> {
+        self.read(|conn| {
+            let generation = scan_generation(conn)?;
+            let value = f(conn)?;
+            Ok((generation, value))
+        })
+    }
+
+    /// One page of images for a view query, with the total match count, from
+    /// one snapshot so the total matches the list.
+    pub fn view(&self, q: &ViewQuery) -> Result<ViewPage, IndexError> {
+        self.read(|conn| view_page_on(conn, || view_sql(q), q.limit, q.offset))
+    }
+
+    /// One page of images, without the total, at the generation it was read
+    /// from. A caller that caches the total under the reported generation can
+    /// trust it exactly until the generation reads back the same, because
+    /// every committed scan raised it first.
+    pub fn view_page_with_generation(
+        &self,
+        q: &ViewQuery,
+    ) -> Result<(u64, Vec<ViewItem>), IndexError> {
+        self.read_at_generation(|conn| view_items_of(conn, || view_sql(q), q.limit, q.offset))
+    }
+
+    /// One page of images with the total match count, at the generation they
+    /// were read from. The first request for a query at a generation counts
+    /// once, and the total and the list come from the same snapshot.
+    pub fn view_with_generation(&self, q: &ViewQuery) -> Result<(u64, ViewPage), IndexError> {
+        self.read_at_generation(|conn| view_page_on(conn, || view_sql(q), q.limit, q.offset))
+    }
+
+    /// The header facts of one image ([`Index::image_meta`]), read on this
+    /// connection so a grid's per-tile lookups never wait for a rescan.
+    pub fn image_meta(&self, path: &str) -> Result<Option<ImageMeta>, IndexError> {
+        self.read(|conn| image_meta_on(conn, path))
+    }
+
+    /// The reusable digest + header row for one image
+    /// ([`Index::reusable_image_meta`]), read on this connection.
+    pub fn reusable_image_meta(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_ns: i64,
+    ) -> Result<Option<(String, ImageMeta)>, IndexError> {
+        self.read(|conn| crate::reusable_image_meta_on(conn, path, size, mtime_ns))
+    }
+}
+
 /// FORMAT §3.1 defines `rating` as an integer 0-5. A value outside that range,
 /// and any value that is not an integer, is not a rating: it reads as "no
 /// rating", so it sorts last and never above a real five-star rating.
@@ -1598,6 +1799,75 @@ mod tests {
 
     fn props(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    /// W31: the reader is a connection of its own, so a rescan's open write
+    /// transaction neither blocks it nor leaks through to it — it answers from
+    /// the last committed snapshot for the whole duration of the rescan, and
+    /// never sees half a scan. The scan generation moved in the same commit as
+    /// the content (not when the scan started), so a generation read outside a
+    /// commit always describes committed content.
+    #[test]
+    fn a_reader_answers_from_the_last_commit_while_a_scan_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str| FileRecord {
+            path: path.to_owned(),
+            size: 1,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: None,
+            rating: None,
+            width: None,
+            height: None,
+            taken_ns: None,
+            taken_reason: None,
+        };
+        index.begin_scan().unwrap();
+        index.upsert_file(&image("a.png")).unwrap();
+        index.upsert_file(&image("b.png")).unwrap();
+        index
+            .finish_scan(&["a.png".into(), "b.png".into()])
+            .unwrap();
+
+        let reader = Reader::open(index.database_path()).unwrap();
+        assert_eq!(reader.view(&ViewQuery::default()).unwrap().total, 2);
+        assert_eq!(reader.generation().unwrap(), 1, "one scan committed");
+
+        // A rescan in progress: its write transaction is open and already holds
+        // an image the reader must not see until it commits.
+        index.begin_scan().unwrap();
+        index.upsert_file(&image("c.png")).unwrap();
+        let page = reader.view(&ViewQuery::default()).unwrap();
+        assert_eq!(
+            page.total, 2,
+            "the reader keeps the committed snapshot while a scan is open"
+        );
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(
+            reader.generation().unwrap(),
+            1,
+            "the generation does not move before the scan commits"
+        );
+
+        // The commit is atomic for the reader too: generation and content change
+        // together, or not at all. A generation that still reads 1 means the
+        // total counted at generation 1 is still valid.
+        index
+            .finish_scan(&["a.png".into(), "b.png".into(), "c.png".into()])
+            .unwrap();
+        let (generation, page) = reader.view_with_generation(&ViewQuery::default()).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(generation, 2);
+        // The page-without-total and its generation are read in one snapshot, so
+        // a caller can pair the page with a cached total counted at that same
+        // generation.
+        let (page_gen, items) = reader
+            .view_page_with_generation(&ViewQuery::default())
+            .unwrap();
+        assert_eq!(page_gen, 2);
+        assert_eq!(items.len(), 3);
     }
 
     /// Seed an index whose every neighbour answer is worked out by hand: four
