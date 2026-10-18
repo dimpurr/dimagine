@@ -97,6 +97,19 @@ run them as one **operation** (FORMAT §8.3).
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
 | `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, note body edit, move, upload, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. The image/note page carries a plain textarea that edits the body as source and posts it to `/api/write/note/body`, with the note's open-time hash as a precondition and a reload-or-overwrite prompt on a conflict. |
 
+The viewer's grid also takes a phone drag-select: a long press on a
+tile opens selection mode, a drag across the grid adds or removes
+every thumbnail the finger passes — the pressed tile's own state is
+the decision the whole drag applies — and release keeps the selection
+open under a bottom bar with the count, Open (the first selected
+tile's page) and Clear, with Esc, Clear or an emptied selection
+standing down. It is an enhancement of the viewer script alone: no
+new route, no new state on the server, and without the script the
+grid is exactly what it was. The gestures keep the ones already
+there — a press that drifts before the long press fires is a scroll
+or a tap and cancels itself, so tap-to-open and scrolling are
+unchanged.
+
 ## Serving media (0.1)
 
 `dimagine serve` answers a rendition request from the library, behind the same

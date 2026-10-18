@@ -3183,3 +3183,101 @@ a.filter-row:active {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
+
+/* ========================= W69 · drag-select =========================
+ * Selection mode (app.js): a long press on a tile opens it, a drag
+ * across the grid adds or removes the thumbnails the pointer passes
+ * over, and release keeps the selection open under a bottom bar. The
+ * selected tiles wear the single selection's own accent border and
+ * soft ring (DESIGN.md §1.3: one accent, one job), so this block only
+ * adds the selecting grid's suppressions and the bar. Appended last,
+ * as the W42 block was, so parallel batches merge cleanly.
+ * ======================================================================= */
+
+/* While selection mode is on, the finger owns the gesture: nothing in
+   the grid can be selected as text, and the cursor says the grid is
+   not a link field any more. */
+.grid.selecting {
+  cursor: default;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* The long press is the selection's own gesture, so the native image
+   callout never competes with it on a touch device. */
+.tile {
+  -webkit-touch-callout: none;
+}
+
+/* The bar the selection stays open under: the count (a status,
+   announced as it grows), Open on the first selected tile, and Clear.
+   On a phone it sits above the bottom tab bar, which already reserves
+   the safe area for the home indicator; on the wider widths there is
+   no tab bar, so the safe area is the bar's own. */
+.selection-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
+  z-index: 35;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 52px;
+  padding: 0 16px;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  box-shadow: var(--elev-1);
+}
+
+/* `display: flex` would otherwise win over the hidden attribute. */
+.selection-bar[hidden] {
+  display: none;
+}
+
+.selection-count {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.selection-bar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0 20px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: var(--text-sm);
+}
+
+.selection-bar button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+  text-decoration: none;
+}
+
+/* Open is the bar's one primary action: the accent-soft fill the
+   design system gives an active state, never a filled accent. */
+.selection-open {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* Above the tablet breakpoint the tab bar stands down, so the bar
+   sits on the bottom edge itself. */
+@media (min-width: 768px) {
+  .selection-bar {
+    bottom: env(safe-area-inset-bottom, 0px);
+  }
+}

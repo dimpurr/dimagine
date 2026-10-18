@@ -7,6 +7,8 @@
 //   * the sort menu submits itself
 //   * single click selects a tile and fills the inspector (desktop)
 //   * arrows move the selection, Enter opens, Esc clears, / focuses search
+//   * a long press opens selection mode, a drag across the grid selects
+//     with it, and release keeps it under a bottom bar (W69)
 //   * "Load more" fetches the next page from /api/view and appends it
 //   * tiles lay out in justified rows by the indexed dimensions
 //   * tiles crop only an extreme aspect ratio, and say so with a badge
@@ -360,8 +362,15 @@
     document.querySelectorAll('.tile[data-path]'),
     function (tile) {
       // On a wide screen a click selects and an Enter or double click opens.
-      // Without the script the tile is a plain link either way.
+      // Without the script the tile is a plain link either way. Inside
+      // selection mode a tap toggles the tile on every width instead.
       tile.addEventListener('click', function (event) {
+        if (grid && grid.classList.contains('selecting')) {
+          event.preventDefault();
+          setTileSelected(tile, !tile.classList.contains('selected'));
+          updateSelectionBar();
+          return;
+        }
         if (window.matchMedia('(min-width: 1200px)').matches) {
           event.preventDefault();
           selectTile(tile, false);
@@ -397,6 +406,10 @@
     }
     if (event.key === 'Escape') {
       selectTile(null);
+      // Selection mode is the other kind of selection, and Esc
+      // leaves it the same way: the tiles stand down and the bar
+      // with them.
+      exitSelectionMode();
       return;
     }
 
@@ -414,6 +427,251 @@
       window.location.href = imageHref(selected.dataset.path);
     }
   });
+
+  /* ------------------------------------------ drag-select (W69) */
+
+  // Selection mode: a long press on a tile opens it, a drag across
+  // the grid adds (or removes) every thumbnail the pointer passes
+  // over, and release keeps the selection open under a bottom bar.
+  // An enhancement like everything else in this file: without it the
+  // grid keeps tap-to-open and scroll exactly as before, and no
+  // selection mode exists at all.
+  //
+  // The state lives here, beside the single selection above, because
+  // the two share the `.selected` class and the Esc key: entering
+  // selection mode clears the single selection (the inspector goes
+  // back to its empty state rather than claiming one tile of many),
+  // and Esc leaves either mode the way it entered. The visual
+  // language is the single selection's own — the accent border and
+  // soft ring (DESIGN.md §1.3: one accent, one job).
+  //
+  // A press is a long press at 500 ms. A press that drifts 10 px
+  // before then is a scroll (or a tap on its way) and cancels
+  // itself, so scrolling and tap-to-open are never in the way. The
+  // pressed tile's own state — unselected, so add; selected, so
+  // remove — is the decision the whole drag applies, so a drag that
+  // passes a tile twice never flickers it.
+  var SELECT_PRESS_MS = 500;
+  var SELECT_DRIFT_PX = 10;
+  var selectionGesture = null;
+  var swallowClick = false;
+  var selectionBarEl = null;
+
+  function selectionTiles() {
+    return grid
+      ? grid.querySelectorAll('.tile[data-path].selected')
+      : [];
+  }
+
+  function setTileSelected(tile, on) {
+    tile.classList.toggle('selected', on);
+  }
+
+  // The bar selection mode keeps open: the count (a status, so a
+  // screen reader announces it as it grows), Open on the first
+  // selected tile — the page a tap would have opened — and Clear.
+  // Built on the first long press, toggled from then on.
+  function selectionBar() {
+    if (selectionBarEl) return selectionBarEl;
+    var bar = document.createElement('div');
+    bar.className = 'selection-bar';
+    bar.hidden = true;
+    var count = document.createElement('span');
+    count.className = 'selection-count';
+    count.setAttribute('role', 'status');
+    var open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'selection-open';
+    open.textContent = 'Open';
+    var clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'selection-clear';
+    clear.textContent = 'Clear';
+    bar.appendChild(count);
+    bar.appendChild(open);
+    bar.appendChild(clear);
+    document.body.appendChild(bar);
+    selectionBarEl = bar;
+    open.addEventListener('click', function () {
+      var first = selectionTiles()[0];
+      if (first) window.location.href = imageHref(first.dataset.path);
+    });
+    clear.addEventListener('click', exitSelectionMode);
+    return bar;
+  }
+
+  function updateSelectionBar() {
+    var count = selectionTiles().length;
+    // An empty selection is no selection: the bar stands down
+    // rather than offer an Open on nothing.
+    if (!count) {
+      exitSelectionMode();
+      return;
+    }
+    var bar = selectionBar();
+    bar.hidden = false;
+    bar.querySelector('.selection-count').textContent =
+      count + ' selected';
+  }
+
+  // The long press fired: the pressed tile is the anchor, and its
+  // own state is the drag's decision.
+  function enterSelectionMode(gesture) {
+    selectTile(null);
+    grid.classList.add('selecting');
+    var add = !gesture.tile.classList.contains('selected');
+    gesture.mode = add ? 'add' : 'remove';
+    setTileSelected(gesture.tile, add);
+    // The release's click is not a tap: it would open the image
+    // (a phone) or re-single-select the tile (a wide screen).
+    swallowClick = true;
+    // The captured pointer keeps its moves coming to the grid even
+    // over the tiles it is not on; the tile under the finger is
+    // found by hit test, never by the event's target.
+    try {
+      grid.setPointerCapture(gesture.id);
+    } catch (error) {
+      // A pointer that left between events is simply not captured.
+    }
+    updateSelectionBar();
+  }
+
+  function exitSelectionMode() {
+    cancelSelectionGesture();
+    if (!grid || !grid.classList.contains('selecting')) return;
+    grid.classList.remove('selecting');
+    Array.prototype.forEach.call(selectionTiles(), function (tile) {
+      setTileSelected(tile, false);
+    });
+    if (selectionBarEl) selectionBarEl.hidden = true;
+  }
+
+  // The gesture in flight: a press that may become a long press,
+  // then the drag selection mode owns. `mode` is null until the
+  // long press fires — before that the gesture belongs to a tap or
+  // a scroll, whichever shows up first.
+  function cancelSelectionGesture() {
+    if (selectionGesture && selectionGesture.timer) {
+      window.clearTimeout(selectionGesture.timer);
+    }
+    selectionGesture = null;
+  }
+
+  function endSelectionGesture(event) {
+    if (!selectionGesture) return;
+    if (event && event.pointerId !== selectionGesture.id) return;
+    // Release keeps the selection open — the bar stays until Clear,
+    // Esc, or a selection emptied. A gesture that never reached the
+    // long press leaves nothing behind.
+    cancelSelectionGesture();
+  }
+
+  // The tile under a point: the pointer is captured to the grid, so
+  // the event's target is the grid and the tile has to be found. A
+  // point over anything that is not a tile of this grid selects
+  // nothing.
+  function tileAtPoint(x, y) {
+    var element = document.elementFromPoint(x, y);
+    var tile = element && element.closest
+      ? element.closest('.tile[data-path]')
+      : null;
+    return tile && grid.contains(tile) ? tile : null;
+  }
+
+  if (grid) {
+    grid.addEventListener('pointerdown', function (event) {
+      if (!event.isPrimary) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      // A new press is a fresh start: the click a previous long
+      // press was holding is no longer coming.
+      swallowClick = false;
+      var tile = event.target.closest
+        ? event.target.closest('.tile[data-path]')
+        : null;
+      if (!tile || !grid.contains(tile)) return;
+      cancelSelectionGesture();
+      var gesture = {
+        id: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        tile: tile,
+        last: tile,
+        mode: null,
+        timer: window.setTimeout(function () {
+          gesture.timer = 0;
+          // The press outlasted the drift window without turning
+          // into a scroll: it is a long press, and selection mode
+          // opens with the pressed tile as its anchor.
+          if (selectionGesture !== gesture) return;
+          enterSelectionMode(gesture);
+        }, SELECT_PRESS_MS),
+      };
+      selectionGesture = gesture;
+    });
+
+    window.addEventListener('pointermove', function (event) {
+      var gesture = selectionGesture;
+      if (!gesture || event.pointerId !== gesture.id) return;
+      var dx = event.clientX - gesture.x;
+      var dy = event.clientY - gesture.y;
+      if (!gesture.mode) {
+        // The press is still deciding. Past the drift window it is a
+        // scroll or a tap-drag, and the long press is off — the
+        // gesture never asked the browser for anything, so the
+        // scroll the finger meant is the one that happens.
+        if (dx * dx + dy * dy > SELECT_DRIFT_PX * SELECT_DRIFT_PX) {
+          cancelSelectionGesture();
+        }
+        return;
+      }
+      // Selection mode owns the finger: whichever tile it passes over
+      // joins or leaves by the anchor's decision.
+      var over = tileAtPoint(event.clientX, event.clientY);
+      if (over && over !== gesture.last) {
+        gesture.last = over;
+        setTileSelected(over, gesture.mode === 'add');
+        updateSelectionBar();
+      }
+    });
+
+    window.addEventListener('pointerup', endSelectionGesture);
+    window.addEventListener('pointercancel', endSelectionGesture);
+
+    // The click a long press ends in: eaten in the capture phase,
+    // before any tile's own click listener can open the image or
+    // claim the single selection. A plain tap is untouched — its
+    // press cleared the flag the moment it went down.
+    grid.addEventListener(
+      'click',
+      function (event) {
+        if (!swallowClick) return;
+        swallowClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      true
+    );
+
+    // A selection drag is not a scroll: once selection mode is on,
+    // the finger moves the selection, never the page. Before the
+    // long press fires nothing is prevented, so a scroll is always
+    // allowed until the press says otherwise.
+    grid.addEventListener(
+      'touchmove',
+      function (event) {
+        if (grid.classList.contains('selecting')) {
+          event.preventDefault();
+        }
+      },
+      { passive: false }
+    );
+
+    // Nothing in a selecting grid is dragged as an image or text:
+    // the finger's drag is the selection's.
+    grid.addEventListener('dragstart', function (event) {
+      if (grid.classList.contains('selecting')) event.preventDefault();
+    });
+  }
 
   /* --------------------------------------------------------- load more */
 
@@ -565,6 +823,15 @@
     tile.appendChild(image);
     tile.appendChild(caption);
     tile.addEventListener('click', function (clickEvent) {
+      // The same tap the page's own tiles carry: selection mode's
+      // toggle on every width, a wide screen's single selection,
+      // and a phone's plain open.
+      if (grid && grid.classList.contains('selecting')) {
+        clickEvent.preventDefault();
+        setTileSelected(tile, !tile.classList.contains('selected'));
+        updateSelectionBar();
+        return;
+      }
       if (window.matchMedia('(min-width: 1200px)').matches) {
         clickEvent.preventDefault();
         selectTile(tile, false);

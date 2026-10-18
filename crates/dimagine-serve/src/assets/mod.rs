@@ -177,4 +177,66 @@ mod tests {
             "both ways the probe settles clear its own timeout"
         );
     }
+
+    /// W69, pinned where the crate has no JS harness: the drag-select
+    /// policy (a 500 ms press within a 10 px drift window opens
+    /// selection mode on the pressed tile, whose own add-or-remove
+    /// state is the decision the whole drag applies), and the gesture
+    /// guards that keep tap-to-open and scroll intact (a drift past
+    /// the window cancels the press before it fires; the captured
+    /// pointer's tile is a hit test, not the event's target; the
+    /// release's click is swallowed once selection mode is on; a
+    /// touch that moves after selection mode is on is not a scroll).
+    /// String-pinning is the honest limit of a test that cannot
+    /// execute the file; a harness that can execute it replaces this.
+    #[test]
+    fn app_js_ships_the_w69_drag_select_policy() {
+        assert!(
+            APP_JS.contains("var SELECT_PRESS_MS = 500;"),
+            "the long-press window"
+        );
+        assert!(
+            APP_JS.contains("var SELECT_DRIFT_PX = 10;"),
+            "the drift window that tells a press from a scroll"
+        );
+        for name in [
+            "enterSelectionMode",
+            "exitSelectionMode",
+            "cancelSelectionGesture",
+            "endSelectionGesture",
+            "tileAtPoint",
+            "setTileSelected",
+            "updateSelectionBar",
+            "selectionBar",
+        ] {
+            assert!(
+                APP_JS.contains(&format!("function {name}(")),
+                "the drag-select function {name}"
+            );
+        }
+        assert!(
+            APP_JS.contains("grid.setPointerCapture(gesture.id)"),
+            "the captured pointer keeps the drag over the grid"
+        );
+        assert!(
+            APP_JS.contains("document.elementFromPoint(x, y)"),
+            "the tile under the finger is hit-tested, not the capture target"
+        );
+        assert!(
+            APP_JS.contains("dx * dx + dy * dy > SELECT_DRIFT_PX * SELECT_DRIFT_PX"),
+            "a drift past the window cancels the press"
+        );
+        assert!(
+            APP_JS.contains("{ passive: false }"),
+            "a selection drag is not a scroll"
+        );
+        assert!(
+            APP_JS.contains("event.stopPropagation();"),
+            "the release's click is swallowed in the capture phase"
+        );
+        assert!(
+            APP_JS.contains("var swallowClick = false;"),
+            "the flag that holds the click a long press ends in"
+        );
+    }
 }

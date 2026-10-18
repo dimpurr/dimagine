@@ -7,6 +7,21 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer: phone drag-select in the grid (Phase 3b). A long press
+  (500 ms) on a tile opens selection mode, a drag across the grid
+  adds or removes every thumbnail the finger passes — the pressed
+  tile's own state decides which, so a drag never flickers a tile
+  it crosses twice — and release keeps the selection open under a
+  bottom bar with the count, Open (the first selected tile's page)
+  and Clear. Esc, Clear or an emptied selection stands down. The
+  selected tiles wear the single selection's own accent border; a
+  tap while the mode is open toggles that tile on every width.
+  Tap-to-open, tap-to-select on a wide screen and scrolling are
+  unchanged: a press that drifts 10 px before the long press fires
+  is a scroll (or a tap) and cancels itself, and nothing is
+  prevented until the press says otherwise. Enhancement only — no
+  new route, no new state, and without the script the grid is
+  exactly what it was.
 - CLI write commands (Phase 3a): `dimagine tag` (add and remove tags), `rate`
   (0–5, or `none` to clear) and `set` (scalar properties — and `KEY=` with no
   value clears a property by deleting its key, never by writing `key: ""`)
