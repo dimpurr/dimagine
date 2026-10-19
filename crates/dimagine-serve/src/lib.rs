@@ -113,7 +113,7 @@ pub const NO_OWNER_REMINDER: &str = "No owner account yet: open /setup to create
 pub const NO_OWNER_REMINDER_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// The default per-file upload cap in bytes (ADR-018 §5: a single upload
-/// file may not exceed 100 MB). `ServeConfig::max_upload_bytes` starts
+/// file may not exceed 100 MiB). `ServeConfig::max_upload_bytes` starts
 /// here and the `serve --max-upload-bytes` flag moves it.
 pub const MAX_UPLOAD_BYTES_DEFAULT: usize = 100 * 1024 * 1024;
 
@@ -150,7 +150,7 @@ pub struct ServeConfig {
     /// `Referer`'s origin must. Required whenever `write` is on.
     pub public_origin: Option<String>,
     /// The largest one file of an upload may be, in bytes (ADR-018 §5:
-    /// 100 MB by default, configurable). It is enforced while the
+    /// 100 MiB by default, configurable). It is enforced while the
     /// multipart body streams in: a field that crosses it is answered
     /// with 413 and the connection is dropped before the rest is read.
     pub max_upload_bytes: usize,

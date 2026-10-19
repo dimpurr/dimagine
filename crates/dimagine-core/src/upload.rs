@@ -132,15 +132,21 @@ pub fn upload_file_name(original: &str, timestamp: &str) -> (String, String, boo
 }
 
 /// Replace the characters that break wikilinks (FORMAT §2.1), control
-/// characters and NUL with `-`.
+/// characters and NUL with `-`, and drop any leading dots: a stem that
+/// starts with `.` would make the file hidden, which the writer refuses
+/// outright (`PathReject::Hidden`) and fails the whole upload. Dropping
+/// the dot keeps the name (`sanitize`d), so a stray leading dot renames
+/// nothing (H4).
 fn sanitize_stem(stem: &str) -> String {
-    stem.chars()
+    let mapped: String = stem
+        .chars()
         .map(|ch| match ch {
             '[' | ']' | '#' | '^' | '|' | '\0' => '-',
             c if c.is_control() => '-',
             c => c,
         })
-        .collect()
+        .collect();
+    mapped.trim_start_matches('.').to_string()
 }
 
 /// The meaningless camera, screenshot and share-panel names (ADR-017
@@ -159,13 +165,28 @@ fn is_meaningless_stem(stem: &str) -> bool {
         || base == "share"
         || base == "shared"
         || base == "attachment"
-        || lower.starts_with("img_")
-            && lower["img_".len()..].chars().all(|c| c.is_ascii_digit())
-            && lower.len() > "img_".len()
+        || is_img_timestamped(&lower)
         || lower.starts_with("pxl_")
         || lower.starts_with("screenshot")
         || lower.starts_with("screen shot")
         || base.chars().all(|c| c.is_ascii_digit())
+}
+
+/// A camera's `IMG_20261017_093012` (and the `IMG-…` spelling): after
+/// `img_`/`img-`, only digits and separators, the date and serial a phone
+/// stamps, so it names no subject (ADR-017 §11.2). A tail with any other
+/// character (`img_summer`, `img-cover-2`) is a real name and is kept.
+fn is_img_timestamped(stem: &str) -> bool {
+    let Some(tail) = stem
+        .strip_prefix("img_")
+        .or_else(|| stem.strip_prefix("img-"))
+    else {
+        return false;
+    };
+    !tail.is_empty()
+        && tail
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Drop a trailing ` (<n>)` — the shape macOS and Windows give a
@@ -414,6 +435,8 @@ mod tests {
         for name in [
             "IMG_1234.jpg",
             "img_0001.jpg",
+            "IMG_20261017_093012.jpg",
+            "IMG-20261017-093012.jpg",
             "PXL_20261017.jpg",
             "Screenshot 2026-10-17 at 09.30.00.png",
             "screenshot.png",
@@ -452,6 +475,16 @@ mod tests {
         let (stem, _, renamed) = upload_file_name(".jpg", "20261017093000");
         assert!(renamed);
         assert_eq!(stem, "Upload 20261017093000");
+        // A leading dot is dropped, not left to hide the file (H4); the rest
+        // of the name is kept.
+        let (stem, ext, renamed) = upload_file_name(".girl.jpg", "20261017093000");
+        assert!(!renamed);
+        assert_eq!(stem, "girl");
+        assert_eq!(ext, "jpg");
+        // An `IMG_` name with a real word after it is meaningful (H5).
+        let (stem, _, renamed) = upload_file_name("IMG_summer.jpg", "20261017093000");
+        assert!(!renamed);
+        assert_eq!(stem, "IMG_summer");
     }
 
     #[test]

@@ -359,6 +359,31 @@ fn collect_new_gives_a_taken_name_the_next_free_one() {
 }
 
 #[test]
+fn collect_refuses_a_mode_with_no_operands() {
+    let dir = tmp("collect-no-operands");
+    write(&dir.0, "one.png", PNG);
+    write(
+        &dir.0,
+        "Picks.md",
+        "---\nkind: collection\ntitle: Picks\n---\n\n![[one.png]]\n",
+    );
+    let before = read(&dir.0, "Picks.md");
+    for args in [
+        ["collect", "--new", "Empty"].as_slice(),
+        ["collect", "--add", "Picks.md"].as_slice(),
+        ["collect", "--remove", "Picks.md"].as_slice(),
+    ] {
+        let (code, _, stderr) = dimagine(&dir.0, args);
+        assert_eq!(code, 2, "`{}`: {stderr}", args.join(" "));
+    }
+    assert!(
+        !exists(&dir.0, "Empty.md"),
+        "no empty collection is created"
+    );
+    assert_eq!(read(&dir.0, "Picks.md"), before);
+}
+
+#[test]
 fn collect_add_and_remove_edit_one_note() {
     let dir = tmp("collect-edit");
     write(&dir.0, "one.png", PNG);

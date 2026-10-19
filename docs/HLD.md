@@ -151,12 +151,17 @@ refuses to start without:
    multipart at a JSON path both answer 415). Each file field is capped per
    file — `--max-upload-bytes`, default 100 MiB — while it streams in: a field
    that would cross the cap is answered 413 and the connection is dropped with
-   the rest of the body unread, nothing is buffered first. A file whose bytes
+   the rest of the body unread, nothing is buffered first. The whole request's
+   file bytes are capped in total at four times the per-file cap, and each
+   `folder`/`collection` field at 4 KiB, so a batch of many large files — or an
+   oversized placement field — cannot buffer without bound. A file whose bytes
    are not the format its name claims is refused, SVG, HTML and XML on both
    sides (ADR-018 §5), and a batch over 1000 files before anything is opened.
    The optional `folder` and `collection` fields are the endpoint's `--to` and
    `--to-collection` (ADR-017 §11.1's folder-view and collection-page context
-   is the page's to send); the upload is the same journaled operation the CLI
+   is the page's to send) and are exclusive, as the CLI's two flags are: a
+   request naming both is a typed refusal, neither silently winning; the upload
+   is the same journaled operation the CLI
    runs, and the response carries the per-file outcomes and the `op` id that
    `POST /api/write/undo` takes.
 - `--allow-anonymous-write` exists only for a no-login server (`--auth none`) on

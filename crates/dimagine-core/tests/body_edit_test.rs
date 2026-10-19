@@ -654,6 +654,24 @@ fn replace_body_gives_a_bare_closing_fence_the_line_break_it_lacked() {
 }
 
 #[test]
+fn replace_body_emptying_a_bare_fence_note_leaves_it_untouched() {
+    // The break a bare closing fence is normally given exists so the new body
+    // has a line to start on. An empty body has no line, so it is not given one:
+    // an already-empty body stays byte for byte, rather than gaining a newline
+    // and a spurious modification (RW68 L3).
+    with_ctx(&["t.md", "girl.jpg"], |ctx| {
+        let note = ctx.index_of("t.md").unwrap();
+        let got = replace_body(b"---\ntitle: T\n---", note, b"", ctx).unwrap();
+        assert_eq!(got.bytes, b"---\ntitle: T\n---".to_vec());
+        assert!(!got.changed);
+        // A CRLF note is empty in the same way.
+        let got = replace_body(b"---\r\ntitle: T\r\n---", note, b"", ctx).unwrap();
+        assert_eq!(got.bytes, b"---\r\ntitle: T\r\n---".to_vec());
+        assert!(!got.changed);
+    });
+}
+
+#[test]
 fn replace_body_refuses_to_append_an_embed_inside_an_open_fence() {
     // The new body leaves a code block unclosed, so the self-embed the rule
     // wants would land inside the code and resolve to nothing: the whole edit

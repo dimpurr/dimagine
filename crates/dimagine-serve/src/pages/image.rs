@@ -407,7 +407,8 @@ fn note_editor_html(note: &str, hash: &str, body: &str, csrf: &str) -> String {
          <h2>Edit note body</h2>\
          <p class=\"note-editor-hint\">\
          The body only; the fields above are edited separately. \
-         Your text is saved only when you press Save.</p>\
+         Your text is saved only when you press Save. \
+         Line endings are sent as LF, even if the note uses CRLF.</p>\
          <textarea class=\"note-body-edit\" rows=\"12\" spellcheck=\"false\" \
          aria-label=\"Note body\">\n{}</textarea>\
          <p><button type=\"button\" class=\"note-save\">Save</button> \
@@ -423,9 +424,11 @@ fn note_editor_html(note: &str, hash: &str, body: &str, csrf: &str) -> String {
 /// The small same-origin script behind the body editor: it posts the textarea to
 /// `/api/write/note/body` with the session's CSRF token in a header (a plain
 /// form cannot carry that, ADR-018 §3), and drives the conflict prompt (ADR-016
-/// §3): on a 409 it offers "load the latest" (reload) or "use mine anyway" (retry
-/// carrying the hash the server just returned). It is written by hand, so it
-/// adds no dependency (FORMAT §5.3: source mode, not a rich editor).
+/// §3): on a 409 it shows what the note holds now (the body the server returned)
+/// and offers "load the latest" (that body into the editor, keeping the hash
+/// current) or "use mine anyway" (retry carrying the hash the server just
+/// returned, the draft untouched). It is written by hand, so it adds no
+/// dependency (FORMAT §5.3: source mode, not a rich editor).
 fn note_editor_script() -> &'static str {
     r#"<script>
 (function () {
@@ -459,35 +462,61 @@ fn note_editor_script() -> &'static str {
       })
       .then(function (result) {
         if (result.ok) {
+          clearConflict();
           if (result.data.hash) { hash = result.data.hash; section.setAttribute('data-hash', hash); }
           say(result.data.changed ? 'Saved.' : 'Already up to date.', false);
           return;
         }
-        if (result.status === 409) { offerConflict(result.data.hash); return; }
+        if (result.status === 409) { offerConflict(result.data.hash, result.data.body); return; }
         say((result.data && result.data.error) || 'the body could not be saved.', true);
       })
       .catch(function () { say('the body could not be saved.', true); });
   }
-  function offerConflict(current) {
-    status.textContent = '';
-    status.className = 'note-editor-status error';
-    var msg = document.createTextNode(
-      'The note was changed elsewhere while you were editing. ');
+  var conflictBox = null;
+  function clearConflict() {
+    if (conflictBox && conflictBox.parentNode) {
+      conflictBox.parentNode.removeChild(conflictBox);
+    }
+    conflictBox = null;
+  }
+  function offerConflict(current, latest) {
+    clearConflict();
+    say('The note was changed elsewhere while you were editing.', true);
+    var box = document.createElement('div');
+    box.className = 'note-conflict';
+    if (typeof latest === 'string') {
+      var details = document.createElement('details');
+      var summary = document.createElement('summary');
+      summary.textContent = 'Show what the note holds now';
+      var pre = document.createElement('pre');
+      pre.className = 'note-conflict-body';
+      pre.textContent = latest;
+      details.appendChild(summary);
+      details.appendChild(pre);
+      box.appendChild(details);
+    }
     var reload = document.createElement('button');
     reload.type = 'button';
     reload.textContent = 'Load the latest';
-    reload.addEventListener('click', function () { location.reload(); });
+    reload.addEventListener('click', function () {
+      if (typeof latest === 'string') { area.value = latest; }
+      if (current) { hash = current; section.setAttribute('data-hash', hash); }
+      clearConflict();
+      say('Loaded the latest; your version was not saved.', false);
+    });
     var overwrite = document.createElement('button');
     overwrite.type = 'button';
     overwrite.textContent = 'Use my version anyway';
     overwrite.addEventListener('click', function () {
       if (current) { hash = current; }
+      clearConflict();
       saveWith(hash);
     });
-    status.appendChild(msg);
-    status.appendChild(reload);
-    status.appendChild(document.createTextNode(' or '));
-    status.appendChild(overwrite);
+    box.appendChild(reload);
+    box.appendChild(document.createTextNode(' or '));
+    box.appendChild(overwrite);
+    section.appendChild(box);
+    conflictBox = box;
   }
   save.addEventListener('click', function () { saveWith(hash); });
 })();
@@ -1424,6 +1453,27 @@ mod tests {
         assert!(!html.contains("<h2>Note</h2>"), "{html}");
         assert!(html.contains("alt=\"plain.png\""), "{html}");
         assert!(html.contains("Not in any collection."), "{html}");
+    }
+
+    /// The body editor's script carries the conflict prompt: the note's current
+    /// body behind a disclosure and the two ways out, both keyed on the hash the
+    /// 409 returned (RW68 M1/L4, ADR-016 §3).
+    #[test]
+    fn the_body_editor_script_carries_a_conflict_prompt() {
+        let script = note_editor_script();
+        assert!(script.contains("function offerConflict"), "{script}");
+        assert!(
+            script.contains("'Show what the note holds now'"),
+            "{script}"
+        );
+        assert!(script.contains("'Load the latest'"), "{script}");
+        assert!(script.contains("'Use my version anyway'"), "{script}");
+        // The 409's body and hash are what the prompt is driven by.
+        assert!(script.contains("result.data.body"), "{script}");
+        assert!(
+            script.contains("offerConflict(result.data.hash, result.data.body)"),
+            "{script}"
+        );
     }
 
     /// A collection's title is library content: whatever it says, it reaches

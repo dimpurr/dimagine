@@ -1,6 +1,6 @@
 # dimagine library format
 
-- **Version:** 0.1 (draft)
+- **Version:** 0.2 (draft)
 - **Status:** Current
 
 This document defines what a dimagine library is on disk. It is the contract
@@ -268,9 +268,10 @@ removing the member.
 A note's **body** is every byte after the line its front matter closes on — the
 same delimiter rule the reader uses to find the body (§5.1, §3). A tool that
 replaces the whole body overwrites exactly those bytes and nothing before them:
-the front matter is carried over untouched and never re-serialized, and the body's
-own line endings, byte-order mark and trailing newline (or its absence) are kept
-as given. A note with no front matter has a body that is the whole file (minus a
+the front matter is carried over untouched and never re-serialized, and the
+body's own line endings and trailing newline (or its absence) are kept as
+given, as is the file's leading byte-order mark, if any (§3.1). A note with no
+front matter has a body that is the whole file (minus a
 BOM, §3.1); a note whose opening `---` fence is never closed has no defined body
 boundary, so it is refused rather than guessed at. A note that ends *at* its
 closing fence has an empty body and no line break after the fence; the break is
@@ -283,6 +284,12 @@ still applies to the result (§3.2): an image note whose new body no longer embe
 its own picture gets the embed added at the end. Collection notes and other plain
 notes are edited as text the same way; only the self-embed rule is specific to
 image notes.
+
+One caveat belongs to the *client*, not the format: an HTML `<textarea>`
+normalizes its value to LF, so a note with CRLF line endings that is edited
+through a browser form comes back with LF in the body, even though the file's
+line endings are otherwise kept as given. The CLI and the write endpoint splice
+the bytes they are handed verbatim; only a browser textarea rewrites them.
 
 ## 6. Boards
 
@@ -396,6 +403,25 @@ mid-flight leaves its half-state in the journal (§8.3), which the next writer
 recovers; an image left in a landing folder with no note is what a lost journal
 can still leave behind, and `dimagine check` reports it (`orphaned_upload`).
 
+## Writing
+
+The rules a tool must follow to *change* a library live in the section that
+owns each fact; this index is a map to them, not a second copy of any rule. It
+exists because, from version 0.2 on, the format itself — not just the viewer —
+is written by tools, so the writing contract is part of what the format
+promises.
+
+| Writing concern | Where the rule lives |
+| --- | --- |
+| Note front matter: tags, `rating`, scalar properties | §3.1 |
+| The self-embed a written note must keep | §3.2 |
+| Assigning the `id` a membership gives an image | §3.3 |
+| Link syntax and resolution (bare name vs full library path) | §5.1 |
+| Member blocks, caption lines, add/remove and reordering | §5.2 |
+| Whole-body edit (front matter untouched, open-hash precondition) | §5.3 |
+| Move, rename, copy, upload, and the group delete | §7 |
+| The journal, write log and settings a writer keeps | §8.3 |
+
 ## 8. The `.dimagine/` folder
 
 `.dimagine/` holds only things that are meaningless to other tools and safe to
@@ -508,3 +534,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-17 | Member blocks, caption lines and reordering (§5.2): a member line plus the plain-text lines that follow it; reordering permutes only the blocks and leaves every other byte, line boundary and trailing-newline shape alone; a caption edit touches one line and never the member line. `dimagine collect --reorder` and `collect --caption` join the CLI (§9). |
 | 0.1 | 2026-10-17 | The whole-body edit (§5.3): a note's body is the bytes after its front matter's closing line; a replacement keeps the front matter and every byte-order mark, line ending and trailing newline as given, carries a precondition on the bytes it replaces, and keeps the self-embed rule on the result; a note whose opening fence is never closed is refused, and a note that ends at its closing fence is given the line break its body needs. `dimagine edit` joins the CLI (§9). |
 | 0.1 | 2026-10-17 | Upload (§7.2): placement is a named folder, else the default upload folder — `attachmentFolderPath`, else `inbox/` — plus a plain join when the upload names a collection; naming keeps a meaningful name and renames a meaningless camera, screenshot or share name to `Upload <YYYYMMDDHHMMSS>.<ext>` with the original kept in `title` (§3.1) and `sources` (§3.4), taking ` 2` on a library-wide NFC, case-insensitive collision; the bytes must match the extension, with SVG, HTML and XML refused on both sides; identical bytes already in the library (outside `.trash/`) are not copied again; a new image lands with a note carrying `id` (§3.3), `added`, `imported` and the upload `sources` entry (§3.4). `dimagine upload` joins the CLI (§9). |
+| 0.2 | 2026-10-19 | Minor bump for the write contract (ADR-017 §12). Every 3b write operation now lands — whole-body edit, member-block reorder, caption edit, upload and the collection join. A new "Writing" index (before §8) maps each writing rule to the section that owns it, so the contract is reachable without a rule living in two places. |

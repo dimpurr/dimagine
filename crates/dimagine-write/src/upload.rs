@@ -274,9 +274,18 @@ impl Writer {
                 })
             };
             if let Some(image) = existing {
+                // A duplicate writes nothing, so its note is named only when
+                // the existing image really has one (H5b): the response never
+                // promises a note that is not there.
+                let note_path = format!("{image}.md");
+                let note = if ctx.index_of(&note_path).is_some() {
+                    note_path
+                } else {
+                    String::new()
+                };
                 landed.push(image.clone());
                 outcomes.push(UploadOutcome {
-                    note: format!("{image}.md"),
+                    note,
                     image,
                     renamed: false,
                     duplicate: true,
@@ -326,10 +335,15 @@ impl Writer {
                 after_bytes: Some(note),
             });
             // The collision rule is on the bare name,
-            // library-wide (ADR-017 §4): the name this
-            // batch took is remembered by its fold key,
-            // the same key `next_free_name` checks.
+            // library-wide (ADR-017 §4): the names this
+            // batch took — the image and its paired note —
+            // are remembered by their fold keys, the same
+            // keys `next_free_name` checks.
             taken.insert(paths::fold_key(&paths::to_nfc(image_rel.name())));
+            taken.insert(paths::fold_key(&paths::to_nfc(&format!(
+                "{}.md",
+                image_rel.name()
+            ))));
             by_sha.insert(sha, image_rel.text());
             landed.push(image_rel.text());
             outcomes.push(UploadOutcome {
@@ -559,7 +573,16 @@ fn next_free_name(
         };
         let nfc = paths::to_nfc(&candidate);
         let key = paths::fold_key(&nfc);
-        if !folded_lib.contains(&key) && !taken.contains(&key) {
+        // The image's paired note lands right beside it (ADR-017 §2), so its
+        // name is reserved too: a pre-existing orphan `X.jpg.md` moves the
+        // image to `X 2.jpg` instead of failing after the image has landed
+        // (H4).
+        let note_key = paths::fold_key(&paths::to_nfc(&format!("{nfc}.md")));
+        if !folded_lib.contains(&key)
+            && !taken.contains(&key)
+            && !folded_lib.contains(&note_key)
+            && !taken.contains(&note_key)
+        {
             return match parent {
                 Some(folder) => folder.join(&nfc),
                 None => RelPath::parse(&nfc),
@@ -611,6 +634,24 @@ mod tests {
                 .unwrap()
                 .text(),
             "café 2.png"
+        );
+        // A pre-existing orphan note reserves the image's name (H4).
+        let mut lib = HashSet::new();
+        lib.insert(paths::fold_key("girl.png.md"));
+        assert_eq!(
+            next_free_name(&lib, &HashSet::new(), root, "girl", "png")
+                .unwrap()
+                .text(),
+            "girl 2.png"
+        );
+        // A name this batch took also reserves its paired note.
+        let mut taken = HashSet::new();
+        taken.insert(paths::fold_key("cat.png.md"));
+        assert_eq!(
+            next_free_name(&HashSet::new(), &taken, root, "cat", "png")
+                .unwrap()
+                .text(),
+            "cat 2.png"
         );
     }
 }

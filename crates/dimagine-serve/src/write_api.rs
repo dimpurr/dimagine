@@ -17,7 +17,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{
-        multipart::{Multipart, MultipartError},
+        multipart::{Field, Multipart, MultipartError},
         ConnectInfo, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
@@ -2263,7 +2263,7 @@ async fn reorder_collection(
     // The precondition holds even when this permutation would change nothing:
     // a stale open hash is a conflict, not a silent no-op (ADR-016 §3).
     if !expect.same_bytes(&current) {
-        return conflict_response(&current);
+        return conflict_response(&current, None);
     }
     let blocks = match body_edit::member_blocks(&bytes, note_index, &ctx) {
         Ok(blocks) => blocks,
@@ -2393,7 +2393,7 @@ async fn caption_collection(
     // The precondition holds even when this caption would change nothing: a
     // stale open hash is a conflict, not a silent no-op (ADR-016 §3).
     if !expect.same_bytes(&current) {
-        return conflict_response(&current);
+        return conflict_response(&current, None);
     }
     let (new_body, change) = match body_edit::edit_caption(
         &bytes,
@@ -2545,9 +2545,10 @@ async fn edit_note_body(
         Err(response) => return *response,
     };
     // The precondition holds even when the new body equals the old: a stale
-    // open hash is a conflict, not a silent no-op (ADR-016 §3).
+    // open hash is a conflict, not a silent no-op (ADR-016 §3). The 409 carries
+    // the note's current body, so the prompt can show what changed elsewhere.
     if !expect.same_bytes(&current) {
-        return conflict_response(&current);
+        return conflict_response(&current, body_edit::body_text(&bytes));
     }
     let replaced = match body_edit::replace_body(&bytes, note_index, new_body.as_bytes(), &ctx) {
         Ok(replaced) => replaced,
@@ -2609,6 +2610,19 @@ async fn edit_note_body(
 /// `sources` (ADR-017 §11.5), as the viewer's uploads stamp it.
 const SERVE_IMPORTER: &str = concat!("dimagine ", env!("CARGO_PKG_VERSION"));
 
+/// The largest a `folder` or `collection` control field may be, in bytes
+/// (H3): the field carries a library-relative path, never content, so a
+/// generous path length bounds it and the placement fields cannot be used to
+/// hold RAM. Enforced while the field streams in, like the per-file cap.
+const MAX_UPLOAD_FIELD_BYTES: usize = 4 * 1024;
+
+/// A whole upload request may buffer at most this many copies of the per-file
+/// cap across its file fields, so a batch of many large files cannot
+/// accumulate unbounded RAM before [`Writer::upload`] runs (H3, ADR-018 §5
+/// bounds one field; this bounds the request). Enforced while streaming, like
+/// the per-file cap.
+const MAX_UPLOAD_TOTAL_CAPS: usize = 4;
+
 /// `POST /api/write/upload` — land files as image groups (ADR-017 §11),
 /// the same journaled operation the CLI's `upload` runs. The body is
 /// `multipart/form-data` (ADR-018 §3, §5): every file field is an image to
@@ -2628,6 +2642,10 @@ async fn upload_files(
         return json_error(StatusCode::NOT_FOUND, "writes are off");
     };
     let cap = state.config.max_upload_bytes;
+    // The whole request's file bytes are bounded too, at a fixed multiple of
+    // the per-file cap (H3): the per-file cap alone lets a 1000-file batch
+    // buffer with no bound.
+    let total_cap = cap.saturating_mul(MAX_UPLOAD_TOTAL_CAPS);
     // The two control fields, and the file items, read straight off the
     // stream. Files are buffered only up to `cap` each: the loop refuses
     // a field the instant its running size would cross `cap`, so the rest
@@ -2635,6 +2653,7 @@ async fn upload_files(
     let mut folder_field: Option<String> = None;
     let mut collection_field: Option<String> = None;
     let mut items: Vec<UploadItem> = Vec::new();
+    let mut total: usize = 0;
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(field)) => field,
@@ -2643,9 +2662,9 @@ async fn upload_files(
         };
         let name = field.name().unwrap_or("").to_string();
         if name == "folder" || name == "collection" {
-            let text = match field.text().await {
+            let text = match read_control_field(&mut field, &name).await {
                 Ok(text) => text,
-                Err(error) => return multipart_error(error),
+                Err(response) => return *response,
             };
             if name == "folder" {
                 folder_field = Some(text);
@@ -2673,6 +2692,12 @@ async fn upload_files(
                         over = true;
                         break;
                     }
+                    if total + bytes.len() + chunk.len() > total_cap {
+                        return json_error(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            &format!("an upload may carry at most {total_cap} bytes in total"),
+                        );
+                    }
                     bytes.extend_from_slice(&chunk);
                 }
                 Ok(None) => break,
@@ -2687,6 +2712,7 @@ async fn upload_files(
                 &format!("a file may not exceed {cap} bytes"),
             );
         }
+        total += bytes.len();
         items.push(UploadItem {
             original_name,
             bytes,
@@ -2747,6 +2773,36 @@ async fn upload_files(
     }
 }
 
+/// Read a `folder`/`collection` control field, refusing as it streams once
+/// the field passes [`MAX_UPLOAD_FIELD_BYTES`] (H3): the placement fields
+/// carry a library-relative path, so the cap is generous but real, and like
+/// the per-file cap it is enforced before the whole field is buffered. A
+/// field that is not UTF-8 is a `400`, not an internal error.
+async fn read_control_field(field: &mut Field<'_>, name: &str) -> Result<String, Box<Response>> {
+    let mut bytes: Vec<u8> = Vec::new();
+    loop {
+        match field.chunk().await {
+            Ok(Some(chunk)) => {
+                if bytes.len() + chunk.len() > MAX_UPLOAD_FIELD_BYTES {
+                    return Err(Box::new(json_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!("the {name} field may not exceed {MAX_UPLOAD_FIELD_BYTES} bytes"),
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(error) => return Err(Box::new(multipart_error(error))),
+        }
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            &format!("the {name} field is not valid UTF-8"),
+        ))
+    })
+}
+
 /// The upload's landing spot, mirroring the CLI's `upload_placement`: a
 /// named collection lands files in the default upload folder and joins
 /// them; otherwise a named folder (the library root for `""`); otherwise
@@ -2757,6 +2813,15 @@ fn upload_placement(
     folder_field: Option<String>,
     collection_field: Option<String>,
 ) -> Result<UploadRequest, Box<Response>> {
+    // The two placements are exclusive, as the CLI's `--to`/`--to-collection`
+    // are (clap `conflicts_with`): a request naming both is a typed refusal,
+    // never a silent preference for one (H6, ADR-017 §11.1).
+    if folder_field.is_some() && collection_field.is_some() {
+        return Err(Box::new(json_error(
+            StatusCode::BAD_REQUEST,
+            "give a folder or a collection, not both",
+        )));
+    }
     if let Some(collection) = collection_field {
         let note_rel = match RelPath::parse(collection.trim_start_matches("./")) {
             Ok(rel) => rel,
@@ -3019,27 +3084,30 @@ fn guarded_write_error(error: dimagine_write::Error) -> Response {
     let dimagine_write::Error::Conflict(conflict) = &error else {
         return write_error(error);
     };
-    conflict_response(&conflict.current)
+    conflict_response(&conflict.current, None)
 }
 
 /// The 409 an open-hash precondition mismatch answers (ADR-016 §3): the note's
 /// current sha256 and view ETag, so the client can offer "load the latest and
 /// re-edit" or "overwrite with mine" (a retry carrying the hash returned here),
-/// and nothing of the request is applied.
-fn conflict_response(current: &Fingerprint) -> Response {
+/// and nothing of the request is applied. `current_body` is the changed-elsewhere
+/// content the prompt shows when the caller can spell it (the body edit can;
+/// a reorder or caption conflict carries only the hash and ETag).
+fn conflict_response(current: &Fingerprint, current_body: Option<&str>) -> Response {
     // The note's view ETag is built from size and mtime (media.rs, the source
     // view), so the current fingerprint renders the ETag the client must
-    // re-read against.
-    let etag = format!("\"size-{:x}-mtime-{:x}\"", current.size, current.mtime_ns);
-    let mut response = (
-        StatusCode::CONFLICT,
-        Json(serde_json::json!({
-            "error": "the file changed since it was read",
-            "hash": current.hex(),
-            "etag": etag,
-        })),
-    )
-        .into_response();
+    // re-read against. Both callers share one helper, so they agree even for a
+    // pre-epoch mtime (W67 D4).
+    let etag = crate::media::view_etag(current.size, current.mtime_ns);
+    let mut payload = serde_json::json!({
+        "error": "the file changed since it was read",
+        "hash": current.hex(),
+        "etag": etag,
+    });
+    if let Some(body) = current_body {
+        payload["body"] = serde_json::Value::String(body.to_string());
+    }
+    let mut response = (StatusCode::CONFLICT, Json(payload)).into_response();
     if let Ok(value) = HeaderValue::from_str(&etag) {
         response.headers_mut().insert(header::ETAG, value);
     }

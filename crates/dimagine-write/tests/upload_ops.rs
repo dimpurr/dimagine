@@ -190,6 +190,9 @@ fn a_duplicate_by_content_is_not_written_again() {
     assert_eq!(outcomes.len(), 1);
     assert!(outcomes[0].duplicate);
     assert_eq!(outcomes[0].image, "refs/girl.png");
+    // The existing image has no note, so the outcome names none (H5b) rather
+    // than promising `refs/girl.png.md`.
+    assert_eq!(outcomes[0].note, "");
     // Nothing new on disk, and the existing file is untouched.
     assert!(!root.join("inbox").exists());
     assert_eq!(std::fs::read(root.join("refs/girl.png")).unwrap(), PNG);
@@ -221,6 +224,41 @@ fn a_stale_dedupe_row_lands_a_new_file() {
     assert!(!outcomes[0].duplicate);
     assert_eq!(outcomes[0].image, "girl.png");
     assert!(root.join("girl.png").exists());
+}
+
+/// A pre-existing orphan note reserves the image's name: the upload lands as
+/// `girl 2.png` (with `girl 2.png.md`), so the group is never split by an
+/// EEXIST on the note after the image has landed (H4).
+#[test]
+fn an_orphan_note_reserves_the_image_name() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    put(
+        &root.join("inbox/girl.png.md"),
+        b"---\nid: 01A\n---\n\n![[inbox/girl.png]]\n",
+    );
+    let writer = Writer::open_raw(root).unwrap();
+
+    let outcomes = upload(
+        "OP-UPLOAD-00000000000006",
+        &writer,
+        root,
+        "inbox",
+        None,
+        vec![("girl.png", PNG)],
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].image, "inbox/girl 2.png");
+    assert_eq!(outcomes[0].note, "inbox/girl 2.png.md");
+    assert!(root.join("inbox/girl 2.png").exists());
+    assert!(root.join("inbox/girl 2.png.md").exists());
+    // The orphan note is untouched.
+    assert_eq!(
+        std::fs::read(root.join("inbox/girl.png.md")).unwrap(),
+        b"---\nid: 01A\n---\n\n![[inbox/girl.png]]\n"
+    );
 }
 
 /// The collection join lands in the same operation: one

@@ -1432,16 +1432,19 @@ pub struct BodyReplaced {
 ///
 /// The split point is the end of that fence's line, as [`front_matter_range`]
 /// reports it — the one delimiter rule the reader uses too — so the front matter
-/// is carried into the result byte for byte and is never re-serialized. Line
-/// endings, a BOM, and an absent trailing newline are the new body's own business:
-/// these bytes are spliced, not normalized.
+/// is carried into the result byte for byte and is never re-serialized. The new
+/// body's own line endings and trailing newline (or its absence) are its business:
+/// these bytes are spliced, not normalized. A leading BOM is the file's, set
+/// before the front matter, and survives for the same reason the front matter does.
 ///
 /// A note with no front matter is body from just past its BOM, so its body is
 /// the whole file. A note whose opening fence is never closed is refused: nothing
 /// says where its front matter ends, and guessing would rewrite user bytes. A
 /// note that ends *at* its closing fence has an empty body and no line break
 /// after the fence; the break is added, because a body spliced onto the fence
-/// line would leave the reader with a note whose front matter never closes.
+/// line would leave the reader with a note whose front matter never closes. An
+/// empty new body is the exception: it needs no line, so the note is left exactly
+/// as it was rather than gaining a break.
 ///
 /// The result still satisfies the self-embed rule (ADR-017 §2): an image note
 /// whose new body holds no embed resolving to its own picture gets the standard
@@ -1469,13 +1472,16 @@ pub fn replace_body(
     };
     let mut bytes = Vec::with_capacity(head_end + new_body.len() + 2);
     bytes.extend_from_slice(&note_bytes[..head_end]);
-    if !fence_closed_the_line {
+    if !fence_closed_the_line && !new_body.is_empty() {
         // The closing fence was the file's last line and held no line break, so
         // the body had no line to start on. Splicing onto it directly would make
         // that line `---<new text>`, which is no longer a fence, and the reader
         // would then report the front matter as never closed. So the fence gets
         // the break it lacked, in the note's own style — the treatment an append
         // already gives a file whose last line has no terminator (ADR-017 §4).
+        // An empty body needs no line, so it is not given one: replacing an
+        // empty body with an empty one leaves the note's bytes exactly as they
+        // were (RW68 L3).
         bytes.extend_from_slice(newline_style(text).as_bytes());
     }
     bytes.extend_from_slice(new_body);
@@ -1497,6 +1503,22 @@ pub fn replace_body(
         changed,
         self_embed_restored,
     })
+}
+
+/// The body region of a note as text: the bytes after the front matter's
+/// closing fence, or after a leading BOM when there is no front matter.
+///
+/// The current body is what a conflict prompt shows when a save loses the
+/// race — "here is what the note holds now" (ADR-016 §3). `None` when the
+/// opening fence is never closed (there is no body to show) or the bytes are
+/// not UTF-8; the prompt then says only that the file changed.
+pub fn body_text(note_bytes: &[u8]) -> Option<&str> {
+    let start = match front_matter_range(note_bytes) {
+        FmRange::NoFrontMatter { bom_len } => bom_len,
+        FmRange::Closed { body_start, .. } => body_start,
+        FmRange::Unterminated { .. } => return None,
+    };
+    std::str::from_utf8(&note_bytes[start..]).ok()
 }
 
 /// The library index of the picture paired with image note `note`, or `None`

@@ -194,11 +194,12 @@ pub fn commands() -> Vec<Command> {
             .arg(
                 Arg::new("images")
                     .value_name("OPERAND")
-                    .num_args(0..)
+                    .num_args(1..)
+                    .required(true)
                     .help(
                         "With --new/--add/--remove: images, by library-relative path or bare \
-                         name. With --reorder: the new 1-based block order. With --caption: \
-                         <BLOCK> <LINE> <TEXT>.",
+                         name (at least one). With --reorder: the new 1-based block order. \
+                         With --caption: <BLOCK> <LINE> <TEXT>.",
                     ),
             ),
         Command::new("mv")

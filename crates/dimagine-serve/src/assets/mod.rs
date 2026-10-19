@@ -230,6 +230,28 @@ mod tests {
             APP_JS.contains("{ passive: false }"),
             "a selection drag is not a scroll"
         );
+        // W69 follow-up M2: the touchmove block is scoped to the finger a
+        // long press already claimed, so a fresh touch after release
+        // scrolls the page again instead of leaving a dead zone where a
+        // swipe neither selects nor scrolls.
+        assert!(
+            APP_JS.contains("if (selectionGesture && selectionGesture.mode) {"),
+            "only the claiming gesture's touchmove is prevented"
+        );
+        // W69 follow-up M1: the double click that opens an image carries
+        // the same `selecting` guard as the single click, so a double tap
+        // in selection mode cannot navigate away and drop the selection.
+        assert_eq!(
+            APP_JS
+                .matches("if (grid && grid.classList.contains('selecting')) {")
+                .count(),
+            3,
+            "click, dblclick and the keyboard block all stand down while selecting"
+        );
+        assert!(
+            APP_JS.contains("if (grid && grid.classList.contains('selecting')) return;"),
+            "the arrows and Enter wait while selection mode is open"
+        );
         assert!(
             APP_JS.contains("event.stopPropagation();"),
             "the release's click is swallowed in the capture phase"

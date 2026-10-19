@@ -631,6 +631,108 @@ async fn a_file_at_the_cap_still_lands() {
     assert_eq!(library_file(&root, "inbox/exact.png").unwrap(), body_bytes);
 }
 
+/// A `folder` field over the control-field cap is refused while it streams and
+/// nothing lands (H3): the placement fields carry a path, so the cap is
+/// generous, but they are bounded like the file fields.
+#[tokio::test]
+async fn an_over_the_cap_control_field_is_refused_and_lands_nothing() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let body = multipart_body(&[
+        Part {
+            name: "folder",
+            file_name: None,
+            content: vec![b'a'; 8 * 1024],
+        },
+        Part {
+            name: "file",
+            file_name: Some("deep.png"),
+            content: png(12),
+        },
+    ]);
+    let (status, _, body) = send(&app, upload_request(body, &cookie, &csrf, ORIGIN)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", text(&body));
+    assert!(text(&body).contains("folder field"), "{}", text(&body));
+    assert!(library_file(&root, "inbox/deep.png").is_none());
+}
+
+/// The whole request's file bytes are bounded, not just each file (H3): a
+/// batch whose files are each within the per-file cap but whose sum crosses
+/// the total cap is refused before anything is written.
+#[tokio::test]
+async fn an_upload_over_the_total_cap_is_refused() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let one = png(13);
+    let cap = one.len();
+    let app = router(
+        FsCatalog::new(root.path().join("library")).unwrap(),
+        OriginalPreview,
+        ServeConfig {
+            max_upload_bytes: cap,
+            ..config(&root, true, None)
+        },
+    );
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    // Four files are the total cap (4 x the per-file cap); a fifth crosses it.
+    let parts: Vec<Part<'_>> = (0..5)
+        .map(|n| Part {
+            name: "file",
+            file_name: Some(["a.png", "b.png", "c.png", "d.png", "e.png"][n]),
+            content: one.clone(),
+        })
+        .collect();
+    let body = multipart_body(&parts);
+    let (status, _, body) = send(&app, upload_request(body, &cookie, &csrf, ORIGIN)).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{}", text(&body));
+    assert!(text(&body).contains("in total"), "{}", text(&body));
+    for name in ["a.png", "b.png", "c.png", "d.png", "e.png"] {
+        assert!(
+            library_file(&root, &format!("inbox/{name}")).is_none(),
+            "{name}"
+        );
+    }
+}
+
+/// A request naming both a `folder` and a `collection` is a typed refusal, as
+/// the CLI's `--to`/`--to-collection` conflict is (H6): neither silently wins,
+/// and nothing lands.
+#[tokio::test]
+async fn naming_both_a_folder_and_a_collection_is_refused() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let body = multipart_body(&[
+        Part {
+            name: "folder",
+            file_name: None,
+            content: b"refs".to_vec(),
+        },
+        Part {
+            name: "collection",
+            file_name: None,
+            content: b"mine.md".to_vec(),
+        },
+        Part {
+            name: "file",
+            file_name: Some("both.png"),
+            content: png(14),
+        },
+    ]);
+    let (status, _, body) = send(&app, upload_request(body, &cookie, &csrf, ORIGIN)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&body));
+    assert!(
+        text(&body).contains("a folder or a collection, not both"),
+        "{}",
+        text(&body)
+    );
+    assert!(library_file(&root, "inbox/both.png").is_none());
+    assert!(library_file(&root, "refs/both.png").is_none());
+}
+
 /// The cap against a real local server on a real socket: the client
 /// pushes a body sixty times the cap with no pause, and the test counts
 /// what the socket actually took. A server that buffered the field first

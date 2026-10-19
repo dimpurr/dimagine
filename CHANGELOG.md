@@ -91,8 +91,8 @@ All notable changes to this project are documented here. The format follows
   3b): the whole-body edit FORMAT §5.3 promises. It replaces every byte after
   the note's front matter with the text given and touches nothing before it —
   the front matter is carried over untouched, never re-serialized, and the body's
-  own line endings, byte-order mark and trailing newline (or absence) survive
-  byte for byte. A note whose opening `---` fence is never closed is refused,
+  own line endings and trailing newline (or absence), and the note's leading
+  byte-order mark, survive byte for byte. A note whose opening `---` fence is never closed is refused,
   because nothing says where its body starts, and a note that ends right at its
   closing fence is given the line break its first body line needs. Collection and
   other plain notes are edited as text the same way. The result keeps the
@@ -405,6 +405,12 @@ All notable changes to this project are documented here. The format follows
   documentation index.
 
 ### Changed
+- Library format `docs/FORMAT.md` is now version **0.2** (its changelog records
+  the bump): the whole 3b write contract has landed, so the minor version the
+  ADR promised is owed. A short **Writing** index section maps each writing
+  rule — front matter and `id`, the self-embed, link syntax, member blocks and
+  captions, the body edit, move/upload/delete, the write log — to the section
+  that owns it, so the contract is reachable without any rule appearing twice.
 - Viewer: `/thumb/<path>` and `/media/<path>` now answer `302 Found` to the
   content URL when the index holds a digest for the bytes, with `private,
   no-cache` on the hop itself — a cached `301` would pin a path to one digest
@@ -515,6 +521,45 @@ All notable changes to this project are documented here. The format follows
   answers in tens of milliseconds.
 
 ### Fixed
+- Upload: the serve endpoint is bounded and two naming edges are closed (RW66c
+  follow-ups). A whole request may buffer at most four times the per-file cap in
+  file bytes, and each `folder`/`collection` field is capped at 4 KiB — both
+  enforced while the body streams, so a batch of many large files or an oversized
+  placement field can no longer hold RAM without bound. The paired note's name is
+  reserved alongside the image leaf, so a pre-existing orphan `X.jpg.md` lands the
+  upload as `X 2.jpg` (with `X 2.jpg.md`) instead of splitting the group after the
+  image has landed, and a leading-dot stem is sanitized rather than failing the
+  whole upload as a hidden path. An `IMG_20261017_093012`-style camera name is now
+  recognized as meaningless and renamed, and a duplicate outcome names its note
+  only when the existing image really has one. `folder` and `collection` in one
+  request is a typed refusal, as the CLI's `--to`/`--to-collection` are, and the
+  upload cap's docs say MiB, matching the value.
+- Viewer: the body editor's conflict prompt (RW68 follow-up). A save whose
+  precondition is stale now shows what the note holds now — the 409 carries the
+  current body beside the hash — behind a disclosure, with "Load the latest"
+  (that body into the editor) and "Use my version anyway" (retry with the hash
+  the server just returned) as the two ways out, so a change made elsewhere is
+  neither silently overwritten nor left unexplained. The editor's hint says the
+  browser sends line endings as LF, and FORMAT §5.3 records that a CRLF body
+  saved through a textarea comes back with LF. Replacing a bare-closing-fence
+  note's empty body with an empty one leaves the file untouched instead of
+  gaining a newline, and the note is no longer reported as changed. A leading
+  byte-order mark is now described as the file's, not the body's.
+- Viewer: three drag-select corners (RW69 follow-up). A double tap on a
+  tile while selection mode is open no longer opens the image and drops the
+  whole selection: the double click carries the same `selecting` guard as
+  the single click. A swipe on a phone with the bottom bar open scrolls the
+  grid again — the `touchmove` block now covers only the finger a long press
+  already claimed, instead of the whole `.selecting` phase, which used to
+  leave a dead zone where a swipe neither selected nor scrolled. The arrow
+  keys and Enter wait while the mode is open rather than refilling the
+  inspector and adding a tile the bar never counted.
+- CLI: `collect --new`, `--add` and `--remove` refuse at the argument parser
+  (exit `2`) when given no images again, as they did before `--reorder` and
+  `--caption` relaxed the operand into a list that could be empty. An empty
+  `--new` no longer creates an empty collection and an empty `--add`/`--remove`
+  no longer reports "nothing to change"; `--reorder` and `--caption` keep the
+  operands they need (RW67 D2).
 - `dimagine serve` now runs its periodic background rescan. The router — which
   starts the rescan task, and needs a Tokio runtime to spawn on — was built
   before that runtime existed, so the task never started and the viewer served

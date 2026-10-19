@@ -376,7 +376,14 @@
           selectTile(tile, false);
         }
       });
-      tile.addEventListener('dblclick', function () {
+      tile.addEventListener('dblclick', function (event) {
+        // The double click is a wide screen's second way to open, so
+        // it stands down while selection mode owns the tile exactly
+        // as the single click above does.
+        if (grid && grid.classList.contains('selecting')) {
+          event.preventDefault();
+          return;
+        }
         window.location.href = imageHref(tile.dataset.path);
       });
     }
@@ -415,6 +422,11 @@
 
     var all = tiles();
     if (!all.length) return;
+    // Selection mode is the other selection and the single one stands
+    // down while it is open: the arrows and Enter below would refill
+    // the inspector the mode emptied and add a `.selected` the bar
+    // never counts. They wait until the mode is left.
+    if (grid && grid.classList.contains('selecting')) return;
     var index = selected ? all.indexOf(selected) : -1;
 
     if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
@@ -652,14 +664,16 @@
       true
     );
 
-    // A selection drag is not a scroll: once selection mode is on,
-    // the finger moves the selection, never the page. Before the
-    // long press fires nothing is prevented, so a scroll is always
-    // allowed until the press says otherwise.
+    // Only the finger a long press already claimed is a selection
+    // drag, so only that finger's moves are withheld from the page.
+    // Once the pointer is up (the gesture is done) selection mode is
+    // still open, but a fresh touch on the grid is the user's again:
+    // before the next long press fires nothing is prevented, so a
+    // scroll is allowed; after release the page scrolls as usual.
     grid.addEventListener(
       'touchmove',
       function (event) {
-        if (grid.classList.contains('selecting')) {
+        if (selectionGesture && selectionGesture.mode) {
           event.preventDefault();
         }
       },

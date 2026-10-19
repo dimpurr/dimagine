@@ -1546,6 +1546,9 @@ async fn the_reorder_endpoint_refuses_a_missing_or_stale_hash() {
     let etag = doc["etag"].as_str().expect("a current etag");
     assert!(etag.starts_with("\"size-"), "{etag:?}");
     assert_eq!(headers["etag"], etag);
+    // The 409 carries the note's current body so the browser can show it beside
+    // the draft being kept (RW68 M1, ADR-016 §3); a reorder carries no body.
+    assert!(doc.get("body").is_none(), "{doc}");
     assert_eq!(read_note(&root, "Picks.md"), before, "nothing changed");
 }
 
@@ -1751,6 +1754,9 @@ async fn the_body_endpoint_refuses_a_missing_or_stale_hash() {
     let etag = doc["etag"].as_str().expect("a current etag");
     assert!(etag.starts_with("\"size-"), "{etag:?}");
     assert_eq!(headers["etag"], etag);
+    // The 409 also carries the note's current body, the latest the browser can
+    // show against the draft it is holding (RW68 M1, ADR-016 §3).
+    assert_eq!(doc["body"], "![[one.png]]\nold body line\n");
     assert_eq!(read_note(&root, "one.png.md"), before);
 }
 
@@ -1878,6 +1884,13 @@ async fn the_image_page_offers_the_body_editor_to_the_owner() {
     assert!(page.contains("/api/write/note/body"), "{page}");
     // The raw body is shown in the textarea, its self-embed intact.
     assert!(page.contains("![[one.png]]"), "{page}");
+    // The conflict prompt the script drives: what the note holds now, and the
+    // two ways out of a 409 (RW68 M1/L4, ADR-016 §3).
+    assert!(page.contains("function offerConflict"), "{page}");
+    assert!(page.contains("'Show what the note holds now'"), "{page}");
+    assert!(page.contains("'Load the latest'"), "{page}");
+    assert!(page.contains("'Use my version anyway'"), "{page}");
+    assert!(page.contains("result.data.body"), "{page}");
 }
 
 /// Without `--write` the note is still shown, but the editor is not offered —
@@ -1892,6 +1905,26 @@ async fn the_image_page_hides_the_body_editor_without_write() {
     assert_eq!(status, StatusCode::OK);
     let page = text(&bytes);
     assert!(!page.contains("note-body-edit"), "{page}");
+    // The note itself is still there to read.
+    assert!(page.contains("class=\"note-body\""), "{page}");
+}
+
+/// A signed-in non-owner (passcode viewer) on a write-enabled server is offered
+/// no editor either: the body editor is an owner action, not merely a `--write`
+/// one (RW68 L4, ADR-018 §1/§2). The note stays readable.
+#[tokio::test]
+async fn the_image_page_hides_the_body_editor_from_a_passcode_viewer() {
+    let root = body_library();
+    let app = app_for(&root, true, Some("passcode123"));
+    let cookie = login(&app, "passcode=passcode123").await;
+    let (status, _, bytes) = send(&app, get("/image/one.png", Some(&cookie))).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let page = text(&bytes);
+    assert!(!page.contains("note-body-edit"), "{page}");
+    assert!(
+        !page.contains("/api/write/note/body"),
+        "no editor wiring for a non-owner: {page}"
+    );
     // The note itself is still there to read.
     assert!(page.contains("class=\"note-body\""), "{page}");
 }

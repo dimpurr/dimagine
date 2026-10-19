@@ -539,11 +539,7 @@ fn open_source_view(
     path: &FsPath,
 ) -> Result<(fs::File, fs::Metadata, String, &'static str, bool), ServeImageError> {
     let opened = open_file(path)?;
-    let etag = format!(
-        "\"size-{:x}-mtime-{:x}\"",
-        opened.metadata.len(),
-        modified_nanos(&opened.metadata)
-    );
+    let etag = view_etag(opened.metadata.len(), modified_nanos(&opened.metadata));
     Ok((
         opened.file,
         opened.metadata,
@@ -614,12 +610,25 @@ fn open_byte_hash(path: &FsPath) -> Result<(OpenedFile, String), ServeImageError
     Ok((opened, etag))
 }
 
-fn modified_nanos(metadata: &fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|when| when.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |since| since.as_nanos())
+fn modified_nanos(metadata: &fs::Metadata) -> i64 {
+    let Ok(stamp) = metadata.modified() else {
+        return 0;
+    };
+    match stamp.duration_since(UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_nanos()).unwrap_or(i64::MAX),
+        Err(before) => -i64::try_from(before.duration().as_nanos()).unwrap_or(i64::MIN),
+    }
+}
+
+/// The ETag a note's source view and a conflict report both render: the
+/// file's own size and modification time (never a hash of its bytes — a note
+/// has no rendition and is small enough that its metadata is the version the
+/// viewer revalidates against). A pre-epoch mtime is folded to zero, the
+/// value the source view has always used, so the two callers cannot spell the
+/// same file two ways (W67 D4).
+pub(crate) fn view_etag(size: u64, mtime_ns: i64) -> String {
+    let mtime = u64::try_from(mtime_ns).unwrap_or(0);
+    format!("\"size-{size:x}-mtime-{mtime:x}\"")
 }
 
 /// A streamed file. The admission permit, when one is held (the heavy
@@ -774,5 +783,19 @@ fn detected_image_mime(bytes: &[u8]) -> Option<&'static str> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::view_etag;
+
+    #[test]
+    fn a_pre_epoch_mtime_renders_the_same_etag_as_zero() {
+        // The conflict report (write_api.rs) and the source view share this
+        // helper, so a negative `Fingerprint::mtime_ns` and the source view's
+        // folded zero spell one ETag (W67 D4).
+        assert_eq!(view_etag(10, -1), view_etag(10, 0));
+        assert_eq!(view_etag(255, 1), "\"size-ff-mtime-1\"");
     }
 }
