@@ -203,6 +203,17 @@ pub async fn remind_until_owner_exists<F>(
 /// is extracted from the LAST hop of the `X-Forwarded-For` header.
 /// For untrusted peers (or if the header is absent/malformed), the
 /// TCP peer IP is used directly, ignoring the header.
+///
+/// A caller with no peer address at all gets the shared `"unknown"`
+/// key, which is also the key every other peer-less caller shares —
+/// so the login budgets are one pool for them (RW19b review Low).
+/// Currency re-checked in W73: both shipped bind paths build the
+/// service with `into_make_service_with_connect_info`, so a peer is
+/// always present and `"unknown"` cannot appear in the binary. Only
+/// an embedder driving [`router`] straight from a test or a harness
+/// reaches it, where sharing one budget is the honest answer rather
+/// than a footgun. This function also names the client in write-op
+/// records, so an embedder's op log may show `unknown` beside them.
 pub fn resolve_client_ip(
     peer_addr: Option<std::net::SocketAddr>,
     headers: &HeaderMap,
@@ -243,6 +254,12 @@ pub(crate) struct AppState {
     /// so the residual window is documented rather than locked; a file
     /// lock, or refusing to start when another server holds the
     /// directory, is the natural follow-up.
+    ///
+    /// Currency check (W73): still unreachable in the shipped deployment,
+    /// which runs exactly one `serve` per state directory, so this lock is
+    /// single-flight for every request that can exist. The cross-process
+    /// half stays parked until a multi-instance deployment is a supported
+    /// configuration.
     pub(crate) setup_lock: Arc<Mutex<()>>,
     pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
     /// The server-side CSRF token of each session (ADR-018 §3), keyed by the
@@ -307,6 +324,19 @@ pub const LOGIN_FAILURE_BUDGET: u32 = 10;
 /// `LOGIN_BUDGET_WINDOW_SECS`. This is the backstop that keeps the
 /// per-client budget from being farmed out across many source
 /// addresses, and it is not affected by client eviction.
+///
+/// Currency re-checked in W73 against accounts-mode auth: the shape
+/// is unchanged and still reaches the owner. A success is charged
+/// here and never refunded (`ThrottleState::record_success` touches
+/// only the client's own entry, and
+/// `login_budget_bounds_comparisons_per_client_and_globally` pins
+/// that), so the owner's own sign-ins also spend this shared pool,
+/// and once it is spent every client — owner included — is refused
+/// until the window rolls over. That is the reviewed, tested intent
+/// (a refund would hand an attacker a fresh allowance) and it is
+/// bounded by [`LOGIN_BUDGET_WINDOW_SECS`]; recovery is to wait the
+/// window out or change the password from the CLI. Revisit only as a
+/// product decision, not as a follow-up fix.
 pub const LOGIN_GLOBAL_FAILURE_BUDGET: u32 = 100;
 
 /// Length of the login attempt budget window. Budgets are restored,
@@ -1254,7 +1284,11 @@ async fn login(
     // still before comparing, so an exhausted budget refuses without
     // comparing and response timing never reveals whether a guess was
     // correct: every attempt that is compared pays the same escalating
-    // delay.
+    // delay. The step is the larger of the two budgets' counts
+    // (RW19b review Low), so a wave of failures anywhere raises every
+    // client's floor. That coupling is the point — responses stay
+    // identical apart from the delay — and W73 re-checked it against
+    // accounts mode and left it as reviewed.
     let delay_step = {
         let mut throttle = state.throttles.lock().unwrap();
         match throttle.admit(&client_key, now_seconds()) {

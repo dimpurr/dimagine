@@ -344,6 +344,11 @@ impl AccountsStore {
     /// one server the setup handler's `setup_lock` holds across this call and
     /// closes the window; across two servers on one state directory it stays
     /// open, which is operator error rather than a supported deployment.
+    ///
+    /// The supported deployment is one `serve` process per state directory
+    /// (the shipped unit runs a single instance), so the in-process lock is
+    /// the whole of the protection. Revisit this only when a second viewer
+    /// on one state directory becomes a supported configuration.
     pub fn create_user(
         &self,
         email: &str,

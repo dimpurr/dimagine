@@ -751,6 +751,16 @@ fn permissions_warning_reports_group_or_world_readable_store() {
     }
 }
 
+/// Single-flight on first-run setup (RW25b Low, currency re-checked in W73).
+///
+/// Two requests race one `--data-dir` inside one server. The `setup_lock`
+/// critical section spans the `has_users` re-check and the write, so exactly
+/// one request creates the owner and the loser is sent to `/login` without
+/// writing. This is the whole of the protection: the supported deployment
+/// runs one `serve` per state directory, so no second process can reach the
+/// un-locked `load → push → rename` path documented on
+/// [`AccountsStore::create_user`]. The cross-process case is out of scope
+/// until a multi-instance deployment is supported.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_setup_requests_still_create_exactly_one_owner() {
     let root = tempfile::tempdir().unwrap();
@@ -789,6 +799,17 @@ async fn concurrent_setup_requests_still_create_exactly_one_owner() {
         1,
         "exactly one request may create the owner: {outcomes:?}"
     );
+    // Whichever request won, the loser went to `/login`: it re-checked the
+    // store under the lock, found an owner, and did not write.
+    let winner_email = if response_a
+        .headers()
+        .get("location")
+        .is_some_and(|l| l == "/")
+    {
+        "owner@example.com"
+    } else {
+        "second@example.com"
+    };
     for (status, headers) in &outcomes {
         if *status == StatusCode::SEE_OTHER && headers["location"] == "/" {
             continue;
@@ -810,6 +831,9 @@ async fn concurrent_setup_requests_still_create_exactly_one_owner() {
         emails.join(", ")
     });
     assert_eq!(doc.users[0].role, "owner");
+    // The survivor is the winner's account, not an arbitrary one: the
+    // single-flight let exactly one writer through.
+    assert_eq!(doc.users[0].email, winner_email);
 
     // Setup stays closed: a follow-up request finds the owner and is a 404.
     assert_eq!(
