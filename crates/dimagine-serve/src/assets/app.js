@@ -851,6 +851,16 @@
         selectTile(tile, false);
       }
     });
+    // The same double click the page's own tiles carry: a wide
+    // screen's second way to open, standing down while selection
+    // mode owns the tile exactly as the single click above does.
+    tile.addEventListener('dblclick', function (event) {
+      if (grid && grid.classList.contains('selecting')) {
+        event.preventDefault();
+        return;
+      }
+      window.location.href = imageHref(tile.dataset.path);
+    });
     return tile;
   }
 

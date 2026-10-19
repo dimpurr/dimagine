@@ -276,9 +276,17 @@ impl Writer {
             if let Some(image) = existing {
                 // A duplicate writes nothing, so its note is named only when
                 // the existing image really has one (H5b): the response never
-                // promises a note that is not there.
+                // promises a note that is not there. A duplicate that points
+                // at a group this very batch planned (by_sha above) has its
+                // note planned too — it lands with the operation — so the
+                // batch's own steps are asked as well as the pre-op index,
+                // which cannot know a note that does not exist yet.
                 let note_path = format!("{image}.md");
-                let note = if ctx.index_of(&note_path).is_some() {
+                let note = if ctx.index_of(&note_path).is_some()
+                    || steps
+                        .iter()
+                        .any(|step| step.kind == StepKind::Create && step.dst == note_path)
+                {
                     note_path
                 } else {
                     String::new()

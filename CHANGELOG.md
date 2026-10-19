@@ -521,6 +521,20 @@ All notable changes to this project are documented here. The format follows
   answers in tens of milliseconds.
 
 ### Fixed
+- Upload: a duplicate inside one batch now names the note its
+  group lands with (RW74 Low-1). The duplicate outcome looked the
+  note up in the pre-op index, so the second of two identical
+  files in one upload reported `note: ""` while the note the
+  first file planned landed with the operation; the outcome now
+  asks the batch's own planned steps as well. Only `--json`
+  consumers see the field.
+- Viewer: the tiles a "Load more" appends now open on double
+  click (RW74 Low-3). Only the server-rendered tiles carried the
+  double-click handler, so an appended tile never opened on a
+  double click — outside selection mode it was single-click
+  only, the asymmetry the drag-select review noted. Appended
+  tiles now carry the same handler: the same `selecting` guard
+  and the same open as the page's own tiles.
 - Upload: the serve endpoint is bounded and two naming edges are closed (RW66c
   follow-ups). A whole request may buffer at most four times the per-file cap in
   file bytes, and each `folder`/`collection` field is capped at 4 KiB — both

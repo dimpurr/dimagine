@@ -198,6 +198,46 @@ fn a_duplicate_by_content_is_not_written_again() {
     assert_eq!(std::fs::read(root.join("refs/girl.png")).unwrap(), PNG);
 }
 
+/// A duplicate that points at a group this very batch planned
+/// names the note that lands with it: the second of two
+/// identical files reports the first one's note (RW74 Low-1),
+/// because the batch's own steps — not the pre-op index — are
+/// what know about a note that does not exist yet.
+#[test]
+fn a_within_batch_duplicate_names_the_note_the_batch_creates() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let writer = Writer::open_raw(root).unwrap();
+
+    let outcomes = upload(
+        "OP-UPLOAD-0000000000001E",
+        &writer,
+        root,
+        "inbox",
+        None,
+        vec![("one.png", PNG), ("two.png", PNG)],
+        None,
+    )
+    .unwrap();
+    assert_eq!(outcomes.len(), 2);
+    assert_eq!(outcomes[0].image, "inbox/one.png");
+    assert_eq!(outcomes[0].note, "inbox/one.png.md");
+    assert!(!outcomes[0].duplicate);
+    // The same bytes again: a duplicate of the group planned
+    // above, so its outcome names that group's note rather
+    // than reporting none.
+    assert!(outcomes[1].duplicate);
+    assert_eq!(outcomes[1].image, "inbox/one.png");
+    assert_eq!(outcomes[1].note, "inbox/one.png.md");
+    // One group on disk, and the note is the one both outcomes
+    // named.
+    assert_eq!(std::fs::read(root.join("inbox/one.png")).unwrap(), PNG);
+    assert!(!root.join("inbox/two.png").exists());
+    assert!(std::fs::read_to_string(root.join("inbox/one.png.md"))
+        .unwrap()
+        .contains("![[inbox/one.png]]"));
+}
+
 /// A stale dedupe row — the index still names a file the
 /// filesystem no longer holds — is no duplicate: the upload
 /// lands a new file.

@@ -245,8 +245,26 @@ mod tests {
             APP_JS
                 .matches("if (grid && grid.classList.contains('selecting')) {")
                 .count(),
-            3,
-            "click, dblclick and the keyboard block all stand down while selecting"
+            4,
+            "the click and dblclick of the page's own tiles and the appended ones all stand down while selecting"
+        );
+        // W75 Low-3: the tiles a "Load more" appends carry the same
+        // double-click-to-open as the page's own tiles — the same
+        // `selecting` guard and the same open — so an appended tile is
+        // not single-click-only outside selection mode.
+        assert_eq!(
+            APP_JS
+                .matches("tile.addEventListener('dblclick', function (event) {")
+                .count(),
+            2,
+            "the page's own tiles and the appended ones both open on double click"
+        );
+        assert_eq!(
+            APP_JS
+                .matches("window.location.href = imageHref(tile.dataset.path);")
+                .count(),
+            2,
+            "both tile classes open the tile's own page"
         );
         assert!(
             APP_JS.contains("if (grid && grid.classList.contains('selecting')) return;"),
