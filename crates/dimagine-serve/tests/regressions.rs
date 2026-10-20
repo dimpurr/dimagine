@@ -1160,3 +1160,21 @@ async fn w70_the_retry_query_parameter_the_client_adds_is_ignored_by_the_media_r
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     assert!(missing.headers().get("retry-after").is_none());
 }
+
+/// "Load more" appended no tile with an ordinary shape: `tileFit` answers
+/// `normal` for one, and the badge table only has the cropped shapes, so the
+/// lookup threw and the button fell back to reloading the page. There is no
+/// JavaScript harness in this repository, so the pin is on the script's bytes:
+/// the badge is asked for only for the two shapes that have one.
+#[test]
+fn an_appended_tile_asks_for_a_badge_only_for_a_cropped_shape() {
+    let script = include_str!("../src/assets/app.js");
+    assert!(script.contains("function tileFit"));
+    assert!(script.contains("return 'normal';"));
+    assert!(
+        script
+            .contains("if (fit === 'tall' || fit === 'wide') tile.appendChild(badgeElement(fit));"),
+        "tileElement must not ask TILE_BADGE for the `normal` shape"
+    );
+    assert!(!script.contains("        tile.appendChild(badgeElement(fit));\n      }"));
+}

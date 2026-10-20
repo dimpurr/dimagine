@@ -893,7 +893,10 @@
       var fit = tileFit(item.width, item.height);
       if (fit) {
         tile.dataset.fit = fit;
-        tile.appendChild(badgeElement(fit));
+        // Only the cropped shapes carry a badge; `normal` has none, and
+        // asking TILE_BADGE for it threw, which sent "Load more" to its
+        // reload fallback instead of appending the page.
+        if (fit === 'tall' || fit === 'wide') tile.appendChild(badgeElement(fit));
       }
     } else {
       tile.style.setProperty('--ar', '1');
