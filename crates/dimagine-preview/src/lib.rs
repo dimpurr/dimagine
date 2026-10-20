@@ -20,6 +20,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zune_core::{bytestream::ZCursor, colorspace::ColorSpace, options::DecoderOptions};
 
+mod fingerprint;
+
+pub use fingerprint::{dhash, dhash_distance, p99, signature, Signature};
+
 const THUMB_EDGE: u32 = 400;
 /// The most extreme thumbnail shape, an aspect of 5:2 (a 400 px box is
 /// at most 400x160 or 160x400). A source with a more extreme aspect is
@@ -241,6 +245,35 @@ pub fn ensure(
     ensure_with_options(library_root, image_path, kinds, Options::default())
 }
 
+/// The oriented, colour-managed pixels of one source and the facts a caller
+/// needs to key cache entries and fingerprints by them, produced by the shared
+/// decode path so renditions and perceptual fingerprints describe the same
+/// pixels a preview would show.
+struct Decoded {
+    /// Lowercase hexadecimal SHA-256 of the original file bytes.
+    hash: Hash,
+    /// The image after orientation and colour conversion.
+    image: DynamicImage,
+    /// Whether the published pixels are in sRGB.
+    converted: bool,
+    /// Whether the source carried an embedded colour profile.
+    has_profile: bool,
+}
+
+/// A perceptual fingerprint of an image's content: the content digest it is
+/// keyed by, a 64-bit difference hash, and a compact grayscale signature. Both
+/// are measured from the oriented, colour-managed pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fingerprint {
+    /// Lowercase hexadecimal SHA-256 of the original file bytes: the same
+    /// content key the cache entries and the index rows use.
+    pub sha256: Hash,
+    /// The 64-bit difference hash (see [`dhash`]).
+    pub dhash: u64,
+    /// The fixed-width grayscale signature (see [`signature`]).
+    pub signature: Signature,
+}
+
 /// Create missing requested previews with an explicit source pixel limit.
 pub fn ensure_with_options(
     library_root: impl AsRef<Path>,
@@ -248,7 +281,57 @@ pub fn ensure_with_options(
     kinds: &[Kind],
     options: Options,
 ) -> Result<Vec<Rendition>, PreviewError> {
-    let image_path = image_path.as_ref();
+    let decoded = decode_oriented(image_path.as_ref(), options)?;
+    publish_renditions(
+        library_root.as_ref(),
+        &decoded.hash,
+        decoded.image,
+        decoded.converted,
+        decoded.has_profile,
+        kinds,
+    )
+}
+
+/// Create the requested previews *and* return the image's perceptual
+/// fingerprint, from a single decode. This is what the previews build command
+/// uses, so one pass over a library both fills the rendition cache and records
+/// the fingerprints `dimagine check`'s near-duplicate scan reads back.
+pub fn ensure_with_fingerprint(
+    library_root: impl AsRef<Path>,
+    image_path: impl AsRef<Path>,
+    kinds: &[Kind],
+) -> Result<(Vec<Rendition>, Fingerprint), PreviewError> {
+    ensure_with_fingerprint_options(library_root, image_path, kinds, Options::default())
+}
+
+/// [`ensure_with_fingerprint`] with an explicit source pixel limit.
+pub fn ensure_with_fingerprint_options(
+    library_root: impl AsRef<Path>,
+    image_path: impl AsRef<Path>,
+    kinds: &[Kind],
+    options: Options,
+) -> Result<(Vec<Rendition>, Fingerprint), PreviewError> {
+    let decoded = decode_oriented(image_path.as_ref(), options)?;
+    let fingerprint = Fingerprint {
+        sha256: decoded.hash.clone(),
+        dhash: fingerprint::dhash(&decoded.image),
+        signature: fingerprint::signature(&decoded.image),
+    };
+    let renditions = publish_renditions(
+        library_root.as_ref(),
+        &decoded.hash,
+        decoded.image,
+        decoded.converted,
+        decoded.has_profile,
+        kinds,
+    )?;
+    Ok((renditions, fingerprint))
+}
+
+/// Decode one source to oriented, colour-managed pixels, applying every size and
+/// resource limit along the way: the shared body behind the `ensure*` functions,
+/// so a rendition pass and a fingerprint pass never decode the same file twice.
+fn decode_oriented(image_path: &Path, options: Options) -> Result<Decoded, PreviewError> {
     let metadata = fs::metadata(image_path)?;
     if metadata.len() > MAX_ENCODED_BYTES {
         return Err(PreviewError::ResourceLimit(format!(
@@ -314,14 +397,12 @@ pub fn ensure_with_options(
     complete_selected_frame(&mut image, format, &bytes)?;
     apply_orientation(&mut image, &bytes);
     converted = finish_colour_conversion(&mut image, icc.as_deref(), converted);
-    publish_renditions(
-        library_root.as_ref(),
-        &hash,
+    Ok(Decoded {
+        hash,
         image,
         converted,
-        icc.is_some(),
-        kinds,
-    )
+        has_profile: icc.is_some(),
+    })
 }
 
 /// Replace `image` with the frame that will actually be published: for
@@ -2005,6 +2086,27 @@ mod tests {
         let a = ensure(dir.path(), one, &[Kind::View]).unwrap();
         let b = ensure(dir.path(), two, &[Kind::View]).unwrap();
         assert_eq!(a[0].path, b[0].path);
+    }
+
+    /// A single decode yields both the renditions and the fingerprint, keyed by
+    /// the same content digest; a second run reports the cache hit and reproduces
+    /// the fingerprint byte for byte.
+    #[test]
+    fn ensure_with_fingerprint_decodes_once_and_is_reproducible() {
+        let dir = temp_library();
+        let source = dir.path().join("grad.png");
+        let pixels = ImageBuffer::from_fn(160, 90, |x, y| {
+            Rgb([(x * 3) as u8, (y * 5) as u8, ((x + y) * 2) as u8])
+        });
+        pixels.save(&source).expect("save source");
+        let (_, first) = ensure_with_fingerprint(dir.path(), &source, &[Kind::Thumb, Kind::View])
+            .expect("preview and fingerprint");
+        assert_eq!(first.sha256, sha256_file(&source).unwrap());
+        assert_eq!(first.signature.width, 128);
+        assert!(!first.signature.gray.is_empty());
+        let (_, second) = ensure_with_fingerprint(dir.path(), &source, &[Kind::Thumb, Kind::View])
+            .expect("cache hit reprints the fingerprint");
+        assert_eq!(first, second);
     }
 
     /// Low-1 (RW33): a rendition written by an older policy — no

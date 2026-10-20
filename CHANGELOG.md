@@ -7,6 +7,24 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Near-duplicate merge (W77): `dimagine check near_duplicate` reports images that
+  are the same picture at different sizes. It reads a 64-bit perceptual hash and a
+  small grayscale signature that `dimagine previews` now stores alongside each
+  rendition — two images whose hashes are close and whose aspect ratios match are a
+  candidate pair; a small measured pixel difference makes it a `same` pair (one
+  picture, re-encoded) and joins it into a mergeable group, a larger one a `variant`
+  (similar but different — reported, never grouped for merge). It reports only and
+  changes nothing. `dimagine merge <keep> <drop>` folds one image into the other as
+  a single undoable operation: the drop's tags merge into the keep, `added` takes
+  the earlier date, and the drop's provenance is appended to the keep's `sources` as
+  a `type: merged` entry (its path and SHA-256, plus its own source when it had one)
+  without touching the keep's own `source`; every link that named the drop is
+  repointed to the keep, and the drop's whole group (image, note, raw sidecars)
+  moves to `.trash/`. By default the first argument names the keeper; `--auto` keeps
+  the file with more pixels, then a lossless format at equal pixels, then a larger
+  file, then the lexicographically later library path. A note too large to read
+  refuses the merge rather than being treated as no note. `--dry-run` prints the
+  plan and writes no library byte.
 - Viewer desktop layout (W76): the sidebar is now the single filter —
   one set of Views / Folders / Collections / Tags on screen, with counts
   scoped to the current selection and zero-count rows dimmed; row-end `+`
@@ -414,6 +432,11 @@ All notable changes to this project are documented here. The format follows
 - Library format 0.1 draft (`docs/FORMAT.md`) and the agent skill (`SKILL.md`).
 - Project restart: README, MIT license, contributor and agent rules, vision and
   documentation index.
+
+### Fixed
+- Viewer: the sidebar Views counts — All, Recent, Untagged — now follow the
+  active filter instead of reporting whole-library totals, so one screen no
+  longer mixes two different populations.
 
 ### Changed
 - Library format `docs/FORMAT.md` is now version **0.2** (its changelog records

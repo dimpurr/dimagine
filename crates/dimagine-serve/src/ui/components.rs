@@ -1030,9 +1030,9 @@ pub fn tag_row(tag: &str, count: u64) -> String {
 /// on screen — the same number the phone's filter drawer shows. A value that
 /// would add nothing (a scoped count of zero) is dimmed and offers no `+`; the
 /// value already chosen is never dimmed. The Views group (All/Recent/Untagged)
-/// keeps its whole-library lens counts throughout: those are lenses, and the
-/// facet queries carry no "everything within the current filters" number to
-/// swap in.
+/// counts the current range beside a filter too — the scoped total, recent and
+/// untagged from the same [`FacetCounts`], each capped at the Recent window —
+/// so one screen never shows two number meanings side by side (W76 D1).
 pub fn sidebar_sections(
     data: &SidebarData,
     params: &ViewParams,
@@ -1044,19 +1044,27 @@ pub fn sidebar_sections(
     out.push_str(
         "<section class=\"sidebar-section\"><h2 class=\"sidebar-section-title\">Views</h2>",
     );
-    out.push_str(&sidebar_row("/", "All", data.total, is_all(params)));
+    // Beside a filter the Views rows count the current range, not the whole
+    // library — the same scoped numbers the phone's filter drawer shows, so one
+    // screen no longer carries two number meanings side by side (W76 D1). The
+    // recent window caps all three, so no row promises more than the grid.
+    let (all, recent, untagged) = match facets {
+        Some(counts) => (counts.total, counts.recent, counts.untagged),
+        None => (data.total, data.recent, data.untagged),
+    };
+    out.push_str(&sidebar_row("/", "All", all, is_all(params)));
     out.push_str(&sidebar_row(
         "/?recent=1",
         // The label states the definition — "the last 200 added" — so the
         // row can no longer read as a smaller "All" (W34 audit #10).
         &recent_label(),
-        data.recent,
+        recent,
         params.recent,
     ));
     out.push_str(&sidebar_row(
         "/?untagged=1",
         "Untagged",
-        data.untagged,
+        untagged,
         params.untagged,
     ));
     out.push_str("</section>");
@@ -1625,6 +1633,7 @@ mod tests {
         // Scope: only `refs` (5) and tag-00 (3) survive the filter that is on;
         // everything else is absent from the facet maps, i.e. zero.
         let facets = FacetCounts {
+            total: 3,
             tags: std::collections::BTreeMap::from([("tag-00".to_owned(), 3u64)]),
             folders: std::collections::BTreeMap::from([("refs".to_owned(), 5u64)]),
             collections: std::collections::BTreeMap::new(),
@@ -1636,6 +1645,21 @@ mod tests {
             &ViewParams::parse("tag=tag-00"),
             None,
             Some(&facets),
+        );
+
+        // W76 D1: the Views group counts the current range beside a filter — the
+        // scoped total/recent/untagged, not the whole-library 612/40/9.
+        assert!(
+            html.contains(">All</span><span class=\"sidebar-row-count\">3"),
+            "All shows the scoped total: {html}"
+        );
+        assert!(
+            !html.contains(">612"),
+            "the whole-library total is gone: {html}"
+        );
+        assert!(
+            !html.contains(">Untagged</span><span class=\"sidebar-row-count\">9"),
+            "Untagged shows the scoped 1, not the whole-library 9: {html}"
         );
 
         // The chosen tag keeps its scoped count (3, not the whole-library 100)

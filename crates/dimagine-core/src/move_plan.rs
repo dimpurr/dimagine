@@ -720,7 +720,10 @@ struct CanvasHits {
 /// Links recorded for one note's body: byte ranges made absolute against
 /// the whole file, with the front matter excluded from the search (links are
 /// body facts, YAML is not spliced).
-fn body_spans(text: &str, entry: &FileEntry) -> Vec<SpanLink> {
+///
+/// [`crate::merge_plan`] reuses this and the other link-fixing helpers so a
+/// merge repoints links with the exact same span logic a move uses (ADR-017 §8).
+pub(crate) fn body_spans(text: &str, entry: &FileEntry) -> Vec<SpanLink> {
     let (body_start, first_line) = body_origin(text.as_bytes());
     if body_start >= text.len() {
         return Vec::new();
@@ -755,7 +758,7 @@ fn body_text(raw: &[u8]) -> String {
 }
 
 /// How many of a note's body links resolve to one of `moved`.
-fn pointing_count(
+pub(crate) fn pointing_count(
     text: &str,
     entry: &FileEntry,
     resolver: &Resolver,
@@ -778,7 +781,7 @@ fn embeds(bytes: &[u8], note_idx: usize, image_idx: usize, ctx: &BodyCtx) -> boo
     body_edit::member_spans(bytes, note_idx, image_idx, ctx).is_ok_and(|hits| !hits.is_empty())
 }
 
-fn ambiguous_link(
+pub(crate) fn ambiguous_link(
     entry: &FileEntry,
     span: &SpanLink,
     candidates: &[usize],
@@ -799,7 +802,7 @@ fn ambiguous_link(
     }
 }
 
-enum CanvasScan {
+pub(crate) enum CanvasScan {
     Hits {
         replacements: Vec<(String, usize)>,
         ambiguous: Vec<AmbiguousLink>,
@@ -810,7 +813,7 @@ enum CanvasScan {
 
 /// One canvas: every `file` node value resolving into the group, and every
 /// ambiguous value that names the group among its candidates.
-fn scan_canvas(
+pub(crate) fn scan_canvas(
     bytes: &[u8],
     entry: &FileEntry,
     resolver: &Resolver,
@@ -867,7 +870,7 @@ fn scan_canvas(
 /// A re-serialized canvas may reorder object keys — JSON object members are
 /// unordered and a canvas is rewritten only when it really references the
 /// moved file.
-fn rewrite_canvas(
+pub(crate) fn rewrite_canvas(
     raw: &[u8],
     replacements: &[(String, usize)],
     new_rel_of: &HashMap<usize, String>,
@@ -915,7 +918,7 @@ fn rewrite_canvas(
 }
 
 /// Splice the recorded spans with their new spellings, in byte order.
-fn rewrite_spans(
+pub(crate) fn rewrite_spans(
     text: &str,
     pointing: &[(SpanLink, usize)],
     new_rel_of: &HashMap<usize, String>,

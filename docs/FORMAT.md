@@ -184,6 +184,13 @@ one entry carrying `type: upload`, the upload `imported` time, the `importer`
 bare upload carries no `raw` file and no source URL; the arrival name and time
 are its provenance.
 
+A merge (§7.3) records the image it folded away with one `type: merged` entry:
+the time of the merge (`merged_at`, RFC 3339 UTC), the dropped image's library
+path (`path`) and its content `sha256`, and — when the dropped image had one —
+its `source`. The dropped image's own `sources` entries are appended after it,
+re-indented to fit, so nothing the drop recorded is lost. The kept image's own
+`source` is never overwritten by a merge.
+
 ## 4. Folders
 
 Folders mean whatever the user wants them to mean. dimagine assigns no meaning
@@ -403,6 +410,46 @@ mid-flight leaves its half-state in the journal (§8.3), which the next writer
 recovers; an image left in a landing folder with no note is what a lost journal
 can still leave behind, and `dimagine check` reports it (`orphaned_upload`).
 
+### 7.3 Merging
+
+Two images can be the same picture at different sizes — a channel that posts a
+compressed copy and then the original. `dimagine check near_duplicate` reports
+these read-only (§9); a merge resolves one into the other without inventing any
+structure Obsidian cannot read (ADR-012): the result is an ordinary image and
+note, and the loser sits in the trash like any other delete (§7.1).
+
+A merge names one kept image and one dropped image. It is one operation, so
+`undo` hands both images back exactly as they were.
+
+- **Provenance is kept.** The drop's `tags` are unioned into the keep; `added`
+  becomes the earlier of the two; the drop's provenance is recorded in the keep's
+  `sources` as one `type: merged` entry, with the drop's own `sources` entries
+  appended after it (§3.4). The keep's own `source` is never overwritten. A keep
+  that had no note gains one carrying this provenance and a fresh `id` of its own
+  (§3.3).
+- **The whole drop group is trashed.** The dropped image, its note, and every raw
+  sidecar named after it move into `.trash/` together, with the record §7.1
+  describes — nothing is removed in place, and a restore brings the group back.
+- **Links follow the keep.** Every link that resolved to the drop — a collection
+  member, a note's embed or wikilink, a `.canvas` file node — is repointed to the
+  keep by the same in-place rule a move uses (§7), each keeping its syntax and
+  display parts. The drop's own note is never rewritten; it moves whole. A link
+  that was already ambiguous before the merge is reported and left as it is.
+
+A merge keeps one image and discards another, so a tool picks the keeper
+deliberately. By default the caller's first argument is the keeper. With `--auto`
+the keeper is chosen from the two files by the picture they hold — more pixels,
+then (at equal pixels) a lossless format such as PNG over a lossy one, then a
+larger file, then, if the two are still tied, the lexicographically later library
+path — and the two arguments may be given in any order.
+
+`dimagine merge` refuses a keep and drop that are the same image, and refuses to
+guess a `sources` value it cannot safely append to (a flow-style `sources: []`
+rather than a block of entries). It also refuses when either note is larger than
+the byte limit a reader will take from one note: a note it cannot read is not an
+absent one, and the merge is refused before any file moves. A `--dry-run` prints
+exactly what the merge would change and writes no library byte.
+
 ## Writing
 
 The rules a tool must follow to *change* a library live in the section that
@@ -420,6 +467,7 @@ promises.
 | Member blocks, caption lines, add/remove and reordering | §5.2 |
 | Whole-body edit (front matter untouched, open-hash precondition) | §5.3 |
 | Move, rename, copy, upload, and the group delete | §7 |
+| Merge two near-duplicate images into one | §7.3 |
 | The journal, write log and settings a writer keeps | §8.3 |
 
 ## 8. The `.dimagine/` folder
@@ -496,6 +544,7 @@ dimagine collect --add|--remove <note> <img>… # edit a collection's members
 dimagine collect --reorder <note> <ordinal>…  # permute the member blocks (§5.2)
 dimagine collect --caption <note> <block> <line> <text|->  # edit one caption line (§5.2)
 dimagine mv <img> <new-path> [--dry-run]      # move a group and repair its links (§7)
+dimagine merge <keep> <drop> [--auto] [--dry-run]  # fold a near-duplicate into the keep, trash the drop (§7.3)
 dimagine upload <file>… [--to <folder>] [--to-collection <note>] [--dry-run]  # land files as image groups (§7.2)
 dimagine trash <img>…                         # move groups into .trash/ (§7.1)
 dimagine restore <img>…                       # move them back
@@ -504,6 +553,7 @@ dimagine config list|get|set|reset …          # read or write .dimagine/settin
 dimagine trash purge [--dry-run] [--yes]      # delete groups past the retention period
 dimagine trash empty [--yes]                  # delete every trashed group now
 dimagine check                                # report problems, including past writes
+dimagine check near_duplicate                 # report same-picture images by fingerprint (§7.3), read-only
 ```
 
 A command that changes a file prints the id of the operation it made, which is
@@ -535,3 +585,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-17 | The whole-body edit (§5.3): a note's body is the bytes after its front matter's closing line; a replacement keeps the front matter and every byte-order mark, line ending and trailing newline as given, carries a precondition on the bytes it replaces, and keeps the self-embed rule on the result; a note whose opening fence is never closed is refused, and a note that ends at its closing fence is given the line break its body needs. `dimagine edit` joins the CLI (§9). |
 | 0.1 | 2026-10-17 | Upload (§7.2): placement is a named folder, else the default upload folder — `attachmentFolderPath`, else `inbox/` — plus a plain join when the upload names a collection; naming keeps a meaningful name and renames a meaningless camera, screenshot or share name to `Upload <YYYYMMDDHHMMSS>.<ext>` with the original kept in `title` (§3.1) and `sources` (§3.4), taking ` 2` on a library-wide NFC, case-insensitive collision; the bytes must match the extension, with SVG, HTML and XML refused on both sides; identical bytes already in the library (outside `.trash/`) are not copied again; a new image lands with a note carrying `id` (§3.3), `added`, `imported` and the upload `sources` entry (§3.4). `dimagine upload` joins the CLI (§9). |
 | 0.2 | 2026-10-19 | Minor bump for the write contract (ADR-017 §12). Every 3b write operation now lands — whole-body edit, member-block reorder, caption edit, upload and the collection join. A new "Writing" index (before §8) maps each writing rule to the section that owns it, so the contract is reachable without a rule living in two places. |
+| 0.2 | 2026-10-20 | Near-duplicate merge (§7.3): `dimagine merge <keep> <drop>` folds one image's provenance into another and moves the loser's whole group into `.trash/` as one undoable op — tags unioned, earliest `added`, a `type: merged` entry plus the drop's own `sources` appended to the keep's `sources` (§3.4) without touching the keep's own `source`, a noteless keep gaining a note with a fresh `id` (§3.3), and links that named the drop repointed to the keep by the move rule (§7); `--auto` keeps the file with more pixels, then a lossless format, then a larger file, then the lexicographically later library path; a note too large to read refuses the merge rather than reading as absent. `dimagine check near_duplicate` reports same-picture images from a stored fingerprint, read-only. Both join the CLI (§9). |

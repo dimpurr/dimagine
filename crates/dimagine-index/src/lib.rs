@@ -260,6 +260,35 @@ pub struct ImageMeta {
     pub taken_reason: Option<TakenReason>,
 }
 
+/// One image's stored perceptual fingerprint, joined to the file it belongs to.
+/// Produced by [`Index::image_fingerprints`]; the caller (the near-duplicate scan
+/// of `dimagine check`) turns these into distance and pixel-difference numbers.
+#[derive(Clone, Debug)]
+pub struct ImageFingerprint {
+    /// Library-relative path of the image file.
+    pub path: String,
+    /// Pixel width after orientation from the file header; `None` if unread.
+    pub file_width: Option<u32>,
+    /// Pixel height after orientation from the file header; `None` if unread.
+    pub file_height: Option<u32>,
+    /// The 64-bit difference hash of the image's shape.
+    pub dhash: u64,
+    /// The fixed-width grayscale signature the pixel comparison runs over.
+    pub signature: SignatureBlob,
+}
+
+/// A stored grayscale signature: the row-major samples of an image rescaled to a
+/// fixed width, with the dimensions they were measured at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignatureBlob {
+    /// Signature width in pixels.
+    pub width: u32,
+    /// Signature height in pixels.
+    pub height: u32,
+    /// The grayscale samples, row-major, `width * height` of them.
+    pub gray: Vec<u8>,
+}
+
 /// Parsed note fields. Body text is supplied separately with [`Index::set_note_body`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NoteRecord {
@@ -740,6 +769,16 @@ impl Index {
                    SELECT sha256 FROM files WHERE kind='image' AND sha256 IS NOT NULL)",
                 [],
             )?;
+            // `image_dhash` is the same kind of content-keyed cache (a digest
+            // of the pixels `dimagine previews` measured), so it is pruned on
+            // the identical rule: content no image row carries any more is
+            // unreachable. The table always exists (created additively on open,
+            // so a legacy index gains it too).
+            conn.execute(
+                "DELETE FROM image_dhash WHERE sha256 NOT IN ( \
+                   SELECT sha256 FROM files WHERE kind='image' AND sha256 IS NOT NULL)",
+                [],
+            )?;
             conn.execute(
                 "DELETE FROM notes WHERE path NOT IN (SELECT path FROM scan_seen)",
                 [],
@@ -886,6 +925,75 @@ impl Index {
             .conn()?
             .prepare("SELECT path FROM files WHERE sha256=?1 ORDER BY path")?;
         let rows = stmt.query_map([sha256], |row| row.get(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Records one image's measured perceptual fingerprint, keyed by the content
+    /// digest the pixels were hashed from, so the same bytes keep one fingerprint
+    /// wherever they appear. Unlike the header cache this is written outside a
+    /// scan (by `dimagine previews`), so it takes no scan guard; the last writer
+    /// for a digest wins. A digest that is not a 64-digit lowercase hex string is
+    /// ignored rather than stored, because nothing could ever join it back.
+    pub fn store_image_dhash(
+        &mut self,
+        sha256: &str,
+        dhash: u64,
+        width: u32,
+        height: u32,
+        gray: &[u8],
+    ) -> Result<(), IndexError> {
+        if !valid_sha256(sha256) {
+            return Ok(());
+        }
+        self.conn()?.execute(
+            "INSERT INTO image_dhash(sha256,dhash,sw,sh,gray) VALUES(?1,?2,?3,?4,?5) \
+             ON CONFLICT(sha256) DO UPDATE SET \
+             dhash=excluded.dhash,sw=excluded.sw,sh=excluded.sh,gray=excluded.gray",
+            params![
+                sha256,
+                dhash as i64,
+                i64::from(width),
+                i64::from(height),
+                gray
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored fingerprint whose content an image row still lists, joined to
+    /// that file for its path and post-orientation dimensions, ordered by path.
+    ///
+    /// This is the population `dimagine check`'s near-duplicate scan compares:
+    /// only images the index both hashed and still sees appear. A fingerprint no
+    /// live file carries has been pruned with the content; a file with no
+    /// fingerprint here has not been measured yet (`dimagine previews` has not
+    /// decoded it), so it is simply absent from the scan rather than a finding.
+    pub fn image_fingerprints(&self) -> Result<Vec<ImageFingerprint>, IndexError> {
+        let mut stmt = self.conn()?.prepare(
+            "SELECT f.path,f.width,f.height,d.dhash,d.sw,d.sh,d.gray \
+             FROM image_dhash d JOIN files f ON f.sha256=d.sha256 \
+             WHERE f.kind='image' ORDER BY f.path",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let dhash: i64 = row.get(3)?;
+            let width: i64 = row.get(4)?;
+            let height: i64 = row.get(5)?;
+            Ok(ImageFingerprint {
+                path: row.get(0)?,
+                file_width: row
+                    .get::<_, Option<i64>>(1)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                file_height: row
+                    .get::<_, Option<i64>>(2)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                dhash: dhash as u64,
+                signature: SignatureBlob {
+                    width: width.max(0) as u32,
+                    height: height.max(0) as u32,
+                    gray: row.get(6)?,
+                },
+            })
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1046,13 +1154,18 @@ fn migrate(conn: &Connection) -> Result<(), IndexError> {
         upgrade_from_previous(conn)?;
     }
     // The scan generation counts how many scans have been committed; the serve
-    // caches validate their totals against it (W31). Both statements are
+    // caches validate their totals against it (W31). These statements are
     // idempotent and additive, so an index built before the table existed
     // gains it on open without a schema-version bump and the rebuild that
     // would force; an older binary still opens a newer index that carries it.
+    // `image_dhash` joins that rule for the same reason: it is derived data
+    // (`dimagine previews` measures it, and can always measure it again), so an
+    // index missing it is not a corrupt index, and `dimagine check` simply
+    // reports near-duplicates as not-yet-measured until it is filled.
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS index_meta(key TEXT PRIMARY KEY,value INTEGER NOT NULL); \
-         INSERT OR IGNORE INTO index_meta(key,value) VALUES('generation',0);",
+         INSERT OR IGNORE INTO index_meta(key,value) VALUES('generation',0); \
+         CREATE TABLE IF NOT EXISTS image_dhash(sha256 TEXT PRIMARY KEY,dhash INTEGER,sw INTEGER,sh INTEGER,gray BLOB);",
     )?;
     validate_schema(conn)?;
     Ok(())
@@ -1536,6 +1649,90 @@ mod tests {
         assert_eq!(index.search_text("海の中").unwrap(), vec!["cn.md"]);
         assert_eq!(index.search_text("少女").unwrap(), vec!["cn.md"]);
         assert_eq!(index.search_text("星空").unwrap(), vec!["jp.md"]);
+    }
+
+    /// A fingerprint written outside any scan (as `dimagine previews` writes it)
+    /// is read back joined to the live image row, carrying that row's dimensions.
+    #[test]
+    fn a_stored_fingerprint_reads_back_with_its_file_dimensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        let mut record = file("a.jpg", 10, 20, Some(&"c".repeat(64)));
+        record.width = Some(640);
+        record.height = Some(480);
+        index.upsert_file(&record).unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+
+        index
+            .store_image_dhash(
+                &"c".repeat(64),
+                0xABCD_0000_1234_FFFF,
+                128,
+                96,
+                &[7, 8, 9, 10],
+            )
+            .unwrap();
+        let read = index.image_fingerprints().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].path, "a.jpg");
+        assert_eq!(read[0].file_width, Some(640));
+        assert_eq!(read[0].file_height, Some(480));
+        assert_eq!(read[0].dhash, 0xABCD_0000_1234_FFFF);
+        assert_eq!(read[0].signature.width, 128);
+        assert_eq!(read[0].signature.height, 96);
+        assert_eq!(read[0].signature.gray, vec![7, 8, 9, 10]);
+    }
+
+    /// A full 64-bit hash round-trips through the signed column unchanged, so
+    /// the Hamming distance the caller takes over it is the true one.
+    #[test]
+    fn a_dhash_round_trips_through_the_signed_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("a.jpg", 10, 20, Some(&"d".repeat(64))))
+            .unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        index
+            .store_image_dhash(&"d".repeat(64), u64::MAX, 128, 1, &[0])
+            .unwrap();
+        assert_eq!(index.image_fingerprints().unwrap()[0].dhash, u64::MAX);
+    }
+
+    /// A fingerprint is content-keyed but read only through a live image row, and
+    /// pruned once no image row carries its content any more.
+    #[test]
+    fn a_fingerprint_is_filtered_to_live_rows_and_pruned_when_content_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+
+        index.begin_scan().unwrap();
+        index
+            .upsert_file(&file("a.jpg", 10, 20, Some(&"a".repeat(64))))
+            .unwrap();
+        index.finish_scan(&["a.jpg".into()]).unwrap();
+        // Stored for the live content, and for content nothing lists: the join
+        // hides the second even before any prune runs.
+        index
+            .store_image_dhash(&"a".repeat(64), 111, 128, 1, &[1])
+            .unwrap();
+        index
+            .store_image_dhash(&"0".repeat(64), 222, 128, 1, &[2])
+            .unwrap();
+        let paths: Vec<String> = index
+            .image_fingerprints()
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths, vec!["a.jpg".to_string()]);
+
+        // A scan that no longer sees the file prunes its fingerprint with it.
+        index.begin_scan().unwrap();
+        index.finish_scan(&[]).unwrap();
+        assert!(index.image_fingerprints().unwrap().is_empty());
     }
 
     #[test]

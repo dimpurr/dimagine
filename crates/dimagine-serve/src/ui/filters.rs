@@ -451,6 +451,7 @@ mod tests {
                 .collect::<BTreeMap<String, u64>>()
         };
         FacetCounts {
+            total: 12,
             tags: map(&[("nature", 5), ("ui", 3), ("wide", 1)]),
             folders: map(&[("refs", 7), ("refs/ui", 3), ("shots", 2)]),
             collections: map(&[("guide.md", 4)]),

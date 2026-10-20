@@ -16,6 +16,9 @@
 //!   file nodes (FORMAT §5.1, §6),
 //! - [`move_plan`]: plan a move/rename of an image group and the repair of
 //!   the links that pointed at it (ADR-017 §8),
+//! - [`merge_plan`]: plan a merge of two near-duplicate images into one, union
+//!   of tags/added/sources and the repoint of the links that pointed at the
+//!   dropped image (W77 design 方案 2, FORMAT §7.3),
 //! - [`upload`]: the pure half of an upload — placement inputs, naming,
 //!   the format check, the note bytes and the collection join
 //!   (ADR-017 §11),
@@ -37,6 +40,7 @@ pub mod image_meta;
 pub mod index;
 pub mod library;
 pub mod links;
+pub mod merge_plan;
 pub mod move_plan;
 pub mod note;
 pub mod scan;

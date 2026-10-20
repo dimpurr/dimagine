@@ -409,6 +409,7 @@ dependencies = [
  "dimagine-preview",
  "dimagine-serve",
  "dimagine-write",
+ "image",
  "rpassword",
  "serde",
  "serde_json",

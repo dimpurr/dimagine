@@ -156,6 +156,35 @@ This includes the self-embed at the end of the image's own note. When you are
 done, run `dimagine check`: it reports any image link left pointing at nothing
 (the `dangling_link` item names each one and where it sits).
 
+## Merge a near-duplicate
+
+A channel often posts a compressed copy of a picture and then the original, so
+the library holds the same image twice at different sizes. Find them first:
+
+```bash
+dimagine check near_duplicate          # read-only; needs `dimagine previews` run first
+```
+
+It lists each same-picture pair with its hash distance and pixel difference and
+groups the ones safe to merge; it changes nothing. Then merge one pair, keeping
+the better copy:
+
+```bash
+dimagine merge big.jpg small.jpg        # keep big.jpg, fold small.jpg into it
+dimagine merge a.jpg b.jpg --auto       # keep whichever holds the bigger picture
+```
+
+`dimagine merge <keep> <drop>` folds the drop into the keep in one undoable
+operation: the drop's tags are added to the keep, `added` takes the earlier date,
+and the drop's provenance is recorded in the keep's `sources` as a `type: merged`
+entry — the keep's own `source` is never overwritten. Every link that pointed at
+the drop is repointed to the keep, and the drop's whole group moves to `.trash/`,
+so `dimagine undo` can bring it all back. By default the first argument is kept;
+`--auto` keeps the file with more pixels (then a lossless format, then a larger
+file, then the lexicographically later library path) whichever order you name
+them. A note too large to read refuses the merge instead of counting as absent.
+`--dry-run` prints the plan without touching a byte.
+
 ## Search
 
 Without tools, search the notes:
@@ -197,7 +226,7 @@ record of where those files came from, so recovering them is a manual move.
 
 ## With the dimagine CLI
 
-`dimagine tag`, `rate`, `set`, `edit`, `collect`, `mv`, `upload`, `trash`,
+`dimagine tag`, `rate`, `set`, `edit`, `collect`, `mv`, `merge`, `upload`, `trash`,
 `restore`, `undo` and `config` make the changes above through one journaled
 operation each; a
 command that changes a file prints that operation's id, and `dimagine undo <id>`

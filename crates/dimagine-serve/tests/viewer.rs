@@ -1866,6 +1866,12 @@ async fn a_filtered_sidebar_scopes_counts_and_offers_a_stack_link() {
         ui.contains("class=\"sidebar-row active\" href=\"/?tag=ui\""),
         "{ui}"
     );
+    // W76 D1: the Views group follows the filter too — "All" is the count of the
+    // current range (only `ui`-tagged button.png = 1), not the whole library.
+    assert!(
+        ui.contains(">All</span><span class=\"sidebar-row-count\">1"),
+        "All shows the scoped total under a filter: {ui}"
+    );
     // `nature` belongs only to landscape.png, so nothing tagged `ui` carries it:
     // its row is dimmed and shows the scoped 0 (whole-library nature was 1).
     assert!(

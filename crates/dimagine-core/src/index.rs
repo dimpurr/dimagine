@@ -306,7 +306,10 @@ fn parse_note_entry(
 /// Serialize the note's front matter as a JSON object so the view queries can
 /// read `title`, `rating`, `tags`, `kind` and the datetimes without a YAML
 /// parser. Notes without a usable front matter store `{}`.
-fn front_matter_json(text: &str) -> String {
+///
+/// [`crate::merge_plan`] reads a note's `tags`, `added`, `source` and `sources`
+/// through this so a merge reads the same front matter the index does.
+pub(crate) fn front_matter_json(text: &str) -> String {
     let Some(yaml) = front_matter_text(text) else {
         return "{}".to_owned();
     };

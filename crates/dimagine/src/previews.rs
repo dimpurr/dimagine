@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use clap::{Arg, ArgMatches, Command};
 use dimagine_core::check::PreviewGaps;
 use dimagine_core::library::{FileClass, Library};
-use dimagine_preview::{ensure, Kind, PreviewError, Rendition};
+use dimagine_preview::{ensure_with_fingerprint, Fingerprint, Kind, PreviewError, Rendition};
 
 use crate::emit_failure;
 
@@ -50,12 +50,15 @@ fn default_jobs() -> usize {
 }
 
 /// One processed image: how many of its renditions were written by this run,
-/// already cached, or why the image failed.
+/// already cached, its measured fingerprint, or why the image failed.
 struct ImageOutcome {
     /// Lossy display path relative to the library root.
     rel: String,
     generated: usize,
     cached: usize,
+    /// The fingerprint measured from the same decode that made the renditions
+    /// (W77); `None` when the image failed to decode, so nothing was measured.
+    fingerprint: Option<Fingerprint>,
     failure: Option<(&'static str, String)>,
 }
 
@@ -63,6 +66,69 @@ struct Failure<'a> {
     path: &'a str,
     code: &'static str,
     reason: String,
+}
+
+/// The run's rendition tallies, gathered so the two printers share one argument
+/// where they once shared five.
+struct Summary {
+    images: usize,
+    generated: usize,
+    cached: usize,
+    failed: usize,
+    jobs: usize,
+}
+
+/// What storing this run's fingerprints into the index came to (W77). The
+/// index is derived data, so a run that cannot open it still built the
+/// rendition cache; the near-duplicate scan simply has nothing new to read.
+struct FingerprintStore {
+    /// Fingerprints written to (or refreshed for) their content digest.
+    stored: usize,
+    /// Images whose write the index refused.
+    failed: usize,
+    /// The index could not be opened at all, so nothing was written.
+    open_error: Option<String>,
+}
+
+/// Writes each decoded image's fingerprint to the content-keyed `image_dhash`
+/// cache in the index, so `dimagine check` can compare them without decoding.
+fn store_fingerprints(root: &Path, outcomes: &[ImageOutcome]) -> FingerprintStore {
+    let mut index = match dimagine_index::Index::open(root) {
+        Ok(index) => index,
+        Err(error) => {
+            return FingerprintStore {
+                stored: 0,
+                failed: 0,
+                open_error: Some(error.to_string()),
+            }
+        }
+    };
+    let mut stored = 0;
+    let mut failed = 0;
+    for outcome in outcomes {
+        let Some(fingerprint) = &outcome.fingerprint else {
+            continue;
+        };
+        let wrote = index
+            .store_image_dhash(
+                &fingerprint.sha256,
+                fingerprint.dhash,
+                fingerprint.signature.width,
+                fingerprint.signature.height,
+                &fingerprint.signature.gray,
+            )
+            .is_ok();
+        if wrote {
+            stored += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    FingerprintStore {
+        stored,
+        failed,
+        open_error: None,
+    }
 }
 
 pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
@@ -104,9 +170,18 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     let mut outcomes = outcomes.into_inner().unwrap();
     outcomes.sort_by(|a, b| a.rel.cmp(&b.rel));
 
-    let generated: usize = outcomes.iter().map(|o| o.generated).sum();
-    let cached: usize = outcomes.iter().map(|o| o.cached).sum();
-    let failed: usize = outcomes.iter().filter(|o| o.failure.is_some()).count();
+    // Every decoded image also carried a perceptual fingerprint (W77). The
+    // single-threaded store after the parallel phase keeps the index writes
+    // serial (one connection) without holding it across any decode.
+    let fingerprints = store_fingerprints(&library.root, &outcomes);
+
+    let summary = Summary {
+        images: images.len(),
+        generated: outcomes.iter().map(|o| o.generated).sum(),
+        cached: outcomes.iter().map(|o| o.cached).sum(),
+        failed: outcomes.iter().filter(|o| o.failure.is_some()).count(),
+        jobs,
+    };
     let findings: Vec<Failure> = outcomes
         .iter()
         .filter_map(|o| {
@@ -120,21 +195,13 @@ pub fn run(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
     let read_complete = library.fully_read();
 
     if json {
-        print_json(
-            &library,
-            images.len(),
-            generated,
-            cached,
-            failed,
-            jobs,
-            &findings,
-        );
+        print_json(&library, &summary, &fingerprints, &findings);
     } else {
-        print_human(&library, images.len(), generated, cached, failed, &findings);
+        print_human(&library, &summary, &fingerprints, &findings);
     }
     if !read_complete {
         ExitCode::from(3)
-    } else if failed > 0 {
+    } else if summary.failed > 0 {
         ExitCode::from(1)
     } else {
         ExitCode::from(0)
@@ -205,13 +272,14 @@ pub fn gaps(library_dir: &Path) -> Option<PreviewGaps> {
 }
 
 fn build(root: &Path, rel: &str, path: &Path, cached: &HashSet<PathBuf>) -> ImageOutcome {
-    match ensure(root, path, &[Kind::Thumb, Kind::View]) {
-        Ok(renditions) => {
+    match ensure_with_fingerprint(root, path, &[Kind::Thumb, Kind::View]) {
+        Ok((renditions, fingerprint)) => {
             let (generated, hits) = classify(&renditions, cached);
             ImageOutcome {
                 rel: rel.to_string(),
                 generated,
                 cached: hits,
+                fingerprint: Some(fingerprint),
                 failure: None,
             }
         }
@@ -219,6 +287,7 @@ fn build(root: &Path, rel: &str, path: &Path, cached: &HashSet<PathBuf>) -> Imag
             rel: rel.to_string(),
             generated: 0,
             cached: 0,
+            fingerprint: None,
             failure: Some((code_for(&error), error.to_string())),
         },
     }
@@ -283,21 +352,23 @@ fn code_for(error: &PreviewError) -> &'static str {
 
 fn print_json(
     library: &Library,
-    images: usize,
-    generated: usize,
-    cached: usize,
-    failed: usize,
-    jobs: usize,
+    summary: &Summary,
+    fingerprints: &FingerprintStore,
     findings: &[Failure],
 ) {
     let document = serde_json::json!({
         "schema": SCHEMA,
         "library": library.root.display().to_string(),
-        "images": images,
-        "generated": generated,
-        "cached": cached,
-        "failed": failed,
-        "jobs": jobs,
+        "images": summary.images,
+        "generated": summary.generated,
+        "cached": summary.cached,
+        "failed": summary.failed,
+        "jobs": summary.jobs,
+        "fingerprints": {
+            "stored": fingerprints.stored,
+            "failed": fingerprints.failed,
+            "index_error": fingerprints.open_error,
+        },
         "read_complete": library.fully_read(),
         "unreadable_dirs": library.unreadable_dirs,
         "findings": findings
@@ -317,14 +388,30 @@ fn print_json(
 
 fn print_human(
     library: &Library,
-    images: usize,
-    generated: usize,
-    cached: usize,
-    failed: usize,
+    summary: &Summary,
+    fingerprints: &FingerprintStore,
     findings: &[Failure],
 ) {
     println!("library: {}", library.root.display());
-    println!("previews: {images} images ({generated} generated, {cached} cached, {failed} failed)");
+    println!(
+        "previews: {images} images ({generated} generated, {cached} cached, {failed} failed)",
+        images = summary.images,
+        generated = summary.generated,
+        cached = summary.cached,
+        failed = summary.failed
+    );
+    match &fingerprints.open_error {
+        Some(error) => println!("fingerprints: not stored, index unavailable ({error})"),
+        None if fingerprints.failed > 0 => println!(
+            "fingerprints: {stored} stored, {failed} failed",
+            stored = fingerprints.stored,
+            failed = fingerprints.failed
+        ),
+        None => println!(
+            "fingerprints: {stored} stored",
+            stored = fingerprints.stored
+        ),
+    }
     for failure in findings {
         println!(
             "error {}: {}: {}",

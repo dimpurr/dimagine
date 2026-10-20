@@ -39,6 +39,10 @@ serde_json = "1"
 [dev-dependencies]
 chrono = { version = "0.4", features = ["clock"] }
 dimagine-index = { path = "../dimagine-index" }
+# The merge tests build their own library in a temp dir and need real, decodable
+# images of known dimensions and formats to drive `--auto` (pixels, then lossless,
+# then size). Same version and feature floor as `dimagine-core`.
+image = { version = "0.25.8", default-features = false, features = ["jpeg", "png"] }
 # The previews tests build their library in the system temp dir and remove it
 # themselves, so they take it out of tempfile's cleanup with `TempDir::keep` —
 # first in 3.20.0, where that was renamed from `into_path`. The floor names what

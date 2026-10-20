@@ -820,6 +820,10 @@ impl RecentWindow {
 /// among those images — that is zero, a fact, and not an unknown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FacetCounts {
+    /// Images the current filters leave, with no facet stepping out and the
+    /// Recent lens not narrowing it: the "how many in the current range" a
+    /// sidebar Views row shows beside a filter, before the window cap below.
+    pub total: u64,
     /// Tag, in the index's folded spelling, to images carrying it.
     pub tags: BTreeMap<String, u64>,
     /// Folder, library-relative, to images inside it and its subfolders —
@@ -915,7 +919,11 @@ impl Index {
             whole.limit = 0;
             whole
         });
-        let recent = facet_count(conn, &recent_sql)?.min(window);
+        // The full filtered set, with no facet stepping out: the "All" row's
+        // scoped number, and the unwindowed base the Recent row caps.
+        let filtered = facet_count(conn, &recent_sql)?;
+        let recent = filtered.min(window);
+        let mut total = filtered;
 
         if lens_on {
             // The lens is on, so the grid stops at the newest `window`
@@ -925,9 +933,11 @@ impl Index {
             cap_counts(&mut folders, window);
             cap_counts(&mut collections, window);
             untagged = untagged.min(window);
+            total = total.min(window);
         }
 
         Ok(FacetCounts {
+            total,
             tags,
             folders,
             collections,

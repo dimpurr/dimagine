@@ -15,6 +15,8 @@
 
 #[cfg(feature = "import-eagle")]
 mod import;
+#[cfg(feature = "previews")]
+mod near_dup;
 mod plugins;
 #[cfg(feature = "previews")]
 mod previews;
@@ -107,9 +109,7 @@ fn cli(plugins: &CorePlugins) -> Command {
         .subcommand(
             Command::new("scan").about("Summarise the library: images, notes, collections, boards."),
         )
-        .subcommand(
-            Command::new("check").about("Report problems in the library; never changes files."),
-        )
+        .subcommand(check_command())
         .subcommands(write::commands())
         .subcommand_required(true)
         .arg_required_else_help(true);
@@ -212,7 +212,20 @@ fn refresh_index(
     index.image_meta_stats()
 }
 
+/// The `check` command, plus — when this build measures perceptual hashes — the
+/// `near_duplicate` report that reads the fingerprints `previews` stored.
+fn check_command() -> Command {
+    let check = Command::new("check").about("Report problems in the library; never changes files.");
+    #[cfg(feature = "previews")]
+    let check = check.subcommand(near_dup::command());
+    check
+}
+
 fn run_check(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    #[cfg(feature = "previews")]
+    if let Some(("near_duplicate", near)) = sub.subcommand() {
+        return near_dup::run(near, library_dir);
+    }
     let json = sub.get_flag("json");
     let max_note_bytes = sub
         .get_one::<u64>("max_note_bytes")

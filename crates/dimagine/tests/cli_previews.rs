@@ -179,6 +179,10 @@ fn previews_json_document_shape() {
     assert_eq!(report["failed"], 0);
     assert_eq!(report["findings"], serde_json::json!([]));
     assert_eq!(report["read_complete"], true);
+    assert_eq!(
+        report["fingerprints"]["stored"], 1,
+        "the decoded image's fingerprint is stored for check to read"
+    );
 
     let (code, stdout, _) = dimagine(&["--json", "previews", "--library", lib]);
     assert_eq!(code, 0);
@@ -624,4 +628,43 @@ fn previews_lists_in_help() {
     let (code, stdout, _) = dimagine(&["--help"]);
     assert_eq!(code, 0);
     assert!(stdout.contains("previews"), "{stdout}");
+}
+
+/// End to end: after `scan` and `previews`, `check near_duplicate` reads the
+/// stored fingerprints back and reports two copies of one picture as a `same`
+/// pair in one mergeable group.
+#[test]
+fn check_near_duplicate_reports_a_measured_pair() {
+    let tmp = tmp("neardup");
+    write(&tmp.0, "one.jpg", JPG);
+    write(&tmp.0, "two.jpg", JPG);
+    let lib = tmp.0.to_str().unwrap();
+    assert_eq!(dimagine(&["scan", "--library", lib]).0, 0);
+    assert_eq!(dimagine(&["previews", "--library", lib]).0, 0);
+
+    let (code, stdout, stderr) = dimagine(&["--json", "check", "near_duplicate", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["schema"], "dimagine.near-duplicate/0.1");
+    assert_eq!(report["measured"], true);
+    assert_eq!(report["images"], 2);
+    assert_eq!(report["pairs"].as_array().unwrap().len(), 1);
+    assert_eq!(report["pairs"][0]["suggestion"], "same");
+    assert_eq!(report["pairs"][0]["dhash_distance"], 0);
+    assert_eq!(report["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(report["groups"][0]["members"].as_array().unwrap().len(), 2);
+}
+
+/// A library with no fingerprints (not indexed, or never previewed) answers
+/// "not measured", which is not the same claim as "no duplicates".
+#[test]
+fn check_near_duplicate_reports_not_measured_without_previews() {
+    let tmp = tmp("neardup-unmeasured");
+    write(&tmp.0, "one.jpg", JPG);
+    let lib = tmp.0.to_str().unwrap();
+    let (code, stdout, stderr) = dimagine(&["--json", "check", "near_duplicate", "--library", lib]);
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(report["measured"], false);
+    assert_eq!(report["images"], 0);
 }

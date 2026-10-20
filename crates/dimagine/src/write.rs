@@ -23,6 +23,7 @@ use dimagine_core::fm_edit::{
 };
 use dimagine_core::library::{classify, FileClass, FileEntry, Library};
 use dimagine_core::links::Resolver;
+use dimagine_core::merge_plan::{self, MergeFacts};
 use dimagine_core::settings::{self, Settings};
 
 use dimagine_write::journal::{StepKind, StepRecord};
@@ -226,6 +227,37 @@ pub fn commands() -> Vec<Command> {
                          recovery, and reports it.",
                     ),
             ),
+        Command::new("merge")
+            .about("Merge two near-duplicate images into one: fold the drop's provenance into the keep and trash the drop (W77).")
+            .arg(
+                Arg::new("keep")
+                    .value_name("KEEP")
+                    .required(true)
+                    .help("The image to keep, by library-relative path or unambiguous bare name."),
+            )
+            .arg(
+                Arg::new("drop")
+                    .value_name("DROP")
+                    .required(true)
+                    .help("The image to fold in and trash (one per call), by path or bare name."),
+            )
+            .arg(
+                Arg::new("auto")
+                    .long("auto")
+                    .action(ArgAction::SetTrue)
+                    .help(
+                        "Choose the keeper automatically: more pixels wins, then a lossless \
+                         format (png/webp-lossless over jpg), then a larger file, then the \
+                         lexicographically later library path; the two arguments name the \
+                         pair in any order.",
+                    ),
+            )
+            .arg(
+                Arg::new("dry_run")
+                    .long("dry-run")
+                    .action(ArgAction::SetTrue)
+                    .help("Print the plan; change no library byte."),
+            ),
         Command::new("trash")
             .about("Move image groups (image, note, raw metadata) into .trash/.")
             .arg(
@@ -321,6 +353,7 @@ pub fn dispatch(name: &str, sub: &ArgMatches, library_dir: &Path) -> Option<Exit
         "upload" => run_upload(sub, library_dir),
         "collect" => run_collect(sub, library_dir),
         "mv" => run_move(sub, library_dir),
+        "merge" => run_merge(sub, library_dir),
         "trash" => run_trash(sub, library_dir),
         "restore" => run_restore(sub, library_dir),
         "undo" => run_undo(sub, library_dir),
@@ -1892,6 +1925,388 @@ fn print_move_details(plan: &dimagine_core::move_plan::MovePlan) {
             );
         }
     }
+}
+
+fn run_merge(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    let json = sub.get_flag("json");
+    let limit = sub
+        .get_one::<u64>("max_note_bytes")
+        .copied()
+        .unwrap_or(dimagine_core::check::DEFAULT_MAX_NOTE_BYTES);
+    let library = match library_walk(library_dir, json) {
+        Ok(library) => library,
+        Err(code) => return code,
+    };
+    let writer = match open_writer(library_dir, json) {
+        Ok(writer) => writer,
+        Err(code) => return code,
+    };
+    let resolver = Resolver::new(&library.files);
+    let root = library.root.clone();
+
+    let keep_arg = sub
+        .get_one::<String>("keep")
+        .map(String::as_str)
+        .unwrap_or("");
+    let drop_arg = sub
+        .get_one::<String>("drop")
+        .map(String::as_str)
+        .unwrap_or("");
+    let keep_entry = match resolve_image(&library.files, &resolver, keep_arg) {
+        Ok(entry) => entry,
+        Err(message) => return fail(json, &message),
+    };
+    let drop_entry = match resolve_image(&library.files, &resolver, drop_arg) {
+        Ok(entry) => entry,
+        Err(message) => return fail(json, &message),
+    };
+    if keep_entry.rel == drop_entry.rel {
+        return fail(json, "keep and drop are the same image");
+    }
+
+    // `--auto` chooses the keeper from the pair, whatever order they were given.
+    let mut keep = keep_entry;
+    let mut drop = drop_entry;
+    if sub.get_flag("auto") {
+        let a = probe_image(&root, keep);
+        let b = probe_image(&root, drop);
+        if keep_rank(&b, &a) == std::cmp::Ordering::Greater {
+            (keep, drop) = (drop, keep);
+        }
+    }
+
+    let note_present = |rel: &str| -> bool {
+        library
+            .files
+            .iter()
+            .any(|e| e.class == FileClass::ImageNote && e.rel == rel)
+    };
+    let read_note = |rel: &str| -> Result<Vec<u8>, String> {
+        let path = root.join(rel);
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_file() => meta,
+            _ => return Ok(Vec::new()),
+        };
+        if meta.len() > limit {
+            return Err(format!("larger than the {limit}-byte note limit"));
+        }
+        std::fs::read(&path).map_err(|e| e.to_string())
+    };
+    let keep_note_rel = format!("{}.md", keep.rel);
+    let drop_note_rel = format!("{}.md", drop.rel);
+    // A note that is present but unreadable or over the limit refuses the merge:
+    // it is never treated as no note, which would let a create step overwrite
+    // bytes the merge was meant to fold in (invariant 4).
+    let keep_note_existed = note_present(&keep_note_rel);
+    let keep_note_bytes = match read_note(&keep_note_rel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return fail(
+                json,
+                &format!("{keep_note_rel} is {message}; the merge is refused"),
+            )
+        }
+    };
+    let drop_note_bytes = match read_note(&drop_note_rel) {
+        Ok(bytes) => bytes,
+        Err(message) => {
+            return fail(
+                json,
+                &format!("{drop_note_rel} is {message}; the merge is refused"),
+            )
+        }
+    };
+
+    let drop_facts = probe_image(&root, drop);
+    let keep_note_rel_for_embed = keep_note_rel.clone();
+    let embed = match kept_embed_text(&library.files, &resolver, keep, keep_note_existed) {
+        Ok(text) => text,
+        Err(message) => return fail(json, &message),
+    };
+    let facts = MergeFacts {
+        keep_image_rel: &keep.rel,
+        drop_image_rel: &drop.rel,
+        keep_note_rel: &keep_note_rel_for_embed,
+        drop_sha256: &drop_facts.sha256,
+        merged_at: &chrono::Utc::now().to_rfc3339(),
+        keep_embed_text: &embed,
+        new_note_id: &new_op_id(),
+    };
+
+    let root_read = root.clone();
+    let read = move |entry: &FileEntry| -> Result<Vec<u8>, String> {
+        let meta =
+            std::fs::symlink_metadata(root_read.join(&entry.path)).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a regular file".to_string());
+        }
+        if meta.len() > limit {
+            return Err(format!("larger than the {limit}-byte note limit"));
+        }
+        std::fs::read(root_read.join(&entry.path)).map_err(|e| e.to_string())
+    };
+
+    let plan = match merge_plan::plan_merge(
+        &library.files,
+        &resolver,
+        &facts,
+        &keep_note_bytes,
+        keep_note_existed,
+        &drop_note_bytes,
+        &read,
+    ) {
+        Ok(plan) => plan,
+        Err(refusal) => return fail(json, &refusal.to_string()),
+    };
+
+    for warning in &plan.warnings {
+        eprintln!("warning: {}: {}", warning.path, warning.message);
+    }
+    for ambiguous in &plan.ambiguous {
+        eprintln!(
+            "ambiguous link, not rewritten: {}:{} `{}` could be {}",
+            ambiguous.note,
+            ambiguous.line,
+            ambiguous.target,
+            ambiguous.matches.join(" or ")
+        );
+    }
+
+    if sub.get_flag("dry_run") {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&merge_plan_json(&plan, None)).unwrap_or_default()
+            );
+        } else {
+            print_merge_plan(&plan, true);
+        }
+        return ExitCode::from(0);
+    }
+
+    // One journaled operation: the kept note, the repointed links, and the drop
+    // group into `.trash/` — the same order undo will reverse (ADR-016 §7–§8).
+    let op_id = new_op_id();
+    let trashed_at = chrono::Utc::now().to_rfc3339();
+    let mut steps: Vec<StepRecord> = Vec::new();
+    let keep_note_path = RelPath::parse(&keep_note_rel).map_err(|e| fail(json, &e.to_string()));
+    let keep_note_path = match keep_note_path {
+        Ok(path) => path,
+        Err(code) => return code,
+    };
+    steps.push(StepRecord {
+        step_idx: 0,
+        kind: if plan.keep_note_existed {
+            StepKind::Modify
+        } else {
+            StepKind::Create
+        },
+        src: None,
+        dst: keep_note_path.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(plan.keep_note_bytes.clone()),
+    });
+    for edit in &plan.edits {
+        steps.push(StepRecord {
+            step_idx: steps.len(),
+            kind: StepKind::Modify,
+            src: None,
+            dst: edit.path.clone(),
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: Some(edit.bytes.clone()),
+        });
+    }
+    let members = group_members(&library.files, drop);
+    let drop_image_rel = match RelPath::parse(&drop.rel) {
+        Ok(rel) => rel,
+        Err(error) => return fail(json, &error_message(&error)),
+    };
+    let round = match free_trash_round(&writer, &drop.name, &drop_image_rel, &members) {
+        Ok(round) => round,
+        Err(message) => return fail(json, &message),
+    };
+    let trash_steps = match build_trash_steps(
+        &writer,
+        &op_id,
+        &trashed_at,
+        drop,
+        &members,
+        round,
+        steps.len(),
+    ) {
+        Ok(trash_steps) => trash_steps,
+        Err(message) => return fail(json, &message),
+    };
+    steps.extend(trash_steps);
+
+    let intent = serde_json::json!({"action": "merge", "keep": keep.rel, "drop": drop.rel});
+    if let Err(error) = writer.execute_op(&op_id, SOURCE, None, intent, steps) {
+        return fail(json, &error_message(&error));
+    }
+    // A merge is one operation; the drop group lands in `.trash/` with its own
+    // record, so both `undo` and `restore` can bring it back (判据 2).
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&merge_plan_json(&plan, Some(op_id.as_str())))
+                .unwrap_or_default()
+        );
+    } else {
+        print_merge_plan(&plan, false);
+        println!("undo with: dimagine undo {op_id}");
+    }
+    ExitCode::from(0)
+}
+
+/// A probed image's facts for the `--auto` keeper choice.
+struct ProbedImage {
+    sha256: String,
+    pixels: u64,
+    lossless: bool,
+    size: u64,
+    rel: String,
+}
+
+fn probe_image(root: &Path, entry: &FileEntry) -> ProbedImage {
+    let bytes = std::fs::read(root.join(&entry.path)).unwrap_or_default();
+    let facts = dimagine_core::image_meta::probe_bytes(&bytes);
+    let lossless = is_lossless(&entry.name, &bytes);
+    ProbedImage {
+        sha256: facts.sha256.clone(),
+        pixels: facts
+            .width
+            .and_then(|w| facts.height.map(|h| u64::from(w) * u64::from(h)))
+            .unwrap_or(0),
+        lossless,
+        size: bytes.len() as u64,
+        rel: entry.rel.clone(),
+    }
+}
+
+/// The `--auto` ranking: more pixels, then a lossless format, then a larger
+/// file, then the library path (a stable, deterministic final tiebreak).
+fn keep_rank(a: &ProbedImage, b: &ProbedImage) -> std::cmp::Ordering {
+    (a.pixels, a.lossless, a.size, ReversePath(&a.rel)).cmp(&(
+        b.pixels,
+        b.lossless,
+        b.size,
+        ReversePath(&b.rel),
+    ))
+}
+
+/// A lexicographic tiebreak that prefers the *later* path so the winner is
+/// stable and does not depend on walk order.
+struct ReversePath<'a>(&'a str);
+impl std::cmp::Ord for ReversePath<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other.0.cmp(self.0)
+    }
+}
+impl std::cmp::PartialOrd for ReversePath<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl std::cmp::PartialEq for ReversePath<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl std::cmp::Eq for ReversePath<'_> {}
+
+/// Whether an image is lossless: PNG always; WebP only when it carries a
+/// `VP8L` (lossless) chunk; everything else (JPEG, lossy WebP, GIF, TIFF) not.
+fn is_lossless(name: &str, bytes: &[u8]) -> bool {
+    match dimagine_core::format::file_extension(name)
+        .and_then(dimagine_core::format::FormatFamily::from_extension)
+    {
+        Some(dimagine_core::format::FormatFamily::Png) => true,
+        Some(dimagine_core::format::FormatFamily::Webp) => {
+            let head: Vec<u8> = bytes.iter().take(64).copied().collect();
+            head.windows(4).any(|w| w == b"VP8L")
+        }
+        _ => false,
+    }
+}
+
+/// The self-embed text a newly created kept note gets, resolved so it never
+/// names the dropped image (which is leaving the library).
+fn kept_embed_text(
+    files: &[FileEntry],
+    resolver: &Resolver,
+    keep: &FileEntry,
+    keep_note_existed: bool,
+) -> Result<String, String> {
+    if keep_note_existed {
+        return Ok(String::new());
+    }
+    let ctx = BodyCtx::new(files, resolver);
+    let index = ctx
+        .index_of(&keep.rel)
+        .ok_or_else(|| format!("{} is not in the library walk", keep.rel))?;
+    match body_edit::link_text_for(index, &ctx).map_err(|e| e.to_string())? {
+        Embed::Text(text) => Ok(text),
+        Embed::RenameOrMove { name, .. } => Err(format!(
+            "bare name {name} is ambiguous; give the kept image a folder"
+        )),
+    }
+}
+
+fn merge_plan_json(plan: &merge_plan::MergePlan, op: Option<&str>) -> serde_json::Value {
+    serde_json::json!({
+        "schema": "dimagine.merge/0.1",
+        "dry_run": op.is_none(),
+        "keep": plan.keep,
+        "drop": plan.drop,
+        "keep_note": plan.keep_note_rel,
+        "keep_note_created": !plan.keep_note_existed,
+        "tags_added": plan.tags_added,
+        "added_set": plan.added_set,
+        "sources_appended": plan.sources_appended,
+        "links_repointed": plan.links_repointed,
+        "repointed_notes": plan.edits.iter().map(|e| e.path.clone()).collect::<Vec<_>>(),
+        "ambiguous": plan.ambiguous.iter().map(|a| serde_json::json!({
+            "note": a.note, "line": a.line, "target": a.target, "matches": a.matches,
+        })).collect::<Vec<_>>(),
+        "warnings": plan.warnings.iter().map(|w| serde_json::json!({"path": w.path, "message": w.message})).collect::<Vec<_>>(),
+        "op": op,
+    })
+}
+
+fn print_merge_plan(plan: &merge_plan::MergePlan, dry: bool) {
+    if dry {
+        println!(
+            "merge {} <- {} (dry run, nothing changed)",
+            plan.keep, plan.drop
+        );
+    } else {
+        println!("merged {} <- {}", plan.keep, plan.drop);
+    }
+    println!(
+        "  {}: {}",
+        plan.keep_note_rel,
+        if plan.keep_note_existed {
+            "edited"
+        } else {
+            "created"
+        }
+    );
+    if !plan.tags_added.is_empty() {
+        println!("  tags added: {}", plan.tags_added.join(", "));
+    }
+    if let Some(added) = &plan.added_set {
+        println!("  added set to: {added}");
+    }
+    println!("  sources entries appended: {}", plan.sources_appended);
+    println!("  links repointed: {}", plan.links_repointed);
+    for edit in &plan.edits {
+        println!("  repointed links in {}", edit.path);
+    }
+    println!("  drop group -> .trash/ (undo or restore to bring it back)");
 }
 
 fn run_trash(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
