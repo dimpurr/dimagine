@@ -8,6 +8,7 @@ use crate::assets::{css_url, js_url};
 use crate::index_sync::SidebarData;
 use crate::ui::escape_html;
 use crate::view_query::{Direction, ViewParams, ViewSort};
+use dimagine_index::FacetCounts;
 
 /// W43: the theme boot, inlined into `<head>` so a stored choice paints
 /// before the first frame — `app.js` is `defer`red and can arrive after the
@@ -74,6 +75,13 @@ pub struct Frame<'a> {
     pub active: Destination,
     /// Sidebar data; `None` on a page without one, such as a sign-in page.
     pub sidebar: Option<&'a SidebarData>,
+    /// W76 §1: the current-scope facet counts, or `None` while the library is
+    /// unfiltered. The library page sets it once a filter is on, so the sidebar's
+    /// Folders/Collections/Tags numbers read as "how many this value would add to
+    /// the view on screen" (the filter drawer's own number) and a scoped zero
+    /// dims. On any page that does not filter, it stays `None` and the sidebar
+    /// keeps whole-library counts.
+    pub facets: Option<&'a FacetCounts>,
     /// The active view, for the top bar's chips, sort and size controls.
     pub view: Option<&'a ViewParams>,
     /// How many items match and how many are on screen, for the result count.
@@ -86,8 +94,11 @@ pub struct Frame<'a> {
     pub banner: Option<&'a str>,
     /// The page itself.
     pub content: String,
-    /// Render the inspector column; only the library grid fills it.
-    pub inspector: bool,
+    /// W76 §3: the inspector's content, or `None` to leave the column off the
+    /// page entirely. The info bar appears only when it has something to say —
+    /// a photo the URL picks out — so there is never a wide column that only
+    /// reads "Select an image", and the grid takes the room instead.
+    pub inspector_html: Option<String>,
 }
 
 impl<'a> Frame<'a> {
@@ -97,12 +108,13 @@ impl<'a> Frame<'a> {
             title,
             active,
             sidebar: None,
+            facets: None,
             view: None,
             result: None,
             notices: &[],
             banner: None,
             content: content.into(),
-            inspector: false,
+            inspector_html: None,
         }
     }
 
@@ -128,7 +140,7 @@ impl<'a> Frame<'a> {
             self.top_bar(),
             self.notices(),
             self.content,
-            self.inspector(),
+            self.inspector_column(),
             self.tab_bar(),
             escape_html(&js_url()),
         )
@@ -142,7 +154,7 @@ impl<'a> Frame<'a> {
         let params = self.view.cloned().unwrap_or_default();
         format!(
             "<aside class=\"desktop-sidebar\"><div class=\"sidebar-brand\">dimagine</div>{}</aside>",
-            crate::ui::components::sidebar_sections(data, &params, active)
+            crate::ui::components::sidebar_sections(data, &params, active, self.facets)
         )
     }
 
@@ -188,13 +200,13 @@ impl<'a> Frame<'a> {
         crate::ui::components::notices(self.notices)
     }
 
-    fn inspector(&self) -> String {
-        if !self.inspector {
-            return String::new();
+    fn inspector_column(&self) -> String {
+        match &self.inspector_html {
+            Some(html) => {
+                format!("<aside class=\"right-inspector\" aria-label=\"Details\">{html}</aside>")
+            }
+            None => String::new(),
         }
-        "<aside class=\"right-inspector\" aria-label=\"Details\"><p class=\"inspector-empty\">\
-         Select an image to see its details.</p></aside>"
-            .to_owned()
     }
 }
 

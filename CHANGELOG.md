@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Viewer desktop layout (W76): the sidebar is now the single filter —
+  one set of Views / Folders / Collections / Tags on screen, with counts
+  scoped to the current selection and zero-count rows dimmed; row-end `+`
+  (Alt-click does the same) stacks a row onto the current filters, all in
+  the URL. The desktop filter column is gone, so the grid runs full width
+  at 1440 px. The info bar only renders when used: no empty "select an
+  image" column — selecting a photo (`?sel=<path>`, in the URL, Esc or
+  clear to dismiss) opens a top-aligned bar with preview, title, path,
+  source, tags and note. No-script, keyboard and phone (drawer, ≤768 px)
+  behaviour unchanged. Rating / file-type chips need index support first
+  and are not faked in.
 - Viewer: phone drag-select in the grid (Phase 3b). A long press
   (500 ms) on a tile opens selection mode, a drag across the grid
   adds or removes every thumbnail the finger passes — the pressed

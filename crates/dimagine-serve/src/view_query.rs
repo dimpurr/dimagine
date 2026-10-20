@@ -200,6 +200,10 @@ pub struct ViewParams {
     pub recursive: bool,
     /// Collection note path (`c`).
     pub collection: Option<String>,
+    /// The one image the reader has picked out (`sel`): a library-relative path.
+    /// W76a mockup — a chosen photo is view state, so it lives in the URL and
+    /// drives the inspector and the tile highlight server-side, without a script.
+    pub selection: Option<String>,
     /// Tags filter (repeatable `tag`, AND logic).
     pub tags: Vec<String>,
     /// Full-text query (`q`).
@@ -262,6 +266,7 @@ impl Default for ViewParams {
             folder: None,
             recursive: true,
             collection: None,
+            selection: None,
             tags: Vec::new(),
             q: None,
             sort: ViewSort::Added,
@@ -321,6 +326,15 @@ impl ViewParams {
                         params
                             .notices
                             .push(format!("Ignored collection 'c': {reason}"));
+                    }
+                },
+                // `sel` names the one photo picked out of the grid (W76a).
+                "sel" => match normalise_path(raw_val) {
+                    Ok(path) => params.selection = path,
+                    Err(reason) => {
+                        params
+                            .notices
+                            .push(format!("Ignored selection 'sel': {reason}"));
                     }
                 },
                 "tag" => match decode_query_value(raw_val) {
@@ -497,6 +511,10 @@ impl ViewParams {
 
         if let Some(coll) = &self.collection {
             pairs.push(format!("c={}", utf8_percent_encode(coll, QUERY_VALUE)));
+        }
+
+        if let Some(sel) = &self.selection {
+            pairs.push(format!("sel={}", utf8_percent_encode(sel, QUERY_VALUE)));
         }
 
         for tag in &self.tags {
@@ -1495,6 +1513,37 @@ mod tests {
     /// W47: the panel caps each facet list and the *Show more* link is a URL,
     /// so the longer list has to survive a round trip and a *Show fewer* has to
     /// give the cap back exactly.
+    /// W76 §3: the selected photo is a fact in the URL (`?sel=<path>`), so it
+    /// must survive a round trip unchanged — a shared or reloaded link opens the
+    /// same bar — and a path that is not a library-relative image is ignored with
+    /// a notice, not silently dropped (so a hand-typed `?sel=../etc` is reported,
+    /// not obeyed).
+    #[test]
+    fn the_selection_round_trips_and_an_invalid_one_is_reported() {
+        let chosen = ViewParams::parse("sel=refs/landscape.png&tag=nature");
+        assert_eq!(chosen.selection.as_deref(), Some("refs/landscape.png"));
+        // Kept in the URL it was written to (`/` rides literal in this set), and
+        // re-parsed to the same thing.
+        let url = chosen.to_query_string();
+        assert!(url.contains("sel=refs/landscape.png"), "{url}");
+        assert_eq!(
+            ViewParams::parse(&url),
+            chosen,
+            "a shared ?sel= link is the same view: {url}"
+        );
+
+        // A selection that is not a relative image path is refused, loudly.
+        let bad = ViewParams::parse("sel=../escape");
+        assert_eq!(bad.selection, None, "traversal never selects");
+        assert!(
+            bad.notices
+                .iter()
+                .any(|notice| notice.contains("Ignored selection 'sel'")),
+            "{:?}",
+            bad.notices
+        );
+    }
+
     #[test]
     fn a_shown_facet_list_round_trips_through_the_url() {
         let expanded = ViewParams::parse("in=refs").with_more_of("tags");

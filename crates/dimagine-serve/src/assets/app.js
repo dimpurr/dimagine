@@ -103,6 +103,7 @@
 
   var grid = document.querySelector('.grid');
   var inspector = document.querySelector('.right-inspector');
+  var appShell = document.querySelector('.app-shell');
 
   /* ------------------------------------------------------- size control */
 
@@ -192,7 +193,72 @@
     );
   });
 
+  /* ------------------------------------------------- sidebar stack (⌥-click) */
+
+  // W76 §1: an option-click on a faceted sidebar row is the same shortcut as
+  // its `+` tail — it stacks the value onto the filters already on, instead of
+  // the row's own "switch to it". The `+` link does the same thing with no
+  // modifier (a real link, so it works with scripting off and is a tab stop);
+  // this only adds the ⌥ shortcut beside it. A row with no data-stack (the
+  // library unfiltered, or the value already chosen) is left to its normal
+  // switch behaviour.
+  document.addEventListener('click', function (event) {
+    if (!event.altKey) return;
+    var row = event.target.closest
+      ? event.target.closest('a.sidebar-row[data-stack]')
+      : null;
+    if (!row) return;
+    event.preventDefault();
+    window.location.href = row.dataset.stack;
+  });
+
   /* ------------------------------------------------------------ inspector */
+
+  // W76 §3: the info bar is not a permanent column. The page renders one only
+  // when the URL already picks a photo out (`?sel=<path>`, server-side); on a
+  // plain grid there is no column at all and the grid fills the width. So a
+  // click that selects must build the column, and letting go of the selection
+  // (Esc, Clear) must take it away again — that is what "appears from the right,
+  // collapses on Esc" means without a permanently-rendered empty bar. The script
+  // only ever creates one on a width that shows it (≥1200px); below that the
+  // stylesheet keeps `.right-inspector` hidden and a phone never grows one.
+  var DESKTOP_QUERY = '(min-width: 1200px)';
+
+  function ensureInspector() {
+    if (inspector) return inspector;
+    if (!appShell || !window.matchMedia(DESKTOP_QUERY).matches) return null;
+    inspector = document.createElement('aside');
+    inspector.className = 'right-inspector';
+    inspector.setAttribute('aria-label', 'Details');
+    // Same slot the server uses: a direct child of `.app-shell`, after `<main>`
+    // and before the phone's fixed tab bar.
+    var tab = appShell.querySelector('.bottom-tab-bar');
+    if (tab) appShell.insertBefore(inspector, tab);
+    else appShell.appendChild(inspector);
+    return inspector;
+  }
+
+  function dropInspector() {
+    if (!inspector) return;
+    inspector.remove();
+    inspector = null;
+  }
+
+  // The selected photo is a fact in the URL (§3): writing it with replaceState
+  // costs no navigation, but a reload (or a shared link) then asks the server,
+  // which answers with the same bar already open. Clearing it on deselect leaves
+  // no `?sel=` behind.
+  function setSelParam(path) {
+    if (!window.history || !window.history.replaceState) return;
+    try {
+      var url = new URL(window.location.href);
+      if (path) url.searchParams.set('sel', path);
+      else url.searchParams.delete('sel');
+      window.history.replaceState({}, '', url);
+    } catch (error) {
+      // A URL the browser will not build is a URL worth nothing here.
+    }
+  }
 
   function currentViewQuery() {
     return window.location.search.replace(/^\?/, '');
@@ -208,9 +274,9 @@
   }
 
   function fillInspector(path) {
-    if (!inspector || !path) return;
-    inspector.innerHTML =
-      '<p class="inspector-empty">Loading details…</p>';
+    var column = ensureInspector();
+    if (!column || !path) return;
+    column.innerHTML = '<p class="inspector-empty">Loading details…</p>';
     fetch('/api/image/' + encodeURIComponent(path).replace(/%2F/g, '/'), {
       credentials: 'same-origin',
     })
@@ -219,10 +285,16 @@
         return response.json();
       })
       .then(function (detail) {
-        inspector.innerHTML = inspectorHtml(path, detail);
+        // The column may have been dropped (Esc, a new selection) while the
+        // fetch was in flight; write only into the bar still on screen, for the
+        // photo still chosen.
+        if (!column.isConnected) return;
+        if (selected && selected.dataset.path !== path) return;
+        column.innerHTML = inspectorHtml(path, detail);
       })
       .catch(function () {
-        inspector.innerHTML =
+        if (!column.isConnected) return;
+        column.innerHTML =
           '<p class="inspector-empty">Could not read this image.</p>';
       });
   }
@@ -338,19 +410,28 @@
 
   var selected = null;
 
+  // When the URL already carried a selection, the page rendered the chosen tile
+  // as `.selected` and filled the bar server-side. Adopt that tile so the arrow
+  // keys continue from it and Esc clears it, rather than the script believing
+  // nothing is selected while a photo is lit and named beside the grid.
+  var preselected = document.querySelector('.tile[data-path].selected');
+  if (preselected) selected = preselected;
+
   function selectTile(tile, focus) {
     if (selected) selected.classList.remove('selected');
     selected = tile;
     if (!selected) {
-      if (inspector) {
-        inspector.innerHTML =
-          '<p class="inspector-empty">Select an image to see its details.</p>';
-      }
+      // §3: letting go of the selection takes the info bar away — no empty
+      // column is left standing, and the grid reclaims the width. The URL fact
+      // goes with it.
+      dropInspector();
+      setSelParam(null);
       return;
     }
     selected.classList.add('selected');
     selected.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     fillInspector(selected.dataset.path);
+    setSelParam(selected.dataset.path);
     if (focus) selected.focus();
   }
 

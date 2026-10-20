@@ -100,11 +100,12 @@ pub fn filter_panel(sidebar: &SidebarData, counts: &FacetCounts, params: &ViewPa
         format!("<span class=\"filter-fold-count\">{active}</span>")
     };
 
-    // The shared body: what the numbers mean, the four groups, and the way out.
-    let mut body = String::from(
-        "<p class=\"filter-hint\">Each number is what that value would show \
-         beside the filters already on.</p>",
-    );
+    // The shared body: the four groups and the way out. W76 §2 removed the
+    // "Each number is what that value would show…" sentence — with the desktop
+    // filter column gone the number has one meaning (what the value adds to the
+    // view on screen) in one place, so it no longer needs a caption beside it
+    // (judgment 4: the meaning is not carried by explanatory text).
+    let mut body = String::new();
     body.push_str(&group("Views", None, params, &lens_rows(counts, params)));
     body.push_str(&group(
         "Folders",
@@ -476,11 +477,11 @@ mod tests {
     #[test]
     fn every_row_carries_the_number_that_would_show_if_it_were_clicked() {
         let panel = panel_of(&ViewParams::default());
+        // W76 §2: the "Each number is what…" caption is gone — the number is the
+        // meaning, in one place, with no sentence beside it.
         assert!(
-            panel.contains(
-                "Each number is what that value would show beside the filters already on."
-            ),
-            "the panel has to say what its numbers mean: {panel}"
+            !panel.contains("Each number is what"),
+            "the hint is deleted: {panel}"
         );
         // nature 5 · ui 3 · wide 1, and the folder tree's 7.
         for (value, count) in [("nature", 5), ("ui", 3), ("wide", 1)] {
@@ -824,7 +825,9 @@ mod tests {
         let panel = panel_of(&ViewParams::default());
         let fold = between(&panel, "<div class=\"filter-fold-body\">");
         let column = between(&panel, "<div class=\"filter-static\">");
-        let column = column[column.find("<p class=\"filter-hint\">").unwrap()..].to_owned();
+        // The static column opens with its own `<h2>` heading (which the fold
+        // carries in its `<summary>` instead), so compare from the first group on.
+        let column = column[column.find("<section class=\"filter-group\">").unwrap()..].to_owned();
         assert!(!fold.is_empty());
         assert_eq!(fold, column, "the two mounts hold different lists");
         // And exactly one of them is on screen at a width, which is the

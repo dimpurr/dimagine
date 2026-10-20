@@ -9,14 +9,16 @@ use axum::{
     response::{Html, IntoResponse, Response},
     Json,
 };
-use dimagine_index::{TakenReason, ViewItem, ViewPage};
+use dimagine_index::{FacetCounts, TakenReason, ViewItem, ViewPage};
 use serde::Serialize;
+use serde_json::Value;
 
+use crate::catalog::ImageDetail;
 use crate::index_sync::{recent_label, recent_window, SidebarData, RECENT_LIMIT};
 use crate::ui::components::{self, TileFact, TileMetas};
-use crate::ui::escape_html;
 use crate::ui::filters;
 use crate::ui::shell::{Destination, Frame};
+use crate::ui::{encode_path, escape_html};
 use crate::view_query::{ViewParams, PAGE_SIZE};
 use crate::{acquire_admission, admission_denied, index_failure, AppState};
 
@@ -182,45 +184,166 @@ pub(crate) async fn library_page(
             (result.page.total, result.page.items.len() as u64),
         )
     };
+    // W76 §3: the info bar appears only when it has something to say — and the
+    // one thing that can say it is a photo the URL picks out. A collection page
+    // needs no column beside it: its note's header already carries the words the
+    // mockup once repeated there (the 10-20 correction: "没有例外"). With nothing
+    // selected there is no column at all — never an empty "Select an image" bar —
+    // and the grid takes the room.
+    let inspector_html = match &params.selection {
+        Some(sel) => selection_inspector(&state, sel).await,
+        None => None,
+    };
+    // W76 §1: one pass of the facet queries answers two readers at once. The
+    // phone's drawer always shows these current-scope counts (that is its whole
+    // job); the desktop sidebar adopts them only once a filter is on, so a facet
+    // row's number says what stacking it would add. With no filter the sidebar
+    // keeps whole-library counts. A count the index could not answer leaves the
+    // drawer off and the sidebar on its whole-library numbers — a number about
+    // the library is never invented (invariant 4).
+    let facets = state
+        .index
+        .view_facet_counts(&params.to_index_query(), recent_window(params.recent))
+        .ok();
     let frame = Frame {
         banner: state.banner(),
         sidebar: Some(&result.sidebar),
+        facets: if params.active_filter_count() > 0 {
+            facets.as_ref()
+        } else {
+            None
+        },
         view: Some(&params),
         result: Some(result_counts),
         notices: &params.notices,
-        inspector: true,
+        inspector_html,
         ..Frame::new(
             view_name.as_deref().unwrap_or("Library"),
             Destination::Library,
-            wrap_with_panel(&state, &params, &result.sidebar, body),
+            wrap_with_panel(facets.as_ref(), &params, &result.sidebar, body),
         )
     };
     Html(frame.render()).into_response()
 }
 
-/// The grid, or the collection page, with the filter panel beside it.
+/// The inspector body for the one photo the URL picks out (`?sel=<path>`).
+/// Reads the same detail the image page shows; `None` when the path is not a
+/// readable image, so a stale or hand-typed selection leaves no column behind.
+async fn selection_inspector(state: &AppState, path: &str) -> Option<String> {
+    let catalog = state.catalog.clone();
+    let path = path.to_owned();
+    let detail = tokio::task::spawn_blocking(move || catalog.image_detail(&path))
+        .await
+        .ok()?
+        .ok()?;
+    Some(inspector_html_for_detail(&detail))
+}
+
+/// The populated inspector for one image: preview, title, path, source, tags and
+/// note — the same fields the click-driven inspector fills from, drawn server-side
+/// so the chosen photo reads without a script.
+fn inspector_html_for_detail(detail: &ImageDetail) -> String {
+    let encoded = encode_path(&detail.path);
+    let title = detail
+        .properties
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|title| !title.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            detail
+                .path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(&detail.path)
+                .to_owned()
+        });
+    let title_html = escape_html(&title);
+    let mut parts = vec![format!(
+        "<a href=\"/image/{encoded}\"><img class=\"inspector-preview-img\" \
+         src=\"/thumb/{encoded}\" alt=\"{title_html}\"></a>"
+    )];
+    parts.push(format!("<h3 class=\"inspector-title\">{title_html}</h3>"));
+    parts.push(format!(
+        "<div class=\"inspector-path-row\"><code class=\"image-path\">{}</code></div>",
+        escape_html(&detail.path)
+    ));
+    if let Some(source) = detail
+        .properties
+        .get("source")
+        .and_then(Value::as_str)
+        .filter(|source| source.starts_with("http"))
+    {
+        parts.push(format!(
+            "<div class=\"inspector-section\"><h4>Source</h4>\
+             <a class=\"source-link\" href=\"{}\" rel=\"noreferrer noopener\">{}</a></div>",
+            escape_html(source),
+            escape_html(source)
+        ));
+    }
+    let tags: Vec<String> = detail
+        .properties
+        .get("tags")
+        .and_then(Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|tag| tag.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !tags.is_empty() {
+        let chips = tags
+            .iter()
+            .map(|tag| {
+                format!(
+                    "<a class=\"inspector-tag\" href=\"/?tag={}\">{}</a>",
+                    crate::view_query::query_value(tag),
+                    escape_html(tag)
+                )
+            })
+            .collect::<String>();
+        parts.push(format!(
+            "<div class=\"inspector-section\"><h4>Tags</h4>\
+             <div class=\"inspector-tags\">{chips}</div></div>"
+        ));
+    }
+    let note = detail
+        .body_html
+        .clone()
+        .or_else(|| (!detail.body.trim().is_empty()).then(|| escape_html(&detail.body)));
+    if let Some(note) = note {
+        parts.push(format!(
+            "<div class=\"inspector-section\"><h4>Note</h4>\
+             <div class=\"note-body\">{note}</div></div>"
+        ));
+    }
+    parts.push(format!(
+        "<p><a href=\"/image/{encoded}\">Open the image page</a></p>"
+    ));
+    parts.join("")
+}
+
+/// The grid, or the collection page, with the phone's filter drawer beside it
+/// (the desktop column is gone — see the W76 stylesheet).
 ///
-/// The panel's counts come from five grouped queries (one per facet, plus the
-/// lens), whatever the library holds: a facet's sixty values cost one query, not
-/// sixty. They are read per page render rather than cached, because they belong
-/// to the filters on screen and every chip changes all of them.
-///
-/// `None` from the index — the same index that just answered the grid, so this
-/// is a contradiction rather than a busy database — leaves the panel off the
-/// page. Numbers about the library are never invented (repository invariant 4).
+/// `counts` is the one facet read the page already did for the sidebar; the
+/// drawer and the sidebar share it, so the two can never show different numbers
+/// for the same value. `None` — the index could not answer — leaves the drawer
+/// off the page (the sidebar still shows whole-library counts); a number about
+/// the library is never invented (repository invariant 4).
 fn wrap_with_panel(
-    state: &AppState,
+    counts: Option<&FacetCounts>,
     params: &ViewParams,
     sidebar: &SidebarData,
     results: String,
 ) -> String {
-    let Ok(counts) = state
-        .index
-        .view_facet_counts(&params.to_index_query(), recent_window(params.recent))
-    else {
-        return results;
-    };
-    filters::with_panel(filters::filter_panel(sidebar, &counts, params), results)
+    match counts {
+        Some(counts) => {
+            filters::with_panel(filters::filter_panel(sidebar, counts, params), results)
+        }
+        None => results,
+    }
 }
 
 /// The body every non-collection view uses: the heading and the grid, or

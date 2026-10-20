@@ -2012,8 +2012,12 @@ a.image-nav-next:hover {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 
+  /* W76 §3: the info bar's content runs from the top, not vertically centred
+     (K27's own "wide empty inspector" trap: a centred column reads as a gap
+     waiting to be filled). The content is a list of facts, so it starts at the
+     top and flows down like the note page it mirrors. */
   .right-inspector {
-    justify-content: safe center;
+    justify-content: flex-start;
   }
 
   .inspector-empty {
@@ -2724,6 +2728,62 @@ html[data-theme="dark"] {
   min-width: 0;
 }
 
+/* W76 §1: the sidebar is the library's filter. Beside a filter a facet row
+   grows a `+` at its tail that stacks the value onto the conditions already on,
+   while the row itself still switches to it. The `+` stays unseen until the row
+   is hovered or keyboard-focused (a plain list reads clean), and shows itself
+   under a finger, where there is no hover to wait for. A value whose scoped
+   count is zero is dimmed and carries no `+`: its own `0` already says that
+   stacking it would add nothing. */
+.sidebar-row-wrap {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sidebar-row-wrap .sidebar-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.sidebar-stack {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  color: var(--text-muted);
+  font-size: 0.9375rem;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+
+.sidebar-row-wrap:hover .sidebar-stack,
+.sidebar-row-wrap:focus-within .sidebar-stack {
+  opacity: 1;
+}
+
+.sidebar-stack:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.sidebar-row-wrap.is-dimmed .sidebar-row,
+.sidebar-row-wrap.is-dimmed .sidebar-row-count {
+  color: var(--text-tertiary);
+}
+
+@media (hover: none), (pointer: coarse) {
+  .sidebar-stack {
+    opacity: 0.85;
+  }
+}
+
 @media (pointer: coarse) {
   .desktop-sidebar .sidebar-row {
     min-height: 44px;
@@ -3128,18 +3188,12 @@ a.filter-row:active {
     min-width: 0;
   }
 
+  /* W76a §1: the desktop filter column is gone. The sidebar already lists the
+     same four groups and marks the active filter, so a second set beside the
+     grid only repeated it and ate the width. The phone's drawer (the fold, the
+     mount shown below 1200px) is untouched. */
   .filter-aside {
-    position: sticky;
-    top: var(--topbar-h);
-    align-self: flex-start;
-    flex: 0 0 var(--panel-w);
-    max-height: calc(100vh - var(--topbar-h) - 16px);
-    max-height: calc(100dvh - var(--topbar-h) - 16px);
-    overflow-y: auto;
-    padding: 4px 8px 16px;
-    background: transparent;
-    border-right: 1px solid var(--separator);
-    border-bottom: 0;
+    display: none;
   }
 
   /* The two mounts trade places here: the fold (button and all) stands down and
@@ -3168,20 +3222,10 @@ a.filter-row:active {
     text-transform: uppercase;
   }
 
-  /* The grid keeps the tile sizes its three settings were chosen for: the panel
-     takes 208px off the content column, so one fewer column at each setting
-     rather than five narrower tiles. */
-  .refine-layout .grid {
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .refine-layout .grid.size-s {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-
-  .refine-layout .grid.size-l {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
+  /* W76a §1: the panel no longer takes 208px out of the content column, so the
+     grid keeps the full five/seven/four columns the plain desktop grid already
+     uses — nothing narrower just to make room for a filter column that is no
+     longer drawn. */
 }
 
 /* ========================= W69 · drag-select =========================

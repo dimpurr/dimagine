@@ -1807,6 +1807,94 @@ async fn the_collections_page_shows_a_title_a_count_and_a_cover() {
 }
 
 #[tokio::test]
+async fn the_info_bar_appears_only_for_a_selected_photo() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // W76 §3/§4: with nothing selected there is no info column at all — not even
+    // the old "Select an image" one — and the grid takes the room.
+    let plain = text(&app, "/", &cookie).await;
+    assert!(!plain.contains("class=\"right-inspector\""), "{plain}");
+    assert!(
+        !plain.contains("Select an image to see its details"),
+        "no empty inspector bar: {plain}"
+    );
+
+    // W76 §3 "没有例外": a collection page gets no info bar either, even though
+    // its note's words already sit in the header above the members.
+    let coll = text(&app, "/?c=browse.md", &cookie).await;
+    assert!(!coll.contains("class=\"right-inspector\""), "{coll}");
+
+    // A photo the URL picks out fills the bar with its details and marks the tile.
+    let sel = text(&app, "/?sel=refs/landscape.png", &cookie).await;
+    assert!(sel.contains("class=\"right-inspector\""), "{sel}");
+    assert!(sel.contains("Landscape"), "the bar names the photo: {sel}");
+    assert!(
+        sel.contains("href=\"/image/refs/landscape.png\""),
+        "the bar links the photo's own page: {sel}"
+    );
+    assert!(
+        sel.contains("class=\"tile selected\""),
+        "the selection is a fact in the markup too: {sel}"
+    );
+
+    // A stale or hand-typed selection that is not a readable image leaves no bar.
+    let stale = text(&app, "/?sel=nope.png", &cookie).await;
+    assert!(!stale.contains("class=\"right-inspector\""), "{stale}");
+}
+
+/// W76 §1: with a filter on, the sidebar's facet rows read the current-scope
+/// count, dim a value the filter leaves nothing for, and offer a keyboard-
+/// reachable stack link only on a value that would add something — while the
+/// phone's filter drawer keeps rendering unchanged.
+#[tokio::test]
+async fn a_filtered_sidebar_scopes_counts_and_offers_a_stack_link() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    // Whole-library view: no stack affordance, nothing dimmed, the plain counts.
+    let all = text(&app, "/", &cookie).await;
+    assert!(!all.contains("class=\"sidebar-stack\""), "{all}");
+    assert!(!all.contains("is-dimmed"), "{all}");
+
+    // Narrow to `tag=ui` (only refs/ui/button.png). The chosen tag is active; a
+    // tag the filter leaves nothing for is dimmed at 0; a folder that still holds
+    // something under the filter offers a stack `+` (a real link, a tab stop)
+    // whose URL keeps the tag already on.
+    let ui = text(&app, "/?tag=ui", &cookie).await;
+    assert!(
+        ui.contains("class=\"sidebar-row active\" href=\"/?tag=ui\""),
+        "{ui}"
+    );
+    // `nature` belongs only to landscape.png, so nothing tagged `ui` carries it:
+    // its row is dimmed and shows the scoped 0 (whole-library nature was 1).
+    assert!(
+        ui.contains("is-dimmed\"><a class=\"sidebar-row\" href=\"/?tag=nature\""),
+        "nature dimmed: {ui}"
+    );
+    assert!(
+        ui.contains(">nature</span><span class=\"sidebar-row-count\">0"),
+        "nature shows the scoped count: {ui}"
+    );
+    // Exactly the folders holding a `ui` image are stackable; the stack link is an
+    // <a href>, so keyboard readers reach it.
+    assert!(ui.contains("class=\"sidebar-stack\""), "{ui}");
+    assert!(
+        ui.contains("data-stack=\"/?in=refs&amp;tag=ui\""),
+        "stack keeps the filter already on: {ui}"
+    );
+
+    // The phone's drawer is unchanged by all this: the two mounts are still there.
+    assert!(ui.contains("<details class=\"filter-fold\">"), "{ui}");
+    assert!(ui.contains("<div class=\"filter-static\">"), "{ui}");
+    // And the old caption that explained the two counting rules is gone (§2).
+    assert!(
+        !ui.contains("Each number is what that value would show"),
+        "{ui}"
+    );
+}
+
+#[tokio::test]
 async fn the_search_page_has_a_field_tags_and_recent_views() {
     let dir = library();
     let (app, cookie) = login(app(&dir)).await;

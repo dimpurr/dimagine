@@ -3,7 +3,7 @@
 //! Everything here returns HTML fragments. No component reads the request or
 //! the filesystem; the page handlers decide what data a component gets.
 
-use dimagine_index::{ImageMeta, ViewItem};
+use dimagine_index::{FacetCounts, ImageMeta, ViewItem};
 use percent_encoding::utf8_percent_encode;
 
 use crate::catalog::PreviewKind;
@@ -622,10 +622,19 @@ pub fn tile(item: &ViewItem, params: &ViewParams, fact: Option<&TileFact>) -> St
     } else {
         String::new()
     };
+    // W76a mockup: a photo chosen by the URL (`?sel=<path>`) wears the single
+    // selection's own highlight, so the selected state is a fact in the URL and
+    // in the markup — it survives without a script, and the inspector beside it
+    // names the same picture.
+    let selected = if params.selection.as_deref() == Some(item.path.as_str()) {
+        " selected"
+    } else {
+        ""
+    };
     format!(
         // `data-path` stays the tile's second attribute: the viewer's own
         // tests read a page's image paths back out of this exact prefix.
-        "<a class=\"tile\" data-path=\"{path}\" id=\"{anchor}\" style=\"{ar}\" \
+        "<a class=\"tile{selected}\" data-path=\"{path}\" id=\"{anchor}\" style=\"{ar}\" \
          href=\"/image/{path_encoded}{view}\" title=\"{label}\"{fit}>\
          {badge}{no_time}\
          <img loading=\"lazy\" decoding=\"async\" src=\"{src}\" alt=\"{label}\"{size}>\
@@ -1010,10 +1019,25 @@ pub fn tag_row(tag: &str, count: u64) -> String {
 
 /// The sidebar: `VIEWS`, `FOLDERS`, `COLLECTIONS`, `TAGS`, each row with its
 /// count (spec §3, principle 3).
+/// The sidebar is the library's filter (W76 §1): the desktop's separate filter
+/// column is gone, so these rows are the only place a facet's count and a way to
+/// stack it live.
+///
+/// `facets` is the current-scope facet counts — `Some` only when a filter is
+/// already on screen. It decides what the Folders/Collections/Tags numbers mean:
+/// whole-library counts while the library is unfiltered (the plain navigation
+/// count), and beside a filter the count of what each value would add to the view
+/// on screen — the same number the phone's filter drawer shows. A value that
+/// would add nothing (a scoped count of zero) is dimmed and offers no `+`; the
+/// value already chosen is never dimmed. The Views group (All/Recent/Untagged)
+/// keeps its whole-library lens counts throughout: those are lenses, and the
+/// facet queries carry no "everything within the current filters" number to
+/// swap in.
 pub fn sidebar_sections(
     data: &SidebarData,
     params: &ViewParams,
     active_folder: Option<&str>,
+    facets: Option<&FacetCounts>,
 ) -> String {
     let mut out = String::new();
 
@@ -1047,6 +1071,7 @@ pub fn sidebar_sections(
             &data.folders,
             params,
             active_folder.unwrap_or(""),
+            facets,
         ));
     }
     out.push_str("</section>");
@@ -1063,12 +1088,32 @@ pub fn sidebar_sections(
             } else {
                 collection.title.clone()
             };
-            out.push_str(&sidebar_row(
-                &format!("/?c={}", query_value(&collection.path)),
-                &label,
-                collection.count,
-                params.collection.as_deref() == Some(collection.path.as_str()),
-            ));
+            let active = params.collection.as_deref() == Some(collection.path.as_str());
+            let scoped = facets.map(|counts| {
+                counts
+                    .collections
+                    .get(&collection.path)
+                    .copied()
+                    .unwrap_or(0)
+            });
+            let count = scoped.unwrap_or(collection.count);
+            let switch = format!("/?c={}", query_value(&collection.path));
+            let stack = facet_stack(facets, active, count, || {
+                params
+                    .with_collection(Some(collection.path.clone()))
+                    .to_url("/")
+            });
+            out.push_str(&facet_row(FacetRow {
+                label: &label,
+                tooltip: &collection.path,
+                switch: &switch,
+                count,
+                active,
+                dimmed: facet_dimmed(facets, count, active),
+                stack: stack.as_deref(),
+                extra_class: "",
+                row_data: "",
+            }));
         }
     }
     out.push_str("</section>");
@@ -1082,12 +1127,24 @@ pub fn sidebar_sections(
         out.push_str("<p class=\"sidebar-empty\">No tags yet.</p>");
     } else {
         for tag in tags.iter().take(SIDEBAR_TAG_LIMIT) {
-            out.push_str(&sidebar_row(
-                &format!("/?tag={}", query_value(&tag.tag)),
-                &tag.tag,
-                tag.count,
-                params.tags.iter().any(|active| active == &tag.tag),
-            ));
+            let active = tag_is_active(params, &tag.tag);
+            let scoped = facets.map(|counts| counts.tags.get(&tag.tag).copied().unwrap_or(0));
+            let count = scoped.unwrap_or(tag.count);
+            let switch = format!("/?tag={}", query_value(&tag.tag));
+            let stack = facet_stack(facets, active, count, || {
+                params.with_tag(tag.tag.clone()).to_url("/")
+            });
+            out.push_str(&facet_row(FacetRow {
+                label: &tag.tag,
+                tooltip: &tag.tag,
+                switch: &switch,
+                count,
+                active,
+                dimmed: facet_dimmed(facets, count, active),
+                stack: stack.as_deref(),
+                extra_class: "",
+                row_data: "",
+            }));
         }
         if tags.len() > SIDEBAR_TAG_LIMIT {
             out.push_str(&sidebar_row(
@@ -1100,6 +1157,103 @@ pub fn sidebar_sections(
     }
     out.push_str("</section>");
     out
+}
+
+/// Whether a scoped-zero facet row dims: only while a filter is on, and never
+/// the row that is on (a value the reader chose is how they let go of it).
+fn facet_dimmed(facets: Option<&FacetCounts>, count: u64, active: bool) -> bool {
+    facets.is_some() && count == 0 && !active
+}
+
+/// The row-tail `+`'s target (W76 §1): the current view with this one value
+/// stacked on — the folder, collection or tag added while everything else on
+/// screen stays. It is offered only while a filter is on (else the row's own
+/// switch already does this), never on the value already chosen (stacking it
+/// again changes nothing), and never on a scoped-zero row (the `+` would only
+/// offer an empty view, the same dead end the dimmed row already says).
+fn facet_stack(
+    facets: Option<&FacetCounts>,
+    active: bool,
+    count: u64,
+    stack: impl FnOnce() -> String,
+) -> Option<String> {
+    if facets.is_some() && !active && count > 0 {
+        Some(stack())
+    } else {
+        None
+    }
+}
+
+/// Everything one faceted sidebar row needs, bundled so [`facet_row`] stays a
+/// plain function over one row rather than nine unrelated arguments.
+struct FacetRow<'a> {
+    label: &'a str,
+    tooltip: &'a str,
+    switch: &'a str,
+    count: u64,
+    active: bool,
+    dimmed: bool,
+    stack: Option<&'a str>,
+    extra_class: &'a str,
+    row_data: &'a str,
+}
+
+/// One faceted sidebar row (a folder, collection or tag): the main link switches
+/// to the value (the sidebar's navigation, keeping only the sort and the tile
+/// size), and when `stack` is `Some` a `+` at the row's tail stacks it onto the
+/// filters already on instead. `dimmed` grays a scoped-zero row and drops its
+/// `+`; the main switch link always stays, so reaching the value alone is never
+/// lost to a filter that left nothing here.
+fn facet_row(row: FacetRow<'_>) -> String {
+    let FacetRow {
+        label,
+        tooltip,
+        switch,
+        count,
+        active,
+        dimmed,
+        stack,
+        extra_class,
+        row_data,
+    } = row;
+    let stack_attr = stack
+        .map(|href| format!(" data-stack=\"{}\"", escape_html(href)))
+        .unwrap_or_default();
+    let plus = match stack {
+        Some(href) => format!(
+            "<a class=\"sidebar-stack\" href=\"{href}\" aria-label=\"Add {label} to the \
+             current filters\">+</a>",
+            href = escape_html(href),
+            label = escape_html(label),
+        ),
+        None => String::new(),
+    };
+    format!(
+        "<div class=\"sidebar-row-wrap{dim}\"><a class=\"sidebar-row{extra}{active}\" \
+         href=\"{switch}\"{data}{stack_attr} title=\"{tip}\">\
+         <span class=\"sidebar-row-label\">{label}</span>\
+         <span class=\"sidebar-row-count\">{count}</span>\
+         <span class=\"sidebar-tip\" aria-hidden=\"true\">{tip}</span></a>{plus}</div>",
+        dim = if dimmed { " is-dimmed" } else { "" },
+        extra = extra_class,
+        active = if active { " active" } else { "" },
+        switch = escape_html(switch),
+        data = row_data,
+        tip = escape_html(tooltip),
+        label = escape_html(label),
+        count = count,
+    )
+}
+
+/// Whether a tag is one of the view's tags. The index folds a tag's case when it
+/// stores and matches it, so a row is chosen for the tag the URL means, not for a
+/// byte-identical spelling of it.
+fn tag_is_active(params: &ViewParams, tag: &str) -> bool {
+    let folded = dimagine_index::searchable(tag);
+    params
+        .tags
+        .iter()
+        .any(|active| dimagine_index::searchable(active) == folded)
 }
 
 fn is_all(params: &ViewParams) -> bool {
@@ -1120,11 +1274,13 @@ fn is_all(params: &ViewParams) -> bool {
 ///
 /// The full path rides in `title` and in a styled tooltip span, because a
 /// truncating label must always have a way to be read whole (W34 audit #6,
-/// DESIGN.md §4.1).
+/// DESIGN.md §4.1). A scoped count and a stack `+` are added beside a filter
+/// exactly as they are for collections and tags (see [`sidebar_sections`]).
 fn folder_tree(
     folders: &[crate::index_sync::SidebarFolder],
     params: &ViewParams,
     active: &str,
+    facets: Option<&FacetCounts>,
 ) -> String {
     let parents: std::collections::HashSet<&str> = folders
         .iter()
@@ -1138,13 +1294,21 @@ fn folder_tree(
         let current = folder.path == active;
         let has_children = parents.contains(folder.path.as_str());
         let open_by_default = depth == 0;
+        let scoped = facets.map(|counts| counts.folders.get(&folder.path).copied().unwrap_or(0));
+        let count = scoped.unwrap_or(folder.count);
+        let switch = format!("/?in={}", query_value(&folder.path)) + &carry_params(params);
+        let stack = facet_stack(facets, current, count, || {
+            params.with_folder(Some(folder.path.clone())).to_url("/")
+        });
+        let row_data = format!(
+            " data-folder=\"{raw}\" data-parent=\"{raw_parent}\"",
+            raw = escape_html(&folder.path),
+            raw_parent = escape_html(parent),
+        );
         out.push_str(&format!(
             "<div class=\"folder-node depth-{depth}\">{triangle}\
-             <a class=\"sidebar-row folder-row{active}\" \
-             data-folder=\"{raw}\" data-parent=\"{raw_parent}\" href=\"/?in={path}{carry}\" \
-             title=\"{full}\"><span class=\"sidebar-row-label\">{label}</span>\
-             <span class=\"sidebar-row-count\">{count}</span>\
-             <span class=\"sidebar-tip\" aria-hidden=\"true\">{full}</span></a></div>",
+             {row}</div>",
+            depth = depth,
             triangle = if has_children {
                 format!(
                     "<button type=\"button\" class=\"tree-triangle\" data-folder=\"{raw}\" \
@@ -1162,14 +1326,17 @@ fn folder_tree(
             } else {
                 String::new()
             },
-            active = if current { " active" } else { "" },
-            raw = escape_html(&folder.path),
-            raw_parent = escape_html(parent),
-            path = escape_html(&query_value(&folder.path)),
-            carry = carry_params(params),
-            full = escape_html(&folder.path),
-            label = escape_html(&label),
-            count = folder.count,
+            row = facet_row(FacetRow {
+                label: &label,
+                tooltip: &folder.path,
+                switch: &switch,
+                count,
+                active: current,
+                dimmed: facet_dimmed(facets, count, current),
+                stack: stack.as_deref(),
+                extra_class: " folder-row",
+                row_data: &row_data,
+            }),
         ));
     }
     out.push_str("</div>");
@@ -1177,7 +1344,9 @@ fn folder_tree(
 }
 
 /// The parameters a sidebar link carries along: everything except the lens the
-/// link is setting.
+/// link is setting. Returned raw (`&sort=name`, not `&amp;…`): the caller passes
+/// the finished href through `escape_html`, which turns the `&` on its own — and
+/// escaping it here would leave a literal `&amp;amp;` in the link.
 fn carry_params(params: &ViewParams) -> String {
     let mut carry = params.clone();
     carry.folder = None;
@@ -1192,7 +1361,7 @@ fn carry_params(params: &ViewParams) -> String {
         .split('&')
         .map(str::to_owned)
         .filter(|pair| !pair.is_empty())
-        .map(|pair| format!("&amp;{pair}"))
+        .map(|pair| format!("&{pair}"))
         .collect::<String>()
 }
 
@@ -1424,7 +1593,7 @@ mod tests {
     #[test]
     fn the_sidebar_lists_every_section_with_counts() {
         let params = ViewParams::parse("recent=1");
-        let html = sidebar_sections(&sidebar(), &params, None);
+        let html = sidebar_sections(&sidebar(), &params, None, None);
         for section in ["Views", "Folders", "Collections", "Tags"] {
             assert!(html.contains(section), "missing the {section} section");
         }
@@ -1439,26 +1608,83 @@ mod tests {
 
     #[test]
     fn the_sidebar_caps_the_tags_and_offers_the_rest() {
-        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None);
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None, None);
         assert!(html.contains("tag-29"));
         assert!(!html.contains("tag-30"), "only 30 tags are listed");
         assert!(html.contains("All tags"));
         assert!(html.contains("All tags</span><span class=\"sidebar-row-count\">40"));
     }
 
+    /// W76 §1: beside a filter the sidebar's facet numbers become the
+    /// current-scope counts — what each value would add to the view on screen —
+    /// a scoped zero dims (and its whole-library number disappears), the chosen
+    /// value is never dimmed, and only a value that would add something (and is
+    /// not already on) grows a stack `+` and its ⌥-click `data-stack`.
+    #[test]
+    fn a_filtered_sidebar_scopes_the_counts_and_stacks_only_what_adds_something() {
+        // Scope: only `refs` (5) and tag-00 (3) survive the filter that is on;
+        // everything else is absent from the facet maps, i.e. zero.
+        let facets = FacetCounts {
+            tags: std::collections::BTreeMap::from([("tag-00".to_owned(), 3u64)]),
+            folders: std::collections::BTreeMap::from([("refs".to_owned(), 5u64)]),
+            collections: std::collections::BTreeMap::new(),
+            untagged: 1,
+            recent: 3,
+        };
+        let html = sidebar_sections(
+            &sidebar(),
+            &ViewParams::parse("tag=tag-00"),
+            None,
+            Some(&facets),
+        );
+
+        // The chosen tag keeps its scoped count (3, not the whole-library 100)
+        // and is the active row.
+        assert!(
+            html.contains(">tag-00</span><span class=\"sidebar-row-count\">3"),
+            "{html}"
+        );
+        // Another tag the filter leaves nothing for shows 0, not its whole count
+        // (99), and its row is dimmed.
+        assert!(
+            html.contains(">tag-01</span><span class=\"sidebar-row-count\">0"),
+            "{html}"
+        );
+        assert!(
+            !html.contains(">tag-01</span><span class=\"sidebar-row-count\">99"),
+            "the whole-library number is replaced by the scoped count: {html}"
+        );
+        assert!(html.contains("sidebar-row-wrap is-dimmed"), "{html}");
+
+        // Exactly one value is worth stacking: the `refs` folder (scoped 5, not
+        // chosen). It grows the `+` and a `data-stack` pointing at the current
+        // view with the folder added on, tag kept.
+        assert_eq!(html.matches("class=\"sidebar-stack\"").count(), 1, "{html}");
+        assert_eq!(html.matches("data-stack=\"").count(), 1, "{html}");
+        assert!(
+            html.contains("data-stack=\"/?in=refs&amp;tag=tag-00\""),
+            "the stack keeps the filter already on: {html}"
+        );
+
+        // And with no filter (`None`) none of this happens: plain whole-library
+        // counts, no `+`, nothing dimmed.
+        let plain = sidebar_sections(&sidebar(), &ViewParams::default(), None, None);
+        assert!(!plain.contains("sidebar-stack"), "{plain}");
+        assert!(!plain.contains("is-dimmed"), "{plain}");
+        assert!(plain.contains(">tag-00</span><span class=\"sidebar-row-count\">100"));
+    }
+
     #[test]
     fn the_sidebar_marks_the_folder_it_is_inside() {
-        let html = sidebar_sections(&sidebar(), &ViewParams::default(), Some("refs/ui"));
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), Some("refs/ui"), None);
         assert!(html.contains("class=\"sidebar-row folder-row active\""));
         assert!(html.contains("folder-node depth-0"));
         assert!(html.contains("folder-node depth-1"));
     }
 
-    /// W34 audit #4: the tree must be collapsible, so every row carries its
-    /// place in the tree and every branch carries a keyboard-reachable toggle.
     #[test]
     fn folder_rows_name_their_node_and_parent_and_branches_get_a_triangle() {
-        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None);
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None, None);
         assert!(
             html.contains("data-folder=\"refs\" data-parent=\"\""),
             "{html}"
@@ -1482,7 +1708,7 @@ mod tests {
             path: "refs/ui/icons".into(),
             count: 4,
         });
-        let html = sidebar_sections(&data, &ViewParams::default(), None);
+        let html = sidebar_sections(&data, &ViewParams::default(), None, None);
         assert!(
             html.contains("aria-expanded=\"false\" aria-label=\"Expand ui\""),
             "{html}"
@@ -1493,7 +1719,7 @@ mod tests {
     /// `title` and in the styled tooltip the script reveals.
     #[test]
     fn sidebar_rows_carry_their_full_name_for_the_tooltip() {
-        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None);
+        let html = sidebar_sections(&sidebar(), &ViewParams::default(), None, None);
         assert!(html.contains("title=\"refs/ui\""), "{html}");
         assert!(
             html.contains("<span class=\"sidebar-tip\" aria-hidden=\"true\">Recent"),
@@ -1504,7 +1730,7 @@ mod tests {
     #[test]
     fn a_sidebar_row_carries_the_size_choice_but_sets_the_focus() {
         let params = ViewParams::parse("in=refs&tag=eagle&size=l&untagged=1");
-        let html = sidebar_sections(&sidebar(), &params, None);
+        let html = sidebar_sections(&sidebar(), &params, None, None);
         let folder_row = html
             .split("sidebar-row folder-row")
             .nth(1)
@@ -1527,7 +1753,7 @@ mod tests {
             untagged: 0,
             recent: 0,
         };
-        let html = sidebar_sections(&empty, &ViewParams::default(), None);
+        let html = sidebar_sections(&empty, &ViewParams::default(), None, None);
         assert_eq!(html.matches("sidebar-empty").count(), 3);
     }
 
