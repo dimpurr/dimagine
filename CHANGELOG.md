@@ -439,6 +439,9 @@ All notable changes to this project are documented here. The format follows
   longer mixes two different populations.
 
 ### Changed
+- Viewer: the `untagged` / `recent` chip's ✕ now clears only that lens and keeps
+  every other filter on screen, instead of dropping the whole view back to the
+  library.
 - Viewer: the sidebar's Views group (All / Recent / Untagged) is now a single
   choice over the range the filters leave. Its rows keep every filter on screen —
   the folder, the tags, the search, the sort, the tile size — and change only the

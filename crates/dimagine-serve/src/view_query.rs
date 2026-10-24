@@ -727,7 +727,8 @@ impl ViewParams {
     /// else on screen. A sidebar Views row and the drawer's lens rows both start
     /// from [`ViewParams::without_lenses`] and add one lens back: the three
     /// Views are one choice over the range the other filters leave, never a
-    /// fresh view that drops them.
+    /// fresh view that drops them. The lens chip's ✕ clears its lens the same
+    /// way, so removing a lens lets nothing else go (W79 Low-1).
     pub fn with_untagged(&self, untagged: bool) -> Self {
         let mut next = self.clone();
         next.untagged = untagged;
@@ -827,25 +828,6 @@ impl ViewParams {
         next.recursive = recursive;
         next.page = 1;
         next
-    }
-
-    /// The untagged lens on its own: `Untagged` is a view, not a filter
-    /// added to whatever was on screen before.
-    pub fn only_untagged(&self) -> Self {
-        Self {
-            untagged: true,
-            size: self.size,
-            ..Self::default()
-        }
-    }
-
-    /// The recent lens on its own.
-    pub fn only_recent(&self) -> Self {
-        Self {
-            recent: true,
-            size: self.size,
-            ..Self::default()
-        }
     }
 }
 
@@ -1128,12 +1110,12 @@ mod tests {
 
     #[test]
     fn the_lenses_round_trip_and_map_onto_the_index_query() {
-        let untagged = ViewParams::parse("untagged=1").only_untagged();
+        let untagged = ViewParams::parse("untagged=1");
         assert!(untagged.untagged);
         assert_eq!(untagged.to_query_string(), "untagged=1");
         assert!(untagged.to_index_query().untagged);
 
-        let recent = ViewParams::parse("recent=1").only_recent();
+        let recent = ViewParams::parse("recent=1");
         assert!(recent.recent);
         assert_eq!(recent.to_query_string(), "recent=1");
         let query = recent.to_index_query();
@@ -1215,13 +1197,16 @@ mod tests {
     }
 
     #[test]
-    fn a_lens_keeps_the_thumbnail_size_and_drops_the_rest() {
-        let params = ViewParams::parse("in=refs&tag=eagle&size=l&recent=1").only_recent();
-        assert_eq!(params.size, ThumbnailSize::L);
-        assert_eq!(params.folder, None);
-        assert!(params.tags.is_empty());
-        assert!(params.q.is_none());
-        assert_eq!(params.to_query_string(), "size=l&recent=1");
+    fn a_lens_keeps_the_thumbnail_size_and_every_filter() {
+        let params = ViewParams::parse("in=refs&tag=eagle&size=l&recent=1");
+        let untagged = params.without_lenses().with_untagged(true);
+        assert_eq!(untagged.size, ThumbnailSize::L);
+        assert_eq!(untagged.folder.as_deref(), Some("refs"));
+        assert_eq!(untagged.tags, vec!["eagle".to_owned()]);
+        assert_eq!(
+            untagged.to_query_string(),
+            "in=refs&tag=eagle&size=l&untagged=1"
+        );
     }
 
     /// W78 B1: the range a Views row links into is the view with both lenses off

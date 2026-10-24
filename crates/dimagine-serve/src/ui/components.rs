@@ -10,9 +10,7 @@ use crate::catalog::PreviewKind;
 use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
-use crate::view_query::{
-    sort_key_as_str, Direction, ThumbnailSize, ViewParams, ViewSort, PAGE_SIZE,
-};
+use crate::view_query::{sort_key_as_str, ThumbnailSize, ViewParams, PAGE_SIZE};
 
 /// How many tags the sidebar lists before offering the rest on `/search`.
 const SIDEBAR_TAG_LIMIT: usize = 30;
@@ -181,10 +179,20 @@ pub fn scope_chips(params: &ViewParams) -> String {
         ));
     }
     if params.untagged {
-        chips.push(chip(ChipKind::Filter, "untagged", "untagged", "/"));
+        chips.push(chip(
+            ChipKind::Filter,
+            "untagged",
+            "untagged",
+            &view_url(&params.with_untagged(false)),
+        ));
     }
     if params.recent {
-        chips.push(chip(ChipKind::Filter, "recent", "recent", "/"));
+        chips.push(chip(
+            ChipKind::Filter,
+            "recent",
+            "recent",
+            &view_url(&params.with_recent(false)),
+        ));
     }
     if chips.is_empty() {
         return String::new();
@@ -1274,12 +1282,12 @@ fn tag_is_active(params: &ViewParams, tag: &str) -> bool {
         .any(|active| dimagine_index::searchable(active) == folded)
 }
 
+/// Whether the Views `All` row is the page already on screen. Its href is the
+/// current range with neither lens on it, so the row is the current page
+/// whenever no lens is: the filters, the sort and the tile size ride along in
+/// the href and cannot make it a different page (W79 Low-3).
 fn is_all(params: &ViewParams) -> bool {
-    params.to_query_string().is_empty()
-        || (params.sort == ViewSort::Added
-            && params.direction == Direction::Desc
-            && !params.untagged
-            && !params.recent)
+    !params.untagged && !params.recent
 }
 
 /// The folder rows, nested by path depth so the tree reads as a tree.
@@ -1585,6 +1593,27 @@ mod tests {
     }
 
     #[test]
+    fn a_lens_chip_leaves_every_other_filter_where_it_was() {
+        // W79 Low-1: clearing a lens from its chip used to drop the whole
+        // scope; the ✕ now removes only the lens it labels, the same rule the
+        // Views rows follow.
+        let html = scope_chips(&ViewParams::parse(
+            "in=refs&tag=eagle&size=l&sort=size&untagged=1&recent=1",
+        ));
+        assert!(
+            html.contains("href=\"/?in=refs&amp;tag=eagle&amp;sort=size&amp;size=l&amp;recent=1\""),
+            "dropping the untagged lens keeps folder, tag, size and sort: {html}"
+        );
+        assert!(
+            html.contains(
+                "href=\"/?in=refs&amp;tag=eagle&amp;sort=size&amp;size=l&amp;untagged=1\""
+            ),
+            "dropping the recent lens keeps folder, tag, size and sort: {html}"
+        );
+        assert!(!html.contains("href=\"/\""), "{html}");
+    }
+
+    #[test]
     fn a_collection_title_carrying_markup_is_escaped_on_its_card() {
         let card = collection_card("set.md", "Set <img onerror=x>", 3, None);
         assert!(card.contains("Set &lt;img onerror=x&gt;"), "{card}");
@@ -1806,6 +1835,48 @@ mod tests {
                 ("Untagged".to_owned(), "/?in=refs&untagged=1".to_owned(), 90),
             ],
             "{html}"
+        );
+    }
+
+    /// W79 Low-3: `All` marks the page it is. Its href keeps the filters, the
+    /// sort and the tile size and drops only the lenses, so on any lens-free
+    /// page the row opens the page already open — whatever else that page
+    /// carries — and under a lens it does not.
+    #[test]
+    fn the_all_row_is_active_on_a_lens_free_page_whatever_the_sort() {
+        let facets = FacetCounts {
+            total: 40,
+            tags: std::collections::BTreeMap::new(),
+            folders: std::collections::BTreeMap::new(),
+            collections: std::collections::BTreeMap::new(),
+            untagged: 4,
+            recent: 20,
+        };
+        let counts = |params: &str| {
+            sidebar_sections(&sidebar(), &ViewParams::parse(params), None, Some(&facets))
+        };
+        assert!(
+            counts("tag=tag-00&sort=size")
+                .contains("class=\"sidebar-row active\" href=\"/?tag=tag-00&amp;sort=size\""),
+            "a non-default sort does not make `All` some other page"
+        );
+        assert!(
+            counts("tag=tag-00").contains("class=\"sidebar-row active\" href=\"/?tag=tag-00\""),
+            "a filter alone marks `All` too"
+        );
+        assert!(
+            counts("tag=tag-00&recent=1").contains("class=\"sidebar-row\" href=\"/?tag=tag-00\""),
+            "under the Recent lens `All` is a different page"
+        );
+        assert!(
+            counts("tag=tag-00&recent=1")
+                .contains("class=\"sidebar-row active\" href=\"/?tag=tag-00&amp;recent=1\""),
+            "and the row for the lens in force is the active one"
+        );
+        // The unfiltered library is marked the way it always was.
+        assert!(
+            counts("").contains("class=\"sidebar-row active\" href=\"/\""),
+            "no filter, no lens: `All` is the page"
         );
     }
 
