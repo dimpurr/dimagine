@@ -724,9 +724,10 @@ impl ViewParams {
     }
 
     /// New instance with the untagged lens set or cleared, keeping everything
-    /// else on screen. The sidebar's [`ViewParams::only_untagged`] is the other
-    /// gesture: a row in a navigation list starts a fresh view, a row in the
-    /// filter panel narrows the one being looked at.
+    /// else on screen. A sidebar Views row and the drawer's lens rows both start
+    /// from [`ViewParams::without_lenses`] and add one lens back: the three
+    /// Views are one choice over the range the other filters leave, never a
+    /// fresh view that drops them.
     pub fn with_untagged(&self, untagged: bool) -> Self {
         let mut next = self.clone();
         next.untagged = untagged;
@@ -739,6 +740,20 @@ impl ViewParams {
     pub fn with_recent(&self, recent: bool) -> Self {
         let mut next = self.clone();
         next.recent = recent;
+        next.page = 1;
+        next
+    }
+
+    /// New instance with both lenses taken off and the first page put back:
+    /// the range the Views rows link to, before the one lens each of them adds
+    /// back (W78 B1). The filters stay — a Views row changes the lens and lets
+    /// nothing else go — and so do the sort, its direction and the tile size.
+    /// The page goes because a lens is read from its first page, not from the
+    /// page the reader had reached inside the old one.
+    pub fn without_lenses(&self) -> Self {
+        let mut next = self.clone();
+        next.recent = false;
+        next.untagged = false;
         next.page = 1;
         next
     }
@@ -1207,6 +1222,27 @@ mod tests {
         assert!(params.tags.is_empty());
         assert!(params.q.is_none());
         assert_eq!(params.to_query_string(), "size=l&recent=1");
+    }
+
+    /// W78 B1: the range a Views row links into is the view with both lenses off
+    /// — every filter kept, the sort and its direction and the tile size kept,
+    /// and only the page put back, because a lens is read from its first page.
+    #[test]
+    fn taking_both_lenses_off_keeps_every_filter_and_the_order() {
+        let params = ViewParams::parse(
+            "in=refs&sub=0&c=browse.md&tag=eagle&q=street&sort=size&dir=asc&p=4&size=l&recent=1",
+        );
+        assert_eq!(
+            params.without_lenses().to_query_string(),
+            "in=refs&sub=0&c=browse.md&tag=eagle&q=street&sort=size&dir=asc&size=l"
+        );
+        // Untagged goes the same way: off with the other lens, nothing else lost.
+        let untagged = ViewParams::parse("tag=eagle&untagged=1&recent=1&p=2");
+        assert_eq!(
+            untagged.without_lenses().to_url("/"),
+            "/?tag=eagle",
+            "the two lenses are taken off together, so one row can swap them"
+        );
     }
 
     #[test]

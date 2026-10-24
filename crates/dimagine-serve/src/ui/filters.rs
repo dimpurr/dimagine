@@ -12,9 +12,10 @@
 //!
 //! Three rules hold across all four groups:
 //!
-//! · Every row is a link to the same view with that one filter toggled, on or
-//!   off. The panel therefore works with scripting off, and every row a reader
-//!   can use is a real tab stop.
+//! · Every row is a link to the same view with that one filter changed: the
+//!   facet rows toggle theirs on or off, and the two Views rows set theirs and
+//!   take the other lens off (W78 B3). The panel therefore works with scripting
+//!   off, and every row a reader can use is a real tab stop.
 //! · A value whose count is zero is dimmed and is *not* a link. Its own number
 //!   already says what clicking it would produce — the empty view — so offering
 //!   it would only offer a dead end. This is the one convention, applied the same
@@ -63,8 +64,9 @@ struct Row {
     count: u64,
     /// Whether this filter is on right now.
     active: bool,
-    /// The same view with this one filter toggled. Empty for a row that cannot
-    /// be clicked, which is only ever the dimmed zero-count row.
+    /// The view this row opens: the same view with this one filter toggled, or
+    /// the range on screen with this lens set. Empty for a row that cannot be
+    /// clicked, which is only ever the dimmed zero-count row.
     href: String,
 }
 
@@ -153,25 +155,29 @@ pub fn filter_panel(sidebar: &SidebarData, counts: &FacetCounts, params: &ViewPa
     )
 }
 
-/// The two lenses. They are the viewer's other two filters, and the reason they
-/// belong in the panel rather than only in the sidebar is that they combine: the
-/// newest 200 *of what is on screen* is a different, and more useful, question
-/// than the newest 200 of everything.
+/// The two lenses are the sidebar's Views rows in the drawer's shape (W78 B3):
+/// one range — the filters on screen, with neither lens over them — read one
+/// lens at a time. Their links carry every filter and swap only the lens, so the
+/// two are a choice between them rather than a stack; a hand-typed URL asking for
+/// both still works. Each number is the total of the page its own row opens: the
+/// window the `Recent` label names, and the images in the range that carry no
+/// tag.
 fn lens_rows(counts: &FacetCounts, params: &ViewParams) -> Vec<Row> {
+    let range = params.without_lenses();
     vec![
         Row {
             label: "Recent".to_owned(),
             tooltip: recent_label(),
             count: counts.recent,
             active: params.recent,
-            href: params.with_recent(!params.recent).to_url("/"),
+            href: range.with_recent(true).to_url("/"),
         },
         Row {
             label: "Untagged".to_owned(),
             tooltip: "Untagged".to_owned(),
             count: counts.untagged,
             active: params.untagged,
-            href: params.with_untagged(!params.untagged).to_url("/"),
+            href: range.with_untagged(true).to_url("/"),
         },
     ]
 }
@@ -499,6 +505,34 @@ mod tests {
         ));
         assert!(panel.contains(">Recent</span><span class=\"filter-row-count\">12</span>"));
         assert!(panel.contains(">Guide</span><span class=\"filter-row-count\">4</span>"));
+    }
+
+    /// W78 B3: the drawer's two Views rows follow the sidebar's rule. They carry
+    /// every filter on screen, they swap the lens instead of stacking a second
+    /// one, and a row that is already on links to the page it counts rather than
+    /// to the view without it.
+    #[test]
+    fn the_views_rows_in_the_drawer_choose_one_lens_over_the_same_range() {
+        let panel = panel_of(&ViewParams::parse("in=refs&tag=ui&recent=1&p=3"));
+        for href in [
+            "href=\"/?in=refs&amp;tag=ui&amp;recent=1\"",
+            "href=\"/?in=refs&amp;tag=ui&amp;untagged=1\"",
+        ] {
+            assert!(panel.contains(href), "{href} missing from {panel}");
+        }
+        assert!(
+            !panel.contains("untagged=1&amp;recent=1"),
+            "the two lenses are a choice, never a stack: {panel}"
+        );
+
+        // The lens that is on is a row like any other: its link is the page its
+        // own number counts, not the view that lets the lens go.
+        let untagged = panel_of(&ViewParams::parse("untagged=1"));
+        assert!(
+            untagged.contains("href=\"/?untagged=1\" aria-current=\"true\""),
+            "the row on links to where the reader is: {untagged}"
+        );
+        assert!(untagged.contains("href=\"/?recent=1\""), "{untagged}");
     }
 
     #[test]

@@ -794,10 +794,11 @@ pub enum RecentWindow {
     /// The lens is off, so only the Recent row looks inside the window: it says
     /// what clicking it would narrow the view to.
     Off { limit: u64 },
-    /// The lens is on, so every facet's count is capped at the window:
-    /// the grid the lens shows stops at the newest `limit` images of
-    /// the set on screen, and a count beside it never promises more
-    /// than the grid can show.
+    /// The lens is on, so every facet's count of the view it narrows is capped
+    /// at the window: the grid the lens shows stops at the newest `limit`
+    /// images of the set on screen, and a count beside it never promises more
+    /// than the grid can show. A row that links out of the lens is not capped
+    /// by it — see [`Index::view_facet_counts`].
     On { limit: u64 },
 }
 
@@ -820,9 +821,9 @@ impl RecentWindow {
 /// among those images — that is zero, a fact, and not an unknown.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FacetCounts {
-    /// Images the current filters leave, with no facet stepping out and the
-    /// Recent lens not narrowing it: the "how many in the current range" a
-    /// sidebar Views row shows beside a filter, before the window cap below.
+    /// The range the three Views rows count: the filters on screen with neither
+    /// lens laid over them, so this is the size of the page `All` opens and the
+    /// base the Recent row caps below.
     pub total: u64,
     /// Tag, in the index's folded spelling, to images carrying it.
     pub tags: BTreeMap<String, u64>,
@@ -834,9 +835,11 @@ pub struct FacetCounts {
     pub folders: BTreeMap<String, u64>,
     /// Collection note path to the members of it that remain.
     pub collections: BTreeMap<String, u64>,
-    /// Images that carry no tag.
+    /// Images in [`FacetCounts::total`]'s range that carry no tag: the size of
+    /// the page the `Untagged` row opens.
     pub untagged: u64,
-    /// Images the Recent window reaches.
+    /// Images the Recent window reaches inside [`FacetCounts::total`]'s range:
+    /// the size of the page the `Recent` row opens.
     pub recent: u64,
 }
 
@@ -850,13 +853,18 @@ impl Index {
     ///
     /// The Recent lens cannot ride in a [`ViewQuery`] — a window is not
     /// a filter — so `recent` states it. The lens caps what the grid
-    /// shows: its pages stop at the newest `limit` images of the set
-    /// on screen, never at the library's newest `limit`, so every count
-    /// beside the lens is capped at `limit` too. Capping — not cutting
-    /// the counts to the library-wide window — is what makes a count
-    /// say what its own row's link shows on any library the filters
-    /// narrow: a filter whose images are all older than the window
-    /// counts what it leaves, not a phantom zero.
+    /// shows: its pages stop at the newest `limit` images of the set on
+    /// screen, never at the library's newest `limit`, so every facet
+    /// count beside the lens is capped at `limit` too. Capping — not
+    /// cutting the counts to the library-wide window — is what makes a
+    /// count say what its own row's link shows on any library the
+    /// filters narrow: a filter whose images are all older than the
+    /// window counts what it leaves, not a phantom zero.
+    ///
+    /// The three Views rows are the exception, because they are not facets of
+    /// the lens but ways out of it: each links to the same filters without it,
+    /// and their counts ([`FacetCounts`]'s `total`, `recent` and `untagged`)
+    /// are the totals of those pages, uncapped (W78 B).
     pub fn view_facet_counts(
         &self,
         view: &ViewQuery,
@@ -907,33 +915,35 @@ impl Index {
         // the view's own untagged lens has to step out of first.
         let mut untagged = facet_sql(view, Facet::Untagged);
         untagged.and("NOT EXISTS(SELECT 1 FROM note_tags WHERE note_tags.image_path=f.path)");
-        let mut untagged = facet_count(conn, &untagged)?;
+        let untagged = facet_count(conn, &untagged)?;
 
-        // The Recent row counts what the lens would leave of the other
-        // filters, capped at the window whether the lens is on or off:
-        // the window is what that row names, and the lens can never
-        // show more than it.
-        let recent_sql = view_sql(&{
-            let mut whole = view.clone();
-            whole.offset = 0;
-            whole.limit = 0;
-            whole
+        // The range the three Views rows count: the filters on screen with
+        // neither lens laid over them. `untagged` steps out because a Views row
+        // links to the same range without it (W78 B1), and the window steps out
+        // with the page and the order a count never uses.
+        let range_sql = view_sql(&{
+            let mut range = view.clone();
+            range.untagged = false;
+            range.offset = 0;
+            range.limit = 0;
+            range
         });
-        // The full filtered set, with no facet stepping out: the "All" row's
-        // scoped number, and the unwindowed base the Recent row caps.
-        let filtered = facet_count(conn, &recent_sql)?;
-        let recent = filtered.min(window);
-        let mut total = filtered;
+        // The size of that range: the "All" row's number, and the unwindowed
+        // base the "Recent" row caps — each Views row's number is the total of
+        // the page its own link opens (W78 B2).
+        let total = facet_count(conn, &range_sql)?;
+        let recent = total.min(window);
 
         if lens_on {
-            // The lens is on, so the grid stops at the newest `window`
-            // images of the set on screen: every count beside it stops
-            // there too, or it would promise images the grid cannot show.
+            // The lens is on, so the grid stops at the newest `window` images
+            // of the set on screen: every facet count stops there too, or it
+            // would promise images the grid cannot show. The three Views rows
+            // are not facets of the lens — each links out of it, to a page with
+            // no window — so `total`, `recent` and `untagged` keep their own
+            // shape above (W78 B2).
             cap_counts(&mut tags, window);
             cap_counts(&mut folders, window);
             cap_counts(&mut collections, window);
-            untagged = untagged.min(window);
-            total = total.min(window);
         }
 
         Ok(FacetCounts {
@@ -3472,6 +3482,7 @@ mod tests {
             "dupe.md embeds b twice and still counts it once; a.png's own note \
              is a collection of c alone, not of a"
         );
+        assert_eq!(counts.total, 5);
         assert_eq!(counts.untagged, 1);
         assert_eq!(counts.recent, 3);
     }
@@ -3551,7 +3562,10 @@ mod tests {
 
     /// A third filter is on as well, and it is the one no tag can express:
     /// `untagged` beside `red` leaves nothing, and every facet says zero rather
-    /// than pretending otherwise.
+    /// than pretending otherwise. The two Views numbers that count the range
+    /// *without* that lens say what the lens lets go of instead — the page
+    /// `All` and the page `Recent` open are the `red` images in `refs`, and
+    /// those exist (W78 B).
     #[test]
     fn a_filter_that_leaves_nothing_leaves_every_facet_at_zero() {
         let (_dir, index) = facet_library();
@@ -3568,7 +3582,8 @@ mod tests {
         assert!(counts.folders.is_empty(), "{:?}", counts.folders);
         assert!(counts.collections.is_empty(), "{:?}", counts.collections);
         assert_eq!(counts.untagged, 0);
-        assert_eq!(counts.recent, 0);
+        // `a.png` and `b.png`: what the untagged lens, let go of, leaves.
+        assert_eq!((counts.total, counts.recent), (2, 2));
 
         // The untagged facet is the exception that proves the rule: with only
         // `untagged` on it counts the images no tag touches.
@@ -3628,6 +3643,42 @@ mod tests {
              and `refs/ui` keeps both of its own"
         );
         assert_eq!(all.recent, 3);
+    }
+
+    /// W78 B: the three Views numbers are the totals of the three pages their
+    /// own rows open — one range, counted with neither lens over it, uncapped.
+    /// With the lens on the grid stops at the window and the facet rows stop
+    /// with it; a Views row links out of the lens, to a page that has no window,
+    /// so its number has none either.
+    #[test]
+    fn the_views_numbers_count_the_range_the_lens_is_taken_off() {
+        let (_dir, index) = facet_library();
+        let view = ViewQuery {
+            untagged: true,
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::On { limit: 3 })
+            .unwrap();
+
+        // Five images in the library, one of them untagged, the window three.
+        assert_eq!(counts.total, 5, "the page `All` opens holds all five");
+        assert_eq!(counts.recent, 3, "the page `Recent` opens is that window");
+        assert_eq!(
+            counts.untagged, 1,
+            "the page `Untagged` opens is that image"
+        );
+
+        // The window still caps a facet of the view the lens narrows.
+        let scoped = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            (scoped.total, scoped.folders["refs"], scoped.recent),
+            (5, 3, 3),
+            "the `refs` row counts the window the grid shows, the `All` row \
+             counts the five images its own page holds"
+        );
     }
 
     /// The window is the newest N rows in the grid's own order (the path

@@ -439,6 +439,19 @@ All notable changes to this project are documented here. The format follows
   longer mixes two different populations.
 
 ### Changed
+- Viewer: the sidebar's Views group (All / Recent / Untagged) is now a single
+  choice over the range the filters leave. Its rows keep every filter on screen —
+  the folder, the tags, the search, the sort, the tile size — and change only the
+  lens, so clicking a row no longer drops you back to the whole library; and the
+  number beside each row is the total of the page that row opens. `All` counts
+  the whole range with no cap, `Recent` the newest 200 of it and `Untagged` the
+  images in it that carry no tag, so a row cannot promise a page smaller than the
+  one it links to (the Recent window capped all three before, and `All` beside a
+  lens said 200 for a page holding 2,584). The phone's filter drawer follows the
+  same rule, which makes its two lens rows a choice between them instead of a
+  stack — a URL asking for both still works, and `Clear all filters` and the
+  chips are unchanged. Folders, Collections and Tags keep counting the view on
+  screen inside the window, as their rows stay inside it.
 - Library format `docs/FORMAT.md` is now version **0.2** (its changelog records
   the bump): the whole 3b write contract has landed, so the minor version the
   ADR promised is owed. A short **Writing** index section maps each writing

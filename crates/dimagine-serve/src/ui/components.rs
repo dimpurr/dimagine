@@ -1029,10 +1029,14 @@ pub fn tag_row(tag: &str, count: u64) -> String {
 /// count), and beside a filter the count of what each value would add to the view
 /// on screen — the same number the phone's filter drawer shows. A value that
 /// would add nothing (a scoped count of zero) is dimmed and offers no `+`; the
-/// value already chosen is never dimmed. The Views group (All/Recent/Untagged)
-/// counts the current range beside a filter too — the scoped total, recent and
-/// untagged from the same [`FacetCounts`], each capped at the Recent window —
-/// so one screen never shows two number meanings side by side (W76 D1).
+/// value already chosen is never dimmed.
+///
+/// The Views group is a single choice over the range the filters leave, not a
+/// facet of the view on screen: its three links carry the filters and swap only
+/// the lens, and each number is the total of the page that link opens (W78 B).
+/// Those three numbers come from the same [`FacetCounts`] and never from the
+/// Recent window's cap, which stops the facet rows below instead — so one screen
+/// still carries one meaning for a number (W76 D1, W78 judgment 2).
 pub fn sidebar_sections(
     data: &SidebarData,
     params: &ViewParams,
@@ -1044,17 +1048,23 @@ pub fn sidebar_sections(
     out.push_str(
         "<section class=\"sidebar-section\"><h2 class=\"sidebar-section-title\">Views</h2>",
     );
-    // Beside a filter the Views rows count the current range, not the whole
-    // library — the same scoped numbers the phone's filter drawer shows, so one
-    // screen no longer carries two number meanings side by side (W76 D1). The
-    // recent window caps all three, so no row promises more than the grid.
+    // The Views group is one choice over one range (W78 B): the three rows keep
+    // every filter on screen and swap only the lens, so a row can be read
+    // without losing the view the reader narrowed. Each row's number is the
+    // total of the page that row opens — `All` the whole range with neither lens
+    // on it, `Recent` the newest RECENT_LIMIT of it, `Untagged` the images in it
+    // that carry no tag — so a number never promises fewer images than its own
+    // page holds (W76 D1's one meaning per screen, kept). The facet groups below
+    // keep the Recent window's cap: their rows stay inside the lens, where the
+    // grid cannot show more than the window.
+    let range = params.without_lenses();
     let (all, recent, untagged) = match facets {
         Some(counts) => (counts.total, counts.recent, counts.untagged),
         None => (data.total, data.recent, data.untagged),
     };
-    out.push_str(&sidebar_row("/", "All", all, is_all(params)));
+    out.push_str(&sidebar_row(&range.to_url("/"), "All", all, is_all(params)));
     out.push_str(&sidebar_row(
-        "/?recent=1",
+        &range.with_recent(true).to_url("/"),
         // The label states the definition — "the last 200 added" — so the
         // row can no longer read as a smaller "All" (W34 audit #10).
         &recent_label(),
@@ -1062,7 +1072,7 @@ pub fn sidebar_sections(
         params.recent,
     ));
     out.push_str(&sidebar_row(
-        "/?untagged=1",
+        &range.with_untagged(true).to_url("/"),
         "Untagged",
         untagged,
         params.untagged,
@@ -1696,6 +1706,107 @@ mod tests {
         assert!(!plain.contains("sidebar-stack"), "{plain}");
         assert!(!plain.contains("is-dimmed"), "{plain}");
         assert!(plain.contains(">tag-00</span><span class=\"sidebar-row-count\">100"));
+    }
+
+    /// The three Views rows as `(label, href, count)`, in the sidebar's order.
+    fn views_rows(html: &str) -> Vec<(String, String, u64)> {
+        let section = html
+            .split("<h2 class=\"sidebar-section-title\">Views</h2>")
+            .nth(1)
+            .expect("a Views section")
+            .split("</section>")
+            .next()
+            .expect("a closed section")
+            .to_owned();
+        section
+            .split("<a class=\"sidebar-row")
+            .skip(1)
+            .map(|cell| {
+                let cell = &cell[..cell.find("</a>").expect("a closed row")];
+                let cut = |marker: &str| {
+                    cell[cell.find(marker).unwrap() + marker.len()..]
+                        .split(['"', '<'])
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                };
+                (
+                    cut("sidebar-row-label\">"),
+                    cut("href=\"").replace("&amp;", "&"),
+                    cut("sidebar-row-count\">").parse().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// W78 B1 + B2: beside a filter with the Recent lens on, the three Views
+    /// rows keep every filter, the order and the tile size, and change only the
+    /// lens — and each number is the total of the page that row opens. `All` is
+    /// the whole range uncapped (the 200-image window belongs to the Recent row
+    /// alone), so the row no longer promises a page smaller than it is.
+    #[test]
+    fn the_views_rows_keep_the_filters_and_promise_their_own_page() {
+        let facets = FacetCounts {
+            total: 2584,
+            tags: std::collections::BTreeMap::from([("tag-00".to_owned(), 2584u64)]),
+            folders: std::collections::BTreeMap::new(),
+            collections: std::collections::BTreeMap::new(),
+            untagged: 12,
+            recent: 200,
+        };
+        let params = ViewParams::parse("tag=tag-00&size=l&sort=size&dir=asc&p=4&recent=1");
+        let html = sidebar_sections(&sidebar(), &params, None, Some(&facets));
+        assert_eq!(
+            views_rows(&html),
+            vec![
+                (
+                    "All".to_owned(),
+                    "/?tag=tag-00&sort=size&dir=asc&size=l".to_owned(),
+                    2584
+                ),
+                (
+                    recent_label(),
+                    "/?tag=tag-00&sort=size&dir=asc&size=l&recent=1".to_owned(),
+                    200
+                ),
+                (
+                    "Untagged".to_owned(),
+                    "/?tag=tag-00&sort=size&dir=asc&size=l&untagged=1".to_owned(),
+                    12
+                ),
+            ],
+            "{html}"
+        );
+    }
+
+    /// The three rows are a single choice: from one lens, a row goes to its own
+    /// lens over the same range and never stacks the two — and the page it opens
+    /// is the page its number counts.
+    #[test]
+    fn a_views_row_swaps_the_lens_instead_of_stacking_it() {
+        let facets = FacetCounts {
+            total: 900,
+            tags: std::collections::BTreeMap::new(),
+            folders: std::collections::BTreeMap::new(),
+            collections: std::collections::BTreeMap::new(),
+            untagged: 90,
+            recent: 200,
+        };
+        let html = sidebar_sections(
+            &sidebar(),
+            &ViewParams::parse("untagged=1&in=refs"),
+            None,
+            Some(&facets),
+        );
+        assert_eq!(
+            views_rows(&html),
+            vec![
+                ("All".to_owned(), "/?in=refs".to_owned(), 900),
+                (recent_label(), "/?in=refs&recent=1".to_owned(), 200),
+                ("Untagged".to_owned(), "/?in=refs&untagged=1".to_owned(), 90),
+            ],
+            "{html}"
+        );
     }
 
     #[test]

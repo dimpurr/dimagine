@@ -2687,6 +2687,135 @@ async fn view_total(app: &axum::Router, href: &str, cookie: &str) -> u64 {
     json(app, &uri, cookie).await["total"].as_u64().unwrap()
 }
 
+/// The sidebar's three Views rows as `(label, href, count)`, in the order the
+/// section puts them. This is the group W78 made a single choice over the range
+/// the filters leave, and the one whose promise is read here off the href rather
+/// than off the panel's convention.
+fn views_rows(html: &str) -> Vec<(String, String, u64)> {
+    let section = html
+        .split("<h2 class=\"sidebar-section-title\">Views</h2>")
+        .nth(1)
+        .expect("the sidebar carries a Views section")
+        .split("</section>")
+        .next()
+        .expect("a closed section")
+        .to_owned();
+    section
+        .split("<a class=\"sidebar-row")
+        .skip(1)
+        .map(|cell| {
+            let cell = &cell[..cell.find("</a>").expect("a closed row")];
+            let cut = |marker: &str| {
+                cell[cell.find(marker).unwrap() + marker.len()..]
+                    .split(['"', '<'])
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            };
+            (
+                cut("sidebar-row-label\">"),
+                cut("href=\"").replace("&amp;", "&"),
+                cut("sidebar-row-count\">").parse().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// W78 B, read off a real index on a library larger than the Recent window: the
+/// number beside each Views row is the total of the page that row's own link
+/// opens — `All` counting the whole range uncapped, where the grid the lens shows
+/// stops at 200 — and the link carries the filters on screen, changing the lens
+/// and nothing else.
+#[tokio::test]
+async fn every_views_row_promise_is_the_page_the_click_opens() {
+    let dir = window_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    for uri in [
+        "/",
+        "/?recent=1",
+        "/?untagged=1",
+        "/?recent=1&untagged=1",
+        "/?recent=1&tag=newtag",
+        "/?recent=1&tag=oldtag",
+        "/?in=refs&sub=0&recent=1",
+        "/?c=album.md&untagged=1",
+    ] {
+        for (label, href, count) in views_rows(&text(&app, uri, &cookie).await) {
+            let holds = view_total(&app, &href, &cookie).await;
+            assert_eq!(
+                count, holds,
+                "on {uri} the {label} row promises {count} and {href} holds {holds}"
+            );
+        }
+    }
+
+    // 210 images, and the row beside the link to all of them says 210 even while
+    // the grid on screen is the 200 the window reaches (W77 F3's cap is gone).
+    let recent = views_rows(&text(&app, "/?recent=1", &cookie).await);
+    assert_eq!(
+        recent,
+        vec![
+            ("All".into(), "/".into(), 210),
+            ("Recent — last 200 added".into(), "/?recent=1".into(), 200),
+            ("Untagged".into(), "/?untagged=1".into(), 190),
+        ],
+        "{recent:?}"
+    );
+
+    // The filter rides along with the lens.
+    let tagged = views_rows(&text(&app, "/?recent=1&tag=oldtag", &cookie).await);
+    assert_eq!(
+        tagged
+            .iter()
+            .map(|(_, href, _)| href.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            "/?tag=oldtag",
+            "/?tag=oldtag&recent=1",
+            "/?tag=oldtag&untagged=1"
+        ],
+        "clicking a Views row changes the lens and lets the tag go nowhere: {tagged:?}"
+    );
+    assert_eq!(
+        tagged
+            .iter()
+            .map(|(_, _, count)| *count)
+            .collect::<Vec<_>>(),
+        vec![10, 10, 0],
+        "the ten old images, the same ten inside the window, and none of them \
+         untagged: {tagged:?}"
+    );
+}
+
+/// W78's no-filter regression guard: with nothing on screen the Views section is
+/// the markup it always was, byte for byte — the same three links, the same
+/// numbers, the same row marked active. These are the bytes the page rendered
+/// before the change.
+#[tokio::test]
+async fn an_unfiltered_views_section_is_the_markup_it_always_was() {
+    let dir = library();
+    let (app, cookie) = login(app(&dir)).await;
+    let html = text(&app, "/", &cookie).await;
+    assert!(
+        html.contains(
+            "<section class=\"sidebar-section\"><h2 class=\"sidebar-section-title\">Views</h2>\
+             <a class=\"sidebar-row active\" href=\"/\" title=\"All\">\
+             <span class=\"sidebar-row-label\">All</span><span class=\"sidebar-row-count\">4\
+             </span><span class=\"sidebar-tip\" aria-hidden=\"true\">All</span></a>\
+             <a class=\"sidebar-row\" href=\"/?recent=1\" title=\"Recent — last 200 added\">\
+             <span class=\"sidebar-row-label\">Recent — last 200 added</span>\
+             <span class=\"sidebar-row-count\">4</span>\
+             <span class=\"sidebar-tip\" aria-hidden=\"true\">Recent — last 200 added</span></a>\
+             <a class=\"sidebar-row\" href=\"/?untagged=1\" title=\"Untagged\">\
+             <span class=\"sidebar-row-label\">Untagged</span>\
+             <span class=\"sidebar-row-count\">2</span>\
+             <span class=\"sidebar-tip\" aria-hidden=\"true\">Untagged</span></a></section>"
+        ),
+        "{html}"
+    );
+}
+
 /// The strongest thing that can be said about a facet count: it is the
 /// number of images the page it links to actually holds. Checked for
 /// every row of every group, on views with no filters, one, and two —
@@ -2701,6 +2830,11 @@ async fn view_total(app: &axum::Router, href: &str, cookie: &str) -> u64 {
 /// other filters — which is the same number in every group: the row's
 /// link is the way out, and the number beside a way-out row says where
 /// the reader is, not where the link goes.
+///
+/// The Views group is the exception in both of its two mounts, and needs no
+/// exception of its own: its rows choose a lens over the range the filters
+/// leave, so the row that is on links to the page it already shows and every
+/// number counts the page beside it (W78 B).
 #[tokio::test]
 async fn every_panel_number_is_the_total_of_the_view_its_row_promises() {
     for (dir, views) in [
@@ -2756,18 +2890,12 @@ async fn every_panel_number_is_the_total_of_the_view_its_row_promises() {
             let mut seen = 0;
             for (group, rows) in panel_groups(&html) {
                 for row in rows {
-                    match (row.active, row.href.as_deref()) {
-                        (true, _) => assert_eq!(
-                            row.count, on_screen,
-                            "on {uri} the {group} row {row:?} is on, \
-                             and the view on screen holds {on_screen}"
-                        ),
-                        // A dimmed row promises the empty view, and
-                        // says so as a number rather than a link.
-                        (false, None) => {
-                            assert_eq!(row.count, 0, "on {uri}: {row:?} in {group}")
-                        }
-                        (false, Some(href)) => {
+                    match (group.as_str(), row.active, row.href.as_deref()) {
+                        // A Views row sets its lens over the range the filters
+                        // leave instead of toggling it on the view on screen, so
+                        // its number counts the page its own link opens even
+                        // when that lens is the one already on (W78 B).
+                        ("Views", _, Some(href)) | (_, false, Some(href)) => {
                             let total = view_total(&app, href, &cookie).await;
                             assert_eq!(
                                 row.count, total,
@@ -2776,6 +2904,16 @@ async fn every_panel_number_is_the_total_of_the_view_its_row_promises() {
                                 row.count
                             );
                         }
+                        // A dimmed row promises the empty view, and
+                        // says so as a number rather than a link.
+                        (_, false, None) => {
+                            assert_eq!(row.count, 0, "on {uri}: {row:?} in {group}")
+                        }
+                        (_, true, _) => assert_eq!(
+                            row.count, on_screen,
+                            "on {uri} the {group} row {row:?} is on, \
+                             and the view on screen holds {on_screen}"
+                        ),
                     }
                     seen += 1;
                     compared += 1;
@@ -2998,9 +3136,13 @@ async fn the_panel_reads_the_library_and_narrows_as_the_filters_go_on() {
             ("ui".into(), 0, "dim"),
         ]
     );
+    // W78 B: the Views rows are a single choice over the range the filters
+    // leave, so with `untagged` on the `Recent` row says what *its* page holds —
+    // the four images of the library, the lens swapped for the recent one — and
+    // not what the current stack of both lenses holds.
     assert_eq!(
         sorted_shapes(&untagged, "Views"),
-        vec![("Recent".into(), 2, "link"), ("Untagged".into(), 2, "on")]
+        vec![("Recent".into(), 4, "link"), ("Untagged".into(), 2, "on")]
     );
 
     // A collection narrows the other groups to its members: `ui` (button.png) is
