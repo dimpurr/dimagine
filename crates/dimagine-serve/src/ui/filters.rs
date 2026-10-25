@@ -463,6 +463,7 @@ mod tests {
             collections: map(&[("guide.md", 4)]),
             untagged: 2,
             recent: 12,
+            ..FacetCounts::default()
         }
     }
 

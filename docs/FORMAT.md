@@ -560,6 +560,48 @@ A command that changes a file prints the id of the operation it made, which is
 what `undo` takes; `--json` prints one document per command carrying the same
 id. `purge` and `empty` delete for good, so each needs an explicit `--yes`.
 
+## Viewer queries
+
+The web viewer and its JSON API select images by URL query strings. What a
+query *means* is part of this contract — two tools answering the same URL must
+show the same images — while how a tool stores the facts it filters on is its
+own business.
+
+| Param | Values | Default |
+| --- | --- | --- |
+| `in` | library-relative folder path | (all folders) |
+| `sub` | `0` / `1`, include subfolders | `1` |
+| `c` | collection note path (§5) | — |
+| `sel` | library-relative image path (the picked-out photo) | — |
+| `tag` | repeatable, AND | — |
+| `q` | full-text query over note text, titles and tags | — |
+| `rating` | `1`–`5`, or `unrated` | — |
+| `type` | `jpg` (also `jpeg`), `png`, `gif`, `webp`, `avif`, `heic`, `svg`, `other` | — |
+| `sort` | `added`, `taken`, `modified`, `name`, `size`, `rating` | `added` |
+| `dir` | `asc`, `desc` | `desc`, `asc` for `name` |
+| `size` | `s`, `m`, `l` (thumbnail size) | `m` |
+| `p` | page number, 120 items per page | `1` |
+| `untagged` | `0` / `1` — only images whose note carries no tag | `0` |
+| `recent` | `0` / `1` — the most recently added images | `0` |
+| `more` | `tags`, `folders`, `collections` (show a facet list whole) | — |
+
+An unknown or malformed value is ignored and reported as a notice beside the
+grid; it never breaks the page. Generated URLs carry only the values that
+differ from the defaults, and one spelling each.
+
+**`rating`** is one chip at a time. `1`–`5` are the `≥N` chips: only images
+whose rating is at least `N`. A missing `rating` and a `0` are not ratings
+(§3.1), so no threshold shows them: `rating=unrated` — spelled `0` in a
+hand-typed URL, which reads back as `unrated` — lists those and only those. A
+threshold and the unrated chip never ride together.
+
+**`type`** is one family at a time, read from the path's extension and never
+from the bytes. `jpg` covers both `jpg` and `jpeg`; the next six name
+themselves; `other` is every extension those seven do not name — §2.1's `heif`,
+`tif`, `tiff`, `bmp` and the rest. `svg` is a family the chips offer, and §2.1
+admits no svg as an image, so an ordinary library shows nothing under it. The
+match is case-insensitive.
+
 ## 10. Versioning
 
 This document carries the format version. Libraries do not record a version;
@@ -586,3 +628,4 @@ cannot keep that promise will describe a migration.
 | 0.1 | 2026-10-17 | Upload (§7.2): placement is a named folder, else the default upload folder — `attachmentFolderPath`, else `inbox/` — plus a plain join when the upload names a collection; naming keeps a meaningful name and renames a meaningless camera, screenshot or share name to `Upload <YYYYMMDDHHMMSS>.<ext>` with the original kept in `title` (§3.1) and `sources` (§3.4), taking ` 2` on a library-wide NFC, case-insensitive collision; the bytes must match the extension, with SVG, HTML and XML refused on both sides; identical bytes already in the library (outside `.trash/`) are not copied again; a new image lands with a note carrying `id` (§3.3), `added`, `imported` and the upload `sources` entry (§3.4). `dimagine upload` joins the CLI (§9). |
 | 0.2 | 2026-10-19 | Minor bump for the write contract (ADR-017 §12). Every 3b write operation now lands — whole-body edit, member-block reorder, caption edit, upload and the collection join. A new "Writing" index (before §8) maps each writing rule to the section that owns it, so the contract is reachable without a rule living in two places. |
 | 0.2 | 2026-10-20 | Near-duplicate merge (§7.3): `dimagine merge <keep> <drop>` folds one image's provenance into another and moves the loser's whole group into `.trash/` as one undoable op — tags unioned, earliest `added`, a `type: merged` entry plus the drop's own `sources` appended to the keep's `sources` (§3.4) without touching the keep's own `source`, a noteless keep gaining a note with a fresh `id` (§3.3), and links that named the drop repointed to the keep by the move rule (§7); `--auto` keeps the file with more pixels, then a lossless format, then a larger file, then the lexicographically later library path; a note too large to read refuses the merge rather than reading as absent. `dimagine check near_duplicate` reports same-picture images from a stored fingerprint, read-only. Both join the CLI (§9). |
+| 0.2 | 2026-10-25 | The viewer's URL queries join the contract (Viewer queries): `rating` is one `≥N` threshold chip or the unrated chip — a missing `rating` and a `0` are unrated (§3.1), so no threshold shows them — and `type` is one extension family read off the path (§2.1). |

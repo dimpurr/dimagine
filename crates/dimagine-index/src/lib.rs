@@ -19,8 +19,9 @@ use unicode_normalization::UnicodeNormalization;
 pub use rusqlite::Connection;
 pub use view::{
     collection_is_listed, collections, folder_counts, note_is_collection, note_rating, tag_counts,
-    view_total, AppearsIn, CollectionEvidence, CollectionInfo, FacetCounts, ImageMetaStats,
-    Neighbours, Reader, RecentWindow, SortKey, ViewItem, ViewPage, ViewQuery,
+    view_total, AppearsIn, CollectionEvidence, CollectionInfo, FacetCounts, FileTypeFamily,
+    ImageMetaStats, Neighbours, RatingFilter, Reader, RecentWindow, SortKey, ViewItem, ViewPage,
+    ViewQuery,
 };
 
 const SCHEMA_VERSION: i64 = 8;

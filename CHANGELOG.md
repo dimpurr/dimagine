@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Rating and file-type chips (W80): the search box's chips menu — beside the
+  chips the scope already carries — now filters the grid by rating and by file
+  type. The rating chips are the `≥1`…`≥5` thresholds and one Unrated chip: a
+  threshold never shows an image with no rating or a `0` (both are unrated),
+  and the Unrated chip lists exactly those. The type chips are the path's
+  extension families — `jpg` (including `jpeg`), `png`, `gif`, `webp`, `avif`,
+  `heic`, `svg` and `other` — read off the file name, never the bytes. One
+  chip per group; each active chip is removable with its ✕ like every other
+  chip, every state is a URL, and the menu opens and closes with scripting
+  off. With the Recent or Untagged lens on, the new counts follow the same
+  rule as every other facet.
 - Near-duplicate merge (W77): `dimagine check near_duplicate` reports images that
   are the same picture at different sizes. It reads a 64-bit perceptual hash and a
   small grayscale signature that `dimagine previews` now stores alongside each

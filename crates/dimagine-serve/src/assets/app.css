@@ -3325,3 +3325,92 @@ a.filter-row:active {
     bottom: env(safe-area-inset-bottom, 0px);
   }
 }
+
+/* === W80: the search box's chips menu ===
+
+   The rating and file-type filters have no sidebar row (W76 §2), so they
+   live in the chips menu beside the chips the scope already carries. The
+   menu is a `<details>`: it opens and closes with scripting off the way the
+   filter fold does, its rows are plain links, and every state is a URL.
+   Appended last, as the blocks before it were, so its rules win over the
+   sections it extends. */
+
+.chip-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.chip-menu-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 26px;
+  padding: 2px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--text-sm);
+  list-style: none;
+  user-select: none;
+}
+
+.chip-menu-summary::-webkit-details-marker {
+  display: none;
+}
+
+.chip-menu-summary:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip-menu-summary .chip-kind {
+  width: 12px;
+  height: 12px;
+}
+
+.chip-menu-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 184px;
+  padding: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--elev-1);
+}
+
+.chip-menu-title {
+  margin: 6px 8px 2px;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.chip-menu-row {
+  display: flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 4px 8px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: var(--text-sm);
+  text-decoration: none;
+}
+
+.chip-menu-row:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* The chip the row would set is already on: the row says so, and its link
+   takes the chip away again (the toggle needs no script). */
+.chip-menu-row.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}

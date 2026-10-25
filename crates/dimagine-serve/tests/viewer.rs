@@ -3640,3 +3640,117 @@ async fn a_tile_the_script_appends_is_marked_the_way_a_rendered_tile_is() {
         "the script writes the server's own sentence, not a second wording"
     );
 }
+
+/// W80: one image of every file-type family the scan admits — `jpg` spelled
+/// both ways, `heic` uppercase — with ratings from five down to missing and a
+/// `0` among them, and the traps a suffix rule survives inside the eleven
+/// image extensions (FORMAT §2.1): `heif` is not the `heic` family (only
+/// `jpeg` folds into `jpg`), `bmp` is `other`, and a folder named `dir.png`
+/// makes none of its members a png. `svg` is a family the filter names, but
+/// §2.1 admits no svg as an image, so its grid is honest-empty here.
+fn rating_type_library() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let write = |rel: &str, rating: Option<u8>| {
+        let path = root.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, PNG_BYTES).unwrap();
+        let note = match rating {
+            Some(value) => format!("---\ntitle: {rel}\nrating: {value}\n---\n![[{rel}]]\n"),
+            None => format!("---\ntitle: {rel}\n---\n![[{rel}]]\n"),
+        };
+        fs::write(root.join(format!("{rel}.md")), note).unwrap();
+    };
+    write("mix/hi.jpg", Some(5));
+    write("mix/mid.jpeg", Some(3));
+    write("mix/low.png", Some(1));
+    write("mix/zero.png", Some(0));
+    write("mix/none.gif", None);
+    write("mix/clip.webp", Some(2));
+    write("mix/shot.avif", Some(4));
+    write("mix/shot.HEIC", Some(5));
+    write("mix/raw.BMP", Some(2));
+    write("mix/sneaky.heif", Some(4));
+    write("dir.png/inner.tif", Some(2));
+    dir
+}
+
+fn sorted(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort();
+    paths
+}
+
+/// The rating and file-type chips end to end over a scanned library (W80): a
+/// `≥N` chip is a threshold that never shows an unrated image, the unrated
+/// chip lists only those, the type chip is the extension family and nothing
+/// else, and the chips menu in the toolbar reaches every state as a link —
+/// `<details>` and anchors only, so it all works with scripting off.
+#[tokio::test]
+async fn the_rating_and_type_chips_filter_the_grid_and_stay_no_script() {
+    let dir = rating_type_library();
+    let (app, cookie) = login(app(&dir)).await;
+
+    let threshold = sorted(json_paths(&app, "rating=3", &cookie).await);
+    assert_eq!(
+        threshold,
+        vec![
+            "mix/hi.jpg",
+            "mix/mid.jpeg",
+            "mix/shot.HEIC",
+            "mix/shot.avif",
+            "mix/sneaky.heif"
+        ],
+        "the five images rated three or above; the zero and the missing are out"
+    );
+    let unrated = sorted(json_paths(&app, "rating=unrated", &cookie).await);
+    assert_eq!(
+        unrated,
+        vec!["mix/none.gif", "mix/zero.png"],
+        "the unrated chip is the missing ratings plus the zero"
+    );
+    assert_eq!(
+        sorted(json_paths(&app, "rating=0", &cookie).await),
+        unrated,
+        "`rating=0` names the unrated chip: a zero rating is an unrated image"
+    );
+
+    assert_eq!(
+        sorted(json_paths(&app, "type=jpg", &cookie).await),
+        vec!["mix/hi.jpg", "mix/mid.jpeg"],
+        "jpeg is jpg"
+    );
+    assert_eq!(
+        sorted(json_paths(&app, "type=heic", &cookie).await),
+        vec!["mix/shot.HEIC"],
+        "the extension is read case-insensitively"
+    );
+    assert_eq!(
+        sorted(json_paths(&app, "type=other", &cookie).await),
+        vec!["dir.png/inner.tif", "mix/raw.BMP", "mix/sneaky.heif"],
+        "bmp and heif are `other` — only jpeg folds into jpg — and a folder \
+         named after an extension makes none of its members that family"
+    );
+    assert_eq!(
+        sorted(json_paths(&app, "type=svg", &cookie).await),
+        Vec::<String>::new(),
+        "svg is a family the chips name, and no §2.1 image is one"
+    );
+    assert_eq!(
+        sorted(json_paths(&app, "rating=3&type=jpg", &cookie).await),
+        vec!["mix/hi.jpg", "mix/mid.jpeg"],
+        "the two chips narrow the same grid"
+    );
+
+    // The menu is the entry point (W76 §2) and it is no-script all the way
+    // down: a native `<details>`, and rows that are links the server answers.
+    let html = text(&app, "/?rating=3", &cookie).await;
+    assert!(
+        html.contains("<details class=\"chip-menu\">"),
+        "the menu opens and closes without a script"
+    );
+    assert!(
+        html.contains("class=\"chip-menu-row on\" href=\"/\" aria-current=\"true\">≥3</a>"),
+        "the chip in force is marked and its row links it away again"
+    );
+    assert!(html.contains("href=\"/?rating=unrated\""), "{}", html.len());
+}

@@ -10,7 +10,9 @@ use crate::catalog::PreviewKind;
 use crate::index_sync::{recent_label, SidebarData, RECENT_LIMIT};
 use crate::ui::escape_html;
 use crate::ui::shell::{Destination, Frame, SORT_CHOICES};
-use crate::view_query::{sort_key_as_str, ThumbnailSize, ViewParams, PAGE_SIZE};
+use crate::view_query::{
+    sort_key_as_str, FileTypeFamily, RatingFilter, ThumbnailSize, ViewParams, PAGE_SIZE,
+};
 
 /// How many tags the sidebar lists before offering the rest on `/search`.
 const SIDEBAR_TAG_LIMIT: usize = 30;
@@ -76,6 +78,11 @@ const CHIP_GLYPH_COLLECTION: &str = r##"<svg class="chip-kind" viewBox="0 0 16 1
 const CHIP_GLYPH_TEXT: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M3.2 4.6h9.6M3.2 8h9.6M3.2 11.4h5.6"/></svg>"##;
 /// A funnel: a filter that carries no value (`untagged`, `recent`).
 const CHIP_GLYPH_FILTER: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M2.4 3.6h11.2l-4.3 4.8v4.2l-2.6-1.5V8.4z"/></svg>"##;
+/// W80: the rating chip's star, the same shape the sort menu's "Rating ★"
+/// names in words.
+const CHIP_GLYPH_RATING: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="m8 1.8 1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z"/></svg>"##;
+/// W80: the file-type chip's picture, the state glyph's photo on a chip grid.
+const CHIP_GLYPH_TYPE: &str = r##"<svg class="chip-kind" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="m3 11 3.2-2.8 2.3 1.9 2-1.8L13 11"/><circle cx="5.6" cy="6.2" r="1"/></svg>"##;
 /// The remove mark inside a chip.
 const CHIP_REMOVE_GLYPH: &str = r##"<svg viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true" focusable="false"><path d="M1.6 1.6 8.4 8.4M8.4 1.6 1.6 8.4"/></svg>"##;
 /// A magnifier for the leading edge of a search capsule.
@@ -96,6 +103,8 @@ enum ChipKind {
     Collection,
     Text,
     Filter,
+    Rating,
+    Type,
 }
 
 impl ChipKind {
@@ -106,6 +115,8 @@ impl ChipKind {
             Self::Collection => CHIP_GLYPH_COLLECTION,
             Self::Text => CHIP_GLYPH_TEXT,
             Self::Filter => CHIP_GLYPH_FILTER,
+            Self::Rating => CHIP_GLYPH_RATING,
+            Self::Type => CHIP_GLYPH_TYPE,
         }
     }
 
@@ -116,6 +127,8 @@ impl ChipKind {
             Self::Collection => "Collection",
             Self::Text => "Search",
             Self::Filter => "Filter",
+            Self::Rating => "Rating",
+            Self::Type => "File type",
         }
     }
 }
@@ -178,6 +191,25 @@ pub fn scope_chips(params: &ViewParams) -> String {
             &view_url(&params.without_q()),
         ));
     }
+    // The rating and file-type chips (W80): one per group, each removed by
+    // its ✕ to the same view with that group empty again.
+    if let Some(rating) = params.rating {
+        let label = rating_label(rating);
+        chips.push(chip(
+            ChipKind::Rating,
+            &label,
+            &label,
+            &view_url(&params.with_rating(None)),
+        ));
+    }
+    if let Some(family) = params.file_type {
+        chips.push(chip(
+            ChipKind::Type,
+            family.as_str(),
+            family.as_str(),
+            &view_url(&params.with_file_type(None)),
+        ));
+    }
     if params.untagged {
         chips.push(chip(
             ChipKind::Filter,
@@ -200,29 +232,95 @@ pub fn scope_chips(params: &ViewParams) -> String {
     format!("<span class=\"scope-chips\">{}</span>", chips.join(""))
 }
 
+/// The words a rating chip carries: `≥N` for a threshold, `Unrated` for the
+/// unrated chip — the same six chips the menu offers (W80).
+fn rating_label(rating: RatingFilter) -> String {
+    match rating {
+        RatingFilter::AtLeast(min) => format!("≥{min}"),
+        RatingFilter::Unrated => String::from("Unrated"),
+    }
+}
+
+/// The search box's chips menu (W80): the filters the sidebar has no row for
+/// — the rating group and the file-type group — as plain links that set the
+/// chip they name, replacing the one already on in that group. A link to the
+/// chip already on goes the other way and clears it, so the menu toggles
+/// without a script. `<details>` is the whole open/close mechanism: it works
+/// with scripting off the way the filter fold does, and its rows are links,
+/// so the menu is keyboard-reachable and every state is a URL.
+pub fn chip_filter_menu(params: &ViewParams) -> String {
+    let mut rows = String::from("<p class=\"chip-menu-title\">Rating</p>");
+    for rating in RatingFilter::ALL {
+        let label = rating_label(rating);
+        let href = if params.rating == Some(rating) {
+            view_url(&params.with_rating(None))
+        } else {
+            view_url(&params.with_rating(Some(rating)))
+        };
+        rows.push_str(&menu_row(&label, params.rating == Some(rating), &href));
+    }
+    rows.push_str("<p class=\"chip-menu-title\">File type</p>");
+    for family in FileTypeFamily::ALL {
+        let href = if params.file_type == Some(family) {
+            view_url(&params.with_file_type(None))
+        } else {
+            view_url(&params.with_file_type(Some(family)))
+        };
+        rows.push_str(&menu_row(
+            family.as_str(),
+            params.file_type == Some(family),
+            &href,
+        ));
+    }
+    format!(
+        "<details class=\"chip-menu\"><summary class=\"chip-menu-summary\" \
+         title=\"Filter by rating or file type\" aria-label=\"Filter by rating or file type\">\
+         {glyph}<span class=\"chip-menu-label\">Filter</span></summary>\
+         <div class=\"chip-menu-pop\">{rows}</div></details>",
+        glyph = CHIP_GLYPH_FILTER,
+    )
+}
+
+/// One menu row: the chip's own words, and the URL that toggles it (W80).
+fn menu_row(label: &str, active: bool, href: &str) -> String {
+    let (class, current) = if active {
+        ("chip-menu-row on", " aria-current=\"true\"")
+    } else {
+        ("chip-menu-row", "")
+    };
+    format!(
+        "<a class=\"{class}\" href=\"{href}\"{current}>{label}</a>",
+        href = escape_html(href),
+        label = escape_html(label),
+    )
+}
+
 /// The search pill: the toolbar's capsule, and where the chips live (§4.3).
 /// On the library it shows the active scope as chips on one line; tapping it
 /// goes to `/search`, where there is a real field (spec §3). The capsule may
 /// be a link rather than a field — there is simply no input. Once chips are
 /// inside, the capsule cannot also be one link around them, so it becomes a
-/// field-shaped container and the trailing label is the link to the page.
+/// field-shaped container and the trailing label is the link to the page —
+/// and with the chips menu in it (W80) the container is the shape every view
+/// takes, chips or none.
 pub fn search_pill(view: Option<&ViewParams>) -> String {
     let label = match view {
         Some(params) if !params.to_query_string().is_empty() => "Refine",
         _ => "Search",
     };
-    let chips = view.map(scope_chips).unwrap_or_default();
-    if chips.is_empty() {
+    let Some(params) = view else {
         return format!(
             "<a class=\"search-pill-container\" href=\"/search\">{glyph}<span class=\
              \"search-label\">{label}</span></a>",
             glyph = SEARCH_GLYPH,
         );
-    }
+    };
     format!(
-        "<div class=\"search-pill-container pill-scoped\">{glyph}{chips}\
+        "<div class=\"search-pill-container pill-scoped\">{glyph}{chips}{menu}\
          <a class=\"search-label\" href=\"/search\">{label}</a></div>",
         glyph = SEARCH_GLYPH,
+        chips = scope_chips(params),
+        menu = chip_filter_menu(params),
     )
 }
 
@@ -269,6 +367,20 @@ pub fn sort_control(params: &ViewParams) -> String {
     }
     if params.untagged {
         out.push_str("<input type=\"hidden\" name=\"untagged\" value=\"1\">");
+    }
+    // The W80 chips are scope like any other filter, so the sort menu keeps
+    // them the way it keeps the tags.
+    if let Some(rating) = params.rating {
+        out.push_str(&format!(
+            "<input type=\"hidden\" name=\"rating\" value=\"{}\">",
+            escape_html(&rating.key())
+        ));
+    }
+    if let Some(family) = params.file_type {
+        out.push_str(&format!(
+            "<input type=\"hidden\" name=\"type\" value=\"{}\">",
+            family.as_str()
+        ));
     }
     // `c` needs no hidden field: a view over a collection never reaches this
     // menu — it states the note's own order instead (`note_order_control`).
@@ -1678,6 +1790,7 @@ mod tests {
             collections: std::collections::BTreeMap::new(),
             untagged: 1,
             recent: 3,
+            ..FacetCounts::default()
         };
         let html = sidebar_sections(
             &sidebar(),
@@ -1782,6 +1895,7 @@ mod tests {
             collections: std::collections::BTreeMap::new(),
             untagged: 12,
             recent: 200,
+            ..FacetCounts::default()
         };
         let params = ViewParams::parse("tag=tag-00&size=l&sort=size&dir=asc&p=4&recent=1");
         let html = sidebar_sections(&sidebar(), &params, None, Some(&facets));
@@ -1820,6 +1934,7 @@ mod tests {
             collections: std::collections::BTreeMap::new(),
             untagged: 90,
             recent: 200,
+            ..FacetCounts::default()
         };
         let html = sidebar_sections(
             &sidebar(),
@@ -1851,6 +1966,7 @@ mod tests {
             collections: std::collections::BTreeMap::new(),
             untagged: 4,
             recent: 20,
+            ..FacetCounts::default()
         };
         let counts = |params: &str| {
             sidebar_sections(&sidebar(), &ViewParams::parse(params), None, Some(&facets))
@@ -2521,7 +2637,12 @@ mod tests {
     #[test]
     fn the_search_pill_is_a_link_to_the_search_page() {
         assert!(search_pill(None).contains("href=\"/search\""));
-        assert!(search_pill(Some(&ViewParams::default())).contains(">Search</span>"));
+        // With a view on screen the capsule is a container — chips or none —
+        // and the trailing label is the link to the page (W80 keeps the chips
+        // menu in it either way, so the first chip has somewhere to come from).
+        let plain = search_pill(Some(&ViewParams::default()));
+        assert!(plain.contains(">Search</a>"), "{plain}");
+        assert!(plain.contains("chip-menu"), "{plain}");
         // With chips inside, the capsule cannot be one link around them, so
         // the label is the link and the chips keep their own remove links.
         let scoped = search_pill(Some(&ViewParams::parse("in=refs")));
@@ -2728,5 +2849,96 @@ mod tests {
     #[test]
     fn a_page_past_the_end_of_a_one_item_view_says_item() {
         assert!(past_end_state(&ViewParams::parse("p=2"), 1).contains("This view has 1 item;"));
+    }
+
+    // === W80 · rating and file-type chips ==================================
+
+    /// The chips round trip (W80): a chip's ✕ goes to the same view with the
+    /// group empty again, and the two rating chips never ride together — the
+    /// URL names one, so a `≥N` chip gives the unrated chip back and the
+    /// other way round.
+    #[test]
+    fn the_rating_chips_round_trip_and_never_ride_together() {
+        let threshold = scope_chips(&ViewParams::parse("rating=3"));
+        assert!(threshold.contains(">≥3<"), "{threshold}");
+        assert!(!threshold.contains("Unrated"), "{threshold}");
+        assert!(
+            threshold.contains("href=\"/\""),
+            "the ✕ goes to the same view with the group empty: {threshold}"
+        );
+
+        // One chip per group: whichever value the URL names last is the one
+        // that shows, and the other is gone.
+        let unrated = scope_chips(&ViewParams::parse("rating=3&rating=unrated"));
+        assert!(unrated.contains(">Unrated<"), "{unrated}");
+        assert!(!unrated.contains("≥3"), "{unrated}");
+
+        // The chips map back onto the URL one-to-one, so the ✕ leaves nothing
+        // behind and a swapped chip replaces rather than stacks.
+        assert_eq!(
+            ViewParams::parse("rating=3")
+                .with_rating(None)
+                .to_query_string(),
+            ""
+        );
+        let swapped =
+            ViewParams::parse("rating=unrated").with_rating(Some(RatingFilter::AtLeast(2)));
+        assert!(scope_chips(&swapped).contains(">≥2<"), "{swapped:?}");
+        assert_eq!(swapped.to_query_string(), "rating=2");
+    }
+
+    /// The type chip names its family and removes to the same view without
+    /// it (W80) — one family at a time, like the rating group.
+    #[test]
+    fn the_type_chip_names_its_family_and_removes_to_the_same_view() {
+        let html = scope_chips(&ViewParams::parse("in=refs&type=png"));
+        assert!(html.contains(">png<"), "{html}");
+        assert!(
+            html.contains("href=\"/?in=refs\""),
+            "the ✕ keeps the rest of the scope: {html}"
+        );
+        assert_eq!(
+            scope_chips(&ViewParams::parse("type=jpg&type=png"))
+                .matches("chip-label")
+                .count(),
+            1,
+            "one family at a time"
+        );
+    }
+
+    /// The chips menu is a `<details>` full of plain links (W80): it opens
+    /// and closes with scripting off the way the filter fold does, every row
+    /// is a real URL, and the chip already on is marked and links back off
+    /// again — a toggle that needs no script.
+    #[test]
+    fn the_chips_menu_is_no_script_links_that_toggle_the_chips() {
+        let menu = chip_filter_menu(&ViewParams::parse("rating=3"));
+        assert!(menu.starts_with("<details class=\"chip-menu\">"), "{menu}");
+        assert!(menu.contains("<summary"), "the native open/close: {menu}");
+        assert_eq!(
+            menu.matches("chip-menu-row").count(),
+            14,
+            "six rating chips and eight file types: {menu}"
+        );
+        assert!(menu.contains("href=\"/?rating=unrated\""), "{menu}");
+        assert!(
+            menu.contains("href=\"/?rating=3&amp;type=other\""),
+            "a row keeps the scope it is set beside: {menu}"
+        );
+        // The row that is on links its chip away again: with `≥3` in force,
+        // its row toggles the group empty, and it is the marked one.
+        assert!(
+            menu.contains("href=\"/\" aria-current=\"true\">≥3</a>"),
+            "{menu}"
+        );
+    }
+
+    /// The sort menu keeps the W80 chips the way it keeps every other filter
+    /// — the order changes, the scope does not.
+    #[test]
+    fn the_sort_menu_keeps_the_rating_and_type_chips() {
+        let html = sort_control(&ViewParams::parse("rating=unrated&type=jpg"));
+        assert!(html.contains("name=\"rating\" value=\"unrated\""), "{html}");
+        assert!(html.contains("name=\"type\" value=\"jpg\""), "{html}");
     }
 }

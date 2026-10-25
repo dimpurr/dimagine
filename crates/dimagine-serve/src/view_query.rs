@@ -6,6 +6,10 @@
 //! - `c`: collection note path
 //! - `tag`: repeatable, AND
 //! - `q`: full-text search string
+//! - `rating`: `1`–`5` for the `≥N` chip, `unrated` (`0` reads the same) for
+//!   the unrated chip (W80). At most one: a later pair replaces an earlier one.
+//! - `type`: one file-type family — `jpg` (also `jpeg`), `png`, `gif`, `webp`,
+//!   `avif`, `heic`, `svg`, `other` — read off the path's extension (W80)
 //! - `sort`: `added` | `taken` | `modified` | `name` | `size` | `rating` (default: `added`)
 //! - `dir`: `asc` | `desc` (default: `desc` for added/taken/modified/size/rating, `asc` for name)
 //! - `size`: `s` | `m` | `l` (default: `m`)
@@ -18,7 +22,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTRO
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-pub use dimagine_index::SortKey;
+pub use dimagine_index::{FileTypeFamily, RatingFilter, SortKey};
 
 use crate::index_sync::RECENT_LIMIT;
 
@@ -187,6 +191,21 @@ pub fn parse_sort_key(s: &str) -> Option<ViewSort> {
     ViewSort::parse(s)
 }
 
+/// The `rating=` value's meaning (W80): `1`–`5` name the `≥N` chips, and
+/// `unrated` names the unrated chip — `0` reads the same, because an image
+/// whose rating is `0` is one of the images that chip lists. Anything else,
+/// including a number above five, is not a rating filter.
+fn parse_rating_filter(raw: &str) -> Option<RatingFilter> {
+    match raw {
+        "unrated" | "0" => Some(RatingFilter::Unrated),
+        _ => raw
+            .parse::<u8>()
+            .ok()
+            .filter(|min| (1..=5).contains(min))
+            .map(RatingFilter::AtLeast),
+    }
+}
+
 /// Every `sort` value a URL may carry, in the words the notice uses when one
 /// is not among them.
 const SORT_KEYS: &str = "added, taken, modified, name, size, rating";
@@ -208,6 +227,13 @@ pub struct ViewParams {
     pub tags: Vec<String>,
     /// Full-text query (`q`).
     pub q: Option<String>,
+    /// The rating chip in force (`rating`), at most one: a `≥N` threshold or
+    /// the unrated chip — the two never ride together, and a threshold never
+    /// shows an unrated image (W80).
+    pub rating: Option<RatingFilter>,
+    /// The one file-type family to show (`type`), read off the path's
+    /// extension (W80).
+    pub file_type: Option<FileTypeFamily>,
     /// Sort key (`sort`, default Added).
     pub sort: ViewSort,
     /// Sort direction (`dir`, default depends on sort).
@@ -269,6 +295,8 @@ impl Default for ViewParams {
             selection: None,
             tags: Vec::new(),
             q: None,
+            rating: None,
+            file_type: None,
             sort: ViewSort::Added,
             direction: Direction::Desc,
             size: ThumbnailSize::M,
@@ -363,6 +391,36 @@ impl ViewParams {
                         params
                             .notices
                             .push("Ignored 'q': invalid UTF-8".to_string());
+                    }
+                },
+                // The rating group is one choice, so `rating` is one value,
+                // never a pair to combine: `1`–`5` are the `≥N` chips,
+                // `unrated` (and `0`, which is what an unrated image is) the
+                // unrated chip. A later pair replaces an earlier one the way
+                // `size` does, and a threshold and the unrated chip therefore
+                // never ride together (W80).
+                "rating" => match parse_rating_filter(raw_val) {
+                    Some(rating) => params.rating = Some(rating),
+                    None => {
+                        params.notices.push(format!(
+                            "Ignored invalid rating '{raw_val}' (expected 1-5 or unrated)"
+                        ));
+                    }
+                },
+                // `type` names one file-type family — the same one spelling a
+                // chip, a URL and the facet counts share (W80).
+                "type" => match decode_query_value(raw_val) {
+                    Ok(decoded) => match FileTypeFamily::parse(&decoded) {
+                        Some(family) => params.file_type = Some(family),
+                        None => params.notices.push(format!(
+                            "Ignored unknown file type '{decoded}' (expected jpg, png, gif, \
+                             webp, avif, heic, svg or other)"
+                        )),
+                    },
+                    Err(_) => {
+                        params
+                            .notices
+                            .push("Ignored 'type': invalid UTF-8".to_string());
                     }
                 },
                 // `sort=<key>` or `sort=<key>-<dir>`: the native `<select>` in
@@ -525,6 +583,16 @@ impl ViewParams {
             pairs.push(format!("q={}", utf8_percent_encode(q, QUERY_VALUE)));
         }
 
+        // One canonical spelling per chip: the threshold's number, `unrated`
+        // for the unrated chip, the family's own name for a type chip (W80).
+        if let Some(rating) = self.rating {
+            pairs.push(format!("rating={}", rating.key()));
+        }
+
+        if let Some(family) = self.file_type {
+            pairs.push(format!("type={}", family.as_str()));
+        }
+
         if self.sort != ViewSort::Added {
             pairs.push(format!("sort={}", sort_key_as_str(self.sort)));
         }
@@ -604,6 +672,8 @@ impl ViewParams {
             text: self.q.clone(),
             untagged: self.untagged,
             added_after_ns: None,
+            rating: self.rating,
+            file_type: self.file_type,
             sort: sort.index_key(),
             descending,
             // Saturating, so an absurd `p` reads as "far past the end" instead
@@ -723,6 +793,26 @@ impl ViewParams {
         next
     }
 
+    /// New instance with the rating chip replaced by `rating`, or cleared by
+    /// `None` — one chip at a time, so choosing a `≥N` threshold gives the
+    /// unrated chip back and the other way round (W80). Everything else on
+    /// screen stays.
+    pub fn with_rating(&self, rating: Option<RatingFilter>) -> Self {
+        let mut next = self.clone();
+        next.rating = rating;
+        next.page = 1;
+        next
+    }
+
+    /// New instance with the file-type chip replaced by `family`, or cleared
+    /// by `None` (see [`ViewParams::with_rating`]).
+    pub fn with_file_type(&self, family: Option<FileTypeFamily>) -> Self {
+        let mut next = self.clone();
+        next.file_type = family;
+        next.page = 1;
+        next
+    }
+
     /// New instance with the untagged lens set or cleared, keeping everything
     /// else on screen. A sidebar Views row and the drawer's lens rows both start
     /// from [`ViewParams::without_lenses`] and add one lens back: the three
@@ -793,6 +883,8 @@ impl ViewParams {
             + usize::from(self.collection.is_some())
             + self.tags.len()
             + usize::from(self.q.is_some())
+            + usize::from(self.rating.is_some())
+            + usize::from(self.file_type.is_some())
             + usize::from(self.untagged)
             + usize::from(self.recent)
     }
@@ -806,17 +898,19 @@ impl ViewParams {
     }
 
     /// New instance with every filter off — folder, collection, tags,
-    /// search text and both lenses — and everything else the reader
-    /// chose kept: the sort and its direction, the tile size, the page
-    /// and the expanded facet lists. The panel's "Clear all filters"
-    /// is this view, because the label promises filters and nothing
-    /// else; `active_filter_count` is the list of what it clears.
+    /// search text, the rating and file-type chips and both lenses — and
+    /// everything else the reader chose kept: the sort and its direction,
+    /// the tile size, the page and the expanded facet lists. The panel's
+    /// "Clear all filters" is this view, because the label promises filters
+    /// and nothing else; `active_filter_count` is the list of what it clears.
     pub fn without_filters(&self) -> Self {
         let mut next = self.clone();
         next.folder = None;
         next.collection = None;
         next.tags.clear();
         next.q = None;
+        next.rating = None;
+        next.file_type = None;
         next.untagged = false;
         next.recent = false;
         next
@@ -1625,5 +1719,145 @@ mod tests {
         );
         // A facet list shown whole is a longer list, not a narrower view.
         assert_eq!(ViewParams::parse("more=tags").active_filter_count(), 0);
+    }
+
+    // === W80 · rating and file-type chips ==================================
+
+    /// The rating group is one choice: `1`–`5` are the `≥N` chips and
+    /// `unrated` the unrated chip — one chip at a time, so the two never ride
+    /// together (W80).
+    #[test]
+    fn the_rating_chips_parse_round_trip_and_never_ride_together() {
+        let threshold = ViewParams::parse("rating=3");
+        assert_eq!(threshold.rating, Some(RatingFilter::AtLeast(3)));
+        assert_eq!(threshold.to_query_string(), "rating=3");
+        assert_eq!(
+            threshold.to_index_query().rating,
+            Some(RatingFilter::AtLeast(3))
+        );
+
+        let unrated = ViewParams::parse("rating=unrated");
+        assert_eq!(unrated.rating, Some(RatingFilter::Unrated));
+        assert_eq!(unrated.to_query_string(), "rating=unrated");
+
+        // A `0` is what an unrated image is, so it names the unrated chip,
+        // and the URL comes back in the one canonical spelling.
+        assert_eq!(
+            ViewParams::parse("rating=0").rating,
+            Some(RatingFilter::Unrated)
+        );
+        assert_eq!(
+            ViewParams::parse("rating=0").to_query_string(),
+            "rating=unrated"
+        );
+
+        // One chip at a time: the later pair replaces the earlier one, so a
+        // threshold and the unrated chip never ride together.
+        let swapped = ViewParams::parse("rating=3&rating=unrated");
+        assert_eq!(swapped.rating, Some(RatingFilter::Unrated));
+        assert_eq!(swapped.to_query_string(), "rating=unrated");
+        assert_eq!(
+            ViewParams::parse("rating=unrated&rating=3").rating,
+            Some(RatingFilter::AtLeast(3))
+        );
+    }
+
+    /// The threshold boundary: one is the lowest chip and five the highest,
+    /// and anything outside `1`–`5` is ignored with a notice (W80).
+    #[test]
+    fn the_threshold_boundary_is_one_to_five_and_the_rest_are_reported() {
+        assert_eq!(
+            ViewParams::parse("rating=1").rating,
+            Some(RatingFilter::AtLeast(1))
+        );
+        assert_eq!(
+            ViewParams::parse("rating=5").rating,
+            Some(RatingFilter::AtLeast(5))
+        );
+        for raw in ["rating=6", "rating=-1", "rating=x", "rating=", "rating=4.5"] {
+            let params = ViewParams::parse(raw);
+            assert_eq!(params.rating, None, "{raw}");
+            assert_eq!(params.notices.len(), 1, "{raw}");
+        }
+        assert!(ViewParams::parse("rating=3").notices.is_empty());
+    }
+
+    /// The type chip names one family, case-insensitively and with `jpeg`
+    /// folded into `jpg`; an unknown name is ignored with a notice, and the
+    /// URL keeps one spelling per family (W80).
+    #[test]
+    fn the_type_chip_round_trips_one_family() {
+        let jpg = ViewParams::parse("type=jpg");
+        assert_eq!(jpg.file_type, Some(FileTypeFamily::Jpg));
+        assert_eq!(jpg.to_query_string(), "type=jpg");
+        assert_eq!(jpg.to_index_query().file_type, Some(FileTypeFamily::Jpg));
+
+        assert_eq!(
+            ViewParams::parse("type=JPEG").file_type,
+            Some(FileTypeFamily::Jpg),
+            "jpeg is jpg, whatever the case"
+        );
+        assert_eq!(ViewParams::parse("type=jpeg").to_query_string(), "type=jpg");
+        assert_eq!(
+            ViewParams::parse("type=other").file_type,
+            Some(FileTypeFamily::Other)
+        );
+
+        let unknown = ViewParams::parse("type=mp4");
+        assert_eq!(unknown.file_type, None);
+        assert_eq!(unknown.notices.len(), 1);
+
+        // One family at a time: a later pair replaces an earlier one.
+        assert_eq!(
+            ViewParams::parse("type=jpg&type=png").file_type,
+            Some(FileTypeFamily::Png)
+        );
+    }
+
+    /// Choosing the other chip in a group replaces the one in force and
+    /// leaves the other group alone — the round trip the menu links make
+    /// (W80).
+    #[test]
+    fn choosing_a_chip_replaces_the_one_in_force_in_its_group() {
+        let threshold = ViewParams::parse("rating=3&type=jpg&p=4");
+        let unrated = threshold.with_rating(Some(RatingFilter::Unrated));
+        assert_eq!(unrated.rating, Some(RatingFilter::Unrated));
+        assert_eq!(
+            unrated.file_type,
+            Some(FileTypeFamily::Jpg),
+            "the other group is untouched"
+        );
+        assert_eq!(unrated.page, 1, "a new filter is read from its first page");
+        assert_eq!(unrated.to_query_string(), "rating=unrated&type=jpg");
+
+        assert_eq!(
+            threshold
+                .with_rating(Some(RatingFilter::Unrated))
+                .with_rating(Some(RatingFilter::AtLeast(5)))
+                .rating,
+            Some(RatingFilter::AtLeast(5)),
+            "one chip per group, whichever the reader picks last"
+        );
+        assert_eq!(
+            threshold
+                .with_rating(None)
+                .with_file_type(None)
+                .to_query_string(),
+            ""
+        );
+    }
+
+    /// The two chips are filters like any other: the panel counts them and
+    /// "Clear all filters" clears them (W80).
+    #[test]
+    fn the_rating_and_type_chips_are_filters_the_panel_knows() {
+        assert_eq!(
+            ViewParams::parse("rating=3&type=png").active_filter_count(),
+            2
+        );
+        let params = ViewParams::parse("in=refs&tag=a&rating=unrated&type=other&recent=1");
+        assert_eq!(params.active_filter_count(), 5);
+        assert_eq!(params.without_filters().to_query_string(), "");
+        assert_eq!(params.without_filters().active_filter_count(), 0);
     }
 }

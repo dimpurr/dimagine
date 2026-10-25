@@ -178,6 +178,161 @@ pub fn collection_is_listed(evidence: &CollectionEvidence<'_>) -> bool {
     note_is_collection(evidence) && (evidence.kind == Some("collection") || !evidence.image_note)
 }
 
+/// The rating filter chips offer: one threshold chip out of `≥1`–`≥5`, or the
+/// unrated chip — never both, because a threshold and "no rating at all" are
+/// answers to different questions and the grid shows one range (W80).
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RatingFilter {
+    /// The `≥N` chip: only images whose rating is at least `N`. A missing
+    /// rating and a `0` are not ratings, so they never pass a threshold —
+    /// they are what [`RatingFilter::Unrated`] lists.
+    AtLeast(u8),
+    /// The unrated chip: only images whose rating is missing or `0`
+    /// (FORMAT §3.1 reads an out-of-range `rating` as no rating too, and no
+    /// scan stores one).
+    Unrated,
+}
+
+impl RatingFilter {
+    /// The key [`FacetCounts::ratings`] counts under, and the `rating=` query
+    /// value: `1`–`5` for a threshold chip, `unrated` for the unrated chip.
+    pub fn key(self) -> String {
+        match self {
+            Self::AtLeast(min) => min.to_string(),
+            Self::Unrated => String::from("unrated"),
+        }
+    }
+
+    /// The chips of the group, in menu order: the five thresholds, then the
+    /// unrated chip.
+    pub const ALL: [RatingFilter; 6] = [
+        Self::AtLeast(1),
+        Self::AtLeast(2),
+        Self::AtLeast(3),
+        Self::AtLeast(4),
+        Self::AtLeast(5),
+        Self::Unrated,
+    ];
+}
+
+/// The file-type families the type chips filter by, derived from the path's
+/// extension and never from the bytes (W80): no decode, no schema field — the
+/// family is a function of the path the `files` row already holds.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum FileTypeFamily {
+    /// `.jpg` and `.jpeg`.
+    Jpg,
+    Png,
+    Gif,
+    Webp,
+    Avif,
+    Heic,
+    Svg,
+    /// Every other spelling: another extension, none at all, or a name whose
+    /// last dot is not an extension this family list names.
+    Other,
+}
+
+impl FileTypeFamily {
+    /// The eight families, in menu order, ending at [`FileTypeFamily::Other`].
+    pub const ALL: [FileTypeFamily; 8] = [
+        Self::Jpg,
+        Self::Png,
+        Self::Gif,
+        Self::Webp,
+        Self::Avif,
+        Self::Heic,
+        Self::Svg,
+        Self::Other,
+    ];
+
+    /// The family's name: the extension it matches (`jpg` covers `jpeg` too),
+    /// or `other`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Jpg => "jpg",
+            Self::Png => "png",
+            Self::Gif => "gif",
+            Self::Webp => "webp",
+            Self::Avif => "avif",
+            Self::Heic => "heic",
+            Self::Svg => "svg",
+            Self::Other => "other",
+        }
+    }
+
+    /// The family a name speaks of, case-insensitively.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            "png" => Some(Self::Png),
+            "gif" => Some(Self::Gif),
+            "webp" => Some(Self::Webp),
+            "avif" => Some(Self::Avif),
+            "heic" => Some(Self::Heic),
+            "svg" => Some(Self::Svg),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+
+    /// The SQL condition saying one path is in this family. The extension is
+    /// the path's own suffix, folded with `lower` so `.JPG` and `.jpg` are one
+    /// family whatever a connection's `case_sensitive_like` says, and a folder
+    /// whose name ends in `.png` never makes its members pngs.
+    fn path_condition(self, path: &str) -> String {
+        let suffix = |ext: &str| format!("lower({path}) LIKE '%.{ext}'");
+        match self {
+            Self::Jpg => format!("({} OR {})", suffix("jpg"), suffix("jpeg")),
+            Self::Png => suffix("png"),
+            Self::Gif => suffix("gif"),
+            Self::Webp => suffix("webp"),
+            Self::Avif => suffix("avif"),
+            Self::Heic => suffix("heic"),
+            Self::Svg => suffix("svg"),
+            Self::Other => {
+                let named: Vec<String> = [
+                    Self::Jpg,
+                    Self::Png,
+                    Self::Gif,
+                    Self::Webp,
+                    Self::Avif,
+                    Self::Heic,
+                    Self::Svg,
+                ]
+                .iter()
+                .map(|family| family.path_condition(path))
+                .collect();
+                format!("NOT ({})", named.join(" OR "))
+            }
+        }
+    }
+
+    /// The SQL expression naming a path's family — one `CASE` over the same
+    /// suffixes [`FileTypeFamily::path_condition`] tests, so a facet's grouped
+    /// counts and a filter can never disagree about which family a path is in.
+    fn classify_sql(path: &str) -> String {
+        let mut out = String::from("CASE");
+        for family in [
+            Self::Jpg,
+            Self::Png,
+            Self::Gif,
+            Self::Webp,
+            Self::Avif,
+            Self::Heic,
+            Self::Svg,
+        ] {
+            out.push_str(&format!(
+                " WHEN {} THEN '{}'",
+                family.path_condition(path),
+                family.as_str()
+            ));
+        }
+        out.push_str(" ELSE 'other' END");
+        out
+    }
+}
+
 /// The parameters of a [`Index::view`] query.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ViewQuery {
@@ -202,6 +357,13 @@ pub struct ViewQuery {
     /// epoch. A general time-window filter; the viewer's Recent lens counts
     /// images instead of days (RECENT_LIMIT in dimagine-serve).
     pub added_after_ns: Option<i64>,
+    /// The rating chip in force, at most one: a `≥N` threshold or the unrated
+    /// chip ([`RatingFilter`]). A threshold never matches an image with no
+    /// rating or a `0` — those are the unrated chip's own list.
+    pub rating: Option<RatingFilter>,
+    /// The one file-type family to show ([`FileTypeFamily`]), read off the
+    /// path's extension.
+    pub file_type: Option<FileTypeFamily>,
     pub sort: SortKey,
     pub descending: bool,
     pub offset: u32,
@@ -218,6 +380,8 @@ impl Default for ViewQuery {
             text: None,
             untagged: false,
             added_after_ns: None,
+            rating: None,
+            file_type: None,
             sort: SortKey::Added,
             descending: true,
             offset: 0,
@@ -392,6 +556,22 @@ fn view_sql_with_order(q: &ViewQuery, order_by: String) -> ViewSql {
     if let Some(after) = q.added_after_ns {
         sql.and("f.added_ns>=?");
         sql.bind(after);
+    }
+    match q.rating {
+        // `>=` on its own excludes a missing rating and a `0` (neither
+        // compares at or above anything), which is exactly the rule: a
+        // threshold chip never shows an unrated image (W80).
+        Some(RatingFilter::AtLeast(min)) => {
+            sql.and("f.rating>=?");
+            sql.bind(i64::from(min));
+        }
+        Some(RatingFilter::Unrated) => {
+            sql.and("(f.rating IS NULL OR f.rating=0)");
+        }
+        None => {}
+    }
+    if let Some(family) = q.file_type {
+        sql.and(&family.path_condition("f.path"));
     }
     if let Some(text) = &q.text {
         // The same two rules as `Index::search_text`: the trigram tokenizer
@@ -755,6 +935,8 @@ enum Facet {
     Folders,
     Collections,
     Untagged,
+    Rating,
+    FileTypes,
 }
 
 impl Facet {
@@ -763,9 +945,10 @@ impl Facet {
     /// it. A count is not a page, so the page and the order a page needs come
     /// off too.
     ///
-    /// A folder, collection or lens row *replaces* its filter — the one
-    /// folder, the one collection, the one lens — so those counts leave the
-    /// filter out entirely: the count for `refs` beside `tag=nature` is what
+    /// A folder, collection, lens, rating or file-type row *replaces* its
+    /// filter — the one folder, the one collection, the one lens, the one
+    /// rating chip, the one type chip — so those counts leave the filter out
+    /// entirely: the count for `refs` beside `tag=nature` is what
     /// `in=refs&tag=nature` shows. A tag row *adds* its tag to the tags
     /// already on, so the tag counts keep them: the count for `beta` beside
     /// `tag=alpha` is what `tag=alpha&tag=beta` shows, which is the row's
@@ -779,6 +962,8 @@ impl Facet {
             Self::Folders => narrowed.folder = None,
             Self::Collections => narrowed.collection = None,
             Self::Untagged => narrowed.untagged = false,
+            Self::Rating => narrowed.rating = None,
+            Self::FileTypes => narrowed.file_type = None,
         }
         narrowed.offset = 0;
         narrowed.limit = 0;
@@ -841,10 +1026,20 @@ pub struct FacetCounts {
     /// Images the Recent window reaches inside [`FacetCounts::total`]'s range:
     /// the size of the page the `Recent` row opens.
     pub recent: u64,
+    /// The rating chips' numbers, keyed by [`RatingFilter::key`]: `1`–`5` for
+    /// the `≥N` chips and `unrated` for the unrated chip. Each is the size of
+    /// the page its own link opens over the other filters on screen — the
+    /// rating filter stepped aside, because the group is one choice and every
+    /// row replaces it. A `≥N` count carries no unrated image (W80).
+    pub ratings: BTreeMap<String, u64>,
+    /// The file-type chips' numbers, keyed by [`FileTypeFamily::as_str`].
+    /// Each is the size of the page its own link opens over the other filters
+    /// on screen, with the type filter stepped aside for the same reason.
+    pub types: BTreeMap<String, u64>,
 }
 
 impl Index {
-    /// The counts one filter panel needs, in five grouped queries.
+    /// The counts one filter panel needs, in seven grouped queries.
     ///
     /// `view` is the view on screen: every filter in it narrows every
     /// facet except the one that answers for it ([`FacetCounts`]). Its
@@ -917,6 +1112,19 @@ impl Index {
         untagged.and("NOT EXISTS(SELECT 1 FROM note_tags WHERE note_tags.image_path=f.path)");
         let untagged = facet_count(conn, &untagged)?;
 
+        // The rating chips: one grouped query over the rating column, summed
+        // into the `≥N` chips — a `≥N` number is every value at or above `N`,
+        // which is its filter's own rule — and into the unrated chip, which is
+        // the missing ratings and the zeros (W80).
+        let ratings = facet_sql(view, Facet::Rating);
+        let mut ratings = rating_values(conn, &ratings)?;
+
+        // The type chips: one grouped query over the family each path's
+        // extension names, the same expression the filter itself is written
+        // from, so a chip's number and its grid can never disagree (W80).
+        let types = facet_sql(view, Facet::FileTypes);
+        let mut types = facet_values(conn, &types, &FileTypeFamily::classify_sql("f.path"), "")?;
+
         // The range the three Views rows count: the filters on screen with
         // neither lens laid over them. `untagged` steps out because a Views row
         // links to the same range without it (W78 B1), and the window steps out
@@ -944,6 +1152,8 @@ impl Index {
             cap_counts(&mut tags, window);
             cap_counts(&mut folders, window);
             cap_counts(&mut collections, window);
+            cap_counts(&mut ratings, window);
+            cap_counts(&mut types, window);
         }
 
         Ok(FacetCounts {
@@ -953,6 +1163,8 @@ impl Index {
             collections,
             untagged,
             recent,
+            ratings,
+            types,
         })
     }
 }
@@ -1015,6 +1227,52 @@ fn facet_values(
         .into_iter()
         .filter(|(value, _)| !value.is_empty())
         .collect())
+}
+
+/// The rating chips' numbers, counted in one grouped query over the rating
+/// column and summed into the shapes the chips ask for (W80): a `≥N` number
+/// is every value at or above `N` — the same rule its filter states — and the
+/// unrated number is the missing ratings plus the zeros, which is the same
+/// set its own filter lists. A chip nothing matches is left out of the map,
+/// like every other facet: zero is a fact, not an unknown.
+fn rating_values(
+    conn: &rusqlite::Connection,
+    sql: &ViewSql,
+) -> Result<BTreeMap<String, u64>, IndexError> {
+    let statement = format!(
+        "{with}SELECT f.rating, count(DISTINCT f.path) {from} \
+         WHERE {where_sql} GROUP BY f.rating",
+        with = sql.with,
+        from = sql.count_from,
+        where_sql = sql.where_sql,
+    );
+    let mut stmt = conn.prepare(&statement)?;
+    let rows = stmt.query_map(bound(&sql.params), |row| {
+        Ok((
+            row.get::<_, Option<i64>>(0)?,
+            row.get::<_, i64>(1)?.max(0) as u64,
+        ))
+    })?;
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        let (rating, count) = row?;
+        let unrated = match rating {
+            None => true,
+            Some(0) => true,
+            Some(value) => {
+                for min in 1..=i64::from(MAX_RATING) {
+                    if value >= min {
+                        *counts.entry(min.to_string()).or_insert(0) += count;
+                    }
+                }
+                false
+            }
+        };
+        if unrated {
+            *counts.entry(String::from("unrated")).or_insert(0) += count;
+        }
+    }
+    Ok(counts.into_iter().filter(|(_, count)| *count > 0).collect())
 }
 
 /// Turn "images in this folder" into "images in this folder and everything
@@ -3729,5 +3987,283 @@ mod tests {
             .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 200 })
             .unwrap();
         assert_eq!(counts, FacetCounts::default());
+    }
+
+    // === W80 · rating and file-type filters =================================
+
+    /// A library whose rating and file-type answers are worked out by hand:
+    /// thirteen images with ratings from five down to missing (a `0` and two
+    /// with none at all), one of every extension family — `jpg` twice, once
+    /// spelled `jpeg`, and `heic` uppercase — plus the traps a suffix rule has
+    /// to survive: `.jpgx` is not a jpg, an extensionless name is `other`, and
+    /// a folder called `dir.png` makes none of its members a png. Those decoy
+    /// rows are written straight into the index — a scan would class them out
+    /// of the image kind (FORMAT §2.1) — because the family rule is a rule
+    /// about paths, and no path may fool it.
+    fn rating_type_library() -> (tempfile::TempDir, Index) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = Index::open(dir.path()).unwrap();
+        let image = |path: &str, added_ns: i64, rating: Option<u8>| FileRecord {
+            path: path.to_owned(),
+            size: 10,
+            mtime_ns: 1,
+            sha256: None,
+            kind: crate::FileKind::Image,
+            note_added_ns: Some(added_ns),
+            rating,
+            width: None,
+            height: None,
+            taken_ns: None,
+            taken_reason: None,
+        };
+        // `added_ns` descends in this order, so the newest three are `hi.jpg`,
+        // `mid.jpeg` and `shot.HEIC`.
+        index.begin_scan().unwrap();
+        for (path, added_ns, rating) in [
+            ("mix/hi.jpg", 1_300, Some(5)),
+            ("mix/mid.jpeg", 1_200, Some(3)),
+            ("mix/shot.HEIC", 1_100, Some(5)),
+            ("mix/low.png", 1_075, Some(1)),
+            ("mix/zero.png", 1_050, Some(0)),
+            ("mix/none.gif", 1_025, None),
+            ("mix/clip.webp", 1_000, Some(2)),
+            ("mix/shot.avif", 950, Some(4)),
+            ("mix/draw.svg", 900, None),
+            ("mix/raw.bmp", 850, Some(2)),
+            ("mix/noext", 800, Some(3)),
+            ("mix/sneaky.jpgx", 750, Some(5)),
+            ("dir.png/inner", 700, Some(2)),
+        ] {
+            index.upsert_file(&image(path, added_ns, rating)).unwrap();
+        }
+        let seen: Vec<String> = [
+            "mix/hi.jpg",
+            "mix/mid.jpeg",
+            "mix/low.png",
+            "mix/zero.png",
+            "mix/none.gif",
+            "mix/clip.webp",
+            "mix/shot.avif",
+            "mix/shot.HEIC",
+            "mix/draw.svg",
+            "mix/raw.bmp",
+            "mix/noext",
+            "mix/sneaky.jpgx",
+            "dir.png/inner",
+        ]
+        .iter()
+        .map(|path| (*path).to_owned())
+        .collect();
+        index.finish_scan(&seen).unwrap();
+        (dir, index)
+    }
+
+    fn view_paths(index: &Index, q: &ViewQuery) -> Vec<String> {
+        let mut page = index.view(q).unwrap();
+        page.items.sort_by(|left, right| left.path.cmp(&right.path));
+        page.items.into_iter().map(|item| item.path).collect()
+    }
+
+    /// A `≥N` chip is a threshold: an image with no rating, or with a `0`, is
+    /// not "below N", it is unrated, and no threshold shows it (W80). The
+    /// unrated chip is the only one that lists those.
+    #[test]
+    fn a_rating_threshold_never_shows_an_unrated_image() {
+        let (_dir, index) = rating_type_library();
+        let at_least = |min: u8| ViewQuery {
+            rating: Some(RatingFilter::AtLeast(min)),
+            limit: 100,
+            ..ViewQuery::default()
+        };
+        let unrated = ViewQuery {
+            rating: Some(RatingFilter::Unrated),
+            limit: 100,
+            ..ViewQuery::default()
+        };
+
+        assert_eq!(
+            index.view(&at_least(1)).unwrap().total,
+            10,
+            "the ten images with a rating of at least one; the `0` and the two \
+             without a rating are not in it"
+        );
+        assert_eq!(
+            index.view(&at_least(5)).unwrap().total,
+            3,
+            "the boundary: five is the top"
+        );
+        assert_eq!(index.view(&at_least(3)).unwrap().total, 6);
+        assert_eq!(
+            view_paths(&index, &unrated),
+            vec![
+                "mix/draw.svg".to_owned(),
+                "mix/none.gif".to_owned(),
+                "mix/zero.png".to_owned()
+            ],
+            "the unrated chip lists the missing ratings and the zero, and only those"
+        );
+        assert!(
+            !view_paths(&index, &at_least(1)).contains(&"mix/zero.png".to_owned()),
+            "a zero is unrated, not a rating one clears"
+        );
+    }
+
+    /// The type chip is the extension family and nothing else: `jpeg` is jpg,
+    /// case is folded, `.jpgx` is not a jpg, an extensionless name is `other`,
+    /// and a folder named `dir.png` never makes its members pngs (W80).
+    #[test]
+    fn the_type_filter_reads_the_familys_extensions_only() {
+        let (_dir, index) = rating_type_library();
+        let of = |family: FileTypeFamily| ViewQuery {
+            file_type: Some(family),
+            limit: 100,
+            ..ViewQuery::default()
+        };
+        assert_eq!(
+            index.view(&of(FileTypeFamily::Jpg)).unwrap().total,
+            2,
+            "jpg and jpeg"
+        );
+        assert_eq!(index.view(&of(FileTypeFamily::Png)).unwrap().total, 2);
+        assert_eq!(
+            index.view(&of(FileTypeFamily::Heic)).unwrap().total,
+            1,
+            "uppercase .HEIC"
+        );
+        assert_eq!(index.view(&of(FileTypeFamily::Svg)).unwrap().total, 1);
+        assert_eq!(
+            view_paths(&index, &of(FileTypeFamily::Other)),
+            vec![
+                "dir.png/inner".to_owned(),
+                "mix/noext".to_owned(),
+                "mix/raw.bmp".to_owned(),
+                "mix/sneaky.jpgx".to_owned(),
+            ],
+            "bmp, no extension, a .jpgx decoy and the member of a folder named \
+             after an extension are all `other`"
+        );
+    }
+
+    /// Each chip group's counts answer for its own row and nothing else: the
+    /// rating facet steps the rating filter out, the type facet steps the type
+    /// filter out, and each keeps every other filter on screen (W80).
+    #[test]
+    fn the_rating_and_type_facets_answer_for_their_own_rows() {
+        let (_dir, index) = rating_type_library();
+        let counts = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::Off { limit: 200 })
+            .unwrap();
+        assert_eq!(
+            counts.ratings,
+            facet_map(&[
+                ("1", 10),
+                ("2", 9),
+                ("3", 6),
+                ("4", 4),
+                ("5", 3),
+                ("unrated", 3)
+            ]),
+            "a `≥N` number is every value at or above N, and the unrated \
+             number is the missing ratings plus the zero"
+        );
+        assert_eq!(
+            counts.types,
+            facet_map(&[
+                ("avif", 1),
+                ("gif", 1),
+                ("heic", 1),
+                ("jpg", 2),
+                ("other", 4),
+                ("png", 2),
+                ("svg", 1),
+                ("webp", 1)
+            ])
+        );
+
+        let view = ViewQuery {
+            rating: Some(RatingFilter::AtLeast(3)),
+            file_type: Some(FileTypeFamily::Jpg),
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::Off { limit: 200 })
+            .unwrap();
+        assert_eq!(
+            counts.ratings,
+            facet_map(&[("1", 2), ("2", 2), ("3", 2), ("4", 1), ("5", 1)]),
+            "the rating rows are the two jpgs — hi.jpg at five and mid.jpeg at \
+             three — with the type filter on and the rating filter stepped aside"
+        );
+        assert_eq!(
+            counts.types,
+            facet_map(&[("avif", 1), ("heic", 1), ("jpg", 2), ("other", 2)]),
+            "the type rows are the six images with a rating of at least three, \
+             with the rating filter on and the type filter stepped aside"
+        );
+    }
+
+    /// The lens caps the rating and type numbers the way it caps every other
+    /// facet — the Views rows stay the totals of the pages they open (W78),
+    /// and the new chips are facets, not ways out of the lens (W80).
+    #[test]
+    fn the_lens_caps_the_rating_and_type_numbers_like_every_other_facet() {
+        let (_dir, index) = rating_type_library();
+        let counts = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 3 })
+            .unwrap();
+        assert_eq!(
+            counts.total, 13,
+            "the `All` row counts the page it opens, uncapped"
+        );
+        assert_eq!(counts.recent, 3);
+        assert_eq!(
+            (
+                counts.ratings["1"],
+                counts.ratings["unrated"],
+                counts.ratings["5"]
+            ),
+            (3, 3, 3),
+            "the window is three images wide, so no chip promises more"
+        );
+        assert_eq!(
+            counts.types["other"], 3,
+            "`other` holds four images and the window reaches three"
+        );
+
+        // The chips are filters, not lenses: a Views row keeps them in its
+        // range and counts the page its own link opens with the lens off
+        // (W78 B2) — the `≥5` page holds its three images, however narrow
+        // the window beside it is.
+        let view = ViewQuery {
+            rating: Some(RatingFilter::AtLeast(5)),
+            ..ViewQuery::default()
+        };
+        let counts = index
+            .view_facet_counts(&view, RecentWindow::On { limit: 2 })
+            .unwrap();
+        assert_eq!(
+            (counts.total, counts.recent),
+            (3, 2),
+            "the destination page's total is uncapped; the window still caps \
+             the facets beside it"
+        );
+    }
+
+    /// The family names parse back to the same family, so a chip's label, its
+    /// query value and its facet key are one spelling.
+    #[test]
+    fn the_family_names_parse_back_to_the_same_family() {
+        for family in FileTypeFamily::ALL {
+            assert_eq!(FileTypeFamily::parse(family.as_str()), Some(family));
+        }
+        assert_eq!(FileTypeFamily::parse("JPEG"), Some(FileTypeFamily::Jpg));
+        assert_eq!(FileTypeFamily::parse("png"), Some(FileTypeFamily::Png));
+        assert_eq!(FileTypeFamily::parse("mp4"), None);
+        assert_eq!(
+            RatingFilter::AtLeast(3).key(),
+            "3",
+            "a threshold chip keys its counts by its number"
+        );
+        assert_eq!(RatingFilter::Unrated.key(), "unrated");
     }
 }

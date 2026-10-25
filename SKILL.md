@@ -194,6 +194,13 @@ grep -rl --include='*.md' -i 'underwater' .          # text and tags
 grep -rl --include='*.md' -E '^rating: [45]' .       # rated 4 or 5
 ```
 
+A rating is 0–5 (FORMAT §3.1), and `0`, an out-of-range value and no `rating`
+at all all read as *unrated*. A "3 stars or more" search therefore excludes
+unrated images — offer to look for them separately rather than folding them in
+at the bottom. File type is the name's extension family (`jpg` covers `jpeg`;
+`heif`, `tif`, `tiff`, `bmp` and anything else are `other`), never a guess at
+the bytes.
+
 Images without notes can only be found by name or by looking at them. If a
 dimagine tool is installed, prefer it for search by meaning or by similar image.
 
