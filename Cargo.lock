@@ -496,6 +496,7 @@ dependencies = [
  "dimagine-write",
  "http-body-util",
  "httpdate",
+ "libc",
  "mime_guess",
  "percent-encoding",
  "pulldown-cmark",

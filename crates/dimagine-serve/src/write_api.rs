@@ -218,13 +218,7 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
                 }
                 Err(error) => return store_error(error),
             }
-            let expected = state
-                .csrf
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&token)
-                .cloned();
-            let Some(expected) = expected else {
+            let Some(expected) = crate::session_csrf(&state, &token) else {
                 return json_error(StatusCode::UNAUTHORIZED, "this session cannot write");
             };
             let presented = request
@@ -284,14 +278,7 @@ fn origin_of(url: &str) -> Option<String> {
 /// token itself; an anonymous caller (no session) gets an empty token.
 async fn csrf_bootstrap(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let token = session_token(&state, &headers)
-        .and_then(|token| {
-            state
-                .csrf
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&token)
-                .cloned()
-        })
+        .and_then(|token| crate::session_csrf(&state, &token))
         .unwrap_or_default();
     Json(serde_json::json!({ "csrf": token })).into_response()
 }
@@ -816,14 +803,7 @@ pub(crate) async fn settings_page(State(state): State<AppState>, headers: Header
         }
     };
     let csrf = session_token(&state, &headers)
-        .and_then(|token| {
-            state
-                .csrf
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .get(&token)
-                .cloned()
-        })
+        .and_then(|token| crate::session_csrf(&state, &token))
         .unwrap_or_default();
     let editable = state.writer.is_some();
     // Whose password the page offers to change: the signed-in account's own.
@@ -1033,14 +1013,7 @@ pub(crate) fn write_controls_for(state: &AppState, headers: &HeaderMap) -> Optio
     }
     Some(
         session_token(state, headers)
-            .and_then(|token| {
-                state
-                    .csrf
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .get(&token)
-                    .cloned()
-            })
+            .and_then(|token| crate::session_csrf(state, &token))
             .unwrap_or_default(),
     )
 }
@@ -2903,14 +2876,18 @@ fn session_token(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
     let token = crate::cookie_value(cookies, &state.config.cookie_name)?;
     // A token counts only while its session is live; this mirrors the auth
-    // gate so a just-expired session never yields a CSRF token.
+    // gate so a just-expired session never yields a CSRF token. The maps are
+    // keyed by the salted hash of the token (W81), never by the token itself.
     let now = now_seconds();
-    let live = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(&token)
-        .is_some_and(|expiry| *expiry > now);
+    let found = {
+        let sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::find_session_key(&sessions, &token)
+            .and_then(|key| sessions.get(&key).map(|entry| (key, entry.expiry)))
+    };
+    let live = found.is_some_and(|(_, expiry)| expiry > now);
     live.then_some(token)
 }
 

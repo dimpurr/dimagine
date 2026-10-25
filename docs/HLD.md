@@ -196,6 +196,17 @@ does these steps themselves:
    user cannot write (alongside an unrecovered journal, a stray temporary file,
    a `.trash` that is a symlink, and trash/record mismatches).
 
+The state directory (`--data-dir`) holds `accounts.json` and — since sessions
+survive a restart — `sessions.jsonl`, the live sessions named by a salted hash
+of each cookie token (every record carries its own random salt beside its
+hash, the shape a password record keeps) and written 0600 like the accounts
+file. Nothing here adds it to
+a backup: it is convenience state, not library data, and losing it only signs
+everyone out. An operator who does back it up should know what a **rollback**
+does: restoring an older copy brings back the sessions that were signed out
+after it was taken — including those a password change signed out — and they
+stay back until their original expiry, no longer.
+
 Enabling `--write` on a real server is gated on the Phase 3a review passing;
 until then it is exercised against test libraries only.
 

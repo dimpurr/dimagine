@@ -7,6 +7,15 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Sessions survive a restart (W81): signing in records the session in the
+  server's state directory (`--data-dir`), so restarting `dimagine serve` no
+  longer signs everyone out — a session that has not expired keeps working,
+  one that expired while the server was down stays signed out, and signing out
+  is still final. The session file names each session by a hash of its cookie
+  token (never the token itself) and is written 0600 like `accounts.json`.
+  One-time note on upgrading: the previous build kept sessions only in memory
+  and they cannot be carried over, so the first restart after the upgrade
+  signs out whatever was still open; every login after that survives.
 - Rating and file-type chips (W80): the search box's chips menu — beside the
   chips the scope already carries — now filters the grid by rating and by file
   type. The rating chips are the `≥1`…`≥5` thresholds and one Unrated chip: a

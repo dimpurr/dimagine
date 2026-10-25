@@ -17,6 +17,7 @@ dimagine-preview = { path = "../dimagine-preview" }
 dimagine-write = { path = "../dimagine-write" }
 httpdate = "1"
 http-body-util = "0.1"
+libc = "0.2"
 mime_guess = "2"
 percent-encoding = "2.3"
 pulldown-cmark = "0.10"

@@ -16,6 +16,7 @@ pub mod content;
 pub mod index_sync;
 pub(crate) mod media;
 pub mod pages;
+pub mod session_log;
 pub mod ui;
 pub mod view_query;
 pub mod write_api;
@@ -261,19 +262,30 @@ pub(crate) struct AppState {
     /// half stays parked until a multi-instance deployment is a supported
     /// configuration.
     pub(crate) setup_lock: Arc<Mutex<()>>,
-    pub(crate) sessions: Arc<Mutex<HashMap<String, u64>>>,
+    /// Every session's expiry and hash salt, keyed by the salted SHA-256 of
+    /// its cookie token (never the token itself). Restored from the session
+    /// log at startup (W81): a session that is still unexpired keeps working
+    /// across a restart, one that expired while the server was down is not
+    /// restored. The salt rides along (W81b) so a presented token can be
+    /// hashed under each live salt until it matches its own record.
+    pub(crate) sessions: Arc<Mutex<HashMap<String, SessionEntry>>>,
     /// The server-side CSRF token of each session (ADR-018 §3), keyed by the
-    /// same session token as [`AppState::sessions`] and pruned with it. It is
+    /// same key as [`AppState::sessions`] and pruned with it. It is
     /// handed to the owner's own pages and read back from a request header on
     /// every write; it is never in a URL or a client-settable cookie.
     pub(crate) csrf: Arc<Mutex<HashMap<String, String>>>,
-    /// The account a session was opened for, keyed by the same session token
+    /// The account a session was opened for, keyed by the same key
     /// as [`AppState::sessions`] and pruned with it. A passcode session has
     /// no entry: it authenticates the server, not a person. The settings
     /// page's password change is the one caller — it edits the signed-in
     /// account's own credential and signs out that account's other sessions,
     /// so it needs to know which account the request belongs to.
     pub(crate) session_users: Arc<Mutex<HashMap<String, String>>>,
+    /// The persistent session log (`<data-dir>/sessions.jsonl`, W81). Every
+    /// session lifecycle change is written here under the maps' locks, so the
+    /// log's order is the maps' order and a restart replays exactly what a
+    /// running server believes.
+    pub(crate) session_log: Arc<session_log::SessionLog>,
     /// The library write core, opened once at router build (ADR-016 §1: the
     /// library root is opened once). `None` when `--write` is off, so every
     /// write route is absent and the settings page is read-only.
@@ -712,6 +724,23 @@ fn store_error(err: accounts::AccountsError) -> Response {
     response
 }
 
+/// Refuse to open a session that could not be recorded (W81): 500 with
+/// the error text and no cookie. A session that exists only in memory
+/// would silently stop working at the next restart, so the login is
+/// refused rather than half-open; the error never contains a token or
+/// hash.
+fn session_error(err: std::io::Error) -> Response {
+    let mut response = (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("session storage error: {err}"),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 /// Refuse a login attempt without comparing it: 429 with `Retry-After`
 /// and an empty body, so a refused attempt is indistinguishable from
 /// any other.
@@ -812,15 +841,47 @@ pub fn router_from(
     };
     let index = Arc::new(index_handle);
     index.ensure_background_rescan(config.rescan_interval);
+    // The session log (W81) restores what the last run left behind: sessions
+    // that are still unexpired keep working, and the first restart after the
+    // upgrade drops the in-memory-only sessions of earlier builds once —
+    // they were never on disk to restore. An unreadable log is not "no
+    // sessions": it is reported and every visitor signs in again, which is
+    // the safe direction (a start can lose a session, never invent one).
+    let session_log = Arc::new(session_log::SessionLog::new(&config.data_dir));
+    let (mut sessions, mut csrf, mut session_users) =
+        (HashMap::new(), HashMap::new(), HashMap::new());
+    match session_log.load(now_seconds()) {
+        Ok(records) => {
+            for record in records {
+                sessions.insert(
+                    record.token_hash.clone(),
+                    SessionEntry {
+                        expiry: record.expiry,
+                        salt: record.salt.clone(),
+                    },
+                );
+                csrf.insert(record.token_hash.clone(), record.csrf);
+                if let Some(account) = record.account {
+                    session_users.insert(record.token_hash, account);
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "WARNING: the session log is unreadable ({error}); every visitor must sign in again"
+            );
+        }
+    }
     let state = AppState {
         catalog,
         previews,
         config,
         accounts,
         setup_lock: Arc::new(Mutex::new(())),
-        sessions: Arc::new(Mutex::new(HashMap::new())),
-        csrf: Arc::new(Mutex::new(HashMap::new())),
-        session_users: Arc::new(Mutex::new(HashMap::new())),
+        sessions: Arc::new(Mutex::new(sessions)),
+        csrf: Arc::new(Mutex::new(csrf)),
+        session_users: Arc::new(Mutex::new(session_users)),
+        session_log,
         writer,
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(Admission::new()),
@@ -985,10 +1046,12 @@ async fn auth(State(state): State<AppState>, request: Request<Body>, next: Next)
     let authenticated = if let Some(token) = token {
         let now = now_seconds();
         let mut sessions = state.sessions.lock().unwrap();
-        match sessions.get(&token).copied() {
-            Some(expiry) if expiry > now => true,
-            Some(_) => {
-                sessions.remove(&token);
+        let found = find_session_key(&sessions, &token)
+            .and_then(|key| sessions.get(&key).map(|entry| (key, entry.expiry)));
+        match found {
+            Some((_, expiry)) if expiry > now => true,
+            Some((key, _)) => {
+                sessions.remove(&key);
                 false
             }
             None => false,
@@ -1171,12 +1234,21 @@ async fn setup(
     drop(setup_guard);
 
     let token = uuid::Uuid::new_v4().to_string();
-    store_session(
-        &mut state.sessions.lock().unwrap(),
-        token.clone(),
-        now_seconds(),
-    );
-    attach_csrf(&state, &token, Some(trimmed_email));
+    if let Err(error) = open_session(&state, &token, Some(trimmed_email)) {
+        // The owner account was created just above, so say so: setup did
+        // not fail outright, only the session could not be recorded.
+        eprintln!("WARNING: the session log write failed: {error}");
+        let html = layout(
+            "Initial Setup",
+            "<p>The owner account was created, but the session could not be recorded. \
+             Sign in at <a href=\"/login\">/login</a>.</p>",
+        );
+        let mut response = (StatusCode::INTERNAL_SERVER_ERROR, Html(html)).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    }
     let mut response = Redirect::to("/").into_response();
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -1363,13 +1435,20 @@ async fn login(
         let mut throttles = state.throttles.lock().unwrap();
         throttles.record_success(&client_key);
     }
+    // Signing in again ends the session the browser still holds (W81b, S4):
+    // the re-login rotates the token instead of leaving the old one live
+    // beside it.
+    if let Some(old) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookies| cookie_value(cookies, &state.config.cookie_name))
+    {
+        drop_session(&state, &old);
+    }
     let token = uuid::Uuid::new_v4().to_string();
-    store_session(
-        &mut state.sessions.lock().unwrap(),
-        token.clone(),
-        now_seconds(),
-    );
-    attach_csrf(&state, &token, account_email.as_deref());
+    if let Err(error) = open_session(&state, &token, account_email.as_deref()) {
+        return session_error(error);
+    }
     let mut response = Redirect::to("/").into_response();
     let cookie = format!(
         "{}={}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
@@ -1491,18 +1570,83 @@ fn asset(
     response
 }
 
-fn store_session(sessions: &mut HashMap<String, u64>, token: String, now: u64) {
-    sessions.retain(|_, expiry| *expiry > now);
+/// The map key of a session: the SHA-256 (hex) of the record's per-session
+/// salt followed by the cookie token. The token itself lives only in the
+/// cookie and the client; the three maps and the session log hold this hash
+/// (W81), so neither a copied state directory nor a memory dump of the maps
+/// yields a session anyone can use. The salt is the record's own (W81b), the
+/// shape a password record keeps: one token hashed under two salts gives two
+/// hashes, so a leaked hash is good on no other record and no other
+/// installation, and a record whose salt is wrong verifies nothing. A record
+/// written before W81b carries no salt and hashes as if salted with nothing,
+/// exactly as its hash was written.
+pub(crate) fn session_key(salt: &str, token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(salt.as_bytes());
+    hasher.update(token.as_bytes());
+    let mut out = String::with_capacity(64);
+    for byte in hasher.finalize() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// One live session as the maps hold it (W81b): its expiry and the salt its
+/// [`session_key`] was hashed with.
+#[derive(Clone, Debug)]
+pub(crate) struct SessionEntry {
+    pub(crate) expiry: u64,
+    pub(crate) salt: String,
+}
+
+/// The key of the live session a presented token opens, or `None` when no
+/// live session matches. Every entry is tried with its own salt
+/// ([`session_key`]), the way a password is checked against the salt of its
+/// own record: a token verifies against exactly its record's salt, and a
+/// wrong salt — a tampered record, a token from elsewhere — matches nothing.
+/// The scan is over the live sessions (bounded by [`store_session`]), and
+/// each step is one small SHA-256.
+pub(crate) fn find_session_key(
+    sessions: &HashMap<String, SessionEntry>,
+    token: &str,
+) -> Option<String> {
+    sessions
+        .iter()
+        .find(|(key, entry)| session_key(&entry.salt, token) == key.as_str())
+        .map(|(key, _)| key.clone())
+}
+
+/// Insert a fresh session's key into the expiry map and return the keys
+/// evicted to keep the map at its bound: expired sessions are pruned first,
+/// and one over the bound evicts the oldest-expiry entry (a busy server
+/// keeps its most-used sessions, W81's log mirrors the eviction).
+fn store_session(
+    sessions: &mut HashMap<String, SessionEntry>,
+    key: String,
+    salt: String,
+    now: u64,
+) -> Vec<String> {
+    sessions.retain(|_, entry| entry.expiry > now);
+    let mut evicted = Vec::new();
     if sessions.len() >= 10_000 {
         if let Some(oldest) = sessions
             .iter()
-            .min_by_key(|(_, expiry)| *expiry)
-            .map(|(token, _)| token.clone())
+            .min_by_key(|(_, entry)| entry.expiry)
+            .map(|(key, _)| key.clone())
         {
             sessions.remove(&oldest);
+            evicted.push(oldest);
         }
     }
-    sessions.insert(token, now + SESSION_SECONDS);
+    sessions.insert(
+        key,
+        SessionEntry {
+            expiry: now + SESSION_SECONDS,
+            salt,
+        },
+    );
+    evicted
 }
 
 /// A fresh server-side CSRF token: 32 random bytes, hex. It is stored against
@@ -1519,37 +1663,135 @@ fn new_csrf_token() -> String {
     out
 }
 
-/// Give a freshly authenticated session its CSRF token and, when it
-/// authenticates a person, the account it belongs to — forgetting the entries
-/// of sessions that have since expired so the three maps cannot drift apart.
-/// Called by both `/login` and `/setup` right after `store_session`.
+/// A fresh per-session hash salt (W81b): 16 random bytes, hex. It is stored
+/// beside the session's hash and is not secret — its job is that every
+/// session's hash is its own.
+fn new_salt() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(32);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Open a freshly authenticated session (W81): give it its expiry, CSRF
+/// token and account in the three maps, and record it in the session log,
+/// all in one critical section. The log line is written while the maps'
+/// locks are held, so the log's order is the maps' order and a restart
+/// replays exactly what this server believes; the entries of sessions that
+/// have since expired are forgotten on the way so the maps cannot drift
+/// apart. On a log failure the maps are rolled back and the error returned:
+/// a session that is only in memory would silently stop working at the next
+/// restart, so the caller refuses the login instead.
 ///
 /// `account` is `None` for a passcode session: it signs in to the server, not
 /// to an account, and the write surface refuses it anyway (ADR-018 §2).
-fn attach_csrf(state: &AppState, token: &str, account: Option<&str>) {
+fn open_session(state: &AppState, token: &str, account: Option<&str>) -> std::io::Result<()> {
     // Lock order everywhere a map is touched from two of the three is
-    // sessions → csrf → session_users; see `invalidate_other_sessions`.
-    let sessions = state.sessions.lock().unwrap();
-    let mut csrf = state.csrf.lock().unwrap();
-    let mut users = state.session_users.lock().unwrap();
+    // sessions → csrf → session_users → session log; see
+    // `invalidate_other_sessions`.
+    let salt = new_salt();
+    let key = session_key(&salt, token);
+    let now = now_seconds();
+    let mut sessions = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut csrf = state
+        .csrf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut users = state
+        .session_users
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let evicted = store_session(&mut sessions, key.clone(), salt.clone(), now);
     csrf.retain(|session, _| sessions.contains_key(session));
     users.retain(|session, _| sessions.contains_key(session));
-    csrf.insert(token.to_owned(), new_csrf_token());
+    let csrf_token = new_csrf_token();
+    csrf.insert(key.clone(), csrf_token.clone());
     match account {
         Some(email) => {
-            users.insert(token.to_owned(), email.to_owned());
+            users.insert(key.clone(), email.to_owned());
         }
         None => {
-            users.remove(token);
+            users.remove(&key);
         }
     }
+    let record = session_log::SessionRecord {
+        token_hash: key.clone(),
+        salt,
+        expiry: now + SESSION_SECONDS,
+        csrf: csrf_token,
+        account: account.map(str::to_owned),
+    };
+    let recorded = state
+        .session_log
+        .drop_keys(&evicted)
+        .and_then(|()| state.session_log.put(&record));
+    if let Err(error) = recorded {
+        sessions.remove(&key);
+        csrf.remove(&key);
+        users.remove(&key);
+        return Err(error);
+    }
+    Ok(())
 }
 
-/// Forget a session, its CSRF token and its account together (logout).
+/// The CSRF token of a session, or `None` when it has none (unknown or
+/// passcode session). `token` is the raw cookie token; the maps are keyed by
+/// its salted hash.
+pub(crate) fn session_csrf(state: &AppState, token: &str) -> Option<String> {
+    let key = {
+        let sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        find_session_key(&sessions, token)?
+    };
+    state
+        .csrf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .cloned()
+}
+
+/// Forget a session, its CSRF token and its account together (logout), in
+/// the maps and in the session log (W81): a signed-out session must not come
+/// back at the next start. The log line is written while the maps' locks are
+/// held. A failed log write leaves the record for the next start to find
+/// (the session is dead either way until then); it is reported on stderr.
 fn drop_session(state: &AppState, token: &str) {
-    state.sessions.lock().unwrap().remove(token);
-    state.csrf.lock().unwrap().remove(token);
-    state.session_users.lock().unwrap().remove(token);
+    let mut sessions = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut csrf = state
+        .csrf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut users = state
+        .session_users
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A token with no live session has no record to name: nothing to drop in
+    // the maps and no hash to write a drop line for. Its log record, if one
+    // outlived it, is compacted away at the next start as expired.
+    let Some(key) = find_session_key(&sessions, token) else {
+        return;
+    };
+    sessions.remove(&key);
+    csrf.remove(&key);
+    users.remove(&key);
+    if let Err(error) = state.session_log.drop_keys(&[key]) {
+        eprintln!(
+            "WARNING: the session log write failed ({error}); the signed-out session may revive at a restart until its expiry"
+        );
+    }
 }
 
 /// The account a live session was opened for, or `None` when the session is
@@ -1557,43 +1799,63 @@ fn drop_session(state: &AppState, token: &str) {
 /// liveness: a token that just expired has no account.
 pub(crate) fn session_account(state: &AppState, token: &str) -> Option<String> {
     let now = now_seconds();
-    let live = state
-        .sessions
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(token)
-        .is_some_and(|expiry| *expiry > now);
-    if !live {
-        return None;
-    }
+    let key = {
+        let sessions = state
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = find_session_key(&sessions, token)?;
+        if !sessions.get(&key).is_some_and(|entry| entry.expiry > now) {
+            return None;
+        }
+        key
+    };
     state
         .session_users
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(token)
+        .get(&key)
         .cloned()
 }
 
 /// Sign out every *other* session of one account, keeping `keep` — the
 /// session that just changed the account's password. Returns how many were
-/// signed out.
+/// signed out. Like [`drop_session`], the deletions reach the session log
+/// (W81) while the maps' locks are held.
 ///
 /// The account is matched case-insensitively, the way the store matches an
 /// email everywhere else. A session with no account entry (a passcode
 /// session) is never touched: it does not belong to this account.
 pub(crate) fn invalidate_other_sessions(state: &AppState, account: &str, keep: &str) -> usize {
-    let mut sessions = state.sessions.lock().unwrap();
-    let mut csrf = state.csrf.lock().unwrap();
-    let mut users = state.session_users.lock().unwrap();
+    let mut sessions = state
+        .sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut csrf = state
+        .csrf
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut users = state
+        .session_users
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keep_key = find_session_key(&sessions, keep).unwrap_or_default();
     let doomed: Vec<String> = users
         .iter()
-        .filter(|(token, email)| token.as_str() != keep && email.eq_ignore_ascii_case(account))
-        .map(|(token, _)| token.clone())
+        .filter(|(key, email)| {
+            key.as_str() != keep_key.as_str() && email.eq_ignore_ascii_case(account)
+        })
+        .map(|(key, _)| key.clone())
         .collect();
-    for token in &doomed {
-        sessions.remove(token);
-        csrf.remove(token);
-        users.remove(token);
+    for key in &doomed {
+        sessions.remove(key);
+        csrf.remove(key);
+        users.remove(key);
+    }
+    if let Err(error) = state.session_log.drop_keys(&doomed) {
+        eprintln!(
+            "WARNING: the session log write failed ({error}); the signed-out sessions may revive at a restart until their expiry"
+        );
     }
     doomed.len()
 }
@@ -1777,18 +2039,95 @@ mod regression_unit_tests {
     #[test]
     fn session_storage_prunes_expired_tokens_and_stays_bounded() {
         let mut sessions = (0..10_000)
-            .map(|index| (format!("session-{index}"), 100 + index))
+            .map(|index| {
+                (
+                    format!("session-{index}"),
+                    SessionEntry {
+                        expiry: 100 + index,
+                        salt: format!("salt-{index}"),
+                    },
+                )
+            })
             .collect::<HashMap<_, _>>();
-        store_session(&mut sessions, "fresh".to_owned(), 50);
+        let evicted = store_session(
+            &mut sessions,
+            "fresh".to_owned(),
+            "salt-fresh".to_owned(),
+            50,
+        );
         assert_eq!(sessions.len(), 10_000);
         assert!(sessions.contains_key("fresh"));
         assert!(!sessions.contains_key("session-0"));
+        // The evicted key is reported so the session log can forget it too
+        // (W81): an eviction the log never hears about would revive at the
+        // next start.
+        assert_eq!(evicted, vec!["session-0".to_owned()]);
 
-        sessions.insert("expired".to_owned(), 1);
-        store_session(&mut sessions, "after-expiry".to_owned(), 200);
+        sessions.insert(
+            "expired".to_owned(),
+            SessionEntry {
+                expiry: 1,
+                salt: "salt-expired".to_owned(),
+            },
+        );
+        store_session(
+            &mut sessions,
+            "after-expiry".to_owned(),
+            "salt-after".to_owned(),
+            200,
+        );
         assert!(!sessions.contains_key("expired"));
         assert!(sessions.contains_key("after-expiry"));
         assert!(sessions.len() <= 10_000);
+    }
+
+    /// W81b: one token hashed under two salts is two hashes — the record's
+    /// salt is not decoration.
+    #[test]
+    fn one_token_under_two_salts_hashes_two_ways() {
+        let token = "f61c1b2a-0000-4000-8000-000000000000";
+        let first = session_key("11111111111111111111111111111111", token);
+        let second = session_key("22222222222222222222222222222222", token);
+        assert_ne!(
+            first, second,
+            "the same token under two salts must hash two ways"
+        );
+        assert_eq!(
+            first,
+            session_key("11111111111111111111111111111111", token),
+            "one salt hashes one way"
+        );
+    }
+
+    /// W81b: verification reads the salt from the record — a record whose
+    /// salt is wrong verifies nothing, the password-record shape.
+    #[test]
+    fn a_record_with_the_wrong_salt_verifies_nothing() {
+        let token = "f61c1b2a-0000-4000-8000-000000000000";
+        let mut sessions = HashMap::new();
+        let key = session_key("right-salt", token);
+        sessions.insert(
+            key.clone(),
+            SessionEntry {
+                expiry: 200,
+                salt: "right-salt".to_owned(),
+            },
+        );
+        assert_eq!(find_session_key(&sessions, token), Some(key));
+
+        let mut tampered = HashMap::new();
+        tampered.insert(
+            session_key("right-salt", token),
+            SessionEntry {
+                expiry: 200,
+                salt: "wrong-salt".to_owned(),
+            },
+        );
+        assert_eq!(
+            find_session_key(&tampered, token),
+            None,
+            "a wrong salt must match no token"
+        );
     }
 
     #[test]
