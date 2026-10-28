@@ -335,8 +335,13 @@ a.search-pill-container:hover {
     flex: 1 1 100%;
   }
 
+  /* With a large system text size the count, sort menu, size segments and
+     theme switch no longer fit one line; they wrap instead of squeezing the
+     size segments to nothing or pushing the theme switch off-screen. */
   .toolbar-controls {
     flex: 1 1 100%;
+    flex-wrap: wrap;
+    row-gap: 8px;
     justify-content: space-between;
   }
 }
@@ -383,6 +388,9 @@ a.search-pill-container:hover {
 
 .size-toggles {
   display: inline-flex;
+  /* `overflow: hidden` drops the automatic minimum width, so without this
+     the segments shrink away on a crowded line. */
+  flex: 0 0 auto;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
