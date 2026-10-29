@@ -1529,6 +1529,11 @@ fn test_recovery_applies_known_steps_beside_third_state() {
             .is_err()
     );
     assert_eq!(writer.read(&victim).unwrap().0, b"after\n");
+    let journal = dir.path().join(".dimagine/journal").join(op_id);
+    let steps: Vec<StepRecord> =
+        serde_json::from_slice(&fs::read(journal.join("steps.json")).unwrap()).unwrap();
+    assert_eq!(steps.len(), 2);
+    assert!(!journal.join("step_0000.json").exists());
 
     // An external tool rewrites step 0's file into a third state.
     fs::write(dir.path().join("victim.md"), b"third state\n").unwrap();
@@ -1846,4 +1851,173 @@ fn execute_op_guarded_accepts_a_digest_only_precondition() {
         other => panic!("expected Conflict, got {other:?}"),
     }
     assert_eq!(fs::read(dir.path().join("note.md")).unwrap(), b"beta\n");
+}
+
+#[test]
+fn alias_writer_undo_and_crash_recovery() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+    let alias = RelPath::parse("_dimagine/tag-aliases.json").unwrap();
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Create,
+        src: None,
+        dst: alias.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(b"aliases".to_vec()),
+    };
+    writer
+        .execute_op(
+            "alias-create",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![step.clone()],
+        )
+        .unwrap();
+    let fp = writer.read(&alias).unwrap().1;
+    writer.update_tag_aliases(&fp, b"changed").unwrap();
+    assert!(matches!(
+        writer.undo("alias-create", None),
+        Err(Error::UndoRefused { .. })
+    ));
+    let fp = writer.read(&alias).unwrap().1;
+    writer.update_tag_aliases(&fp, b"aliases").unwrap();
+    writer.undo("alias-create", None).unwrap();
+    assert!(writer.read(&alias).is_err());
+    let records = writer.trash_records().unwrap();
+    let record = records[0].record.as_ref().unwrap();
+    assert_eq!(record.files[0].original, alias.text());
+    assert_eq!(
+        fs::read(dir.path().join(&record.files[0].trash)).unwrap(),
+        b"aliases"
+    );
+
+    assert!(writer
+        .execute_op_with_crash_injection(
+            "alias-crash",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![step],
+            Some(0)
+        )
+        .is_err());
+    kill_journal_writer(dir.path(), "alias-crash");
+    let report = writer.startup_sweep().unwrap();
+    assert!(matches!(
+        report.recovery[0],
+        RecoveryOutcome::RolledBack { .. }
+    ));
+    assert!(writer.read(&alias).is_err());
+    assert_eq!(writer.trash_records().unwrap().len(), 2);
+}
+
+#[test]
+fn alias_modification_is_exact_and_rejects_symlinks() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+    let alias = RelPath::parse("_dimagine/tag-aliases.json").unwrap();
+    let fp = writer.create_tag_aliases(b"one").unwrap();
+    writer.update_tag_aliases(&fp, b"two").unwrap();
+    assert!(matches!(
+        writer.update_tag_aliases(&fp, b"stale"),
+        Err(Error::Conflict(_))
+    ));
+    let other = RelPath::parse("_dimagine/other.json").unwrap();
+    let other_fp = writer.create_exclusive(&other, b"original").unwrap();
+    assert!(writer.update_existing(&other, &other_fp, b"bad").is_err());
+    assert!(RelPath::parse("_dimagine/../tag-aliases.json").is_err());
+    #[cfg(unix)]
+    {
+        fs::remove_file(dir.path().join(alias.to_path())).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(other.to_path()),
+            dir.path().join(alias.to_path()),
+        )
+        .unwrap();
+        assert!(writer.read(&alias).is_err());
+        assert!(writer.update_tag_aliases(&fp, b"bad").is_err());
+        assert_eq!(
+            fs::read(dir.path().join(other.to_path())).unwrap(),
+            b"original"
+        );
+    }
+}
+
+#[test]
+fn alias_modify_journal_undo_and_recovery_classification() {
+    let dir = tempdir().unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+    let alias = RelPath::parse("_dimagine/tag-aliases.json").unwrap();
+    writer.create_tag_aliases(b"before").unwrap();
+    let step = StepRecord {
+        step_idx: 0,
+        kind: StepKind::Modify,
+        src: None,
+        dst: alias.text(),
+        before_hash: None,
+        after_hash: String::new(),
+        before_bytes: None,
+        after_bytes: Some(b"after".to_vec()),
+    };
+    writer
+        .execute_op(
+            "alias-modify",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![step.clone()],
+        )
+        .unwrap();
+    writer.undo("alias-modify", None).unwrap();
+    assert_eq!(writer.read(&alias).unwrap().0, b"before");
+    assert!(writer
+        .execute_op_with_crash_injection(
+            "alias-modify-crash",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![step.clone()],
+            Some(0)
+        )
+        .is_err());
+    kill_journal_writer(dir.path(), "alias-modify-crash");
+    let report = writer.startup_sweep().unwrap();
+    assert!(matches!(
+        report.recovery[0],
+        RecoveryOutcome::RolledBack { .. }
+    ));
+    assert_eq!(writer.read(&alias).unwrap().0, b"before");
+    assert!(writer
+        .execute_op_with_crash_injection(
+            "alias-third-state",
+            "test",
+            None,
+            serde_json::json!({}),
+            vec![step],
+            Some(0)
+        )
+        .is_err());
+    fs::write(dir.path().join(alias.to_path()), b"external").unwrap();
+    kill_journal_writer(dir.path(), "alias-third-state");
+    let report = writer.startup_sweep().unwrap();
+    assert!(matches!(
+        report.recovery[0],
+        RecoveryOutcome::ThirdStateRefused { .. }
+    ));
+    assert_eq!(writer.read(&alias).unwrap().0, b"external");
+}
+
+#[cfg(unix)]
+#[test]
+fn alias_refuses_symlinked_parent() {
+    let dir = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("_dimagine")).unwrap();
+    let writer = Writer::open_raw(dir.path()).unwrap();
+    assert!(writer.create_tag_aliases(b"data").is_err());
+    assert!(!outside.path().join("tag-aliases.json").exists());
 }

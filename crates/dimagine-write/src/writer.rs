@@ -203,18 +203,49 @@ impl Writer {
         expected: &Fingerprint,
         new_bytes: &[u8],
     ) -> Result<Fingerprint> {
+        if path.note_kind().is_none() {
+            return Err(Error::BadPath {
+                path: path.text(),
+                reject: PathReject::NotANote,
+            });
+        }
         let lock = WriteLock::acquire(&self.root, &self.root_path)?;
         self.update_existing_locked(&lock, &StepPath::Library(path.clone()), expected, new_bytes)
     }
 
+    /// Replace the tag alias file using the same fingerprint checks as a note.
+    pub fn update_tag_aliases(&self, expected: &Fingerprint, bytes: &[u8]) -> Result<Fingerprint> {
+        let lock = WriteLock::acquire(&self.root, &self.root_path)?;
+        let path = StepPath::parse(crate::paths::TAG_ALIASES_PATH)?;
+        self.update_existing_locked(&lock, &path, expected, bytes)
+    }
+
+    /// Exclusively create the tag alias file.
+    pub fn create_tag_aliases(&self, bytes: &[u8]) -> Result<Fingerprint> {
+        let lock = WriteLock::acquire(&self.root, &self.root_path)?;
+        let path = StepPath::parse(crate::paths::TAG_ALIASES_PATH)?;
+        self.create_step_exclusive_locked(&lock, &path, bytes)
+    }
+
     pub(crate) fn update_existing_locked(
+        &self,
+        lock: &WriteLock,
+        path: &StepPath,
+        expected: &Fingerprint,
+        new_bytes: &[u8],
+    ) -> Result<Fingerprint> {
+        self.update_existing_with_deferred_dir_sync(lock, path, expected, new_bytes, None)
+    }
+
+    fn update_existing_with_deferred_dir_sync(
         &self,
         _lock: &WriteLock,
         path: &StepPath,
         expected: &Fingerprint,
         new_bytes: &[u8],
+        dirty_dirs: Option<&mut std::collections::BTreeMap<Vec<String>, File>>,
     ) -> Result<Fingerprint> {
-        if path.note_kind().is_none() {
+        if path.note_kind().is_none() && path.text() != crate::paths::TAG_ALIASES_PATH {
             return Err(Error::BadPath {
                 path: path.text(),
                 reject: PathReject::NotANote,
@@ -275,10 +306,21 @@ impl Writer {
             }));
         }
 
-        fs::rename_replace(&dir, &temp_name, path.name())?;
-        temp_guard.defuse();
-
-        fs::fsync_dir(&dir)?;
+        if let Some(dirty_dirs) = dirty_dirs {
+            let key = path.parent_components().to_vec();
+            if let std::collections::btree_map::Entry::Vacant(entry) = dirty_dirs.entry(key) {
+                let handle = dir
+                    .try_clone()
+                    .map_err(|e| fs::io_failed("clone parent directory", path.text(), e))?;
+                entry.insert(handle);
+            }
+            fs::rename_replace(&dir, &temp_name, path.name())?;
+            temp_guard.defuse();
+        } else {
+            fs::rename_replace(&dir, &temp_name, path.name())?;
+            temp_guard.defuse();
+            fs::fsync_dir(&dir)?;
+        }
 
         let (final_bytes, final_meta) = fs::read_leaf(&dir, path.name())?;
         Ok(Fingerprint::of(&final_bytes, &final_meta))
@@ -384,6 +426,19 @@ impl Writer {
             Ok(Renamed::Done) => {
                 fs::fsync_dir(&from_dir)?;
                 fs::fsync_dir(&to_dir)?;
+                if from.text() == crate::paths::TAG_ALIASES_PATH
+                    && to.text().starts_with(".trash/_dimagine/tag-aliases-")
+                {
+                    match fs::remove_dir_at(&self.root, "_dimagine") {
+                        Ok(()) => fs::fsync_dir(&self.root)?,
+                        Err(Error::Io { source, .. })
+                            if matches!(
+                                source.raw_os_error(),
+                                Some(libc::ENOTEMPTY | libc::EEXIST)
+                            ) => {}
+                        Err(e) => return Err(e),
+                    }
+                }
                 Ok(())
             }
             Ok(Renamed::Occupied) => Err(Error::Exists(Exists { path: to.to_path() })),
@@ -788,6 +843,32 @@ impl Writer {
         fail_after_step: Option<usize>,
         expect: Vec<Precondition>,
     ) -> Result<()> {
+        self.execute_op_locked_progress(
+            lock,
+            op_id,
+            source,
+            client_addr,
+            intent,
+            steps,
+            fail_after_step,
+            expect,
+            &mut |_, _| {},
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn execute_op_locked_progress(
+        &self,
+        lock: &WriteLock,
+        op_id: &str,
+        source: &str,
+        client_addr: Option<&str>,
+        intent: serde_json::Value,
+        steps: Vec<crate::journal::StepRecord>,
+        fail_after_step: Option<usize>,
+        expect: Vec<Precondition>,
+        progress: &mut dyn FnMut(usize, usize),
+    ) -> Result<()> {
         // A caller describes an intent; the journal must record fact. Read the
         // state each step is about to change before any file is touched, so
         // recovery and undo have hashes that are really the before and after.
@@ -795,6 +876,7 @@ impl Writer {
         // does not exist) refuses the whole operation here, before any file
         // moves.
         let mut steps = steps;
+        let mut expect = expect;
         for step in &mut steps {
             crate::journal::enrich_step(self, step)?;
         }
@@ -826,9 +908,19 @@ impl Writer {
 
         let now = chrono::Utc::now().to_rfc3339();
         let mut failures: Vec<crate::error::BatchStepError> = Vec::new();
+        let mut log_dir_synced = false;
+        let mut dirty_dirs = std::collections::BTreeMap::new();
 
+        let total = steps.len();
+        progress(0, total);
         for (idx, step) in steps.iter_mut().enumerate() {
-            if let Err(e) = self.apply_journaled_step(
+            #[cfg(test)]
+            STEP_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(idx);
+                }
+            });
+            match self.apply_journaled_step(
                 lock,
                 &journal,
                 op_id,
@@ -838,15 +930,28 @@ impl Writer {
                 &now,
                 step,
                 &expect,
+                &mut log_dir_synced,
+                &mut dirty_dirs,
             ) {
-                failures.push(crate::error::BatchStepError {
+                Ok(Some((path, fingerprint))) => {
+                    for pre in expect
+                        .iter_mut()
+                        .filter(|pre| pre.path == path && pre.open.is_some())
+                    {
+                        pre.expected = fingerprint.clone();
+                        pre.open = Some(fingerprint.clone());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => failures.push(crate::error::BatchStepError {
                     step_idx: idx,
                     path: PathBuf::from(step.dst.clone()),
                     message: e.to_string(),
                     landed_unaudited: matches!(e, Error::LandedButUnaudited { .. }),
-                });
+                }),
             }
 
+            progress(idx + 1, total);
             if fail_after_step == Some(idx) {
                 return Err(Error::Io {
                     context: "simulated crash between steps".to_string(),
@@ -856,6 +961,11 @@ impl Writer {
             }
         }
 
+        // Persist modified directory entries before either terminal marker.
+        // A sync failure leaves the journal for recovery.
+        for dir in dirty_dirs.values() {
+            fs::fsync_dir(dir)?;
+        }
         if failures.is_empty() {
             journal.mark_committed()?;
 
@@ -907,7 +1017,9 @@ impl Writer {
         now: &str,
         step: &mut crate::journal::StepRecord,
         expect: &[Precondition],
-    ) -> Result<()> {
+        log_dir_synced: &mut bool,
+        dirty_dirs: &mut std::collections::BTreeMap<Vec<String>, File>,
+    ) -> Result<Option<(StepPath, Fingerprint)>> {
         // Something outside this process may have edited the file since the
         // journal was written. Re-record it, so a rollback restores what
         // was actually there rather than what was expected there.
@@ -919,6 +1031,7 @@ impl Writer {
         }
 
         let mut before_bytes_recorded = None;
+        let mut updated_fingerprint = None;
 
         let after_hash_recorded = match step.kind {
             crate::journal::StepKind::Create => {
@@ -958,23 +1071,33 @@ impl Writer {
                 // construction, proving nothing, and would let a whole
                 // replace land over an edit made after the check up front
                 // (ADR-016 §3). A step with no such precondition — a move's
-                // link repair, an undo, a create — keeps the apply-time read.
+                // link repair or a create — keeps the apply-time read.
                 let expected = expect
                     .iter()
                     .find(|pre| pre.path == dst)
                     .and_then(|pre| pre.open.clone())
                     .unwrap_or(cur_fp);
-                let new_fp = self.update_existing_locked(lock, &dst, &expected, bytes)?;
-                new_fp.hex()
+                let new_fp = self.update_existing_with_deferred_dir_sync(
+                    lock,
+                    &dst,
+                    &expected,
+                    bytes,
+                    Some(dirty_dirs),
+                )?;
+                let hash = new_fp.hex();
+                updated_fingerprint = Some((dst, new_fp));
+                hash
             }
             crate::journal::StepKind::Move => {
                 let src = StepPath::parse(step.src.as_ref().unwrap())?;
                 let dst = StepPath::parse(&step.dst)?;
+                self.check_step_precondition(&src, expect)?;
                 self.move_step_noreplace_locked(lock, &src, &dst)?;
                 step.after_hash.clone()
             }
             crate::journal::StepKind::Delete => {
                 let dst = StepPath::parse(&step.dst)?;
+                self.check_step_precondition(&dst, expect)?;
                 self.unlink_step_locked(lock, &dst)?;
                 // The recorded bytes ride the audit line, so an
                 // undo can put a small trash record back
@@ -1003,17 +1126,34 @@ impl Writer {
             after_hash: after_hash_recorded,
             before_bytes: before_bytes_recorded,
         };
-        crate::op_log::append_op_entry(&self.root, &log_entry).map_err(|e| {
-            Error::LandedButUnaudited {
+        crate::op_log::append_op_entry_with_dir_sync(&self.root, &log_entry, !*log_dir_synced)
+            .map_err(|e| Error::LandedButUnaudited {
                 path: step.dst.clone(),
                 message: e.to_string(),
+            })?;
+        *log_dir_synced = true;
+        Ok(updated_fingerprint)
+    }
+
+    fn check_step_precondition(&self, path: &StepPath, expect: &[Precondition]) -> Result<()> {
+        if let Some(expected) = expect
+            .iter()
+            .find(|pre| &pre.path == path)
+            .and_then(|pre| pre.open.as_ref())
+        {
+            let (bytes, current) = self.read_step(path)?;
+            if !expected.matches(&current) {
+                return Err(conflict_err(crate::error::Conflict {
+                    path: path.to_path(),
+                    expected: expected.clone(),
+                    current,
+                    current_bytes: bytes,
+                }));
             }
-        })?;
+        }
         Ok(())
     }
 
-    /// Undo an operation by op_id.
-    ///
     /// `client_addr` is the peer the undo was asked for, recorded on the
     /// inverse operation's audit lines (ADR-018 §6). Callers without a peer
     /// — the CLI — pass `None`.
@@ -1137,4 +1277,13 @@ impl Writer {
     pub fn trash_records(&self) -> Result<Vec<crate::trash::ScannedRecord>> {
         crate::trash::scan_records(self)
     }
+}
+
+#[cfg(test)]
+type StepHook = Option<Box<dyn FnMut(usize)>>;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static STEP_HOOK: std::cell::RefCell<StepHook> =
+        std::cell::RefCell::new(None);
 }

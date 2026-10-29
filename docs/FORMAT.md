@@ -61,8 +61,20 @@ them in existing names should report them, not rename.
 
 Tools must ignore: any file or folder whose name starts with `.` (including
 `.dimagine/` for content purposes), `._*` resource-fork files, `Thumbs.db` and
-`desktop.ini`. Tools must not follow symbolic links that leave the library and
+`desktop.ini`, and any directory named `_dimagine` with all of its contents.
+Tools must not follow symbolic links that leave the library and
 should not follow symbolic links at all when scanning.
+
+The optional root file `_dimagine/tag-aliases.json` stores input aliases as
+UTF-8 JSON: `{"version":1,"aliases":{"old name":"canonical/path"}}`.
+Aliases are for canonicalizing new tag input; existing note tags remain the
+source of truth. Keys use Unicode case folding and NFC for matching, and must
+be unambiguous. Targets follow the tag rules (§3.1) and have no empty path
+segments. Keys may contain spaces, but may not contain empty path segments,
+control characters or tag punctuation. Invalid, cyclic, excessively long or
+unreadable tables must be reported rather than treated as empty. An absent
+file means there are no aliases. Tool support for applying aliases is not yet
+wired into tag input.
 
 ## 3. The image note
 
@@ -589,6 +601,10 @@ An unknown or malformed value is ignored and reported as a notice beside the
 grid; it never breaks the page. Generated URLs carry only the values that
 differ from the defaults, and one spelling each.
 
+**`tag`** matches the selected tag and its slash-delimited descendants; multiple
+`tag` parameters are combined with AND. A facet counts each image once within
+the selected subtree. Library scans ignore `_dimagine/` as specified in §2.2.
+
 **`rating`** is one chip at a time. `1`–`5` are the `≥N` chips: only images
 whose rating is at least `N`. A missing `rating` and a `0` are not ratings
 (§3.1), so no threshold shows them: `rating=unrated` — spelled `0` in a
@@ -612,6 +628,9 @@ cannot keep that promise will describe a migration.
 
 | Version | Date | Change |
 | --- | --- | --- |
+| 0.1 | 2026-10-28 | Specify subtree tag queries. |
+| 0.1 | 2026-10-28 | Specify the optional input alias table (§2.2). |
+| 0.1 | 2026-10-27 | Exclude `_dimagine/` directories and their contents from library scans (§2.2). |
 | 0.1 | 2026-10-04 | First draft. |
 | 0.1 | 2026-10-04 | Draft revision: image notes end with a self-embed (§3.2); file names avoid `[ ] # ^ \|` (§2.1). |
 | 0.1 | 2026-10-05 | Additive optional property `added` (§3.1): when the image first entered the collection, possibly in another tool. |

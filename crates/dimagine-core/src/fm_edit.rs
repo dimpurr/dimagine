@@ -2239,6 +2239,31 @@ fn flow_spelling(tags: &[String]) -> String {
         .join(", ")
 }
 
+/// Read editable tag values without changing the note. Unsupported or ambiguous
+/// front matter is refused using the same rules as tag edits.
+pub fn editable_tags(raw: &[u8]) -> Result<Vec<String>, FmEditError> {
+    let text = ensure_utf8(raw)?;
+    let Some(fm) = closed_of(front_matter_range(raw)) else {
+        return match front_matter_range(raw) {
+            FmRange::NoFrontMatter { .. } => Ok(Vec::new()),
+            FmRange::Unterminated { .. } => Err(FmEditError::UnterminatedFrontMatter),
+            FmRange::Closed { .. } => unreachable!(),
+        };
+    };
+    let ctx = open_edit(raw, text, fm, "tags")?;
+    let Some(entry) = ctx.find("tags")? else {
+        return Ok(Vec::new());
+    };
+    match &entry.value {
+        ScannedValue::Empty { .. } => Ok(Vec::new()),
+        ScannedValue::Scalar { .. } => Err(FmEditError::TagsNotAList),
+        ScannedValue::Uneditable => Err(FmEditError::ValueNotEditable),
+        ScannedValue::FlowSeq { .. } | ScannedValue::BlockSeq { .. } => {
+            existing_tag_texts(&ctx.doc)?.ok_or(FmEditError::VerificationFailed)
+        }
+    }
+}
+
 /// Add tags to the `tags` list, deduplicating case-insensitively and keeping
 /// the first spelling. The existing style is kept — a flow list gains
 /// elements before its `]`, a block list gains `- item` lines — and a note
@@ -2359,13 +2384,33 @@ pub fn add_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
 /// spelling of what stays. Removing the last tag deletes the `tags` key;
 /// removing nothing changes nothing.
 pub fn remove_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
-    let text = ensure_utf8(raw)?;
+    // Preserve validation order and the no-op behaviour for empty selections.
+    ensure_utf8(raw)?;
     let removals = normalize_tag_list(tags)?;
     if removals.is_empty() {
         return Ok(raw.to_vec());
     }
     let remove_ci: std::collections::BTreeSet<String> =
         removals.iter().map(|t| t.to_lowercase()).collect();
+    remove_matching_tags(raw, |tag| remove_ci.contains(&tag.to_lowercase()))
+}
+
+/// Remove exact stored tag spellings, including historical names containing
+/// spaces. This does not normalize inputs or resolve aliases.
+pub fn remove_exact_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
+    ensure_utf8(raw)?;
+    if tags.is_empty() {
+        return Ok(raw.to_vec());
+    }
+    let removals: std::collections::BTreeSet<&str> = tags.iter().copied().collect();
+    remove_matching_tags(raw, |tag| removals.contains(tag))
+}
+
+fn remove_matching_tags(
+    raw: &[u8],
+    matches: impl Fn(&str) -> bool,
+) -> Result<Vec<u8>, FmEditError> {
+    let text = ensure_utf8(raw)?;
     const KEY: &str = "tags";
     let fm = closed_of(front_matter_range(raw));
     let Some(fm) = fm else {
@@ -2383,10 +2428,7 @@ pub fn remove_tags(raw: &[u8], tags: &[&str]) -> Result<Vec<u8>, FmEditError> {
         let Some(existing) = existing_tag_texts(doc)? else {
             return Ok(None);
         };
-        let matched: Vec<bool> = existing
-            .iter()
-            .map(|t| remove_ci.contains(&t.to_lowercase()))
-            .collect();
+        let matched: Vec<bool> = existing.iter().map(|t| matches(t)).collect();
         Ok(Some((existing, matched)))
     };
     match &entry.value {

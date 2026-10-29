@@ -8,3 +8,5 @@ pub mod folders;
 pub mod image;
 pub mod library;
 pub mod search;
+
+pub mod tags;

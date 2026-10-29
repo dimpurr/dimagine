@@ -44,7 +44,19 @@ const TRASH_EMPTY_SCHEMA: &str = "dimagine.trash-empty/0.1";
 pub fn commands() -> Vec<Command> {
     vec![
         Command::new("tag")
-            .about("Add or remove tags in an image's note front matter.")
+            .about("Edit image tags or plan library-wide tag changes.")
+            .args_conflicts_with_subcommands(true)
+            .subcommand_negates_reqs(true)
+            .subcommand(Command::new("list").about("Preview or apply a versioned tag operations list.")
+                    .arg(Arg::new("expect-digest").long("expect-digest").requires("apply"))
+                .arg(Arg::new("file").required(true))
+                .arg(Arg::new("apply").long("apply").action(ArgAction::SetTrue))
+                .arg(Arg::new("no-aliases").long("no-aliases").action(ArgAction::SetTrue)))
+            .subcommand(tag_batch_command("rename", false))
+            .subcommand(tag_batch_command("merge", true))
+            .subcommand(tag_batch_command("move", false))
+            .subcommand(tag_batch_command("rm", false))
+            .subcommand(Command::new("aliases").about("Show the validated alias table."))
             .arg(
                 Arg::new("image")
                     .value_name("IMG")
@@ -342,6 +354,157 @@ pub fn commands() -> Vec<Command> {
     ]
 }
 
+fn tag_batch_command(name: &'static str, multiple: bool) -> Command {
+    let sources = Arg::new("sources").value_name("SOURCE").required(true);
+    let sources = if multiple {
+        sources.num_args(1..)
+    } else {
+        sources
+    };
+    let mut command = Command::new(name)
+        .arg(sources)
+        .arg(
+            Arg::new("apply")
+                .long("apply")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("dry-run"),
+        )
+        .arg(
+            Arg::new("dry-run")
+                .long("dry-run")
+                .action(ArgAction::SetTrue),
+        );
+    if name != "rm" {
+        command = command.arg(
+            Arg::new("no-aliases")
+                .long("no-aliases")
+                .action(ArgAction::SetTrue)
+                .help("Do not remember changed names as aliases."),
+        );
+        command = command.arg(Arg::new("target").value_name("TARGET").required(true));
+    }
+    command
+}
+
+use dimagine_core::tag_batch::parse_tag_list;
+
+fn run_tag_batch(name: &str, sub: &ArgMatches, root: &Path) -> ExitCode {
+    use dimagine_core::tag_aliases::{TagAliases, ALIAS_PATH};
+    use dimagine_core::tag_batch::{plan_tag_batch, remembered_aliases, TagOperation};
+    let json = sub.get_flag("json");
+    if let Err(error) = TagAliases::load(root) {
+        return fail(json, &error);
+    }
+    if name == "aliases" {
+        let bytes = match std::fs::read(root.join(ALIAS_PATH)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                br#"{"version":1,"aliases":{}}"#.to_vec()
+            }
+            Err(error) => return fail(json, &error.to_string()),
+        };
+        if let Err(error) = TagAliases::parse(&bytes) {
+            return fail(json, &format!("invalid alias table: {error}"));
+        }
+        if json {
+            let document: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(document) => document,
+                Err(error) => return fail(json, &error.to_string()),
+            };
+            let output = serde_json::json!({"version": 1, "operations": [], "counts": {"aliases": document["aliases"].as_object().unwrap().len()}, "conflicts": [], "plan_digest": null, "op_id": null, "aliases": document["aliases"]});
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        } else {
+            println!("{}", String::from_utf8_lossy(&bytes));
+        }
+        return ExitCode::SUCCESS;
+    }
+    let operations = if name == "list" {
+        let path = sub.get_one::<String>("file").expect("required file");
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) => return fail(json, &e.to_string()),
+        };
+        match parse_tag_list(&bytes) {
+            Ok(ops) => ops,
+            Err(e) => return fail(json, &e),
+        }
+    } else {
+        let sources: Vec<String> = sub
+            .get_many::<String>("sources")
+            .unwrap()
+            .cloned()
+            .collect();
+        let source = sources[0].clone();
+        let target = if name == "rm" {
+            String::new()
+        } else {
+            sub.get_one::<String>("target").cloned().unwrap_or_default()
+        };
+        let operation = match name {
+            "rename" => TagOperation::Rename { source, target },
+            "merge" => TagOperation::Merge { sources, target },
+            "move" => TagOperation::Move { source, target },
+            "rm" => TagOperation::Remove { source },
+            _ => unreachable!(),
+        };
+        vec![operation]
+    };
+    let mut plan = match plan_tag_batch(root, &operations, None) {
+        Ok(plan) => plan,
+        Err(error) => return fail(json, &error),
+    };
+    if name != "rm" && !sub.get_flag("no-aliases") && plan.ready() {
+        let proposed = match remembered_aliases(&plan) {
+            Ok(proposed) => proposed,
+            Err(error) => return fail(json, &error),
+        };
+        if let Some(bytes) = proposed {
+            if let Err(error) = plan.set_alias_after(&bytes) {
+                return fail(json, &error);
+            }
+        }
+    }
+    if name == "list" && sub.get_flag("apply") {
+        match sub.get_one::<String>("expect-digest") {
+            Some(expected) if expected == &plan.digest => {}
+            _ => {
+                return fail(
+                    json,
+                    "apply requires the matching --expect-digest from preview",
+                )
+            }
+        }
+    }
+    let op_id = if sub.get_flag("apply") {
+        let writer = match open_writer(root, json) {
+            Ok(writer) => writer,
+            Err(code) => return code,
+        };
+        match writer.apply_tag_batch(&plan) {
+            Ok(id) => id,
+            Err(error) => return fail(json, &error.to_string()),
+        }
+    } else {
+        None
+    };
+    let changed = plan
+        .notes
+        .iter()
+        .filter(|note| note.before != note.after)
+        .count();
+    let output = serde_json::json!({"version": plan.version, "operations": &plan.operations,
+        "counts": {"notes_scanned": plan.notes.len(), "notes_changed": changed,
+            "deduplicated": plan.notes.iter().map(|n| n.deduplicated).sum::<usize>()},
+        "conflicts": &plan.conflicts, "unreadable": &plan.unreadable,
+        "plan_digest": &plan.digest, "op_id": op_id, "alias_changes": plan.aliases.as_ref().and_then(|a| a.after.as_ref()).map(|b| serde_json::from_slice::<serde_json::Value>(b).expect("validated aliases")), "dry_run": !sub.get_flag("apply")});
+    println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    if plan.ready() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// Run a write command, returning its exit code, or `None` for a command this
 /// module does not own.
 pub fn dispatch(name: &str, sub: &ArgMatches, library_dir: &Path) -> Option<ExitCode> {
@@ -492,7 +655,14 @@ fn resolve_all<'a>(
 // ---------------------------------------------------------------------------
 
 fn run_tag(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
+    if let Some((name, nested)) = sub.subcommand() {
+        return run_tag_batch(name, nested, library_dir);
+    }
     let json = sub.get_flag("json");
+    let aliases = match dimagine_core::tag_aliases::TagAliases::load(library_dir) {
+        Ok(a) => a,
+        Err(e) => return fail(json, &e),
+    };
     let adds: Vec<String> = sub
         .get_many::<String>("add")
         .map(|v| v.cloned().collect())
@@ -501,6 +671,14 @@ fn run_tag(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
         .get_many::<String>("remove")
         .map(|v| v.cloned().collect())
         .unwrap_or_default();
+    let adds = match adds
+        .iter()
+        .map(|tag| aliases.resolve(tag))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(tags) => tags,
+        Err(e) => return fail(json, &e),
+    };
     if adds.is_empty() && removes.is_empty() {
         return fail(json, "give at least one --add or --remove tag");
     }
@@ -2373,10 +2551,9 @@ fn run_trash(sub: &ArgMatches, library_dir: &Path) -> ExitCode {
 /// Plan one trash operation: each named image's group becomes a block of
 /// steps, numbered in a single sequence across the whole operation.
 ///
-/// The journal names every step file from `step_idx` (`step_{:04}.json`), so
-/// numbering per group would let a later group's step files rename-replace an
-/// earlier group's and hide those groups from crash recovery entirely
-/// (ADR-016 §7). The numbering is therefore the operation's, not a group's.
+/// Journal step indices must be unique across the operation: recovery uses
+/// them to match any corrected step to its original record (ADR-016 §7).
+/// The numbering is therefore the operation's, not a group's.
 fn plan_trash_steps(
     writer: &Writer,
     files: &[FileEntry],
@@ -3758,23 +3935,13 @@ mod tests {
         );
         assert!(crash.is_err());
         let op_dir = dir.path().join(".dimagine/journal").join(&op_id);
-        let mut names: Vec<String> = std::fs::read_dir(&op_dir)
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        let records: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(op_dir.join("steps.json")).unwrap()).unwrap();
+        let indices: Vec<u64> = records
+            .iter()
+            .map(|step| step["step_idx"].as_u64().unwrap())
             .collect();
-        names.sort();
-        assert_eq!(
-            names,
-            vec![
-                "meta.json",
-                "step_0000.json",
-                "step_0001.json",
-                "step_0002.json",
-                "step_0003.json",
-            ],
-            "every step of the operation has its own journal file"
-        );
+        assert_eq!(indices, vec![0, 1, 2, 3], "the journal contains all steps");
 
         // Recovery sees both groups: the landed steps roll back, so both
         // images are back in the library and neither is left in the trash.
@@ -3840,5 +4007,50 @@ mod tests {
         assert!(dir.path().join(".trash/a.md.trash.json").exists());
         assert!(dir.path().join(".trash/c.md").exists());
         assert!(dir.path().join(".trash/c.md.trash.json").exists());
+    }
+}
+
+#[cfg(test)]
+mod tag_list_tests {
+    use super::parse_tag_list;
+
+    fn list(entries: &str) -> Vec<u8> {
+        format!(r#"{{"version":1,"entries":[{entries}],"notes":[],"optional_operations":[]}}"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn optional_selection_is_explicit_unique_and_can_stand_alone() {
+        let optional =
+            r#"{"operation":"remove-redundant-parent","selected":true,"description":"review"}"#;
+        let input = |ops: &str| {
+            format!(r#"{{"version":1,"entries":[],"notes":[],"optional_operations":[{ops}]}}"#)
+        };
+        let parsed = parse_tag_list(input(optional).as_bytes()).unwrap();
+        assert!(matches!(
+            parsed.as_slice(),
+            [dimagine_core::tag_batch::TagOperation::RemoveRedundantParent]
+        ));
+        assert!(parse_tag_list(input(&optional.replace("true", "false")).as_bytes()).is_err());
+        assert!(parse_tag_list(input(&format!("{optional},{optional}")).as_bytes()).is_err());
+        assert!(parse_tag_list(
+            input(&optional.replace("remove-redundant-parent", "unknown")).as_bytes()
+        )
+        .is_err());
+        assert!(
+            parse_tag_list(input(&optional.replace(",\"selected\":true", "")).as_bytes()).is_err()
+        );
+    }
+    #[test]
+    fn strict_list_and_duplicate_validation() {
+        let entry = r#"{"source":"old","target":"new","action":"rename","selected":true,"image_count":1,"reason":"review","alternative_action":null}"#;
+        assert_eq!(parse_tag_list(&list(entry)).unwrap().len(), 1);
+        assert!(parse_tag_list(&list(&format!("{entry},{entry}"))).is_err());
+        assert!(parse_tag_list(&list(&entry.replace(r#""source""#, r#""unknown""#))).is_err());
+        assert!(
+            parse_tag_list(&list(&entry.replace(r#","alternative_action":null"#, ""))).is_err()
+        );
+        assert!(parse_tag_list(&list(&entry.replace("rename", "unsupported"))).is_err());
+        assert!(parse_tag_list(&list(&entry.replace("true", "false"))).is_err());
     }
 }

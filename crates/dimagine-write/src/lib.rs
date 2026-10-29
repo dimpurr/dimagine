@@ -34,7 +34,8 @@
 //! compare-and-swap.
 //!
 //! CLI and HTTP wiring is W63/W64, and so is the trash hand-back: this crate
-//! only ever reports a created file as "hand this to the trash".
+//! normally reports a created file as "hand this to the trash"; the tag alias
+//! file is moved to recorded trash within undo.
 
 pub mod error;
 pub mod fingerprint;
@@ -43,6 +44,7 @@ pub mod journal;
 pub mod lock;
 pub mod op_log;
 pub mod paths;
+pub mod tag_batch;
 pub mod trash;
 pub mod upload;
 pub mod writer;

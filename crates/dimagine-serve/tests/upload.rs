@@ -911,3 +911,236 @@ async fn a_collection_page_upload_resolves_the_folder_against_the_note() {
     let note = std::fs::read_to_string(root.path().join("library/refs/shots.md")).unwrap();
     assert!(note.contains("![[refs/harbour.png]]"), "{note}");
 }
+
+#[tokio::test]
+async fn tag_batch_preview_apply_and_undo_require_csrf_and_reject_stale_plans() {
+    let root = library();
+    let note = root.path().join("library/synthetic.md");
+    let original = b"---\ntags: [old]\n---\nSynthetic.\n";
+    std::fs::write(&note, original).unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let request = |path: &str, body: &serde_json::Value, token: &str| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("cookie", &cookie)
+            .header("origin", ORIGIN)
+            .header("x-csrf-token", token)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let mut proposal = serde_json::json!({"version":1,"entries":[{"source":"old","target":"new","action":"rename","selected":true,"image_count":1,"reason":"test","alternative_action":null}],"notes":[],"optional_operations":[]});
+    let (status, _, _) = send(
+        &app,
+        request("/api/write/tags/validate-proposal", &proposal, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    // Unselected entries must receive the same validation as CLI list input.
+    proposal["entries"][0]["selected"] = serde_json::json!(false);
+    proposal["entries"].as_array_mut().unwrap().push(serde_json::json!({"source":"other","target":"valid","action":"rename","selected":true,"image_count":1,"reason":"test","alternative_action":null}));
+    proposal["entries"][0]["target"] = serde_json::json!("bad//target");
+    let (status, _, _) = send(
+        &app,
+        request("/api/write/tags/validate-proposal", &proposal, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut batch = serde_json::json!({"operations": [{"action":"rename", "source":"old", "target":"new"}], "remember_aliases":true});
+    let (status, _, _) = send(&app, request("/api/write/tags/plan", &batch, "bad")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = send(&app, request("/api/write/tags/plan", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let preview = json_body(&body);
+    assert_eq!(preview["changed_notes"], 1);
+    batch["digest"] = preview["digest"].clone();
+    std::fs::write(&note, b"---\ntags: [old]\n---\nChanged.\n").unwrap();
+    let (status, _, _) = send(&app, request("/api/write/tags/apply", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, _, _) = send(&app, request("/api/write/tags/start", &batch, "bad")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = send(&app, request("/api/write/tags/start", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    std::fs::write(&note, original).unwrap();
+    let (status, _, body) = send(&app, request("/api/write/tags/apply", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let op = json_body(&body)["op"].as_str().unwrap().to_owned();
+    assert!(text(&std::fs::read(&note).unwrap()).contains("new"));
+    let (status, _, body) = send(
+        &app,
+        request("/api/write/undo", &serde_json::json!({"op":op}), &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert_eq!(std::fs::read(&note).unwrap(), original);
+    let (status, _, body) = send(&app, request("/api/write/tags/plan", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::OK);
+    batch["digest"] = json_body(&body)["digest"].clone();
+    let (status, _, _) = send(&app, request("/api/write/tags/start", &batch, &csrf)).await;
+    assert_eq!(status, StatusCode::OK);
+    loop {
+        let req = Request::builder()
+            .uri("/api/write/tags/progress")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let progress = json_body(&body);
+        if progress["state"] == "done" {
+            assert_eq!(progress["completed"], progress["total"]);
+            assert!(progress["total"].as_u64().unwrap() > 0);
+            break;
+        }
+        assert_eq!(progress["state"], "running", "{progress}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn tag_form_requires_csrf_and_revalidates_before_apply_and_undo() {
+    let root = library();
+    let note = root.path().join("library/form-synthetic.md");
+    let original = b"---\ntags: [old]\n---\nSynthetic.\n";
+    std::fs::write(&note, original).unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let request = |path: &str, fields: &[(&str, &str)]| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &cookie)
+            .header("origin", ORIGIN)
+            .body(Body::from(serde_urlencoded::to_string(fields).unwrap()))
+            .unwrap()
+    };
+    let fields = |token: &str, step: &str, digest: &str| {
+        vec![
+            ("csrf", token.to_owned()),
+            ("action", "rename".into()),
+            ("source", "old".into()),
+            ("target", "new".into()),
+            ("step", step.into()),
+            ("digest", digest.into()),
+        ]
+    };
+    let encode = |v: Vec<(&str, String)>| {
+        v.into_iter()
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect::<Vec<_>>()
+    };
+    let send_fields = |path: &str, fields: Vec<(String, String)>| {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &cookie)
+            .header("origin", ORIGIN)
+            .body(Body::from(serde_urlencoded::to_string(fields).unwrap()))
+            .unwrap()
+    };
+    let (status, _, _) = send(
+        &app,
+        send_fields("/api/write/tags/form", encode(fields("bad", "preview", ""))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, body) = send(
+        &app,
+        send_fields("/api/write/tags/form", encode(fields(&csrf, "preview", ""))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let html = text(&body);
+    let digest = html
+        .split("name=\"digest\" value=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap();
+    std::fs::write(&note, b"---\ntags: [old]\n---\nChanged.\n").unwrap();
+    let (status, _, _) = send(
+        &app,
+        send_fields(
+            "/api/write/tags/form",
+            encode(fields(&csrf, "apply", digest)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    std::fs::write(&note, original).unwrap();
+    let (status, _, body) = send(
+        &app,
+        send_fields(
+            "/api/write/tags/form",
+            encode(fields(&csrf, "apply", digest)),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert!(text(&body).contains("Apply running"));
+    let op = loop {
+        let req = Request::builder()
+            .uri("/api/write/tags/progress")
+            .header("cookie", &cookie)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let progress = json_body(&body);
+        if progress["state"] == "done" {
+            break progress["op"].as_str().unwrap().to_owned();
+        }
+        assert_eq!(progress["state"], "running", "{progress}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
+    let page = Request::builder()
+        .uri("/tags")
+        .header("cookie", &cookie)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(&app, page).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(text(&body).contains("Tag apply finished"));
+    let (status, _, _) = send(
+        &app,
+        request("/api/write/tags/undo-form", &[("csrf", &csrf), ("op", &op)]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(std::fs::read(&note).unwrap(), original);
+}
+
+#[tokio::test]
+async fn tag_batch_cleanup_runs_last_and_operation_chains_are_refused() {
+    let root = library();
+    let note = root.path().join("library/parent-synthetic.md");
+    std::fs::write(&note, b"---\ntags: [parent, parent/child, old]\n---\n").unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let request = |body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/write/tags/plan")
+            .header("content-type", "application/json")
+            .header("cookie", &cookie)
+            .header("origin", ORIGIN)
+            .header("x-csrf-token", &csrf)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, _, body) = send(&app, request(serde_json::json!({"operations":[{"action":"rename","source":"old","target":"new"},{"action":"remove_redundant_parent"}]}))).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    assert_eq!(json_body(&body)["changed_notes"], 1);
+    let (status, _, _) = send(&app, request(serde_json::json!({"operations":[{"action":"remove_redundant_parent"},{"action":"remove","source":"old"}]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = send(&app, request(serde_json::json!({"operations":[{"action":"rename","source":"old","target":"middle"},{"action":"remove","source":"middle"}]}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

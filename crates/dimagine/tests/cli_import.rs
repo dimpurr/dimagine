@@ -632,3 +632,47 @@ fn backfill_added_rejects_a_library_that_cannot_be_read() {
     ]);
     assert_eq!(code, 0, "stderr: {stderr}");
 }
+
+#[test]
+fn import_resolves_aliases_without_changing_source_metadata() {
+    let tmp = tmp("aliases");
+    let source = tmp.0.join("Fixture.library");
+    let destination = tmp.0.join("dest");
+    clean_eagle_library(&source);
+    let metadata =
+        json!({"id":"a","name":"Alpha","ext":"png","folders":["f1"],"tags":["old name"]});
+    item(
+        &source,
+        "a",
+        metadata.clone(),
+        Some(("Alpha.png", b"png-a")),
+    );
+    std::fs::create_dir_all(destination.join("_dimagine")).unwrap();
+    std::fs::write(
+        destination.join("_dimagine/tag-aliases.json"),
+        r#"{"version":1,"aliases":{"old name":"new"}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = dimagine(&[
+        "import",
+        "eagle",
+        source.to_str().unwrap(),
+        "--library",
+        destination.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0, "{stdout} {stderr}");
+    let tree = canonical_tree(&destination);
+    let note = tree
+        .iter()
+        .find(|(path, _)| path.ends_with("Alpha.png.md"))
+        .unwrap();
+    assert!(String::from_utf8_lossy(&note.1).contains("new"));
+    let raw = tree
+        .iter()
+        .find(|(path, _)| path.ends_with("Alpha.png.eagle.json"))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&raw.1).unwrap(),
+        metadata
+    );
+}

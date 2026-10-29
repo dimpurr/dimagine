@@ -136,6 +136,7 @@ pub struct IgnoredCounts {
     pub resource_fork: usize,
     pub os_metadata: usize,
     pub symlink: usize,
+    pub dimagine: usize,
 }
 
 /// A path that could not be read, and why.
@@ -274,6 +275,11 @@ impl Library {
                     continue;
                 }
             };
+            if metadata.is_dir() && name == "_dimagine" {
+                self.ignored.total += 1;
+                self.ignored.dimagine += 1;
+                continue;
+            }
             let rel_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
             let rel = display_rel(&rel_path);
             if metadata.is_dir() {

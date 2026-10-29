@@ -56,7 +56,7 @@ use crate::pages::{
     collections::collection_json, collections::collection_redirect, collections::collections_page,
     folders::folder_json, folders::folder_redirect, folders::folder_root_json,
     folders::folders_page, image::image_json, image::image_page, library::library_page,
-    library::sidebar_json, library::view_json, search::search_page,
+    library::sidebar_json, library::view_json, search::search_page, tags::tags_page,
 };
 use crate::ui::{layout, shell::Destination};
 
@@ -290,6 +290,7 @@ pub(crate) struct AppState {
     /// library root is opened once). `None` when `--write` is off, so every
     /// write route is absent and the settings page is read-only.
     pub(crate) writer: Option<Arc<Writer>>,
+    pub(crate) tag_progress: Arc<Mutex<write_api::TagProgress>>,
     pub(crate) throttles: Arc<Mutex<ThrottleState>>,
     pub(crate) admission: Arc<Admission>,
     pub(crate) login_slots: Arc<tokio::sync::Semaphore>,
@@ -883,6 +884,7 @@ pub fn router_from(
         session_users: Arc::new(Mutex::new(session_users)),
         session_log,
         writer,
+        tag_progress: Arc::new(Mutex::new(write_api::TagProgress::default())),
         throttles: Arc::new(Mutex::new(ThrottleState::default())),
         admission: Arc::new(Admission::new()),
         login_slots: Arc::new(tokio::sync::Semaphore::new(LOGIN_CONCURRENCY_LIMIT)),
@@ -915,6 +917,7 @@ pub fn router_from(
         .route("/folders", get(folders_page))
         .route("/collections", get(collections_page))
         .route("/search", get(search_page))
+        .route("/tags", get(tags_page))
         .route("/image/*path", get(image_page))
         // Old links keep working, pointing at the new form (spec §2).
         .route("/folder/*path", get(folder_redirect))

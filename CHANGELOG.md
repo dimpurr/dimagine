@@ -6,7 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Protect tag scan and progress details, and keep tag planning and legacy applies off async workers.
+
+- Improve tag menu dismissal and distinguish blocking preview issues.
+
+- Show live progress for background tag applies, with a refreshable no-JavaScript status.
+
+- Show notes that prevent tag batches on the tags page.
+
+- Validate and resolve aliases when replacing tags through the front-matter API.
+
+- Follow ordered tag operations when recording aliases and report invalid alias JSON without panicking.
+
+- Plan tag batches with one library scan and shared CLI/browser proposal validation.
+
+- Review tag proposals in the browser, manage individual tags without JavaScript, and navigate the complete tag hierarchy.
+
+- Suggest full tag paths and aliases when adding tags in the inspector.
+
+- Show the sidebar tag navigation as a hierarchy with per-tag management links.
+
+- Show affected image counts and thumbnail samples in tag operation previews.
+
+- Remove the empty alias table directory after undo or recovery moves a newly created table to trash.
+
+- Add tag row selection and single-tag action menus, with a narrower overview tree.
+
+- Add an initial write-mode tag selection and batch management interface with plan, apply, and undo. Image previews and browser-based no-JavaScript management remain in progress.
+
+- Add a read-only tag hierarchy with server-side name and review filtering, and guarded batch planning and apply endpoints.
+
+- Add validation and input resolution foundations for tag alias tables.
+
 ### Added
+- Preview and apply versioned tag operations lists, including optional redundant-parent removal, as one journaled batch.
+- Add library-wide tag CLI operations and resolve aliases on tag additions and Eagle import.
+- Tag filters include descendants, and tag counts deduplicate images across each subtree.
+- Add a library-wide tag batch planner and locked, journaled application with a single undo.
+- Library scans exclude `_dimagine/` directories and all their contents.
 - Sessions survive a restart (W81): signing in records the session in the
   server's state directory (`--data-dir`), so restarting `dimagine serve` no
   longer signs everyone out — a session that has not expired keeps working,

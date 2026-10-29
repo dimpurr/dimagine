@@ -22,6 +22,9 @@ ordinary file operations and the rules below. The full specification is
    do not write an empty value.
 5. **Do not write inside `.dimagine/`.** It belongs to tools and may be deleted.
 6. **Never invent an `id`.** Leave it out, or generate a real ULID.
+7. **Ignore `_dimagine/` directories when scanning library content.** See
+   `docs/FORMAT.md` §2.2. The optional root alias table is described there;
+   tool support for applying it to input is not yet wired.
 
 ## Create a library
 
@@ -186,6 +189,11 @@ them. A note too large to read refuses the merge instead of counting as absent.
 `--dry-run` prints the plan without touching a byte.
 
 ## Search
+
+Tag filters include slash-delimited descendants and combine with AND; see
+[viewer queries](docs/FORMAT.md#viewer-queries). For reviewed bulk tag changes,
+use the versioned list workflow in [HLD](docs/HLD.md#tag-operations-lists).
+
 
 Without tools, search the notes:
 

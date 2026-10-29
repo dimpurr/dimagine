@@ -1,7 +1,7 @@
 //! Multi-step journal and crash recovery (ADR-016 §7).
 //!
-//! Scope: multi-file operations write one atomically-fsynced step file per
-//! step into `.dimagine/journal/<op-id>/`, then touch user files, then write a
+//! Scope: multi-file operations write an atomically-fsynced step collection
+//! into `.dimagine/journal/<op-id>/`, then touch user files, then write a
 //! fsynced `committed` marker, and finally remove the journal directory. A
 //! partial batch (a step failed, the rest landed) writes a fsynced `partial`
 //! marker *before* attempting that removal, so the terminal state — "a subset
@@ -236,11 +236,8 @@ impl JournalOp {
         // Write meta.json
         write_atomic_json(&op_dir, META_FILE, &meta)?;
 
-        // Write each step file
-        for step in &steps {
-            let step_file_name = format!("step_{:04}.json", step.step_idx);
-            write_atomic_json(&op_dir, &step_file_name, step)?;
-        }
+        // Persist every before/after state before touching any user file.
+        write_atomic_json(&op_dir, "steps.json", &steps)?;
         fs::fsync_dir(&op_dir)?;
 
         Ok(Self {
@@ -660,18 +657,32 @@ fn recover_op(
         .collect();
     step_files.sort();
 
-    let mut steps = Vec::new();
+    let mut steps = if fs::leaf_exists(&op_dir, "steps.json") {
+        let (bytes, _) = fs::read_leaf(&op_dir, "steps.json").map_err(|e| Error::BadJournal {
+            op: op_id.to_string(),
+            message: format!("cannot read steps.json: {e}"),
+        })?;
+        serde_json::from_slice::<Vec<StepRecord>>(&bytes).map_err(|e| Error::BadJournal {
+            op: op_id.to_string(),
+            message: format!("cannot parse steps.json: {e}"),
+        })?
+    } else {
+        Vec::new()
+    };
     for sfile in &step_files {
         let (bytes, _) = fs::read_leaf(&op_dir, sfile).map_err(|e| Error::BadJournal {
             op: op_id.to_string(),
             message: format!("cannot read {sfile}: {e}"),
         })?;
-        steps.push(serde_json::from_slice::<StepRecord>(&bytes).map_err(|e| {
-            Error::BadJournal {
-                op: op_id.to_string(),
-                message: format!("cannot parse {sfile}: {e}"),
-            }
-        })?);
+        let step = serde_json::from_slice::<StepRecord>(&bytes).map_err(|e| Error::BadJournal {
+            op: op_id.to_string(),
+            message: format!("cannot parse {sfile}: {e}"),
+        })?;
+        if let Some(old) = steps.iter_mut().find(|old| old.step_idx == step.step_idx) {
+            *old = step;
+        } else {
+            steps.push(step);
+        }
     }
 
     // Classify every step on its own. A third-state file never blocks the
@@ -792,10 +803,23 @@ fn recover_op(
             match step.kind {
                 StepKind::Create => {
                     let dst = StepPath::parse(&step.dst)?;
-                    let dst_dir =
-                        fs::resolve_dir(writer.root_file(), dst.parent_components(), false)?;
-                    fs::unlink(&dst_dir, dst.name())?;
-                    let _ = fs::fsync_dir(&dst_dir);
+                    if dst.text() == crate::paths::TAG_ALIASES_PATH {
+                        let (_, fp) = writer.read_step(&dst)?;
+                        let trash_steps = crate::trash::alias_trash_steps(&op_id, &fp)?;
+                        let record = StepPath::parse(&trash_steps[0].dst)?;
+                        writer.create_step_exclusive_locked(
+                            lock,
+                            &record,
+                            trash_steps[0].after_bytes.as_deref().unwrap(),
+                        )?;
+                        let trash = StepPath::parse(&trash_steps[1].dst)?;
+                        writer.move_step_noreplace_locked(lock, &dst, &trash)?;
+                    } else {
+                        let dst_dir =
+                            fs::resolve_dir(writer.root_file(), dst.parent_components(), false)?;
+                        fs::unlink(&dst_dir, dst.name())?;
+                        let _ = fs::fsync_dir(&dst_dir);
+                    }
                 }
                 StepKind::Modify => {
                     let dst = StepPath::parse(&step.dst)?;

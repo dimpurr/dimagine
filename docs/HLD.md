@@ -3,6 +3,16 @@
 - **Status:** Planned (0.1). Everything here is optional tooling on top of
   [FORMAT.md](FORMAT.md); the format wins on any conflict.
 
+In write mode the inspector suggests full tag paths and aliases when adding a tag; the server resolves aliases on submission. The front-matter API accepts `fields.tags` only as a list of strings, resolving and validating its entries as tag inputs. The tags page reports unreadable inputs that block a batch and links to the affected notes. Web tag applies run in the background; the tags page reports completed write steps and the result, and can be refreshed without JavaScript. The writer lock serializes writers, while reads remain available during an apply.
+
+The sidebar presents tag paths hierarchically, with links to manage individual tags. On `/tags` it shows only the tag count.
+
+The viewer provides a read-only `/tags` hierarchy with indexed subtree counts,
+server-side name filtering, and a review filter for invalid names, rare tags,
+and matching leaf names. Write mode exposes CSRF-protected batch plan and apply
+endpoints; apply rebuilds the preview and the Writer revalidates under its lock.
+Write-enabled owner views also offer an initial JavaScript batch management interface with selection, preview, apply and undo. The preview reports changed notes and paired images, with up to twelve image thumbnails; browser-based management without JavaScript remains planned.
+
 ## Shape
 
 One Rust binary, `dimagine` (short alias `dimg`), with subcommands. It reads a
@@ -45,8 +55,8 @@ run them as one **operation** (FORMAT §8.3).
 - A file is read, hashed, changed in a `.dimagine.tmp.<nonce>` file beside it,
   fsynced and renamed into place. A modify or move whose recorded hash no longer
   matches refuses, so a note edited by hand in the meantime is never overwritten.
-- Each step is journaled under `.dimagine/journal/<op-id>/` before it happens;
-  a crash is recovered by the next writer. Each step that lands is appended to
+- All step states are journaled together under `.dimagine/journal/<op-id>/` before any step happens; a later correction is recorded separately. Recovery also reads older individual step files.
+  A crash is recovered by the next writer. Each step that lands is appended to
   `.dimagine/log/ops.jsonl` with its operation's id and intent and the
   before/after hash of the file it touched, which is what an undo reads. A
   step may name a file its own operation moves in — that is how `mv` renames
@@ -97,6 +107,31 @@ run them as one **operation** (FORMAT §8.3).
 | `import::eagle` | Read an Eagle library read-only and write images, notes and raw files into a target folder. |
 | `serve` | axum server: grid, folder and collection views, image detail, previews; a login by owner account, by shared passcode until an account exists, or none at all (`--auth none`). Accounts live outside the library in `--data-dir` and are managed by `dimagine user`. Read-only by default; `--write` opens the write API (front-matter, note body edit, move, upload, collection reorder and caption, undo, trash view, settings, password change) behind the CSRF, origin and owner-only rules of *Serving with writes (deployment)* below. The image/note page carries a plain textarea that edits the body as source and posts it to `/api/write/note/body`, with the note's open-time hash as a precondition and a reload-or-overwrite prompt on a conflict. The browser normalizes a textarea's value to LF, so a note with CRLF line endings edited through that page comes back with LF in the body (FORMAT §5.3). |
 
+### Tag batch planning (Current)
+
+`dimagine-core::tag_batch::plan_tag_batch` is a read-only library planner. It
+walks all non-ignored Markdown notes, retains their original and proposed bytes,
+and snapshots the optional alias table. It validates a requested complete alias
+replacement, reports unreadable or uneditable paths and rename collisions, and
+produces a versioned deterministic SHA-256 digest of the plan. A missing alias
+table is distinct from an unreadable one. Plans with issues are not ready.
+
+`dimagine-write::Writer::apply_tag_batch` acquires the Writer lock, rejects an
+existing `apply.pid` at the library root or under `.dimagine/`, rebuilds and
+compares the complete plan, and refuses conflicts and unreadable files. It
+uses per-file preconditions and journals all changes as one operation, with a
+single undo and the standard partial and crash recovery behavior. Undo and
+recovery move a newly created alias table to recorded trash and remove its parent `_dimagine/` if empty. The digest is not
+an authorization or a cross-file atomicity guarantee. The lock cooperates with
+other Writers; external editors remain subject to the existing per-file CAS
+semantics. `dimagine tag rename SOURCE TARGET`, `merge SOURCE... TARGET`,
+`move SOURCE TARGET`, and `rm SOURCE` plan by default; `--apply` journals
+the change. Rename, merge, and move remember changed source spellings as aliases by default; `--no-aliases` opts out. Moves remember each changed descendant, following subsequent operations to the final name. The proposed table is validated and included in the same journal and undo as the notes. `--json` reports the proposed alias table, operations, counts, conflicts, the plan digest,
+and the operation ID. `tag aliases` displays the validated alias table. Sources
+can include legacy spaces; targets cannot. Single-image tag additions, web tag
+additions, and Eagle-imported tags resolve through the same alias table. Tag
+removals select the stored spelling. Upload intake has no tag input.
+
 The viewer's grid also takes a phone drag-select: a long press on a
 tile opens selection mode, a drag across the grid adds or removes
 every thumbnail the finger passes — the pressed tile's own state is
@@ -109,6 +144,14 @@ grid is exactly what it was. The gestures keep the ones already
 there — a press that drifts before the long press fires is a scroll
 or a tap and cancels itself, so tap-to-open and scrolling are
 unchanged.
+
+### Hierarchical tag views (Current)
+
+Tag filters match the case-folded tag and its slash-delimited descendants;
+`a` includes `a/b` but not `ab`. Tag counts include descendants and count
+an image once per tag even when it carries several tags in that subtree.
+Facet counts retain the current view's filters and the Recent lens cap; the
+Views rows retain their existing uncapped semantics.
 
 ## Serving media (0.1)
 
@@ -248,3 +291,39 @@ is derived data the viewer rebuilds, so it never makes `check` exit non-zero.
 
 Search by meaning or by similar image, MCP, tagging models, colour management
 beyond EXIF orientation, watching the folder for changes.
+
+
+## Tag operations lists
+
+Status: Current. `dimagine tag list FILE` previews a UTF-8 JSON document;
+`--apply --expect-digest DIGEST` requires the digest from that preview and
+applies through the existing tag batch journal as one undoable operation.
+The writer revalidates the plan under its lock. Preview again after any change.
+`--no-aliases` suppresses remembering changed names as input aliases; use the
+same option for preview and apply. Conflicts and unreadable files block apply.
+
+Version 1 requires `version`, `entries`, `notes`, and `optional_operations`.
+Each entry requires `source`, `target`, `action` (`rename`, `merge`, `move`,
+`remove`, or `keep`), `selected`, `image_count`, `reason`, and
+`alternative_action` (an action or null). Counts and reasons are review context,
+not current measurements or authorization. Select only reviewed actions; change
+`action` to an alternative explicitly. `keep` requires identical paths and
+does nothing. Duplicate sources and exact target-to-source operation chains are rejected. A rename
+whose target exists is a conflict; choose merge after review. Optional entries
+require `operation`, `selected`, and `description`; the only recognized option,
+`remove-redundant-parent`, defaults to unselected in proposals and requires explicit
+selection. It runs after selected entry actions, removing a parent only when a
+case-sensitive, slash-delimited descendant remains on the same note. It does not
+create aliases. Duplicate optional operations are rejected.
+Unknown fields, action names, and versions are rejected.
+
+A preview's digest covers the planned library snapshot and alias change, not
+an authorization to write. External non-cooperating writers can still race;
+review failures and the journal outcome rather than assuming atomicity.
+
+The write-enabled Tags page also accepts version 1 proposal JSON for review,
+including alternate actions and an explicitly selected redundant-parent cleanup.
+The browser previews selected actions through the batch planner before applying
+and offers undo. The Tags page also provides a server-rendered single-action
+preview, apply and undo flow when JavaScript is disabled. Form submissions use
+the same origin and session-token checks as the JSON write API.

@@ -2012,3 +2012,128 @@ fn edit_takes_a_body_file_and_stdin_never_both() {
     assert!(stderr.contains("cannot be used with"), "{stderr}");
     assert_eq!(read(dir.lib(), "shelf.md"), SHELF);
 }
+
+#[test]
+fn tag_batch_dry_run_apply_and_alias_refusal() {
+    let dir = one_image("batch-alias");
+    write(&dir.0, "one.png.md", "---\ntags: [\"old name\"]\n---\n");
+    write(
+        &dir.0,
+        "_dimagine/tag-aliases.json",
+        r#"{"version":1,"aliases":{"old input":"new"}}"#,
+    );
+    let dry = json_in(&ok(&dir.0, &["tag", "rename", "old name", "new", "--json"]));
+    assert_eq!(dry["version"], 1);
+    assert_eq!(dry["counts"]["notes_changed"], 1);
+    assert!(dry["op_id"].is_null());
+    assert!(dry["plan_digest"].as_str().is_some());
+    assert!(read(&dir.0, "one.png.md").contains("old name"));
+    let aliases = json_in(&ok(&dir.0, &["tag", "aliases", "--json"]));
+    assert_eq!(aliases["counts"]["aliases"], 1);
+    let removed = json_in(&ok(&dir.0, &["tag", "rm", "old name", "--json"]));
+    assert_eq!(removed["counts"]["notes_changed"], 1);
+    let merged = json_in(&ok(
+        &dir.0,
+        &["tag", "merge", "old name", "other", "new", "--json"],
+    ));
+    assert_eq!(merged["counts"]["notes_changed"], 1);
+    let applied = json_in(&ok(
+        &dir.0,
+        &["tag", "rename", "old name", "new", "--apply", "--json"],
+    ));
+    assert!(applied["op_id"].as_str().is_some());
+    assert!(read(&dir.0, "one.png.md").contains("new"));
+    ok(&dir.0, &["tag", "one.png", "--add", "old input"]);
+    assert!(!read(&dir.0, "one.png.md").contains("old input"));
+    for bad in [
+        r#"{"version":1,"aliases":{"a":"b","b":"a"}}"#,
+        r#"{"version":1,"aliases":{"A":"x","a":"y"}}"#,
+    ] {
+        write(&dir.0, "_dimagine/tag-aliases.json", bad);
+        assert_ne!(dimagine(&dir.0, &["tag", "one.png", "--add", "x"]).0, 0);
+        let (code, stdout, stderr) = dimagine(&dir.0, &["tag", "aliases", "--json"]);
+        assert_ne!(code, 0);
+        assert!(!stdout.contains("panicked") && !stderr.contains("panicked"));
+    }
+}
+
+#[test]
+fn batch_remembers_aliases_and_undo_restores_both_files() {
+    let dir = one_image("batch-remember");
+    let original = "---\ntags: [old, old/child]\n---\n";
+    write(&dir.0, "one.png.md", original);
+    let prior = r#"{"version":1,"aliases":{"OLD":"previous","other":"old"}}"#;
+    write(&dir.0, "_dimagine/tag-aliases.json", prior);
+    let dry = json_in(&ok(&dir.0, &["tag", "move", "old", "new", "--json"]));
+    assert_eq!(dry["alias_changes"]["aliases"]["OLD"], "new");
+    assert_eq!(dry["alias_changes"]["aliases"]["old/child"], "new/child");
+    assert_eq!(read(&dir.0, "_dimagine/tag-aliases.json"), prior);
+    assert_eq!(read(&dir.0, "one.png.md"), original);
+    let result = json_in(&ok(
+        &dir.0,
+        &["tag", "move", "old", "new", "--apply", "--json"],
+    ));
+    let op = result["op_id"].as_str().unwrap();
+    let aliases: serde_json::Value =
+        serde_json::from_str(&read(&dir.0, "_dimagine/tag-aliases.json")).unwrap();
+    assert_eq!(aliases["aliases"]["OLD"], "new");
+    assert_eq!(aliases["aliases"]["old/child"], "new/child");
+    ok(&dir.0, &["undo", op]);
+    assert_eq!(read(&dir.0, "one.png.md"), original);
+    assert_eq!(read(&dir.0, "_dimagine/tag-aliases.json"), prior);
+    let no_alias = json_in(&ok(
+        &dir.0,
+        &[
+            "tag",
+            "rename",
+            "old",
+            "new",
+            "--no-aliases",
+            "--apply",
+            "--json",
+        ],
+    ));
+    assert!(no_alias["alias_changes"].is_null());
+    assert_eq!(read(&dir.0, "_dimagine/tag-aliases.json"), prior);
+}
+
+#[test]
+fn batch_refuses_invalid_existing_or_proposed_aliases() {
+    let dir = one_image("batch-invalid-aliases");
+    write(&dir.0, "one.png.md", "---\ntags: [old]\n---\n");
+    for aliases in [
+        r#"{"version":1,"aliases":{"a":"b","b":"a"}}"#,
+        r#"{"version":1,"aliases":{"A":"x","a":"y"}}"#,
+        r#"{"version":1,"aliases":{"new":"old"}}"#,
+    ] {
+        write(&dir.0, "_dimagine/tag-aliases.json", aliases);
+        assert_ne!(
+            dimagine(
+                &dir.0,
+                &["tag", "rename", "old", "new", "--apply", "--json"]
+            )
+            .0,
+            0
+        );
+        assert_eq!(read(&dir.0, "_dimagine/tag-aliases.json"), aliases);
+        assert!(read(&dir.0, "one.png.md").contains("old"));
+    }
+}
+
+#[test]
+fn merge_creates_alias_table_and_one_undo_restores_notes() {
+    let dir = one_image("merge-create-alias");
+    let original = "---\ntags: [one, two]\n---\n";
+    write(&dir.0, "one.png.md", original);
+    let result = json_in(&ok(
+        &dir.0,
+        &["tag", "merge", "one", "two", "final", "--apply", "--json"],
+    ));
+    let aliases: serde_json::Value =
+        serde_json::from_str(&read(&dir.0, "_dimagine/tag-aliases.json")).unwrap();
+    assert_eq!(aliases["aliases"]["one"], "final");
+    assert_eq!(aliases["aliases"]["two"], "final");
+    ok(&dir.0, &["undo", result["op_id"].as_str().unwrap()]);
+    assert_eq!(read(&dir.0, "one.png.md"), original);
+    assert!(!dir.0.join("_dimagine/tag-aliases.json").exists());
+}

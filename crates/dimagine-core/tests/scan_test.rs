@@ -151,3 +151,26 @@ fn mismatched_content_is_counted_by_real_format() {
     assert_eq!(report.images["png"], 1, "by real format, not extension");
     assert_eq!(report.images.get("jpeg").copied().unwrap_or(0), 0);
 }
+
+#[test]
+fn visible_tool_directories_are_excluded_recursively() {
+    let tmp = tmp("scan-visible-tool-directory");
+    write(tmp.path(), "visible.jpg", jpg());
+    write(tmp.path(), "_dimagine/tag-aliases.json", "{}");
+    write(tmp.path(), "_dimagine/nested/hidden.jpg", jpg());
+    write(
+        tmp.path(),
+        "_dimagine/nested/hidden.jpg.md",
+        "---\ntags: [hidden]\n---\n",
+    );
+    write(tmp.path(), "sub/_dimagine/deeper/hidden.png", png());
+    let lib = open_library(tmp.path());
+    let report = scan::run(&lib);
+    assert_eq!(report.image_total, 1);
+    assert_eq!(report.notes_total, 0);
+    assert_eq!(report.ignored.dimagine, 2);
+    assert!(lib
+        .files
+        .iter()
+        .all(|entry| !entry.rel.contains("_dimagine/")));
+}

@@ -6,6 +6,7 @@
 
 use axum::{
     extract::{RawQuery, State},
+    http::HeaderMap,
     response::{Html, IntoResponse, Response},
     Json,
 };
@@ -133,6 +134,7 @@ impl ViewPageJson {
 pub(crate) async fn library_page(
     State(state): State<AppState>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
 ) -> Response {
     let _permit = match acquire_admission(&state) {
         Some(permit) => permit,
@@ -205,6 +207,27 @@ pub(crate) async fn library_page(
         .index
         .view_facet_counts(&params.to_index_query(), recent_window(params.recent))
         .ok();
+    let tag_editor = match (
+        crate::write_api::write_controls_for(&state, &headers),
+        state.writer.as_ref(),
+    ) {
+        (Some(csrf), Some(writer)) => {
+            match dimagine_core::tag_aliases::TagAliases::load(writer.root_path())
+                .and_then(|aliases| aliases.suggestions())
+            {
+                Ok(aliases) => {
+                    let tags: Vec<_> = result.sidebar.tags.iter().map(|tag| &tag.tag).collect();
+                    let data = serde_json::json!({"tags": tags, "aliases": aliases});
+                    format!("<div id=\"inspector-tag-config\" hidden data-csrf=\"{}\" data-suggestions=\"{}\"></div>", escape_html(&csrf), escape_html(&data.to_string()))
+                }
+                Err(_) => {
+                    "<div id=\"inspector-tag-error\" hidden>Tag aliases could not be read.</div>"
+                        .to_owned()
+                }
+            }
+        }
+        _ => String::new(),
+    };
     let frame = Frame {
         banner: state.banner(),
         sidebar: Some(&result.sidebar),
@@ -220,10 +243,19 @@ pub(crate) async fn library_page(
         ..Frame::new(
             view_name.as_deref().unwrap_or("Library"),
             Destination::Library,
-            wrap_with_panel(facets.as_ref(), &params, &result.sidebar, body),
+            format!(
+                "{}{}",
+                tag_editor,
+                wrap_with_panel(facets.as_ref(), &params, &result.sidebar, body)
+            ),
         )
     };
-    Html(frame.render()).into_response()
+    let mut response = Html(frame.render()).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
 }
 
 /// The inspector body for the one photo the URL picks out (`?sel=<path>`).

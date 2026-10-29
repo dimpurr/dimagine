@@ -82,6 +82,14 @@ pub struct UndoOutcome {
 
 /// Append a single operation line and fsync it immediately.
 pub fn append_op_entry(root: &File, entry: &OpEntry) -> Result<()> {
+    append_op_entry_with_dir_sync(root, entry, true)
+}
+
+pub(crate) fn append_op_entry_with_dir_sync(
+    root: &File,
+    entry: &OpEntry,
+    sync_directory: bool,
+) -> Result<()> {
     let log_dir = fs::resolve_dir(root, &[".dimagine".to_string(), "log".to_string()], true)?;
     let mut file = fs::open_leaf(
         &log_dir,
@@ -98,7 +106,9 @@ pub fn append_op_entry(root: &File, entry: &OpEntry) -> Result<()> {
     file.write_all(&line)
         .map_err(|e| fs::io_failed("write ops.jsonl", OPS_LOG_FILE, e))?;
     fs::fsync_file(&file)?;
-    fs::fsync_dir(&log_dir)?;
+    if sync_directory {
+        fs::fsync_dir(&log_dir)?;
+    }
     Ok(())
 }
 
@@ -222,14 +232,23 @@ pub(crate) fn undo(
 
     let mut mismatches = Vec::new();
     let mut valid_entries = Vec::new();
+    let mut preconditions = Vec::new();
 
     for (entry_idx, entry) in op_entries.iter().enumerate() {
         let path = StepPath::parse(&entry.path)?;
         match entry.step_kind {
             StepKind::Create => match writer.read_step(&path) {
-                Ok((bytes, _)) => {
+                Ok((bytes, read_fp)) => {
                     let fp = Fingerprint::of_bytes(&bytes);
                     if fp.hex() == entry.after_hash {
+                        if path.as_trash().is_some()
+                            || path.text() == crate::paths::TAG_ALIASES_PATH
+                        {
+                            preconditions.push(crate::writer::Precondition::from_read(
+                                path.clone(),
+                                read_fp,
+                            ));
+                        }
                         valid_entries.push(entry.clone());
                     } else {
                         mismatches.push(UndoMismatch {
@@ -247,7 +266,7 @@ pub(crate) fn undo(
                 Err(e) => return Err(e),
             },
             StepKind::Modify => match writer.read_step(&path) {
-                Ok((bytes, _)) => {
+                Ok((bytes, read_fp)) => {
                     let fp = Fingerprint::of_bytes(&bytes);
                     let hex = fp.hex();
                     if hex == entry.after_hash {
@@ -257,6 +276,10 @@ pub(crate) fn undo(
                                 reason: UndoReason::NoRecord,
                             });
                         } else {
+                            preconditions.push(crate::writer::Precondition::from_read(
+                                path.clone(),
+                                read_fp,
+                            ));
                             valid_entries.push(entry.clone());
                         }
                     } else if entry.before_hash.as_deref() == Some(&hex) {
@@ -299,7 +322,7 @@ pub(crate) fn undo(
                 }
 
                 match dst_read {
-                    Ok((bytes, _)) => {
+                    Ok((bytes, read_fp)) => {
                         let fp = Fingerprint::of_bytes(&bytes);
                         let hex = fp.hex();
                         // ADR-016 §8 asks every file to be in the state the
@@ -314,6 +337,10 @@ pub(crate) fn undo(
                             .iter()
                             .any(|later| later.path == entry.path && later.after_hash == hex);
                         if hex == entry.after_hash || edited_later {
+                            preconditions.push(crate::writer::Precondition::from_read(
+                                path.clone(),
+                                read_fp,
+                            ));
                             valid_entries.push(entry.clone());
                         } else {
                             mismatches.push(UndoMismatch {
@@ -393,6 +420,21 @@ pub(crate) fn undo(
             StepKind::Create => match &path {
                 // A created library file: the caller hands
                 // it to the trash (ADR-016 §8).
+                StepPath::Library(rel) if rel.text() == crate::paths::TAG_ALIASES_PATH => {
+                    let fp = preconditions
+                        .iter()
+                        .find(|pre| pre.path == path)
+                        .and_then(|pre| pre.open.as_ref())
+                        .expect("alias preflight fingerprint");
+                    for mut step in crate::trash::alias_trash_steps(op_id, fp)? {
+                        step.step_idx = steps.len();
+                        steps.push(step);
+                    }
+                    undone.push(UndoneItem::Moved {
+                        from: path.clone(),
+                        to: StepPath::parse(&steps.last().unwrap().dst)?,
+                    });
+                }
                 StepPath::Library(rel) => {
                     undone.push(UndoneItem::TrashThis(rel.clone()));
                 }
@@ -430,8 +472,8 @@ pub(crate) fn undo(
                 undone.push(UndoneItem::Modified(rel.clone()));
                 // The before-state is re-read from the file (which
                 // sits at the recorded after-hash) and the after-state
-                // is the recorded before-bytes, by `enrich_step` and
-                // the journal write respectively.
+                // is the recorded before-bytes. The preflight fingerprint
+                // is retained as the inverse step's CAS precondition.
                 steps.push(crate::journal::StepRecord {
                     step_idx: steps.len(),
                     kind: StepKind::Modify,
@@ -502,7 +544,7 @@ pub(crate) fn undo(
             serde_json::json!({ "undo_op": op_id }),
             steps,
             None,
-            Vec::new(),
+            preconditions,
         )?;
     }
 
@@ -511,4 +553,153 @@ pub(crate) fn undo(
         undone,
         skipped: mismatches,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::journal::StepRecord;
+
+    #[test]
+    fn undo_rechecks_preflight_fingerprint_at_each_inverse_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::open_raw(dir.path()).unwrap();
+        for name in ["a.md", "b.md"] {
+            std::fs::write(dir.path().join(name), b"before").unwrap();
+        }
+        let steps = ["a.md", "b.md"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| StepRecord {
+                step_idx: i,
+                kind: StepKind::Modify,
+                src: None,
+                dst: (*name).into(),
+                before_hash: None,
+                after_hash: String::new(),
+                before_bytes: None,
+                after_bytes: Some(b"after".to_vec()),
+            })
+            .collect();
+        writer
+            .execute_op("test-undo-cas", "test", None, serde_json::json!({}), steps)
+            .unwrap();
+        let edited = dir.path().join("a.md");
+        crate::writer::STEP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |idx| {
+                if idx == 1 {
+                    std::fs::write(&edited, b"external edit").unwrap();
+                }
+            }))
+        });
+        let result = writer.undo("test-undo-cas", None);
+        crate::writer::STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            matches!(result, Err(Error::BatchPartial { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("a.md")).unwrap(),
+            b"external edit"
+        );
+        assert_eq!(std::fs::read(dir.path().join("b.md")).unwrap(), b"before");
+    }
+    #[test]
+    fn undo_alias_create_rechecks_after_preflight_and_reports_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::open_raw(dir.path()).unwrap();
+        let step = StepRecord {
+            step_idx: 0,
+            kind: StepKind::Create,
+            src: None,
+            dst: crate::paths::TAG_ALIASES_PATH.into(),
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: Some(b"created".to_vec()),
+        };
+        writer
+            .execute_op(
+                "alias-inverse",
+                "test",
+                None,
+                serde_json::json!({}),
+                vec![step],
+            )
+            .unwrap();
+        let edited = dir.path().join(crate::paths::TAG_ALIASES_PATH);
+        crate::writer::STEP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |idx| {
+                if idx == 1 {
+                    std::fs::write(&edited, b"external").unwrap();
+                }
+            }))
+        });
+        let result = writer.undo("alias-inverse", None);
+        crate::writer::STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            matches!(result, Err(Error::BatchPartial { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(crate::paths::TAG_ALIASES_PATH)).unwrap(),
+            b"external"
+        );
+    }
+    #[test]
+    fn undo_rechecks_move_after_inverse_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let writer = Writer::open_raw(dir.path()).unwrap();
+        std::fs::write(dir.path().join("old.md"), b"before").unwrap();
+        let steps = vec![
+            StepRecord {
+                step_idx: 0,
+                kind: StepKind::Move,
+                src: Some("old.md".into()),
+                dst: "new.md".into(),
+                before_hash: None,
+                after_hash: String::new(),
+                before_bytes: None,
+                after_bytes: None,
+            },
+            StepRecord {
+                step_idx: 1,
+                kind: StepKind::Modify,
+                src: None,
+                dst: "new.md".into(),
+                before_hash: None,
+                after_hash: String::new(),
+                before_bytes: Some(b"before".to_vec()),
+                after_bytes: Some(b"after".to_vec()),
+            },
+        ];
+        writer
+            .execute_op(
+                "move-edit-inverse",
+                "test",
+                None,
+                serde_json::json!({}),
+                steps,
+            )
+            .unwrap();
+        let edited = dir.path().join("new.md");
+        crate::writer::STEP_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |idx| {
+                if idx == 1 {
+                    std::fs::write(&edited, b"external").unwrap();
+                }
+            }))
+        });
+        let result = writer.undo("move-edit-inverse", None);
+        crate::writer::STEP_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(
+            matches!(result, Err(Error::BatchPartial { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("new.md")).unwrap(),
+            b"external"
+        );
+        assert!(!dir.path().join("old.md").exists());
+    }
 }

@@ -24,7 +24,7 @@ use axum::{
     middleware::Next,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
+    Form, Json, Router,
 };
 use dimagine_core::body_edit::{self, BodyCtx, Embed, FolderSource};
 use dimagine_core::fm_edit::{
@@ -88,6 +88,16 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
             post(edit_front_matter).patch(edit_front_matter),
         )
         .route("/api/write/undo", get(undo_toast).post(undo_op))
+        .route("/api/write/tags/plan", post(plan_tags))
+        .route(
+            "/api/write/tags/validate-proposal",
+            post(validate_tag_proposal),
+        )
+        .route("/api/write/tags/apply", post(apply_tags))
+        .route("/api/write/tags/start", post(start_tags))
+        .route("/api/write/tags/progress", get(tag_progress))
+        .route("/api/write/tags/form", post(tag_form))
+        .route("/api/write/tags/undo-form", post(tag_undo_form))
         .route("/api/write/password", post(change_password))
         .route("/api/write/settings", post(save_settings))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_JSON_BODY));
@@ -104,6 +114,449 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
     )
 }
 
+// Validate every proposal entry with the same parser used by the CLI.
+async fn validate_tag_proposal(body: Bytes) -> Response {
+    match dimagine_core::tag_batch::parse_tag_list(&body) {
+        Ok(_) => Json(serde_json::json!({"valid": true})).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": error})),
+        )
+            .into_response(),
+    }
+}
+
+// Batch requests carry the operations again at apply time. The server rebuilds
+// the plan and checks the preview digest; Writer checks it again under lock.
+#[derive(serde::Deserialize)]
+struct TagBatchRequest {
+    operations: Vec<TagBatchOperation>,
+    #[serde(default)]
+    remember_aliases: bool,
+    digest: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum TagBatchOperation {
+    Rename {
+        source: String,
+        target: String,
+    },
+    Merge {
+        sources: Vec<String>,
+        target: String,
+    },
+    Move {
+        source: String,
+        target: String,
+    },
+    Remove {
+        source: String,
+    },
+    RemoveRedundantParent,
+}
+
+fn build_tag_plan(
+    root: &std::path::Path,
+    request: TagBatchRequest,
+) -> Result<(dimagine_core::tag_batch::TagBatchPlan, Option<String>), String> {
+    use dimagine_core::tag_batch::{plan_tag_batch, remembered_aliases, TagOperation};
+    if request.operations.is_empty() || request.operations.len() > MAX_BATCH {
+        return Err("expected between 1 and 1000 operations".into());
+    }
+    let operations: Vec<_> = request
+        .operations
+        .into_iter()
+        .map(|op| match op {
+            TagBatchOperation::Rename { source, target } => TagOperation::Rename { source, target },
+            TagBatchOperation::Merge { sources, target } => TagOperation::Merge { sources, target },
+            TagBatchOperation::Move { source, target } => TagOperation::Move { source, target },
+            TagBatchOperation::Remove { source } => TagOperation::Remove { source },
+            TagBatchOperation::RemoveRedundantParent => TagOperation::RemoveRedundantParent,
+        })
+        .collect();
+    // Match reviewed-list semantics: targets may not feed another selected
+    // operation, and redundant-parent cleanup always runs last.
+    for (i, op) in operations.iter().enumerate() {
+        if matches!(op, TagOperation::RemoveRedundantParent) && i + 1 != operations.len() {
+            return Err("redundant-parent operation must be last".into());
+        }
+        let target = match op {
+            TagOperation::Rename { target, .. }
+            | TagOperation::Move { target, .. }
+            | TagOperation::Merge { target, .. } => Some(target),
+            _ => None,
+        };
+        if let Some(target) = target {
+            for (j, other) in operations.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let sources: Vec<&String> = match other {
+                    TagOperation::Rename { source, .. }
+                    | TagOperation::Move { source, .. }
+                    | TagOperation::Remove { source } => vec![source],
+                    TagOperation::Merge { sources, .. } => sources.iter().collect(),
+                    TagOperation::RemoveRedundantParent => Vec::new(),
+                };
+                for source in sources {
+                    if dimagine_core::tag_batch::edit_note_tags(
+                        b"---\ntags: []\n---\n",
+                        &[
+                            TagOperation::Remove {
+                                source: target.clone(),
+                            },
+                            TagOperation::Remove {
+                                source: source.clone(),
+                            },
+                        ],
+                    )
+                    .is_err()
+                    {
+                        return Err("an operation target is another operation's source".into());
+                    }
+                }
+            }
+        }
+    }
+    let mut plan = plan_tag_batch(root, &operations, None)?;
+    if request.remember_aliases && plan.ready() {
+        if let Some(aliases) = remembered_aliases(&plan)? {
+            plan.set_alias_after(&aliases)?;
+        }
+    }
+    Ok((plan, request.digest))
+}
+
+async fn build_tag_plan_blocking(
+    root: std::path::PathBuf,
+    request: TagBatchRequest,
+) -> Result<(dimagine_core::tag_batch::TagBatchPlan, Option<String>), String> {
+    tokio::task::spawn_blocking(move || build_tag_plan(&root, request))
+        .await
+        .map_err(|error| format!("tag plan task failed: {error}"))?
+}
+
+fn affected_images(
+    library: &Library,
+    changed: &[&dimagine_core::tag_batch::PlannedNote],
+) -> Vec<String> {
+    let notes: std::collections::HashSet<_> =
+        changed.iter().map(|note| note.path.as_str()).collect();
+    let images: std::collections::HashSet<_> = library
+        .files
+        .iter()
+        .filter(|entry| entry.class == FileClass::Image)
+        .map(|entry| entry.path.as_path())
+        .collect();
+    let mut result: Vec<_> = library
+        .files
+        .iter()
+        .filter(|entry| notes.contains(entry.rel.as_str()))
+        .filter_map(|entry| {
+            let paired = entry.paired_image_path()?;
+            if images.contains(paired.as_path()) {
+                entry.paired_image_rel().map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
+
+async fn plan_tags(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: TagBatchRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    match build_tag_plan_blocking(writer.root_path().to_path_buf(), request).await {
+        Ok((plan, _)) => {
+            let changed: Vec<_> = plan.notes.iter().filter(|n| n.before != n.after).collect();
+            let root = writer.root_path().to_path_buf();
+            let library = match tokio::task::spawn_blocking(move || Library::open(&root)).await {
+                Ok(Ok(library)) if library.fully_read() => library,
+                _ => {
+                    return json_error(
+                        StatusCode::CONFLICT,
+                        "library could not be fully read; plan again",
+                    )
+                }
+            };
+            let images = affected_images(&library, &changed);
+            Json(serde_json::json!({
+                "changed_images": images.len(),
+                "sample_images": images.iter().take(12).collect::<Vec<_>>(),
+                "digest": plan.digest, "ready": plan.ready(),
+                "changed_notes": changed.len(),
+                "deduplicated": changed.iter().map(|n| n.deduplicated).sum::<usize>(),
+                "sample_notes": changed.iter().take(12).map(|n| &n.path).collect::<Vec<_>>(),
+                "conflicts": plan.conflicts, "unreadable": plan.unreadable,
+            }))
+            .into_response()
+        }
+        Err(error) => json_error(StatusCode::BAD_REQUEST, &error),
+    }
+}
+
+async fn apply_tags(State(state): State<AppState>, body: Bytes) -> Response {
+    let permit = match crate::acquire_admission(&state) {
+        Some(permit) => permit,
+        None => return crate::admission_denied(1),
+    };
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: TagBatchRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let (plan, digest) =
+        match build_tag_plan_blocking(writer.root_path().to_path_buf(), request).await {
+            Ok(plan) => plan,
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, &error),
+        };
+    if digest.as_deref() != Some(plan.digest.as_str()) {
+        return json_error(StatusCode::CONFLICT, "preview is stale; plan again");
+    }
+    if !plan.ready() {
+        return json_error(StatusCode::CONFLICT, "preview has unresolved issues");
+    }
+    let writer = writer.clone();
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        writer.apply_tag_batch(&plan)
+    })
+    .await
+    {
+        Ok(Ok(op)) => Json(serde_json::json!({"op": op})).into_response(),
+        Ok(Err(error)) => write_error(error),
+        Err(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "tag apply task failed"),
+    }
+}
+
+#[derive(Clone, Default, serde::Serialize)]
+pub(crate) struct TagProgress {
+    state: &'static str,
+    completed: usize,
+    total: usize,
+    op: Option<String>,
+    error: Option<String>,
+}
+
+fn start_tag_job(
+    state: &AppState,
+    plan: dimagine_core::tag_batch::TagBatchPlan,
+) -> Result<(), &'static str> {
+    let mut status = state.tag_progress.lock().unwrap();
+    if status.state == "running" {
+        return Err("A tag batch is already running");
+    }
+    *status = TagProgress {
+        state: "running",
+        ..TagProgress::default()
+    };
+    drop(status);
+    let progress = state.tag_progress.clone();
+    let writer = state.writer.as_ref().unwrap().clone();
+    tokio::task::spawn_blocking(move || {
+        let outcome = writer.apply_tag_batch_with_progress(&plan, &mut |completed, total| {
+            let mut status = progress.lock().unwrap();
+            status.completed = completed;
+            status.total = total;
+        });
+        let mut status = progress.lock().unwrap();
+        match outcome {
+            Ok(op) => {
+                status.state = "done";
+                status.op = op;
+            }
+            Err(error) => {
+                status.state = "error";
+                status.error = Some(error.to_string());
+            }
+        }
+    });
+    Ok(())
+}
+
+pub(crate) fn tag_progress_html(status: &TagProgress, csrf: Option<&str>) -> String {
+    if csrf.is_none() {
+        return match status.state {
+            "running" => "<p>Tag apply is running.</p>",
+            "done" => "<p>Tag apply finished.</p>",
+            "error" => "<p>Tag apply failed.</p>",
+            _ => "",
+        }
+        .to_owned();
+    }
+    match status.state {
+        "running" => format!(
+            "<p>Apply running: writing {}/{}. Refresh to check progress.</p>",
+            status.completed, status.total
+        ),
+        "done" => {
+            let undo = match (&status.op, csrf) {
+                (Some(op), Some(csrf)) => format!("<form method=\"post\" action=\"/api/write/tags/undo-form\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input type=\"hidden\" name=\"op\" value=\"{}\"><button>Undo</button></form>", escape_html(csrf), escape_html(op)),
+                _ => String::new(),
+            };
+            format!("<p>Tag apply finished.</p>{undo}")
+        }
+        "error" => format!(
+            "<p>Tag apply failed: {}</p>",
+            escape_html(status.error.as_deref().unwrap_or("Unknown error"))
+        ),
+        _ => String::new(),
+    }
+}
+
+fn clear_tag_result(state: &AppState, op: &str) {
+    let mut status = state.tag_progress.lock().unwrap();
+    if status.op.as_deref() == Some(op) {
+        *status = TagProgress::default();
+    }
+}
+
+async fn tag_progress(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if !owner_view_allowed(&state, &headers) {
+        return json_error(StatusCode::FORBIDDEN, "owner access required");
+    }
+    Json(state.tag_progress.lock().unwrap().clone()).into_response()
+}
+
+async fn start_tags(State(state): State<AppState>, body: Bytes) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let request: TagBatchRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &format!("bad JSON: {error}")),
+    };
+    let (plan, digest) =
+        match build_tag_plan_blocking(writer.root_path().to_path_buf(), request).await {
+            Ok(plan) => plan,
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, &error),
+        };
+    if digest.as_deref() != Some(plan.digest.as_str()) || !plan.ready() {
+        return json_error(
+            StatusCode::CONFLICT,
+            "preview is stale or has unresolved issues; plan again",
+        );
+    }
+    match start_tag_job(&state, plan) {
+        Ok(()) => Json(serde_json::json!({"state": "running"})).into_response(),
+        Err(error) => json_error(StatusCode::CONFLICT, error),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TagForm {
+    csrf: String,
+    action: String,
+    source: String,
+    target: String,
+    #[serde(default)]
+    remember_aliases: bool,
+    #[serde(default)]
+    digest: String,
+    step: String,
+}
+
+async fn tag_form(State(state): State<AppState>, Form(form): Form<TagForm>) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    let operation = match form.action.as_str() {
+        "rename" => TagBatchOperation::Rename {
+            source: form.source.clone(),
+            target: form.target.clone(),
+        },
+        "move" => TagBatchOperation::Move {
+            source: form.source.clone(),
+            target: form.target.clone(),
+        },
+        "merge" => TagBatchOperation::Merge {
+            sources: vec![form.source.clone()],
+            target: form.target.clone(),
+        },
+        "remove" => TagBatchOperation::Remove {
+            source: form.source.clone(),
+        },
+        _ => return json_error(StatusCode::BAD_REQUEST, "unknown action"),
+    };
+    let request = TagBatchRequest {
+        operations: vec![operation],
+        remember_aliases: form.remember_aliases,
+        digest: None,
+    };
+    let (plan, _) = match build_tag_plan_blocking(writer.root_path().to_path_buf(), request).await {
+        Ok(plan) => plan,
+        Err(error) => {
+            return Html(format!(
+                "<p>{}</p><a href=\"/tags\">Back to tags</a>",
+                escape_html(&error)
+            ))
+            .into_response()
+        }
+    };
+    if form.step == "apply" {
+        if form.digest != plan.digest || !plan.ready() {
+            return (
+                StatusCode::CONFLICT,
+                Html(
+                    "Preview is stale or has unresolved issues. <a href=\"/tags\">Plan again</a>"
+                        .to_string(),
+                ),
+            )
+                .into_response();
+        }
+        return match start_tag_job(&state, plan) {
+            Ok(()) => Html("<p>Apply running. Refresh the tags page to check progress and the result.</p><a href=\"/tags\">Check progress</a>".to_string()).into_response(),
+            Err(error) => (StatusCode::CONFLICT, Html(escape_html(error))).into_response(),
+        };
+    }
+    if form.step != "preview" {
+        return json_error(StatusCode::BAD_REQUEST, "unknown step");
+    }
+    let changed = plan.notes.iter().filter(|n| n.before != n.after).count();
+    let mut html = format!("<h1>Tag change preview</h1><p>{changed} notes affected.</p>");
+    for issue in plan.conflicts.iter().chain(&plan.unreadable) {
+        html.push_str(&format!(
+            "<p>{}: {}</p>",
+            escape_html(&issue.path),
+            escape_html(&issue.message)
+        ));
+    }
+    if plan.ready() {
+        html.push_str(&format!("<form method=\"post\" action=\"/api/write/tags/form\"><input type=\"hidden\" name=\"csrf\" value=\"{}\"><input type=\"hidden\" name=\"action\" value=\"{}\"><input type=\"hidden\" name=\"source\" value=\"{}\"><input type=\"hidden\" name=\"target\" value=\"{}\"><input type=\"hidden\" name=\"remember_aliases\" value=\"{}\"><input type=\"hidden\" name=\"digest\" value=\"{}\"><button name=\"step\" value=\"apply\">Apply changes</button></form>", escape_html(&form.csrf), escape_html(&form.action), escape_html(&form.source), escape_html(&form.target), form.remember_aliases, escape_html(&plan.digest)));
+    }
+    html.push_str("<a href=\"/tags\">Back to tags</a>");
+    Html(html).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct TagUndoForm {
+    op: String,
+}
+async fn tag_undo_form(State(state): State<AppState>, Form(form): Form<TagUndoForm>) -> Response {
+    let Some(writer) = state.writer.as_ref() else {
+        return json_error(StatusCode::NOT_FOUND, "writes are off");
+    };
+    match writer.undo(&form.op, None) {
+        Ok(_) => {
+            clear_tag_result(&state, &form.op);
+            Html("<p>Changes undone.</p><a href=\"/tags\">Back to tags</a>").into_response()
+        }
+        Err(error) => write_error(error),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CSRF guard (ADR-018 §3, §6)
 // ---------------------------------------------------------------------------
@@ -112,7 +565,11 @@ pub(crate) fn write_router(state: &AppState) -> Router<AppState> {
 /// and pass reads (the trash view, the token bootstrap) through to their
 /// handlers. The auth gate has already run: in account mode an anonymous
 /// write never reaches here.
-async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+async fn csrf_guard(
+    State(state): State<AppState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
     // ADR-018 §3: method-override headers (`X-HTTP-Method-Override`,
     // `X-Method-Override`, `X-HTTP-Method`, `_method`) are ignored, never
     // honoured. axum routes by the real request method, so a GET is a read
@@ -142,8 +599,14 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
+    let is_tag_form = matches!(
+        request.uri().path(),
+        "/api/write/tags/form" | "/api/write/tags/undo-form"
+    );
     let expected = if is_upload {
         "multipart/form-data"
+    } else if is_tag_form {
+        "application/x-www-form-urlencoded"
     } else {
         "application/json"
     };
@@ -152,6 +615,26 @@ async fn csrf_guard(State(state): State<AppState>, request: Request<Body>, next:
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             &format!("a write body must be {expected}"),
         );
+    }
+
+    if is_tag_form {
+        let (mut parts, body) = request.into_parts();
+        let bytes = match axum::body::to_bytes(body, MAX_JSON_BODY).await {
+            Ok(bytes) => bytes,
+            Err(_) => return json_error(StatusCode::PAYLOAD_TOO_LARGE, "form is too large"),
+        };
+        let values: std::collections::HashMap<String, String> =
+            match serde_urlencoded::from_bytes(&bytes) {
+                Ok(values) => values,
+                Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid form"),
+            };
+        if let Some(token) = values
+            .get("csrf")
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
+            parts.headers.insert(CSRF_HEADER, token);
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
     }
 
     // ADR-018 §3: the request must come from the configured public origin.
@@ -343,11 +826,49 @@ async fn edit_front_matter(
     let Some(image) = request.get("image").and_then(|v| v.as_str()) else {
         return json_error(StatusCode::BAD_REQUEST, "an \"image\" path is required");
     };
-    let adds = string_array(&request, "add");
+    let aliases = match dimagine_core::tag_aliases::TagAliases::load(writer.root_path()) {
+        Ok(aliases) => aliases,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let adds = match string_array(&request, "add")
+        .iter()
+        .map(|tag| aliases.resolve(tag))
+        .collect::<Result<Vec<_>, _>>()
+    {
+        Ok(tags) => tags,
+        Err(error) => return json_error(StatusCode::BAD_REQUEST, &error),
+    };
     let removes = string_array(&request, "remove");
+    let replacement_tags = match request.get("fields").and_then(|fields| fields.get("tags")) {
+        None => None,
+        Some(value) => {
+            let Some(tags) = value.as_array() else {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "fields.tags must be a list of strings",
+                );
+            };
+            let mut resolved = Vec::new();
+            for tag in tags {
+                let Some(tag) = tag.as_str() else {
+                    return json_error(
+                        StatusCode::BAD_REQUEST,
+                        "fields.tags must be a list of strings",
+                    );
+                };
+                let tag = match aliases.resolve(tag) {
+                    Ok(tag) => tag,
+                    Err(error) => return json_error(StatusCode::BAD_REQUEST, &error),
+                };
+                resolved.push(tag);
+            }
+            Some(resolved)
+        }
+    };
     let fields: Vec<(String, String)> = match request.get("fields") {
         Some(serde_json::Value::Object(map)) => map
             .iter()
+            .filter(|(key, _)| key.as_str() != "tags")
             .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_string()))
             .collect(),
         Some(_) => return json_error(StatusCode::BAD_REQUEST, "\"fields\" must be an object"),
@@ -365,7 +886,12 @@ async fn edit_front_matter(
             }
         },
     };
-    if adds.is_empty() && removes.is_empty() && fields.is_empty() && rating.is_none() {
+    if adds.is_empty()
+        && removes.is_empty()
+        && fields.is_empty()
+        && replacement_tags.is_none()
+        && rating.is_none()
+    {
         return json_error(
             StatusCode::BAD_REQUEST,
             "nothing to change: give tags, fields, or a rating",
@@ -412,6 +938,17 @@ async fn edit_front_matter(
     if !removes.is_empty() {
         let refs: Vec<&str> = removes.iter().map(String::as_str).collect();
         edited = match remove_tags(&edited, &refs) {
+            Ok(bytes) => bytes,
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+    }
+    if let Some(tags) = &replacement_tags {
+        edited = match delete_key(&edited, "tags") {
+            Ok(bytes) => bytes,
+            Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
+        };
+        let refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+        edited = match add_tags(&edited, &refs) {
             Ok(bytes) => bytes,
             Err(error) => return json_error(StatusCode::BAD_REQUEST, &error.to_string()),
         };
@@ -621,6 +1158,7 @@ async fn undo_op(
                     ),
                 );
             }
+            clear_tag_result(&state, op_id);
             Json(serde_json::json!({
                 "op": outcome.op_id,
                 "undone": outcome.undone.len(),
@@ -3107,4 +3645,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.ct_eq(b).unwrap_u8() == 1
+}
+
+#[cfg(test)]
+mod tag_progress_visibility_tests {
+    use super::*;
+
+    #[test]
+    fn failure_details_are_owner_only() {
+        let status = TagProgress {
+            state: "error",
+            error: Some("private note error".into()),
+            ..TagProgress::default()
+        };
+        assert!(tag_progress_html(&status, Some("csrf")).contains("private note error"));
+        assert_eq!(tag_progress_html(&status, None), "<p>Tag apply failed.</p>");
+    }
 }

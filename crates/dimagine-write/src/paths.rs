@@ -8,6 +8,9 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{Error, PathReject};
 
+/// The only non-note file the Writer may modify.
+pub const TAG_ALIASES_PATH: &str = "_dimagine/tag-aliases.json";
+
 /// The note extensions this crate may rewrite. Anything else is an image or a
 /// raw metadata sidecar, and those are never opened for writing (FORMAT §2.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

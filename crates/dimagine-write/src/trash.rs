@@ -93,6 +93,49 @@ impl TrashRecord {
     }
 }
 
+/// Prepare a collision-resistant trash record and destination for an alias file.
+pub(crate) fn alias_trash_steps(
+    op_id: &str,
+    fingerprint: &crate::fingerprint::Fingerprint,
+) -> Result<Vec<crate::journal::StepRecord>> {
+    use crate::journal::{StepKind, StepRecord};
+    let original = crate::paths::TAG_ALIASES_PATH;
+    let nonce = ulid::Ulid::new();
+    let trash = format!(".trash/_dimagine/tag-aliases-{nonce}.json");
+    let record_path = format!("{trash}.trash.json");
+    let record = TrashRecord {
+        op_id: op_id.to_string(),
+        trashed_at: chrono::Utc::now().to_rfc3339(),
+        files: vec![TrashedFile {
+            original: original.to_string(),
+            trash: trash.clone(),
+            mtime_ns: fingerprint.mtime_ns,
+        }],
+    };
+    Ok(vec![
+        StepRecord {
+            step_idx: 0,
+            kind: StepKind::Create,
+            src: None,
+            dst: record_path,
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: Some(record.to_bytes()?),
+        },
+        StepRecord {
+            step_idx: 1,
+            kind: StepKind::Move,
+            src: Some(original.to_string()),
+            dst: trash,
+            before_hash: None,
+            after_hash: String::new(),
+            before_bytes: None,
+            after_bytes: None,
+        },
+    ])
+}
+
 /// Every trash record in the library, in walk order.
 /// Symlinked entries are not followed, and a record
 /// that does not parse is reported, not dropped.

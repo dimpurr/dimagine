@@ -293,3 +293,17 @@ fn hierarchical_and_case_variant_tags_match_the_way_the_rules_say() {
     let kept = remove_tags(&removed, &["style"]).unwrap();
     assert_eq!(kept, removed.clone());
 }
+
+#[test]
+fn remove_exact_historical_tags_keeps_other_spelling_and_bytes() {
+    let before = b"---\r\ntitle: unchanged\r\ntags: [\"old name\", \"Old Name\", keep] # comment\r\n---\r\nbody\r\n";
+    let after = dimagine_core::fm_edit::remove_exact_tags(before, &["old name"]).unwrap();
+    assert_eq!(
+        after,
+        b"---\r\ntitle: unchanged\r\ntags: [\"Old Name\", keep] # comment\r\n---\r\nbody\r\n"
+    );
+    assert_eq!(
+        dimagine_core::fm_edit::remove_exact_tags(before, &["absent"]).unwrap(),
+        before
+    );
+}

@@ -170,13 +170,22 @@ pub fn import(
         for entry in fs::read_dir(dst_library)? {
             let entry = entry?;
             let name = entry.file_name();
-            let allowed = name == ".obsidian" || name == ".dimagine";
+            let allowed = name == ".obsidian"
+                || name == ".dimagine"
+                || (name == "_dimagine"
+                    && entry.file_type()?.is_dir()
+                    && fs::read_dir(entry.path())?.all(|child| {
+                        child.is_ok_and(|child| child.file_name() == "tag-aliases.json")
+                    }));
             if !allowed || !entry.file_type()?.is_dir() {
                 return Err(ImportError::DestinationNotEmpty(dst_library.to_path_buf()));
             }
         }
     }
 
+    let aliases = dimagine_core::tag_aliases::TagAliases::load(dst_library).map_err(|error| {
+        ImportError::InvalidSource(format!("invalid destination aliases: {error}"))
+    })?;
     let json_bytes = fs::read(&source_meta)?;
     let mut deserializer = serde_json::Deserializer::from_slice(&json_bytes);
     deserializer.disable_recursion_limit();
@@ -468,8 +477,16 @@ pub fn import(
             report.renamed += 1;
         }
         let rel = relative_string(dst_library, &destination_image);
+        let mut note_metadata = metadata.clone();
+        if let Some(tags) = note_metadata.get_mut("tags").and_then(Value::as_array_mut) {
+            for tag in tags {
+                if let Some(text) = tag.as_str() {
+                    *tag = Value::String(aliases.resolve(text).expect("validated alias table"));
+                }
+            }
+        }
         let note = make_note(
-            &metadata,
+            &note_metadata,
             &display_library,
             &item,
             &paths,

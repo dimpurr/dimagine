@@ -14,9 +14,6 @@ use crate::view_query::{
     sort_key_as_str, FileTypeFamily, RatingFilter, ThumbnailSize, ViewParams, PAGE_SIZE,
 };
 
-/// How many tags the sidebar lists before offering the rest on `/search`.
-const SIDEBAR_TAG_LIMIT: usize = 30;
-
 /// Encode a value for use inside a query string.
 fn query_value(value: &str) -> String {
     utf8_percent_encode(value, crate::view_query::QUERY_VALUE).to_string()
@@ -1264,16 +1261,57 @@ pub fn sidebar_sections(
     if tags.is_empty() {
         out.push_str("<p class=\"sidebar-empty\">No tags yet.</p>");
     } else {
-        for tag in tags.iter().take(SIDEBAR_TAG_LIMIT) {
+        let mut root = SidebarTagNode::default();
+        for tag in &tags {
+            let mut node = &mut root;
+            for segment in tag.tag.split('/') {
+                node = node.children.entry(segment.to_owned()).or_default();
+            }
+            node.tag = Some(tag);
+        }
+        render_sidebar_tags(&root, "", params, facets, &mut out);
+        out.push_str(&sidebar_row("/tags", "All tags", tags.len() as u64, false));
+    }
+    out.push_str("</section>");
+    out
+}
+
+#[derive(Default)]
+struct SidebarTagNode<'a> {
+    tag: Option<&'a crate::index_sync::SidebarTag>,
+    children: std::collections::BTreeMap<String, SidebarTagNode<'a>>,
+}
+
+fn render_sidebar_tags(
+    node: &SidebarTagNode<'_>,
+    parent: &str,
+    params: &ViewParams,
+    facets: Option<&FacetCounts>,
+    out: &mut String,
+) {
+    out.push_str("<div class=\"sidebar-tag-tree\">");
+    for (name, child) in &node.children {
+        let path = if parent.is_empty() {
+            name.clone()
+        } else {
+            format!("{parent}/{name}")
+        };
+        if !child.children.is_empty() {
+            out.push_str("<details open><summary>");
+        } else {
+            out.push_str("<div class=\"sidebar-tag-leaf\">");
+        }
+        if let Some(tag) = child.tag {
             let active = tag_is_active(params, &tag.tag);
-            let scoped = facets.map(|counts| counts.tags.get(&tag.tag).copied().unwrap_or(0));
-            let count = scoped.unwrap_or(tag.count);
+            let count = facets
+                .map(|counts| counts.tags.get(&tag.tag).copied().unwrap_or(0))
+                .unwrap_or(tag.count);
             let switch = format!("/?tag={}", query_value(&tag.tag));
             let stack = facet_stack(facets, active, count, || {
                 params.with_tag(tag.tag.clone()).to_url("/")
             });
             out.push_str(&facet_row(FacetRow {
-                label: &tag.tag,
+                label: name,
                 tooltip: &tag.tag,
                 switch: &switch,
                 count,
@@ -1283,18 +1321,23 @@ pub fn sidebar_sections(
                 extra_class: "",
                 row_data: "",
             }));
-        }
-        if tags.len() > SIDEBAR_TAG_LIMIT {
-            out.push_str(&sidebar_row(
-                "/search",
-                "All tags",
-                tags.len() as u64,
-                false,
+            out.push_str(&format!("<a class=\"sidebar-tag-manage\" href=\"/tags?select={}\" aria-label=\"Manage {}\">⋯</a>", escape_html(&query_value(&path)), escape_html(&path)));
+        } else {
+            out.push_str(&format!(
+                "<a class=\"sidebar-tag-virtual\" href=\"/?tag={}\">{}</a>",
+                escape_html(&query_value(&path)),
+                escape_html(name)
             ));
         }
+        if !child.children.is_empty() {
+            out.push_str("</summary>");
+            render_sidebar_tags(child, &path, params, facets, out);
+            out.push_str("</details>");
+        } else {
+            out.push_str("</div>");
+        }
     }
-    out.push_str("</section>");
-    out
+    out.push_str("</div>");
 }
 
 /// Whether a scoped-zero facet row dims: only while a filter is on, and never
@@ -1766,10 +1809,24 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_caps_the_tags_and_offers_the_rest() {
+    fn sidebar_tags_include_virtual_parents_and_manage_links() {
+        let mut data = sidebar();
+        data.tags = vec![crate::index_sync::SidebarTag {
+            tag: "screen/mobile".into(),
+            count: 4,
+        }];
+        let html = sidebar_sections(&data, &ViewParams::default(), None, None);
+        assert!(html.contains("sidebar-tag-virtual\" href=\"/?tag=screen\">screen"));
+        assert!(html.contains("/tags?select=screen/mobile"));
+        assert!(html.contains("<details open><summary>"));
+    }
+
+    #[test]
+    fn the_sidebar_shows_all_tags() {
         let html = sidebar_sections(&sidebar(), &ViewParams::default(), None, None);
         assert!(html.contains("tag-29"));
-        assert!(!html.contains("tag-30"), "only 30 tags are listed");
+        assert!(html.contains("tag-30"));
+        assert!(html.contains("tag-39"));
         assert!(html.contains("All tags"));
         assert!(html.contains("All tags</span><span class=\"sidebar-row-count\">40"));
     }

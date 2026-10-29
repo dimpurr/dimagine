@@ -291,12 +291,50 @@
         if (!column.isConnected) return;
         if (selected && selected.dataset.path !== path) return;
         column.innerHTML = inspectorHtml(path, detail);
+        addInspectorTagEditor(column, path);
       })
       .catch(function () {
         if (!column.isConnected) return;
         column.innerHTML =
           '<p class="inspector-empty">Could not read this image.</p>';
       });
+  }
+
+  function addInspectorTagEditor(column, path) {
+    var config = document.getElementById('inspector-tag-config');
+    var error = document.getElementById('inspector-tag-error');
+    if (!config) {
+      if (error) column.appendChild(document.createTextNode(error.textContent));
+      return;
+    }
+    var suggestions = JSON.parse(config.dataset.suggestions);
+    var section = document.createElement('section');
+    section.className = 'inspector-section';
+    var form = document.createElement('form');
+    var label = document.createElement('label');
+    label.textContent = 'Add tag';
+    var input = document.createElement('input');
+    input.required = true;
+    input.setAttribute('list', 'inspector-tag-suggestions');
+    input.autocomplete = 'off';
+    var list = document.createElement('datalist');
+    list.id = 'inspector-tag-suggestions';
+    suggestions.tags.forEach(function (tag) {
+      var option = document.createElement('option'); option.value = tag; list.appendChild(option);
+    });
+    suggestions.aliases.forEach(function (alias) {
+      var option = document.createElement('option'); option.value = alias[0]; option.label = alias[1]; list.appendChild(option);
+    });
+    var submit = document.createElement('button'); submit.textContent = 'Add';
+    var status = document.createElement('p'); status.setAttribute('role', 'status');
+    label.appendChild(input); form.append(label, list, submit, status); section.appendChild(form); column.appendChild(section);
+    form.addEventListener('submit', function (event) {
+      event.preventDefault(); submit.disabled = true; status.textContent = 'Saving…';
+      fetch('/api/write/image/front-matter', {method: 'POST', headers: {'content-type': 'application/json', 'x-csrf-token': config.dataset.csrf}, body: JSON.stringify({image: path, add: [input.value.trim()]})})
+        .then(function (response) { return response.json().then(function (data) { if (!response.ok) throw new Error(data.error || 'Could not add tag'); return data; }); })
+        .then(function () { fillInspector(path); })
+        .catch(function (error) { status.textContent = error.message; submit.disabled = false; });
+    });
   }
 
   // The inspector's preview address: the image's content when the row
@@ -415,7 +453,10 @@
   // keys continue from it and Esc clears it, rather than the script believing
   // nothing is selected while a photo is lit and named beside the grid.
   var preselected = document.querySelector('.tile[data-path].selected');
-  if (preselected) selected = preselected;
+  if (preselected) {
+    selected = preselected;
+    if (inspector) addInspectorTagEditor(inspector, preselected.dataset.path);
+  }
 
   function selectTile(tile, focus) {
     if (selected) selected.classList.remove('selected');
@@ -1977,4 +2018,179 @@
       row.addEventListener('focusout', leave);
     }
   );
+})();
+
+// Batch tag operations always submit the preview digest for server revalidation.
+(() => {
+  const root = document.getElementById('tag-management');
+  if (!root) return;
+  const dialog = document.getElementById('tag-dialog');
+  const form = document.getElementById('tag-operation');
+  const target = document.getElementById('tag-target');
+  const alias = document.getElementById('tag-alias');
+  const preview = document.getElementById('tag-preview');
+  const apply = document.getElementById('tag-apply');
+  const result = document.getElementById('tag-result');
+  let action, request, digest, trigger, revision = 0;
+  const selected = () => [...document.querySelectorAll('.tag-select:checked')].map(el => el.value);
+  const refresh = () => { document.getElementById('tag-selection-count').textContent = `${selected().length} selected`; };
+  document.querySelectorAll('.tag-select').forEach(el => {
+    el.addEventListener('click', event => event.stopPropagation());
+    el.addEventListener('change', refresh);
+  });
+  refresh();
+  document.querySelectorAll('.tags-tree a').forEach(link => link.addEventListener('click', event => {
+    const checkbox = link.parentElement.querySelector('.tag-select');
+    if (!checkbox) return;
+    event.preventDefault(); event.stopPropagation(); checkbox.checked = !checkbox.checked; refresh();
+  }));
+  document.querySelectorAll('.tag-row-menu').forEach(button => button.addEventListener('click', event => {
+    event.preventDefault(); event.stopPropagation();
+    const popup = button.nextElementSibling;
+    const opening = popup.hidden;
+    document.querySelectorAll('.tag-row-popup').forEach(menu => { menu.hidden = true; });
+    popup.hidden = !opening;
+    if (opening) popup.querySelector('button').focus();
+  }));
+  document.querySelectorAll('[data-row-action]').forEach(button => button.addEventListener('click', event => {
+    event.preventDefault(); event.stopPropagation();
+    const row = button.closest('summary, .tags-leaf');
+    document.querySelectorAll('.tag-select').forEach(input => { input.checked = input === row.querySelector('.tag-select'); });
+    refresh(); button.parentElement.hidden = true;
+    root.querySelector(`[data-tag-action="${button.dataset.rowAction}"]`).click();
+  }));
+  document.addEventListener('click', event => {
+    if (!event.target.closest('.tag-row-popup, .tag-row-menu')) document.querySelectorAll('.tag-row-popup').forEach(menu => { menu.hidden = true; });
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    document.querySelectorAll('.tag-row-popup:not([hidden])').forEach(menu => { menu.hidden = true; menu.previousElementSibling.focus(); });
+  });
+  const post = async (path, body) => {
+    const response = await fetch(path, {method: 'POST', headers: {'content-type': 'application/json', 'x-csrf-token': root.dataset.csrf}, body: JSON.stringify(body)});
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    return data;
+  };
+  let polling = false;
+  const pollProgress = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      const response = await fetch('/api/write/tags/progress', {cache: 'no-store'});
+      if (!response.ok) throw new Error('Could not check apply progress. Refresh to retry.');
+      const data = await response.json();
+      document.getElementById('tag-server-status')?.replaceChildren();
+      if (data.state === 'running') {
+        result.textContent = data.total ? `Writing ${data.completed}/${data.total}` : 'Apply running: checking the plan';
+        setTimeout(() => { polling = false; pollProgress(); }, 1000);
+        return;
+      }
+      if (data.state === 'error') result.textContent = `Apply failed: ${data.error}`;
+      if (data.state === 'done') {
+        result.replaceChildren(document.createTextNode('Changes applied. '));
+        if (data.op) { const undo = document.createElement('button'); undo.type = 'button'; undo.textContent = 'Undo'; undo.addEventListener('click', async () => { try { await post('/api/write/undo', {op: data.op}); result.textContent = 'Changes undone. Reload to refresh tags.'; } catch (error) { result.textContent = error.message; } }); result.append(undo); }
+      }
+    } catch (error) { result.textContent = error.message; }
+    polling = false;
+  };
+  pollProgress();
+  root.querySelectorAll('[data-tag-action]').forEach(button => button.addEventListener('click', () => {
+    const sources = selected(); action = button.dataset.tagAction;
+    if (!sources.length || (['rename', 'move'].includes(action) && sources.length !== 1) || (action === 'merge' && sources.length < 2)) {
+      result.textContent = action === 'merge' ? 'Select at least two tags.' : 'Select the required tags (one for rename or move).'; return;
+    }
+    trigger = button; request = null; digest = null; preview.textContent = ''; apply.hidden = true; target.value = ''; alias.checked = false;
+    document.getElementById('tag-dialog-title').textContent = `${action[0].toUpperCase()}${action.slice(1)} tags`;
+    document.getElementById('tag-sources').textContent = `Sources: ${sources.join(', ')}`;
+    document.getElementById('tag-target-label').hidden = action === 'remove';
+    document.getElementById('tag-alias-label').hidden = action === 'remove';
+    dialog.showModal();
+    (action === 'remove' ? document.getElementById('tag-plan') : target).focus();
+  }));
+  const proposalRows = document.getElementById('tag-proposal-rows');
+  document.getElementById('tag-proposal-load').addEventListener('click', async () => {
+    proposalRows.replaceChildren();
+    document.getElementById('tag-proposal-preview').hidden = true;
+    try {
+      const list = JSON.parse(document.getElementById('tag-proposal-input').value);
+      await post('/api/write/tags/validate-proposal', list);
+      const groups = new Map();
+      for (const entry of list.entries) {
+        if (!groups.has(entry.target)) groups.set(entry.target, []); groups.get(entry.target).push(entry);
+      }
+      for (const [targetName, entries] of groups) {
+        const group = document.createElement('fieldset'); const legend = document.createElement('legend'); legend.textContent = targetName; group.append(legend);
+        for (const entry of entries) {
+          const row = document.createElement('div'); row.className = 'tag-proposal-row';
+          const label = document.createElement('label'); const check = document.createElement('input'); check.type = 'checkbox'; check.checked = entry.selected && entry.action !== 'keep'; check.dataset.source = entry.source; check.dataset.target = entry.target; label.append(check, document.createTextNode(` ${entry.source} · ${entry.image_count} images · ${entry.reason} `));
+          const select = document.createElement('select'); select.setAttribute('aria-label', `Action for ${entry.source}`);
+          for (const name of [...new Set([entry.action, entry.alternative_action].filter(Boolean))]) { const option = document.createElement('option'); option.value = name; option.textContent = name; select.append(option); }
+          row.append(label, select); group.append(row);
+        }
+        proposalRows.append(group);
+      }
+      for (const note of list.notes) { const p = document.createElement('p'); p.textContent = note; proposalRows.append(p); }
+      const note = document.createElement('p'); note.textContent = 'screen/mobile and device/mobile may have different meanings; review them separately. No automatic merge is suggested.'; proposalRows.append(note);
+      for (const item of list.optional_operations) {
+        const label = document.createElement('label'); const check = document.createElement('input'); check.type = 'checkbox'; check.id = 'tag-proposal-redundant'; check.checked = item.selected; label.append(check, document.createTextNode(` ${item.description}`)); proposalRows.append(label);
+      }
+      document.getElementById('tag-proposal-preview').hidden = false;
+    } catch (error) { proposalRows.textContent = error.message; }
+  });
+  document.getElementById('tag-proposal-preview').addEventListener('click', event => {
+    const operations = [];
+    proposalRows.querySelectorAll('.tag-proposal-row').forEach(row => {
+      const check = row.querySelector('input'); const choice = row.querySelector('select').value;
+      if (!check.checked || choice === 'keep') return;
+      if (choice === 'merge') operations.push({action: choice, sources: [check.dataset.source], target: check.dataset.target});
+      else if (choice === 'remove') operations.push({action: choice, source: check.dataset.source});
+      else operations.push({action: choice, source: check.dataset.source, target: check.dataset.target});
+    });
+    if (document.getElementById('tag-proposal-redundant')?.checked) operations.push({action: 'remove_redundant_parent'});
+    if (!operations.length) { result.textContent = 'Select at least one proposal.'; return; }
+    trigger = event.currentTarget; action = 'proposal'; request = {operations, remember_aliases: false}; digest = null; preview.textContent = ''; apply.hidden = true; alias.checked = false;
+    document.getElementById('tag-dialog-title').textContent = 'Review selected proposals';
+    document.getElementById('tag-sources').textContent = `${operations.length} operations selected`;
+    document.getElementById('tag-target-label').hidden = true; document.getElementById('tag-alias-label').hidden = false;
+    dialog.showModal(); document.getElementById('tag-plan').focus();
+  });
+  document.getElementById('tag-cancel').addEventListener('click', () => dialog.close());
+  dialog.addEventListener('close', () => { revision++; if (trigger) trigger.focus(); });
+  form.addEventListener('input', () => { revision++; digest = null; apply.hidden = true; preview.textContent = ''; });
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const sources = selected();
+    if (action !== 'proposal') document.getElementById('tag-sources').textContent = `Sources: ${sources.map(source => source === target.value.trim() ? `${source} (target)` : source).join(', ')}`;
+    const operations = action === 'proposal' ? request.operations : action === 'merge' ? [{action, sources: sources.filter(source => source !== target.value.trim()), target: target.value.trim()}] : sources.map(source => action === 'remove' ? {action, source} : {action, source, target: target.value.trim()});
+    request = {operations, remember_aliases: alias.checked};
+    const currentRevision = ++revision;
+    try {
+      const plan = await post('/api/write/tags/plan', request);
+      if (currentRevision !== revision || !dialog.open) return;
+      digest = plan.digest;
+      preview.replaceChildren();
+      const summary = document.createElement('p'); summary.textContent = `${plan.changed_images} images affected (${plan.changed_notes} notes).`; preview.append(summary);
+      if (plan.sample_images.length) {
+        const samples = document.createElement('div'); samples.className = 'tag-preview-samples';
+        for (const path of plan.sample_images) {
+          const img = document.createElement('img'); img.src = '/thumb/' + encodeURIComponent(path).replace(/%2F/g, '/'); img.alt = path; img.loading = 'lazy'; samples.append(img);
+        }
+        preview.append(samples);
+      }
+      if (plan.deduplicated) { const notice = document.createElement('p'); notice.textContent = `${plan.deduplicated} already have the target tag; only one will remain.`; preview.append(notice); }
+      for (const issue of [...plan.conflicts, ...plan.unreadable]) { const p = document.createElement('p'); p.className = 'tag-preview-blocker'; p.textContent = `${issue.path}: ${issue.message}`; preview.append(p); }
+      apply.hidden = !plan.ready;
+    } catch (error) { preview.textContent = error.message; apply.hidden = true; }
+  });
+  apply.addEventListener('click', async () => {
+    if (!digest) return;
+    apply.disabled = true;
+    try {
+      await post('/api/write/tags/start', {...request, digest});
+      dialog.close(); result.textContent = 'Apply running: checking the plan';
+      setTimeout(pollProgress, 100);
+    } catch (error) { preview.textContent = error.message; apply.hidden = true; }
+    finally { apply.disabled = false; }
+  });
 })();

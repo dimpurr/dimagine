@@ -1928,3 +1928,173 @@ async fn the_image_page_hides_the_body_editor_from_a_passcode_viewer() {
     // The note itself is still there to read.
     assert!(page.contains("class=\"note-body\""), "{page}");
 }
+
+#[tokio::test]
+async fn front_matter_resolves_aliases_and_refuses_invalid_tables() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let path = root.path().join("library/_dimagine/tag-aliases.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"version":1,"aliases":{"old name":"middle","middle":"canonical/tag"}}"#,
+    )
+    .unwrap();
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let request = || {
+        write_post(
+            "/api/write/image/front-matter",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            r#"{"image":"one.png","add":["old name"]}"#,
+        )
+    };
+    let (status, _, body) = send(&app, request()).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let note = root.path().join("library/one.png.md");
+    let before = std::fs::read(&note).unwrap();
+    assert!(text(&before).contains("canonical/tag"));
+    assert!(!text(&before).contains("old name"));
+    for bad in [
+        r#"{"version":1,"aliases":{"a":"b","b":"a"}}"#,
+        r#"{"version":1,"aliases":{"A":"x","a":"y"}}"#,
+    ] {
+        std::fs::write(&path, bad).unwrap();
+        let (status, _, _) = send(&app, request()).await;
+        assert!(!status.is_success());
+        assert_eq!(std::fs::read(&note).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn front_matter_tag_field_validates_and_resolves_aliases() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let path = root.path().join("library/_dimagine/tag-aliases.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        r#"{"version":1,"aliases":{"old name":"canonical/tag"}}"#,
+    )
+    .unwrap();
+    let app = app_for(&root, true, None);
+    let (cookie, csrf) = owner_and_csrf(&app).await;
+    let post = |body| {
+        write_post(
+            "/api/write/image/front-matter",
+            &cookie,
+            &csrf,
+            Some(ORIGIN),
+            body,
+        )
+    };
+    let (status, _, body) = send(
+        &app,
+        post(r#"{"image":"one.png","fields":{"tags":["old name"]}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let note = root.path().join("library/one.png.md");
+    let before = std::fs::read(&note).unwrap();
+    assert!(text(&before).contains("canonical/tag"));
+    for value in [r#""bad""#, "42", "null", "[42]", r#"["bad tag"]"#] {
+        let request = format!(r#"{{"image":"one.png","fields":{{"tags":{value}}}}}"#);
+        let (status, _, _) = send(
+            &app,
+            write_post(
+                "/api/write/image/front-matter",
+                &cookie,
+                &csrf,
+                Some(ORIGIN),
+                &request,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(std::fs::read(&note).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn tags_page_lists_notes_blocking_batches() {
+    let root = library();
+    std::fs::write(
+        root.path().join("library/one.png.md"),
+        "---\ntags: scalar\n---\n",
+    )
+    .unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    std::fs::write(root.path().join("library/broken.md"), [0xff]).unwrap();
+    let (cookie, _) = owner_and_csrf(&app).await;
+    let (status, _, body) = send(&app, get("/tags", Some(&cookie))).await;
+    let html = text(&body);
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(html.contains("Notes blocking batch operations"), "{html}");
+    assert!(html.contains("href=\"/image/one.png\""), "{html}");
+    assert!(
+        html.contains("tags: scalar") || html.contains("scalar, not a list"),
+        "{html}"
+    );
+    assert!(html.contains("broken.md"), "{html}");
+}
+
+#[tokio::test]
+async fn tags_page_shows_blockers_even_if_index_cannot_read_a_note() {
+    let root = library();
+    std::fs::write(root.path().join("library/broken.md"), [0xff]).unwrap();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    let (status, _, body) = send(&app, get("/tags", Some(&cookie))).await;
+    let html = text(&body);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{html}");
+    assert!(html.contains("Notes blocking batch operations"), "{html}");
+    assert!(html.contains("broken.md"), "{html}");
+}
+
+#[tokio::test]
+async fn tags_scan_failure_does_not_disclose_root() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, None);
+    let cookie = login(&app, "email=owner%40example.com&password=secret123").await;
+    std::fs::rename(
+        root.path().join("library"),
+        root.path().join("removed-library"),
+    )
+    .unwrap();
+    let (_, _, body) = send(&app, get("/tags", Some(&cookie))).await;
+    let html = text(&body);
+    assert!(html.contains("Could not inspect batch blockers."), "{html}");
+    assert!(!html.contains(&root.path().display().to_string()), "{html}");
+    assert!(!html.contains("not a folder"), "{html}");
+}
+
+#[tokio::test]
+async fn tag_progress_requires_owner() {
+    let root = library();
+    create_owner(&root, "owner@example.com", "secret123");
+    let app = app_for(&root, true, Some("visitor-pass"));
+    let owner = login(&app, "email=owner%40example.com&password=secret123").await;
+    let visitor_root = library();
+    let visitor_app = app_for(&visitor_root, true, Some("visitor-pass"));
+    let visitor = login(&visitor_app, "passcode=visitor-pass").await;
+    assert_eq!(
+        send(&app, get("/api/write/tags/progress", Some(&owner)))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(
+            &visitor_app,
+            get("/api/write/tags/progress", Some(&visitor))
+        )
+        .await
+        .0,
+        StatusCode::FORBIDDEN
+    );
+}

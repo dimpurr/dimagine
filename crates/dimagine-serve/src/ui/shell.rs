@@ -152,10 +152,17 @@ impl<'a> Frame<'a> {
         };
         let active = self.view.and_then(|view| view.folder.as_deref());
         let params = self.view.cloned().unwrap_or_default();
-        format!(
-            "<aside class=\"desktop-sidebar\"><div class=\"sidebar-brand\">dimagine</div>{}</aside>",
-            crate::ui::components::sidebar_sections(data, &params, active, self.facets)
-        )
+        let mut sections =
+            crate::ui::components::sidebar_sections(data, &params, active, self.facets);
+        if self.title == "Tags" {
+            if let Some(start) = sections.find(
+                "<section class=\"sidebar-section\"><h2 class=\"sidebar-section-title\">Tags</h2>",
+            ) {
+                sections.truncate(start);
+                sections.push_str(&format!("<section class=\"sidebar-section\"><a class=\"sidebar-row\" href=\"/tags\"><span class=\"sidebar-row-label\">Tags</span><span class=\"sidebar-row-count\">{}</span></a></section>", data.tags.len()));
+            }
+        }
+        format!("<aside class=\"desktop-sidebar\"><div class=\"sidebar-brand\">dimagine</div>{sections}</aside>")
     }
 
     fn rail(&self) -> String {

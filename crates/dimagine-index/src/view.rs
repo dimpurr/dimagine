@@ -544,9 +544,13 @@ fn view_sql_with_order(q: &ViewQuery, order_by: String) -> ViewSql {
     for tag in &q.tags {
         sql.and(
             "EXISTS(SELECT 1 FROM note_tags \
-             WHERE note_tags.image_path=f.path AND note_tags.tag=?)",
+             WHERE note_tags.image_path=f.path AND \
+             (note_tags.tag=? OR (note_tags.tag>=? AND note_tags.tag<?)))",
         );
-        sql.bind(crate::searchable(tag));
+        let tag = crate::searchable(tag);
+        sql.bind(tag.clone());
+        sql.bind(format!("{tag}/"));
+        sql.bind(format!("{tag}0"));
     }
     if q.untagged {
         // "No tags" is not a tag, so it cannot be a `note_tags` lookup: it is
@@ -1010,7 +1014,7 @@ pub struct FacetCounts {
     /// lens laid over them, so this is the size of the page `All` opens and the
     /// base the Recent row caps below.
     pub total: u64,
-    /// Tag, in the index's folded spelling, to images carrying it.
+    /// Tag, in the index's folded spelling, to images carrying it or a descendant.
     pub tags: BTreeMap<String, u64>,
     /// Folder, library-relative, to images inside it and its subfolders —
     /// what a recursive view counts, and the same thing a folder row
@@ -1070,8 +1074,8 @@ impl Index {
         let lens_on = recent.active();
 
         let mut tags = facet_sql(view, Facet::Tags);
-        tags.and("note_tags.image_path=f.path");
-        let mut tags = facet_values(conn, &tags, "note_tags.tag", ", note_tags")?;
+        tags.and("tag_tree.image_path=f.path");
+        let mut tags = facet_values(conn, &tags, "tag_tree.tag", TAG_TREE_JOIN)?;
 
         let folders = facet_sql(view, Facet::Folders);
         let direct = facet_values(conn, &folders, "f.folder", "")?;
@@ -1870,20 +1874,22 @@ pub fn folder_counts(conn: &Connection) -> Result<Vec<(String, u64)>, IndexError
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Image count per tag ([`Index::tag_counts`]).
+// Expand every indexed tag into its slash-delimited prefixes. Counting distinct
+// paths afterwards avoids double-counting images with overlapping subtrees.
+const TAG_TREE_JOIN: &str = " JOIN (WITH RECURSIVE tree(image_path, original, pos) AS ( \
+    SELECT image_path, tag, 0 FROM note_tags \
+    UNION ALL SELECT image_path, original, pos + instr(substr(original, pos+1), '/') \
+    FROM tree WHERE instr(substr(original, pos+1), '/')>0 \
+    ) SELECT image_path, CASE WHEN pos=0 THEN original ELSE substr(original, 1, pos-1) END AS tag \
+    FROM tree) tag_tree ON tag_tree.image_path=f.path";
+
+/// Image count per tag and its descendants ([`Index::tag_counts`]).
 pub fn tag_counts(conn: &Connection) -> Result<Vec<(String, u64)>, IndexError> {
-    let mut stmt = conn.prepare(
-        "SELECT note_tags.tag, count(*) FROM note_tags \
-         JOIN files ON files.path=note_tags.image_path AND files.kind='image' \
-         GROUP BY note_tags.tag ORDER BY note_tags.tag",
-    )?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?.max(0) as u64,
-        ))
-    })?;
-    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    Ok(
+        facet_values(conn, &ViewSql::new(), "tag_tree.tag", TAG_TREE_JOIN)?
+            .into_iter()
+            .collect(),
+    )
 }
 
 /// Notes that are collections ([`Index::collections`]).
@@ -3712,6 +3718,75 @@ mod tests {
             ])
             .unwrap();
         (dir, index)
+    }
+
+    #[test]
+    fn hierarchical_tags_match_and_count_distinct_images() {
+        let (_dir, index) = facet_library();
+        let conn = index.conn().unwrap();
+        conn.execute("DELETE FROM note_tags", []).unwrap();
+        for (path, tag) in [
+            ("refs/a.png", "a"),
+            ("refs/a.png", "a/x"),
+            ("refs/a.png", "a/y/deep"),
+            ("refs/b.png", "a/x/deep"),
+            ("refs/ui/c.png", "a/y"),
+            ("refs/ui/d.png", "ab"),
+            ("refs/ui/d.png", "legacy//child"),
+            ("refs/ui/d.png", "trailing/"),
+        ] {
+            conn.execute(
+                "INSERT INTO note_tags(image_path,tag) VALUES (?1,?2)",
+                [path, tag],
+            )
+            .unwrap();
+        }
+        let query = ViewQuery {
+            tags: vec!["A".into()],
+            ..ViewQuery::default()
+        };
+        let page = index.view(&query).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.path.as_str())
+                .collect::<Vec<_>>(),
+            ["refs/a.png", "refs/b.png", "refs/ui/c.png"]
+        );
+        let expected = facet_map(&[
+            ("a", 3),
+            ("a/x", 2),
+            ("a/x/deep", 1),
+            ("a/y", 2),
+            ("a/y/deep", 1),
+            ("ab", 1),
+            ("legacy", 1),
+            ("legacy/", 1),
+            ("legacy//child", 1),
+            ("trailing", 1),
+            ("trailing/", 1),
+        ]);
+        assert_eq!(
+            index.tag_counts().unwrap(),
+            expected.clone().into_iter().collect::<Vec<_>>()
+        );
+        let off = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::Off { limit: 2 })
+            .unwrap();
+        let on = index
+            .view_facet_counts(&ViewQuery::default(), RecentWindow::On { limit: 2 })
+            .unwrap();
+        assert_eq!(off.tags, expected);
+        assert_eq!(on.tags["a"], 2);
+        assert_eq!(on.tags["a/x"], 2);
+        assert_eq!((on.total, on.recent, on.untagged), (5, 2, 1));
+        let scoped = index
+            .view_facet_counts(&query, RecentWindow::On { limit: 2 })
+            .unwrap();
+        assert_eq!(scoped.tags["a"], 2);
+        assert!(!scoped.tags.contains_key("ab"));
+        assert_eq!((scoped.total, scoped.recent, scoped.untagged), (3, 2, 0));
     }
 
     /// Nothing narrowed: every facet counts the library, a folder row counts

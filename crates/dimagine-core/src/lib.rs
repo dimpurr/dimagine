@@ -46,6 +46,8 @@ pub mod note;
 pub mod scan;
 pub mod settings;
 pub mod sniff;
+pub mod tag_aliases;
+pub mod tag_batch;
 pub mod upload;
 
 pub use check::{CheckReport, Finding, Severity};
