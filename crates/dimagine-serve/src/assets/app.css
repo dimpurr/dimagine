@@ -1331,6 +1331,7 @@ a.image-nav-next:hover {
   background: var(--tile-bg);
   border-radius: 10px;  /* --radius-md */
   overscroll-behavior: contain;
+  touch-action: pan-y pinch-zoom;
 }
 
 .image-stage img {
@@ -1340,6 +1341,18 @@ a.image-nav-next:hover {
   max-width: 100%;
   max-height: calc(80vh - 32px);
   border-radius: 6px;  /* --radius-sm */
+}
+
+.image-stage img {
+  transition: transform 180ms ease-out;
+}
+
+.image-stage img.swipe-dragging {
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-stage img { transition: none; }
 }
 
 /* A very tall picture (aspect < 0.4, DESIGN.md §5.4) is read top to bottom:

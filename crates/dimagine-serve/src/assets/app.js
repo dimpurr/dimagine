@@ -1500,38 +1500,60 @@
       }
     });
 
-    // A finger's sideways stroke across the picture walks the view: a stroke
-    // that turns vertical pans the page instead, and the navigation itself is a
-    // plain link, so nothing moves that prefers-reduced-motion has not already
-    // stopped (§2.6). The check below hands the stroke to the well when it
-    // scrolls sideways — which no rule of this stylesheet gives it today, since
-    // `.image-stage img` is capped at the well's width and the stage's own
-    // `data-fit` rules only ever shrink it. It is the guard for the day a
-    // `.image-stage[data-fit="wide"]` rule makes the picture wider than the
-    // well: the scroll would be the reader's, not this handler's.
+    // Warm the same display-size rendition used by the neighbouring pages.
+    [prev, next].forEach(function (link) {
+      if (!link) return;
+      var preload = new Image();
+      preload.src = '/media/' + new URL(link.href).pathname.slice('/image/'.length);
+    });
+
     var stroke = null;
-    if (stage) {
+    var touches = new Set();
+    var picture = stage && stage.querySelector('img');
+    function resetSwipe() {
+      if (picture) {
+        picture.classList.remove('swipe-dragging');
+        picture.style.transform = '';
+      }
+      stroke = null;
+    }
+    if (stage && picture) {
       stage.addEventListener('pointerdown', function (event) {
         if (event.pointerType !== 'touch') return;
-        stroke = { x: event.clientX, y: event.clientY, id: event.pointerId };
-        try {
-          stage.setPointerCapture(event.pointerId);
-        } catch (error) {
-          /* a pointer that left between events is simply not tracked */
-        }
+        touches.add(event.pointerId);
+        if (touches.size > 1) { resetSwipe(); return; }
+        if (stage.scrollWidth > stage.clientWidth + 1 ||
+            (window.visualViewport && window.visualViewport.scale > 1)) return;
+        stroke = { x: event.clientX, y: event.clientY, id: event.pointerId,
+          time: event.timeStamp, direction: null };
       });
-      stage.addEventListener('pointerup', function (event) {
-        if (!stroke || event.pointerId !== stroke.id) return;
+      stage.addEventListener('pointermove', function (event) {
+        if (!stroke || event.pointerId !== stroke.id || touches.size !== 1) return;
         var dx = event.clientX - stroke.x;
         var dy = event.clientY - stroke.y;
-        stroke = null;
-        if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.2) return;
-        if (stage.scrollWidth > stage.clientWidth + 1) return;
-        // Left is forward — the same direction the row of a book turns.
-        follow(dx < 0 ? next : prev);
+        if (!stroke.direction && Math.hypot(dx, dy) >= 10) {
+          stroke.direction = Math.abs(dx) > Math.abs(dy) ? 'horizontal' : 'vertical';
+        }
+        if (stroke.direction !== 'horizontal') return;
+        picture.classList.add('swipe-dragging');
+        var edge = dx < 0 ? !next : !prev;
+        picture.style.transform = 'translateX(' + (edge ? dx * 0.3 : dx) + 'px)';
       });
-      stage.addEventListener('pointercancel', function () {
-        stroke = null;
+      stage.addEventListener('pointerup', function (event) {
+        touches.delete(event.pointerId);
+        if (!stroke || event.pointerId !== stroke.id) return;
+        var dx = event.clientX - stroke.x;
+        var elapsed = Math.max(1, event.timeStamp - stroke.time);
+        var link = dx < 0 ? next : prev;
+        var navigate = stroke.direction === 'horizontal' && link &&
+          (Math.abs(dx) >= stage.clientWidth * 0.25 ||
+            (Math.abs(dx) >= 30 && Math.abs(dx) / elapsed >= 0.5));
+        resetSwipe();
+        if (navigate) follow(link);
+      });
+      stage.addEventListener('pointercancel', function (event) {
+        touches.delete(event.pointerId);
+        resetSwipe();
       });
     }
 

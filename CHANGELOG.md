@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Follow touch swipes between images on the detail page, with edge resistance and neighbour preloading.
+
 - Protect tag scan and progress details, and keep tag planning and legacy applies off async workers.
 
 - Improve tag menu dismissal and distinguish blocking preview issues.
