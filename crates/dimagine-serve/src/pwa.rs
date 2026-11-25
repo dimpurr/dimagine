@@ -2,11 +2,11 @@
 //! artwork; library pages and data stay behind the normal auth layer.
 
 use axum::{
+    Router,
     body::Body,
-    http::{header, HeaderValue},
+    http::{HeaderValue, header},
     response::Response,
     routing::get,
-    Router,
 };
 
 const MANIFEST: &str = include_str!("assets/manifest.webmanifest");
@@ -28,7 +28,11 @@ pub fn router() -> Router {
 }
 
 async fn manifest() -> Response {
-    text_asset(MANIFEST, "application/manifest+json; charset=utf-8", "no-cache")
+    text_asset(
+        MANIFEST,
+        "application/manifest+json; charset=utf-8",
+        "no-cache",
+    )
 }
 
 async fn service_worker() -> Response {
@@ -36,7 +40,11 @@ async fn service_worker() -> Response {
 }
 
 async fn offline_page() -> Response {
-    text_asset(OFFLINE_PAGE, "text/html; charset=utf-8", "public, max-age=3600")
+    text_asset(
+        OFFLINE_PAGE,
+        "text/html; charset=utf-8",
+        "public, max-age=3600",
+    )
 }
 
 async fn icon_192() -> Response {
@@ -51,11 +59,18 @@ async fn maskable_512() -> Response {
     image_asset(MASKABLE_512)
 }
 
-fn text_asset(body: &'static str, content_type: &'static str, cache_control: &'static str) -> Response {
+fn text_asset(
+    body: &'static str,
+    content_type: &'static str,
+    cache_control: &'static str,
+) -> Response {
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
     response
 }
 
@@ -63,6 +78,9 @@ fn image_asset(body: &'static [u8]) -> Response {
     let mut response = Response::new(Body::from(body));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=31536000, immutable"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
     response
 }
