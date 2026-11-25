@@ -15,6 +15,8 @@ const OFFLINE_PAGE: &str = include_str!("assets/offline.html");
 const ICON_192: &[u8] = include_bytes!("assets/icon-192.png");
 const ICON_512: &[u8] = include_bytes!("assets/icon-512.png");
 const MASKABLE_512: &[u8] = include_bytes!("assets/maskable-512.png");
+const SCREENSHOT_NARROW: &[u8] = include_bytes!("assets/screenshots/pwa-narrow.png");
+const SCREENSHOT_WIDE: &[u8] = include_bytes!("assets/screenshots/pwa-wide.png");
 
 pub fn router() -> Router {
     Router::new()
@@ -24,6 +26,8 @@ pub fn router() -> Router {
         .route("/icons/icon-192.png", get(icon_192))
         .route("/icons/icon-512.png", get(icon_512))
         .route("/icons/maskable-512.png", get(maskable_512))
+        .route("/screenshots/pwa-narrow.png", get(screenshot_narrow))
+        .route("/screenshots/pwa-wide.png", get(screenshot_wide))
         .route("/apple-touch-icon.png", get(icon_192))
 }
 
@@ -57,6 +61,14 @@ async fn icon_512() -> Response {
 
 async fn maskable_512() -> Response {
     image_asset(MASKABLE_512)
+}
+
+async fn screenshot_narrow() -> Response {
+    image_asset(SCREENSHOT_NARROW)
+}
+
+async fn screenshot_wide() -> Response {
+    image_asset(SCREENSHOT_WIDE)
 }
 
 fn text_asset(
