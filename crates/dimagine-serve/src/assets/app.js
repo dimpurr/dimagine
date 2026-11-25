@@ -67,6 +67,15 @@
   function applyTheme(choice) {
     if (choice === 'auto') document.documentElement.removeAttribute('data-theme');
     else document.documentElement.setAttribute('data-theme', choice);
+    syncThemeColor();
+  }
+
+  function syncThemeColor() {
+    var canvas = window.getComputedStyle(document.documentElement).backgroundColor;
+    Array.prototype.forEach.call(
+      document.querySelectorAll('meta[name="theme-color"]'),
+      function (meta) { meta.setAttribute('content', canvas); }
+    );
   }
 
   function rememberTheme(choice) {
@@ -79,6 +88,12 @@
 
   var themeChoice = storedTheme();
   applyTheme(themeChoice);
+  if (window.matchMedia) {
+    var systemTheme = window.matchMedia('(prefers-color-scheme: dark)');
+    if (systemTheme.addEventListener) systemTheme.addEventListener('change', function () {
+      if (themeChoice === 'auto') syncThemeColor();
+    });
+  }
 
   // The switch is the toolbar's fifth control, and the toolbar is drawn by
   // the server for every page; building it here keeps a theme preference a

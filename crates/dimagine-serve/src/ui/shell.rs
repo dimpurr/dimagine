@@ -127,8 +127,8 @@ impl<'a> Frame<'a> {
         format!(
             "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
              <meta name=\"viewport\" content=\"width=device-width,initial-scale=1,viewport-fit=cover\">\
-             <meta name=\"theme-color\" content=\"#f5f5f2\" media=\"(prefers-color-scheme: light)\">\
-             <meta name=\"theme-color\" content=\"#171a1b\" media=\"(prefers-color-scheme: dark)\">\
+             <meta name=\"theme-color\" content=\"#f7f8fa\" media=\"(prefers-color-scheme: light)\">\
+             <meta name=\"theme-color\" content=\"#0e1116\" media=\"(prefers-color-scheme: dark)\">\
              <title>{} · dimagine</title><link rel=\"manifest\" href=\"/manifest.webmanifest\"><link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\"><link rel=\"icon\" href=\"/icons/icon-192.png\"><link rel=\"stylesheet\" href=\"{}\">{}</head><body>\
              {}\
              <div class=\"app-shell\">{}{}<main class=\"main-column\">{}<section class=\"pwa-install\"><button id=\"pwa-install-button\" type=\"button\">Install app</button><details><summary>Install steps</summary><p>Android: choose Install app from the browser menu. iPhone or iPad: in Safari, choose Share, then Add to Home Screen.</p></details></section>{}{}</main>{}{}</div>\
