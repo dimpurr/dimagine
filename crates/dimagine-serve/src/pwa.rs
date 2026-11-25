@@ -2,11 +2,11 @@
 //! artwork; library pages and data stay behind the normal auth layer.
 
 use axum::{
-    Router,
     body::Body,
-    http::{HeaderValue, header},
+    http::{header, HeaderValue},
     response::Response,
     routing::get,
+    Router,
 };
 
 const MANIFEST: &str = include_str!("assets/manifest.webmanifest");
