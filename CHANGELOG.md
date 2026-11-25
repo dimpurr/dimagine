@@ -6,7 +6,7 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-- Add installable PWA metadata and an offline shell while keeping private pages and library data out of the service worker cache.
+- Add installable PWA metadata, an offline shell, and public narrow/wide install screenshots generated from a synthetic library, while keeping private pages and library data out of the service worker cache.
 
 - Follow touch swipes between images on the detail page, with edge resistance and neighbour preloading.
 
