@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-25
+
 - Keep the page canvas, top and bottom bars, and browser theme color on one opaque theme color.
 
 - Add installable PWA metadata, an offline shell, and public narrow/wide install screenshots generated from a synthetic library, while keeping private pages and library data out of the service worker cache.
