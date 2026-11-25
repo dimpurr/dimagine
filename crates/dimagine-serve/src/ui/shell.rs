@@ -131,7 +131,7 @@ impl<'a> Frame<'a> {
              <meta name=\"theme-color\" content=\"#171a1b\" media=\"(prefers-color-scheme: dark)\">\
              <title>{} · dimagine</title><link rel=\"manifest\" href=\"/manifest.webmanifest\"><link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\"><link rel=\"icon\" href=\"/icons/icon-192.png\"><link rel=\"stylesheet\" href=\"{}\">{}</head><body>\
              {}\
-             <div class=\"app-shell\">{}{}<main class=\"main-column\">{}<section class=\"pwa-install\"><button id=\"pwa-install-button\" type=\"button\">Install app</button><details><summary>Install steps</summary><p>Android: choose Install app from the browser menu. iPhone or iPad: in Safari, choose Share, then Add to Home Screen.</p></details></section>{}{}{}</main>{}{}</div>\
+             <div class=\"app-shell\">{}{}<main class=\"main-column\">{}<section class=\"pwa-install\"><button id=\"pwa-install-button\" type=\"button\">Install app</button><details><summary>Install steps</summary><p>Android: choose Install app from the browser menu. iPhone or iPad: in Safari, choose Share, then Add to Home Screen.</p></details></section>{}{}</main>{}{}</div>\
              <script src=\"{}\" defer></script></body></html>",
             escape_html(self.title),
             escape_html(&css_url()),
