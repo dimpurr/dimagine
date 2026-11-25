@@ -1,0 +1,22 @@
+{
+  "id": "/",
+  "name": "dimagine",
+  "short_name": "dimagine",
+  "description": "A private image reference library",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "lang": "en",
+  "theme_color": "#f5f5f2",
+  "background_color": "#f5f5f2",
+  "icons": [
+    { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "screenshots": [
+    { "src": "/screenshots/pwa-narrow.png", "sizes": "390x844", "type": "image/png", "form_factor": "narrow" },
+    { "src": "/screenshots/pwa-wide.png", "sizes": "1440x900", "type": "image/png", "form_factor": "wide" }
+  ]
+}

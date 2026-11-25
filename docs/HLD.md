@@ -1,5 +1,15 @@
 # High-level design of the tools
 
+## PWA shell
+
+The viewer exposes a stable root-scoped manifest, regular and maskable PNG
+icons, a small offline page and a service worker. The worker caches only the
+offline page, brand icons and content-hashed app assets. Navigations use the
+network and fall back to the offline page; library HTML, API routes,
+authentication routes, media and user data are never written to Cache
+Storage. PWA metadata and image assets are public static resources and do not
+expose library data.
+
 - **Status:** Planned (0.1). Everything here is optional tooling on top of
   [FORMAT.md](FORMAT.md); the format wins on any conflict.
 

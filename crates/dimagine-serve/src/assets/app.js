@@ -23,6 +23,26 @@
 (function () {
   'use strict';
 
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', function () {
+      navigator.serviceWorker.register('/sw.js').catch(function () {});
+    });
+  }
+
+  var installButton = document.getElementById('pwa-install-button');
+  var installPrompt = null;
+  if (installButton) {
+    window.addEventListener('beforeinstallprompt', function (event) {
+      event.preventDefault();
+      installPrompt = event;
+    });
+    installButton.addEventListener('click', function () {
+      if (!installPrompt) return;
+      installPrompt.prompt();
+      installPrompt = null;
+    });
+  }
+
   // Marks the document so CSS can hide the no-script affordances (the sort
   // submit button) that only exist for a browser without this file.
   document.documentElement.classList.add('js');

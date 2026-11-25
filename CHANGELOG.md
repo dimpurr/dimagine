@@ -6,6 +6,8 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+- Add installable PWA metadata and an offline shell while keeping private pages and library data out of the service worker cache.
+
 - Follow touch swipes between images on the detail page, with edge resistance and neighbour preloading.
 
 - Protect tag scan and progress details, and keep tag planning and legacy applies off async workers.

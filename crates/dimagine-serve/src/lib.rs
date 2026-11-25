@@ -16,6 +16,7 @@ pub mod content;
 pub mod index_sync;
 pub(crate) mod media;
 pub mod pages;
+pub mod pwa;
 pub mod session_log;
 pub mod ui;
 pub mod view_query;
@@ -950,7 +951,10 @@ pub fn router_from(
         .route("/settings/json", get(write_api::settings_json_page))
         .merge(write_routes)
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state);
+        .with_state(state)
+        // Public app metadata and artwork contain no library data; dynamic
+        // routes and APIs above remain behind the normal auth layer.
+        .merge(pwa::router());
     Ok(app)
 }
 
